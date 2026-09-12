@@ -1,0 +1,79 @@
+{
+  "host": {
+    "system": "Linux",
+    "release": "6.18.44-fc-v32",
+    "machine": "x86_64",
+    "python_version": "3.12.3"
+  },
+  "image_digest": "sha256:5cfb3f40a8a668c4a6f570579b0f84cda901dba7d65a7e2de146c0e98be08a4b",
+  "trials": [
+    {
+      "trial": 1,
+      "run_id": "s1-trial1-3e5290a0",
+      "image_digest": "sha256:5cfb3f40a8a668c4a6f570579b0f84cda901dba7d65a7e2de146c0e98be08a4b",
+      "worktree_created": true,
+      "docker_exit_code": 0,
+      "testcases": [
+        {
+          "classname": "test_sample",
+          "name": "test_addition",
+          "status": "passed"
+        },
+        {
+          "classname": "test_sample",
+          "name": "test_string",
+          "status": "passed"
+        }
+      ],
+      "worktree_removed_cleanly": true,
+      "container_leftover": false,
+      "worktree_dir_leftover": false
+    },
+    {
+      "trial": 2,
+      "run_id": "s1-trial2-9a238443",
+      "image_digest": "sha256:5cfb3f40a8a668c4a6f570579b0f84cda901dba7d65a7e2de146c0e98be08a4b",
+      "worktree_created": true,
+      "docker_exit_code": 0,
+      "testcases": [
+        {
+          "classname": "test_sample",
+          "name": "test_addition",
+          "status": "passed"
+        },
+        {
+          "classname": "test_sample",
+          "name": "test_string",
+          "status": "passed"
+        }
+      ],
+      "worktree_removed_cleanly": true,
+      "container_leftover": false,
+      "worktree_dir_leftover": false
+    },
+    {
+      "trial": 3,
+      "run_id": "s1-trial3-50db0712",
+      "image_digest": "sha256:5cfb3f40a8a668c4a6f570579b0f84cda901dba7d65a7e2de146c0e98be08a4b",
+      "worktree_created": true,
+      "docker_exit_code": 0,
+      "testcases": [
+        {
+          "classname": "test_sample",
+          "name": "test_addition",
+          "status": "passed"
+        },
+        {
+          "classname": "test_sample",
+          "name": "test_string",
+          "status": "passed"
+        }
+      ],
+      "worktree_removed_cleanly": true,
+      "container_leftover": false,
+      "worktree_dir_leftover": false
+    }
+  ],
+  "per_test_identity_equivalent_across_trials": true,
+  "no_labeled_containers_remain_after_cleanup": true
+}

@@ -1,0 +1,22 @@
+{
+  "trial": 1,
+  "run_id": "s1-trial1-3e5290a0",
+  "image_digest": "sha256:5cfb3f40a8a668c4a6f570579b0f84cda901dba7d65a7e2de146c0e98be08a4b",
+  "worktree_created": true,
+  "docker_exit_code": 0,
+  "testcases": [
+    {
+      "classname": "test_sample",
+      "name": "test_addition",
+      "status": "passed"
+    },
+    {
+      "classname": "test_sample",
+      "name": "test_string",
+      "status": "passed"
+    }
+  ],
+  "worktree_removed_cleanly": true,
+  "container_leftover": false,
+  "worktree_dir_leftover": false
+}

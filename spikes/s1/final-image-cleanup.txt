@@ -1,0 +1,5 @@
+Untagged: codeagent-spike-s1-image:latest
+Deleted: sha256:5cfb3f40a8a668c4a6f570579b0f84cda901dba7d65a7e2de146c0e98be08a4b
+Deleted: sha256:5e3a070a7e3c4c0053c688bb02dc5a129750a1146be7f939b11d80316a2f0882
+Untagged: codeagent-spike-s1-base:latest
+Deleted: sha256:ebc7a4c049f9d6bd17c90fdeb7cc62f374ed333ac31212b8454bcb2ff421da41
