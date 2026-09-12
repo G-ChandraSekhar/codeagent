@@ -36,6 +36,12 @@ broader feature trivially easy to add.
 
 ## Reference documents, in order of authority
 
+The current explicit user request always outranks every document listed
+below — none of these documents authorize overriding what the user
+actually asked for in this conversation. The authority order below
+applies only when reconciling these repository documents against each
+other, not against the user.
+
 1. `docs/CODEAGENT_LLM_HANDOFF.md` — top authority. Where it conflicts
    with `CODEAGENT_IMPLEMENTATION_GUIDE.md` or an open question in
    `DESIGN_SPEC.md`, the handoff's decision wins (see its own "Stage 4
@@ -52,17 +58,49 @@ broader feature trivially easy to add.
    the phase-level rationale, not as the current source of truth for
    sequencing.
 
+## Documentation ladder
+
+Match the record to the decision — don't over- or under-document:
+
+- **ADR** (`docs/adr/`): a durable, cross-cutting decision with credible
+  alternatives and a meaningful reversal cost. Created only when a
+  consequential decision actually meets this bar — not on a fixed
+  schedule or a target count.
+- **ENGINEERING_LOG.md**: meaningful session-level trade-offs, evidence,
+  corrections, and lessons — including decisions that don't rise to an
+  ADR.
+- **Code comment**: a non-obvious local invariant.
+- **Issue/risk register** (e.g. the threat model's residual-risk
+  entries): unresolved or unbuilt work.
+- Do not permanently document routine edits, test additions, status
+  changes, or ordinary pushes as if they were engineering decisions.
+
 ## Current status
 
-No production code exists. Milestone 0 ("Contracts and threats" —
-domain types, state-transition table, event/error schemas, threat
-model, ADRs for consequential decisions) has not started: there is no
-`src/`, no `docs/adr/`, and no `docs/threat-model.md`.
+Milestone 0 ("Contracts and threats") core deliverables are done:
+
+- `src/codeagent/domain.py` — `RunState`/`Trigger`/`TerminalReason`
+  state-transition table (fail-closed), tool-legality-per-state,
+  budget/approval vocabulary.
+- `src/codeagent/events.py` — 16 typed, cross-validated event schemas
+  for the append-only run log.
+- `src/codeagent/errors.py` — stable `ErrorCode`/`ErrorDomain`
+  taxonomy, explicitly excluding expected domain outcomes.
+- `docs/adr/0001-no-model-callable-process-execution.md` — Accepted.
+- `docs/adr/0002-single-generic-budget-exceeded-trigger.md` — Accepted.
+- `docs/threat-model.md` — Accepted (2026-09-12).
+- `ENGINEERING_LOG.md` — session-level decision trail, per the
+  documentation ladder above.
+- `tests/unit/{test_domain,test_events,test_errors}.py` — 677 tests,
+  all passing as of the last full run.
+
+Further ADRs are not inherently required — per the documentation ladder
+above, another ADR is created only when a future consequential decision
+actually meets the ADR threshold, not as a standing checklist item.
 
 Stage 2 (of the four-stage planning process in
-`docs/CODEAGENT_LLM_HANDOFF.md`) is in progress: technical spikes
-validating uncertain infrastructure decisions before Milestone 0 work
-begins.
+`docs/CODEAGENT_LLM_HANDOFF.md`) spikes remain separately unstarted
+except S1:
 
 - **S1 — temporary worktree + Docker + pytest + cleanup: PASSED**
   (Linux; 3 trials, exit 0, consistent per-test results, no orphaned
