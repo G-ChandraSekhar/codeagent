@@ -26,14 +26,35 @@ ALL_DOMAINS = list(ErrorDomain)
 
 @pytest.mark.parametrize("code", ALL_CODES)
 def test_operational_error_construction_with_every_code(code: ErrorCode) -> None:
-    e = OperationalError(code=code, message="a sanitized summary")
+    e = OperationalError(code=code, error_id="err-1", message="a sanitized summary")
     assert e.code is code
+    assert e.error_id == "err-1"
     assert e.message == "a sanitized summary"
 
 
 def test_operational_error_rejects_empty_message() -> None:
     with pytest.raises(ValueError):
-        OperationalError(code=ErrorCode.TOOL_EXECUTION_FAILED, message="")
+        OperationalError(code=ErrorCode.TOOL_EXECUTION_FAILED, error_id="err-1", message="")
+
+
+def test_operational_error_rejects_empty_error_id() -> None:
+    with pytest.raises(ValueError):
+        OperationalError(code=ErrorCode.TOOL_EXECUTION_FAILED, error_id="", message="x")
+
+
+def test_operational_error_reuses_the_same_error_id_across_instances() -> None:
+    """The whole point of error_id: two OperationalError instances
+    representing the same failure occurrence carry identical error_id
+    values even though they're separate objects (e.g. one attached to
+    a ToolCompleted, one to a RunFinished)."""
+    shared_id = "err-shared-1"
+    first = OperationalError(
+        code=ErrorCode.PATCH_VALIDATION_FAILED, error_id=shared_id, message="a"
+    )
+    second = OperationalError(
+        code=ErrorCode.PATCH_VALIDATION_FAILED, error_id=shared_id, message="a, restated"
+    )
+    assert first.error_id == second.error_id == shared_id
 
 
 # --------------------------------------------------------------------

@@ -44,9 +44,14 @@ Deferred to later work, not in this file:
   describes but may not itself be able to record, if the very sink that
   failed is what would have to record it (see PERSISTENCE_WRITE_FAILED
   below).
-- error_id: no OperationalError in this design is referenced from more
-  than one event, or needs deduplication, so none is defined. Add one
-  if and when a real cross-event reference need appears — not before.
+
+`OperationalError.error_id` (below) was deliberately deferred in the
+original design pass — no design at that point referenced one failure
+from two events. The Milestone 1 controller then produced a concrete
+case (one apply_patch failure represented by both a ToolCompleted and
+the RunFinished that cites it), so the deferral's own stated
+reconsideration condition was met and error_id was added. See
+ENGINEERING_LOG.md for the evidence-driven reversal entry.
 """
 
 from __future__ import annotations
@@ -168,18 +173,26 @@ class OperationalError:
 
     `code` is the serialization identifier: stable, matched
     programmatically, never renamed once persisted (see ErrorCode).
-    `message` is free text for a human reading the trace — it must
-    already be sanitized by the caller before construction (no raw
-    exception tracebacks, environment variables, model arguments,
-    subprocess output, secrets, or unrestricted provider payloads);
-    this module cannot verify that mechanically, the same way
-    events.ToolRequested cannot verify its arguments were actually
-    redacted. `message` must never be parsed or matched against by
-    other code — only `code` is a serialization identifier.
+    `error_id` identifies one specific *occurrence* of a failure — the
+    caller generates it once and reuses the same value verbatim on
+    every event representing that same occurrence (e.g. a failed
+    ToolCompleted and the RunFinished that cites it), so a reader can
+    join them. A new failure occurrence gets a new error_id even if it
+    has the same `code`. `message` is free text for a human reading the
+    trace — it must already be sanitized by the caller before
+    construction (no raw exception tracebacks, environment variables,
+    model arguments, subprocess output, secrets, or unrestricted
+    provider payloads); this module cannot verify that mechanically,
+    the same way events.ToolRequested cannot verify its arguments were
+    actually redacted. `message` must never be parsed or matched
+    against by other code — only `code` and `error_id` are
+    serialization identifiers.
     """
 
     code: ErrorCode
+    error_id: str
     message: str
 
     def __post_init__(self) -> None:
+        _require_nonempty("error_id", self.error_id)
         _require_nonempty("message", self.message)

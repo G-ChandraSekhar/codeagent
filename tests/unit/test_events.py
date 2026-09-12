@@ -26,7 +26,7 @@ _EXECUTOR_ERROR_CODE_BY_OUTCOME = {
 
 
 def _executor_error_for(outcome: events.VerificationOutcome) -> OperationalError:
-    return OperationalError(code=_EXECUTOR_ERROR_CODE_BY_OUTCOME[outcome], message="executor failure")
+    return OperationalError(code=_EXECUTOR_ERROR_CODE_BY_OUTCOME[outcome], error_id="err-1", message="executor failure")
 
 
 def now() -> datetime:
@@ -436,7 +436,7 @@ def test_model_response_received_allows_missing_token_counts() -> None:
         output_tokens=None,
         latency_seconds=0.1,
         tool_call_count=0,
-        error=OperationalError(code=ErrorCode.MODEL_RESPONSE_FAILED_STATUS, message="boom"),
+        error=OperationalError(code=ErrorCode.MODEL_RESPONSE_FAILED_STATUS, error_id="err-1", message="boom"),
     )
     assert e.input_tokens is None
 
@@ -469,7 +469,7 @@ def test_model_response_received_completed_without_error() -> None:
 def test_model_response_received_completed_with_malformed_error() -> None:
     e = _make_model_response_received(
         status=events.ModelResponseStatus.COMPLETED,
-        error=OperationalError(code=ErrorCode.MODEL_RESPONSE_MALFORMED, message="bad json"),
+        error=OperationalError(code=ErrorCode.MODEL_RESPONSE_MALFORMED, error_id="err-1", message="bad json"),
     )
     assert e.error.code is ErrorCode.MODEL_RESPONSE_MALFORMED
 
@@ -478,7 +478,7 @@ def test_model_response_received_rejects_wrong_error_code_when_completed() -> No
     with pytest.raises(ValueError):
         _make_model_response_received(
             status=events.ModelResponseStatus.COMPLETED,
-            error=OperationalError(code=ErrorCode.MODEL_RESPONSE_FAILED_STATUS, message="x"),
+            error=OperationalError(code=ErrorCode.MODEL_RESPONSE_FAILED_STATUS, error_id="err-1", message="x"),
         )
 
 
@@ -491,7 +491,7 @@ def test_model_response_received_rejects_wrong_error_code_when_failed() -> None:
     with pytest.raises(ValueError):
         _make_model_response_received(
             status=events.ModelResponseStatus.FAILED,
-            error=OperationalError(code=ErrorCode.MODEL_RESPONSE_MALFORMED, message="x"),
+            error=OperationalError(code=ErrorCode.MODEL_RESPONSE_MALFORMED, error_id="err-1", message="x"),
         )
 
 
@@ -509,7 +509,7 @@ def test_model_response_received_forbids_error_for_other_statuses(
 ) -> None:
     kwargs: dict[str, object] = dict(
         status=status,
-        error=OperationalError(code=ErrorCode.MODEL_RESPONSE_MALFORMED, message="x"),
+        error=OperationalError(code=ErrorCode.MODEL_RESPONSE_MALFORMED, error_id="err-1", message="x"),
     )
     if status is events.ModelResponseStatus.INCOMPLETE:
         kwargs["incomplete_reason"] = "max_output_tokens"
@@ -612,7 +612,7 @@ def test_model_request_failed_construction() -> None:
     e = events.ModelRequestFailed(
         **make_envelope(),
         request_id="req-1",
-        error=OperationalError(code=ErrorCode.MODEL_PROVIDER_REQUEST_FAILED, message="timed out"),
+        error=OperationalError(code=ErrorCode.MODEL_PROVIDER_REQUEST_FAILED, error_id="err-1", message="timed out"),
     )
     assert e.request_id == "req-1"
     assert e.error.code is ErrorCode.MODEL_PROVIDER_REQUEST_FAILED
@@ -622,7 +622,7 @@ def test_model_request_failed_accepts_auth_failed() -> None:
     e = events.ModelRequestFailed(
         **make_envelope(),
         request_id="req-1",
-        error=OperationalError(code=ErrorCode.MODEL_PROVIDER_AUTH_FAILED, message="401"),
+        error=OperationalError(code=ErrorCode.MODEL_PROVIDER_AUTH_FAILED, error_id="err-1", message="401"),
     )
     assert e.error.code is ErrorCode.MODEL_PROVIDER_AUTH_FAILED
 
@@ -632,7 +632,7 @@ def test_model_request_failed_rejects_empty_request_id() -> None:
         events.ModelRequestFailed(
             **make_envelope(),
             request_id="",
-            error=OperationalError(code=ErrorCode.MODEL_PROVIDER_REQUEST_FAILED, message="x"),
+            error=OperationalError(code=ErrorCode.MODEL_PROVIDER_REQUEST_FAILED, error_id="err-1", message="x"),
         )
 
 
@@ -647,7 +647,7 @@ def test_model_request_failed_rejects_codes_outside_model_provider_domain(
         events.ModelRequestFailed(
             **make_envelope(),
             request_id="req-1",
-            error=OperationalError(code=code, message="x"),
+            error=OperationalError(code=code, error_id="err-1", message="x"),
         )
 
 
@@ -848,7 +848,7 @@ def _make_tool_completed_failure(
         success=False,
         duration_seconds=0.0,
         result_summary="",
-        error=OperationalError(code=code, message="failed"),
+        error=OperationalError(code=code, error_id="err-1", message="failed"),
     )
 
 
@@ -967,7 +967,7 @@ def test_tool_completed_rejects_error_when_success() -> None:
             success=True,
             duration_seconds=0.0,
             result_summary="ok",
-            error=OperationalError(code=ErrorCode.TOOL_EXECUTION_FAILED, message="x"),
+            error=OperationalError(code=ErrorCode.TOOL_EXECUTION_FAILED, error_id="err-1", message="x"),
         )
 
 
@@ -1439,7 +1439,7 @@ def test_run_finished_forbids_error_for_expected_terminal_reasons(
     with pytest.raises(ValueError):
         _make_run_finished(
             terminal_reason=terminal_reason,
-            error=OperationalError(code=ErrorCode.UNCLASSIFIED_FAILURE, message="x"),
+            error=OperationalError(code=ErrorCode.UNCLASSIFIED_FAILURE, error_id="err-1", message="x"),
         )
 
 
@@ -1451,7 +1451,7 @@ def test_run_finished_requires_error_for_policy_violation() -> None:
 def test_run_finished_accepts_policy_violation_with_severe_code() -> None:
     e = _make_run_finished(
         terminal_reason=domain.TerminalReason.POLICY_VIOLATION,
-        error=OperationalError(code=ErrorCode.POLICY_VIOLATION_SEVERE, message="sandbox escape"),
+        error=OperationalError(code=ErrorCode.POLICY_VIOLATION_SEVERE, error_id="err-1", message="sandbox escape"),
     )
     assert e.error.code is ErrorCode.POLICY_VIOLATION_SEVERE
 
@@ -1461,7 +1461,7 @@ def test_run_finished_rejects_non_severe_codes_for_policy_violation(code: ErrorC
     with pytest.raises(ValueError):
         _make_run_finished(
             terminal_reason=domain.TerminalReason.POLICY_VIOLATION,
-            error=OperationalError(code=code, message="x"),
+            error=OperationalError(code=code, error_id="err-1", message="x"),
         )
 
 
@@ -1476,7 +1476,7 @@ def test_run_finished_accepts_any_non_policy_code_for_unrecoverable_error(
 ) -> None:
     e = _make_run_finished(
         terminal_reason=domain.TerminalReason.UNRECOVERABLE_ERROR,
-        error=OperationalError(code=code, message="x"),
+        error=OperationalError(code=code, error_id="err-1", message="x"),
     )
     assert e.error.code is code
 
@@ -1485,7 +1485,7 @@ def test_run_finished_rejects_policy_violation_severe_code_for_unrecoverable_err
     with pytest.raises(ValueError):
         _make_run_finished(
             terminal_reason=domain.TerminalReason.UNRECOVERABLE_ERROR,
-            error=OperationalError(code=ErrorCode.POLICY_VIOLATION_SEVERE, message="x"),
+            error=OperationalError(code=ErrorCode.POLICY_VIOLATION_SEVERE, error_id="err-1", message="x"),
         )
 
 

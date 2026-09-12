@@ -236,3 +236,54 @@ verified. 677 tests passing, `git diff --check` clean.
   ladder (ADR / ENGINEERING_LOG / code comment / issue register) so future
   sessions size the record to the decision instead of treating ADR count as
   a checklist to fill.
+
+## Session: Milestone 1 slice A — controller, plus correction pass
+
+**Outcome**: `src/codeagent/controller.py` (RunController + Protocols),
+`tests/support/fakes.py` (test doubles moved out of production code),
+`tests/integration/test_controller.py`. 697 tests passing.
+
+- First version of the controller used a single `attempt` counter for
+  both plan revisions and verification repairs, and indexed the fake
+  verifier's outcome list by that same counter. Review (by the user,
+  reading actual behavior rather than trusting passing tests) found
+  this let a plan revision silently consume repair budget and skip a
+  verification outcome — the 685 tests passing at the time didn't cover
+  it because no test exercised revision and repair in the same run.
+  Fixed by separating four previously-conflated counters: the event
+  `iteration` index (pass_index), approval-visit index, verification-
+  attempt index, and two real counts (repair_iterations_used,
+  plan_revisions_used) checked against independent budgets.
+- Same review found an unbounded loop: a fake approval provider that
+  always returns REVISION_REQUESTED ran forever, since no plan-revision
+  budget existed. Added `max_plan_revisions` with the same
+  "count-used-vs-max" pattern as repair iterations, terminating via
+  `BudgetExceeded(kind=PLAN_REVISIONS)`.
+- **error_id reversal (author decision, evidence-driven, not
+  preemptive)**: `errors.py`'s original design explicitly deferred
+  `OperationalError.error_id` until "a real cross-event reference need
+  appears." The controller's patch-failure path produced exactly that
+  need — one failure occurrence represented by both a `ToolCompleted`
+  and the `RunFinished` that cites it, with no way to prove they're the
+  same occurrence. Added `error_id: str` (validated nonempty) to
+  `OperationalError`; the controller generates one id per failure and
+  reuses the same object on every event representing it. No ADR — this
+  is exactly the kind of decision the deferral's own stated
+  reconsideration condition anticipated, not a new architectural
+  question.
+- Decoupled production orchestration from test doubles: `RunController`
+  now depends only on four narrow Protocols (`ModelClient`,
+  `ApprovalProvider`, `Verifier`, `PatchApplier`) plus `Clock`; concrete
+  fakes (including a new `SteppingClock` for reproducible timestamps
+  without real time or sleeping) moved to `tests/support/fakes.py`.
+  `FixtureScenario`/`FixturePlan` were removed in favor of a smaller
+  `RunConfig` (real run parameters only) plus the fakes' own
+  constructor arguments (scripted decisions), since conflating the two
+  was part of what made the counter bug hard to see.
+- Added `PolicyDecisionRecorded` (request→policy→completion ordering)
+  and `CheckpointCreated` (preceding every `PatchApplied`, chained via
+  `parent_checkpoint_id`) — the prior version's audit trace was
+  incomplete in exactly the way a real reviewer would notice first.
+- This is still explicitly "Milestone 1, slice A," not Milestone 1
+  completion — no real worktree, executor, or model integration exists;
+  see controller.py's module docstring.
