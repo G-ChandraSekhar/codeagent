@@ -3,12 +3,12 @@ CodeAgent Stage 2 -- S4 post-hardening follow-up: validates the
 Milestone 3 executor changes (commit 00063d445d9c25f957c0c6474701fb61d1217f67)
 that were made *in response to* the original S4 spike's open questions.
 
-Scope: macOS/Docker Desktop ONLY in this pass (see docs/threat-model.md's
-A9 -- Linux and macOS/Docker Desktop are separate evidence domains; a
-Linux repetition of this follow-up is separate, later work, not done
-here). This is a distinct, narrower run -- not a rerun of the original
-14-check spike_s4.py, and it never touches that script's own retained
-evidence.
+Scope: macOS/Docker Desktop and Linux/x86_64 (each its own evidence
+domain -- see docs/threat-model.md's A9). The same three checks run on
+both platforms; nothing here claims cross-platform equivalence beyond
+what each platform's own retained evidence actually shows. This is a
+distinct, narrower run -- not a rerun of the original 14-check
+spike_s4.py, and it never touches that script's own retained evidence.
 
 What changed in production since the original S4 run, and what this
 follow-up checks:
@@ -51,19 +51,60 @@ than re-implemented -- see that module's own docstring for the
 rationale. This file adds only what's specific to the post-hardening
 follow-up.
 
-Evidence is written under a fresh, uniquely named subdirectory of the
-EXISTING macOS platform evidence directory:
+Evidence is written under a fresh, run-specific subdirectory of the
+EXISTING per-platform evidence directory (reusing spike_s4.py's own
+`_platform_key()`, never a retyped copy):
 
-    spikes/s4/evidence/macos-docker-desktop-arm64/run-m3-followup-<timestamp>-<id>/
+    spikes/s4/evidence/macos-docker-desktop-<machine>/run-m3-followup-<timestamp>-<id>/
+    spikes/s4/evidence/linux-x86_64/run-m3-followup-<github-run-id>-attempt-<github-run-attempt>/
 
-never into the existing platform directory's own flat files (the
-original S4 run's evidence), which this script never opens for
-writing.
+never into either platform directory's own flat files (the original S4
+run's evidence), which this script never opens for writing. On Linux,
+the run directory is named after the actual GitHub Actions run id AND
+run attempt (`GITHUB_RUN_ID`/`GITHUB_RUN_ATTEMPT`) rather than a
+timestamp -- a re-run of the same workflow run (e.g. after a transient
+failure) reuses the same run id but increments the attempt, and
+without the attempt suffix a second attempt's evidence would silently
+overwrite the first's. This extends, rather than replaces,
+`spike_s4.py`'s own Linux evidence convention
+(`spikes/s4/evidence/linux-x86_64/run-<run-id>/`). macOS keeps its
+original timestamp+random-id naming unchanged, since there is no
+run id/attempt to key off of on a manual local run.
+
+Provenance, recorded in RUN_INFO.json and validated (fail loudly, not
+merely recorded) before any check runs:
+  - `production_hardening_commit`: the fixed Milestone 3 commit this
+    follow-up exists to validate.
+  - `harness_source_commit`: this checkout's actual `git rev-parse
+    HEAD` -- independently computed, not merely echoed from an env var.
+  - `production_hardening_is_ancestor`: whether
+    `production_hardening_commit` is a real ancestor of
+    `harness_source_commit`, determined by precisely interpreting `git
+    merge-base --is-ancestor`'s exit code (0 = confirmed ancestor, 1 =
+    confirmed NOT an ancestor, anything else = the check itself failed
+    and raises rather than being silently folded into "not an
+    ancestor") -- if not a confirmed ancestor, the hardening this
+    follow-up exists to validate isn't even present in what's checked
+    out, so the run refuses to proceed.
+  - `workflow_run_id` / `workflow_run_attempt` / `workflow_url`:
+    populated from the standard `GITHUB_RUN_ID`/`GITHUB_RUN_ATTEMPT`/
+    `GITHUB_SERVER_URL`/`GITHUB_REPOSITORY` environment variables
+    GitHub Actions always sets for a running job; `None` on a local
+    (non-CI) run, e.g. macOS. When `GITHUB_RUN_ID` is set but
+    `GITHUB_RUN_ATTEMPT` is missing or not a plain positive integer,
+    the run refuses to proceed rather than construct an ambiguous
+    evidence path.
+  - When `GITHUB_SHA` is set (i.e. running inside Actions), it must
+    equal `harness_source_commit` -- otherwise the checkout does not
+    match what the workflow believes it triggered on, and the run
+    refuses to proceed.
 """
 from __future__ import annotations
 
 import json
+import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -94,10 +135,135 @@ PASS, FAIL, INCONCLUSIVE, TECHNICAL_FAILURE = (
     base.TECHNICAL_FAILURE,
 )
 
-EXPECTED_SOURCE_COMMIT = "00063d445d9c25f957c0c6474701fb61d1217f67"
+PRODUCTION_HARDENING_COMMIT = "00063d445d9c25f957c0c6474701fb61d1217f67"
 
-_RUN_ID = f"run-m3-followup-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}"
-EVIDENCE_DIR = base.SPIKE_DIR / "evidence" / "macos-docker-desktop-arm64" / _RUN_ID
+
+def is_supported_platform(system: str, machine: str) -> bool:
+    """macOS on any machine (unchanged from the original macOS-only
+    pass) or Linux specifically on x86_64 (the only Linux evidence
+    domain this project has ever tested -- see docs/threat-model.md's
+    A9). Pulled out as a pure function so platform selection is unit
+    testable without actually running on each platform."""
+    if system == "Darwin":
+        return True
+    return system == "Linux" and machine == "x86_64"
+
+
+# A canonical positive decimal integer: digits only, no sign, no
+# leading zero (so "0", "007", "-1", "1.5", "1e3", and "" are all
+# rejected) -- matches the shape GitHub Actions actually assigns to
+# GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT (both start at 1, never 0).
+_CANONICAL_POSITIVE_INTEGER_RE = re.compile(r"^[1-9][0-9]*$")
+
+
+def _is_canonical_positive_integer(value: str | None) -> bool:
+    return value is not None and bool(_CANONICAL_POSITIVE_INTEGER_RE.fullmatch(value))
+
+
+def compute_run_id(github_run_id: str | None, github_run_attempt: str | None = None) -> str:
+    """Keys the run directory off the real GitHub Actions run id AND
+    run attempt when running in that workflow (extending spike_s4.py's
+    own Linux evidence convention, `run-<run-id>/`, with the attempt
+    number) -- a workflow re-run reuses the same run id but increments
+    the attempt, so the attempt must be part of the path or a second
+    attempt's evidence would silently overwrite the first's. Falls
+    back to the original timestamp+random-id naming for a local (e.g.
+    macOS Docker Desktop) run, where no run id/attempt exists -- an
+    absent `github_run_attempt` is simply ignored in that case, never
+    treated as an error.
+
+    Fails loudly rather than guessing whenever `github_run_id` is
+    present but either field is not a canonical positive decimal
+    integer (digits only, > 0 -- "0" is explicitly invalid, as is any
+    malformed/empty value) -- that combination would otherwise
+    silently construct an ambiguous or misleading Linux evidence run
+    id. The diagnostic names exactly which field failed and why,
+    rather than reporting both fields identically.
+    """
+    if github_run_id:
+        if not _is_canonical_positive_integer(github_run_id):
+            raise RuntimeError(
+                f"GITHUB_RUN_ID is set but is not a canonical positive decimal "
+                f"integer (digits only, greater than zero): {github_run_id!r} -- "
+                "refusing to construct an ambiguous Linux evidence run id."
+            )
+        if not _is_canonical_positive_integer(github_run_attempt):
+            raise RuntimeError(
+                f"GITHUB_RUN_ID is set ({github_run_id!r}) but GITHUB_RUN_ATTEMPT is "
+                f"not a canonical positive decimal integer (digits only, greater "
+                f"than zero): {github_run_attempt!r} -- refusing to construct an "
+                "ambiguous Linux evidence run id."
+            )
+        return f"run-m3-followup-{github_run_id}-attempt-{github_run_attempt}"
+    return f"run-m3-followup-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}"
+
+
+def compute_evidence_dir(spike_dir: Path, platform_key: str, run_id: str) -> Path:
+    return spike_dir / "evidence" / platform_key / run_id
+
+
+def compute_workflow_url(server_url: str | None, repository: str | None, run_id: str | None) -> str | None:
+    if server_url and repository and run_id:
+        return f"{server_url}/{repository}/actions/runs/{run_id}"
+    return None
+
+
+def interpret_ancestor_check_returncode(returncode: int, *, commit: str, stderr: str = "") -> bool:
+    """Precisely interprets `git merge-base --is-ancestor <commit>
+    HEAD`'s exit code: 0 and 1 are both legitimate, confirmed answers
+    (ancestor / not an ancestor respectively) -- neither is an error.
+    Any other exit code (e.g. a bad/unknown revision from a shallow
+    clone, or an internal git failure) means the check itself did not
+    produce a real answer at all, and must be reported as a technical
+    provenance-check failure rather than silently folded into "not an
+    ancestor", which would misrepresent a broken check as a confirmed
+    negative result."""
+    if returncode == 0:
+        return True
+    if returncode == 1:
+        return False
+    detail = f": {stderr.strip()}" if stderr and stderr.strip() else ""
+    raise RuntimeError(
+        f"'git merge-base --is-ancestor {commit} HEAD' failed with unexpected exit "
+        f"code {returncode} (neither 0 nor 1) -- this is a provenance-check failure, "
+        f"not a confirmed ancestor/not-ancestor answer{detail}"
+    )
+
+
+def validate_provenance(
+    *,
+    harness_source_commit: str,
+    github_sha: str | None,
+    production_hardening_is_ancestor: bool,
+    production_hardening_commit: str = PRODUCTION_HARDENING_COMMIT,
+) -> None:
+    """Fails loudly (raises) rather than merely recording a problem,
+    per two explicit requirements: the production hardening commit
+    this follow-up exists to validate must actually be checked out,
+    and -- when running inside GitHub Actions (GITHUB_SHA set) -- the
+    real checkout must match what the workflow believes it triggered
+    on. A pure function so this validation is unit testable without a
+    real git repository or a real Actions environment."""
+    if not production_hardening_is_ancestor:
+        raise RuntimeError(
+            f"production hardening commit {production_hardening_commit} is not an "
+            f"ancestor of the checked-out HEAD ({harness_source_commit}) -- this "
+            "follow-up exists to validate that commit's changes and refuses to "
+            "proceed without them."
+        )
+    if github_sha is not None and harness_source_commit != github_sha:
+        raise RuntimeError(
+            f"checked-out commit ({harness_source_commit}) does not match "
+            f"GITHUB_SHA ({github_sha}) -- refusing to proceed with mismatched "
+            "provenance."
+        )
+
+
+_PLATFORM_KEY = base._platform_key()
+_GITHUB_RUN_ID = os.environ.get("GITHUB_RUN_ID")
+_GITHUB_RUN_ATTEMPT = os.environ.get("GITHUB_RUN_ATTEMPT")
+_RUN_ID = compute_run_id(_GITHUB_RUN_ID, _GITHUB_RUN_ATTEMPT)
+EVIDENCE_DIR = compute_evidence_dir(base.SPIKE_DIR, _PLATFORM_KEY, _RUN_ID)
 
 # The fixed, sanitized OOM message defined in executor.py's _attempt.
 # Reproduced here as the CURRENTLY OBSERVED literal so this follow-up
@@ -413,55 +579,90 @@ CHECKS: list[tuple[str, str]] = [
 
 
 def main() -> None:
-    if platform.system() != "Darwin":
+    system = platform.system()
+    machine = platform.machine()
+    if not is_supported_platform(system, machine):
         raise RuntimeError(
-            "spike_s4_m3_followup.py is scoped to macOS/Docker Desktop only in "
-            f"this pass -- refusing to run on platform.system()={platform.system()!r}. "
-            "A Linux repetition is separate, later work."
+            "spike_s4_m3_followup.py supports macOS/Docker Desktop (any machine) "
+            f"or Linux/x86_64 only -- refusing to run on system={system!r} "
+            f"machine={machine!r}."
         )
 
-    actual_commit = base.run(["git", "rev-parse", "HEAD"], cwd=base.SPIKE_DIR).stdout.strip()
+    harness_source_commit = base.run(["git", "rev-parse", "HEAD"], cwd=base.SPIKE_DIR).stdout.strip()
 
-    docker_version = base.run(["docker", "version", "--format", "{{.Server.Version}}"]).stdout.strip()
+    github_sha = os.environ.get("GITHUB_SHA")
+    ancestor_check = base.run(
+        ["git", "merge-base", "--is-ancestor", PRODUCTION_HARDENING_COMMIT, "HEAD"],
+        cwd=base.SPIKE_DIR,
+        check=False,
+    )
+    production_hardening_is_ancestor = interpret_ancestor_check_returncode(
+        ancestor_check.returncode, commit=PRODUCTION_HARDENING_COMMIT, stderr=ancestor_check.stderr
+    )
+    validate_provenance(
+        harness_source_commit=harness_source_commit,
+        github_sha=github_sha,
+        production_hardening_is_ancestor=production_hardening_is_ancestor,
+    )
+
+    docker_client_version = base.run(["docker", "version", "--format", "{{.Client.Version}}"]).stdout.strip()
+    docker_server_version = base.run(["docker", "version", "--format", "{{.Server.Version}}"]).stdout.strip()
     cgroup_version = base.run(["docker", "info", "--format", "{{.CgroupVersion}}"]).stdout.strip()
-    if not docker_version or not cgroup_version:
+    if not docker_client_version or not docker_server_version or not cgroup_version:
         raise RuntimeError(
-            f"host metadata query returned an empty value "
-            f"(docker_version={docker_version!r}, cgroup_version={cgroup_version!r})"
+            "host metadata query returned an empty value "
+            f"(docker_client_version={docker_client_version!r}, "
+            f"docker_server_version={docker_server_version!r}, "
+            f"cgroup_version={cgroup_version!r})"
+        )
+
+    base.run(["docker", "pull", DEFAULT_IMAGE])
+    image_platform = base.run(
+        ["docker", "inspect", "--format", "{{.Os}}/{{.Architecture}}", DEFAULT_IMAGE]
+    ).stdout.strip()
+    if system == "Linux" and image_platform != "linux/amd64":
+        raise RuntimeError(
+            f"expected the pinned verification image to report linux/amd64 on "
+            f"Linux, got {image_platform!r}"
         )
 
     host_info = {
-        "system": platform.system(),
+        "system": system,
         "release": platform.release(),
-        "machine": platform.machine(),
+        "machine": machine,
         "python_version": platform.python_version(),
-        "docker_version": docker_version,
+        "docker_client_version": docker_client_version,
+        "docker_server_version": docker_server_version,
         "cgroup_version": cgroup_version,
+        "image_platform": image_platform,
     }
     write(EVIDENCE_DIR / "host.json", json.dumps(host_info, indent=2))
     log("host: " + json.dumps(host_info))
     log(
-        "PLATFORM SCOPE: macOS/Docker Desktop only in this pass "
-        f"(threat-model.md A9). Evidence directory: {EVIDENCE_DIR}"
+        f"PLATFORM: {_PLATFORM_KEY} (threat-model.md A9 -- a separate evidence "
+        f"domain from any other platform). Evidence directory: {EVIDENCE_DIR}"
     )
 
+    github_run_id = _GITHUB_RUN_ID
+    github_run_attempt = _GITHUB_RUN_ATTEMPT
+    workflow_url = compute_workflow_url(
+        os.environ.get("GITHUB_SERVER_URL"), os.environ.get("GITHUB_REPOSITORY"), github_run_id
+    )
     run_info = {
         "purpose": "S4 post-hardening follow-up: validate the Milestone 3 "
         "executor changes (--memory-swap, OOM classification) made in "
         "direct response to the original S4 spike's open questions.",
         "run_id": _RUN_ID,
-        "expected_source_commit": EXPECTED_SOURCE_COMMIT,
-        "actual_source_commit": actual_commit,
-        "source_commit_matches_expected": actual_commit == EXPECTED_SOURCE_COMMIT,
+        "production_hardening_commit": PRODUCTION_HARDENING_COMMIT,
+        "harness_source_commit": harness_source_commit,
+        "production_hardening_is_ancestor": production_hardening_is_ancestor,
+        "workflow_run_id": github_run_id,
+        "workflow_run_attempt": github_run_attempt,
+        "workflow_url": workflow_url,
         "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     write(EVIDENCE_DIR / "RUN_INFO.json", json.dumps(run_info, indent=2))
     log("run info: " + json.dumps(run_info))
-    if not run_info["source_commit_matches_expected"]:
-        log(
-            "WARNING: actual HEAD does not match the expected source commit -- "
-            "recorded as evidence, not silently corrected."
-        )
 
     tested_config = {"image": DEFAULT_IMAGE, "security_flags": list(_SECURITY_FLAGS)}
     write(EVIDENCE_DIR / "tested_config.json", json.dumps(tested_config, indent=2))

@@ -1,0 +1,148 @@
+name: S4 Milestone 3 Follow-up Evidence (Linux, manual)
+
+# Manual, evidence-gathering-only workflow -- workflow_dispatch only,
+# never part of ordinary push/PR CI, and it does not gate merges. This
+# is a DIFFERENT, narrower workflow from s4-linux-evidence.yml (the
+# original 14-check S4 isolation spike): it runs only the three
+# post-hardening follow-up checks (spike_s4_m3_followup.py) that
+# validate the Milestone 3 executor changes -- --memory-swap and OOM
+# classification -- made in commit
+# 00063d445d9c25f957c0c6474701fb61d1217f67, in response to the
+# original S4 spike's own memory/OOM finding. It never repurposes or
+# weakens s4-linux-evidence.yml, which is left untouched.
+#
+# Produces a Linux/x86_64 evidence bundle comparable to the
+# already-committed macOS follow-up run under
+# spikes/s4/evidence/macos-docker-desktop-arm64/run-m3-followup-*/.
+# See docs/threat-model.md's A9: Linux and macOS/Docker Desktop are
+# separate evidence domains. The evidence produced here is uploaded as
+# a build artifact for inspection; it is not committed to the
+# repository by this workflow.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s4-m3-followup-linux:
+    name: S4 M3 follow-up evidence (ubuntu-24.04, Python 3.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository (full history, for merge-base ancestor check)
+        # actions/checkout v7.0.1 (same verified pin as ci.yml / s4-linux-evidence.yml)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        # actions/setup-python v7.0.0 (same verified pin as ci.yml / s4-linux-evidence.yml)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Install project and test dependencies
+        run: pip install -e ".[test]"
+
+      - name: Docker preflight (mandatory)
+        run: docker info
+
+      - name: Confirm runner is linux/x86_64
+        run: |
+          set -euo pipefail
+          UNAME_M=$(uname -m)
+          echo "runner uname -m: $UNAME_M"
+          if [ "$UNAME_M" != "x86_64" ]; then
+            echo "expected runner architecture x86_64, got '$UNAME_M'" >&2
+            exit 1
+          fi
+
+      - name: Verify provenance (fail loudly on either problem)
+        run: |
+          set -euo pipefail
+          ACTUAL_HEAD=$(git rev-parse HEAD)
+          echo "checked-out HEAD: $ACTUAL_HEAD"
+          echo "github.sha:       ${{ github.sha }}"
+          if [ "$ACTUAL_HEAD" != "${{ github.sha }}" ]; then
+            echo "checked-out HEAD ($ACTUAL_HEAD) does not match github.sha (${{ github.sha }}) -- failing." >&2
+            exit 1
+          fi
+          HARDENING_COMMIT=00063d445d9c25f957c0c6474701fb61d1217f67
+          # Distinguish a confirmed "not an ancestor" (exit 1) from the
+          # check itself failing (any other exit code, e.g. an unknown
+          # revision) -- both fail this preflight, but the diagnostic
+          # should say which one actually happened rather than
+          # reporting every nonzero result identically.
+          set +e
+          git merge-base --is-ancestor "$HARDENING_COMMIT" HEAD
+          ANCESTOR_RC=$?
+          set -e
+          if [ "$ANCESTOR_RC" -eq 0 ]; then
+            echo "production hardening commit $HARDENING_COMMIT confirmed as an ancestor of HEAD."
+          elif [ "$ANCESTOR_RC" -eq 1 ]; then
+            echo "production hardening commit $HARDENING_COMMIT is CONFIRMED NOT an ancestor of HEAD ($ACTUAL_HEAD) -- failing." >&2
+            exit 1
+          else
+            echo "'git merge-base --is-ancestor' failed with unexpected exit code $ANCESTOR_RC (neither 0 nor 1) -- this is a provenance-check failure, not a confirmed ancestor/not-ancestor answer -- failing." >&2
+            exit 1
+          fi
+
+      - name: Run spike_s4 and spike_s4_m3_followup focused tests
+        run: |
+          python -m pytest spikes/s4/test_spike_s4.py -v
+          python -m pytest spikes/s4/test_spike_s4_m3_followup.py -v
+
+      - name: Run the real S4 Milestone 3 follow-up spike (writes Linux evidence)
+        # The harness itself independently re-verifies the same
+        # provenance facts checked above (production_hardening_commit
+        # is an ancestor of the real git HEAD it computes; the
+        # checked-out commit matches GITHUB_SHA when set) and fails
+        # loudly (raises) if either does not hold -- this step is not
+        # merely trusting the preflight step above.
+        run: python spikes/s4/spike_s4_m3_followup.py
+
+      - name: Upload Linux S4 Milestone 3 follow-up evidence
+        if: always()
+        # actions/upload-artifact v7.0.1, resolved via gh api (not guessed) --
+        # same verified pin as s4-linux-evidence.yml
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          # Includes both the run id and the run attempt in the
+          # artifact name -- a re-run of this same workflow run reuses
+          # the run id but increments the attempt, and without the
+          # attempt suffix a second attempt's artifact would collide
+          # with (or ambiguously coexist alongside) the first's.
+          name: s4-m3-followup-linux-evidence-run${{ github.run_id }}-attempt${{ github.run_attempt }}
+          path: spikes/s4/evidence/linux-x86_64/run-m3-followup-${{ github.run_id }}-attempt-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Verify no leftover CodeAgent-owned containers
+        if: always()
+        run: |
+          set -euo pipefail
+          # Capture the listing as its OWN command first, so a failed
+          # `docker ps` (e.g. daemon unreachable) propagates and fails
+          # this step -- piping it straight into `grep ... || true`
+          # would have swallowed that failure (the pipeline's exit
+          # status would be grep's/true's, not docker ps's) and a
+          # silently-empty $ALL_CONTAINERS would have been
+          # indistinguishable from "confirmed no containers exist".
+          ALL_CONTAINERS=$(docker ps -a --format '{{.Names}}')
+          echo "All containers on runner:"
+          echo "$ALL_CONTAINERS"
+          # grep exiting 1 here means "no match" (a normal, successful
+          # empty result) -- `|| true` only swallows THAT, not a
+          # failure of the listing itself, which already happened (or
+          # didn't) on the line above.
+          LEFTOVER=$(echo "$ALL_CONTAINERS" | grep -E '^(codeagent-verify-|codeagent-spike-s4-)' || true)
+          echo "CodeAgent-owned containers currently present (expected: none):"
+          echo "$LEFTOVER"
+          if [ -n "$LEFTOVER" ]; then
+            echo "leftover CodeAgent-owned container(s) found -- failing." >&2
+            echo "Not deleting them here: this check exists to catch a real cleanup bug," >&2
+            echo "and unrelated containers on the runner are never touched by this job." >&2
+            exit 1
+          fi
