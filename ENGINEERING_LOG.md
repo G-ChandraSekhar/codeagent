@@ -458,3 +458,15 @@ is not, and Slice B accepts that gap rather than fixing it
 speculatively. Validate and close it during the Stage-2 interruption/
 orphan-cleanup spike, where this class of failure is the actual subject
 under test.
+
+## Note: minor documentation inaccuracy, tracked not fixed by rewriting history
+
+Commit `528ea8d`'s message says "the six tools the model is allowed to
+request" — `domain.ToolName` has exactly five (`list_directory`,
+`read_file`, `search_text`, `propose_plan`, `apply_patch`; the sixth,
+`run_process`, was removed per ADR 0001 before that commit). No tracked
+markdown doc repeats the error (checked). Not fixed by amending and
+force-pushing that already-pushed commit — that rewrites shared history
+for a wording-only fix in a message, not the code. If this project ever
+writes public-facing prose (README, portfolio writeup) that references
+tool count, say five, not six.
