@@ -197,17 +197,37 @@ below.
   claim; see `ENGINEERING_LOG.md`'s "narrow Linux CI slice" entry.
 
 Stage 2 (of the four-stage planning process in
-`docs/CODEAGENT_LLM_HANDOFF.md`) spikes remain separately unstarted
-except S1:
+`docs/CODEAGENT_LLM_HANDOFF.md`) spikes:
 
 - **S1 — temporary worktree + Docker + pytest + cleanup: PASSED**
   (Linux; 3 trials, exit 0, consistent per-test results, no orphaned
   containers or worktrees after cleanup). See `spikes/s1/S1_RESULT.md`.
-- Remaining four Stage-2 spikes are unstarted:
+- **S3 — multi-file patch atomicity: DONE, decision accepted.** Three
+  distinct guarantees found, not one: prevalidation atomicity is real
+  (experiment 1); a handled mid-application failure produces a
+  genuinely observable partial state before any rollback runs, and
+  in-place `git checkout` rollback was demonstrated only for one
+  tracked, previously-clean file (experiment 2); a SIGKILL produces a
+  partial worktree that is detectable only by convention, not by any
+  structural safeguard (experiment 3, deliberately not called "crash
+  consistency" — see the corrected terminology in
+  `spikes/s3/S3_RESULT.md`). Author decision, recorded as
+  **`docs/adr/0003-recover-partial-patches-by-replacing-worktree.md`
+  (Accepted)**: Milestone 2's patch mechanism must discard and
+  recreate the disposable worktree from the last accepted checkpoint
+  on a handled failure (not per-file rollback), and must check
+  HEAD-equals-checkpoint plus a clean tree/index before ever trusting
+  or resuming a worktree. True crash-consistent filesystem mutation is
+  explicitly not guaranteed in v1 — the claim is recovery plus
+  interruption detection/rejection at the controller boundary. No
+  implementation exists yet; the ADR records required Milestone 2
+  failure-path testing obligations (disposal/recreation failure,
+  additions, deletions, renames, unexpected dirty/index states) that
+  S3's evidence does not cover.
+- Remaining three Stage-2 spikes are unstarted:
   1. Responses API strict function tools and multiple tool calls.
-  2. Atomic multi-file patch failure behavior.
-  3. Network/path/timeout/output/resource isolation.
-  4. Interruption without orphaned containers.
+  2. Network/path/timeout/output/resource isolation.
+  3. Interruption without orphaned containers.
   (A sixth spike, JSONL replay into the first frontend view, is also
   listed in the handoff and unstarted.)
 

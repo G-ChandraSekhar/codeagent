@@ -1,0 +1,57 @@
+{
+  "run_id": "s3-exp3-251fc429",
+  "barrier_reached": true,
+  "child_returncode": -9,
+  "child_killed_by_sigkill": true,
+  "manifest_before": {
+    "head": "ed9fe63055f62a7948f7316f332ca69b9be4f0f1",
+    "status_porcelain": "",
+    "files": {
+      "a.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "a7f160b1af1e8dec36f5d4519befec5a6d17087dbbeb10a10b19fb2cbcbf962d"
+      },
+      "b.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "17c7796331a215e1b90c0f82796dc2d0d47fe85e74c5855bfdae76aefd405426"
+      },
+      "c.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "b0a2b11c87c0c218872154c74163c5da52906d2ba25aae3dc62402d08be65f48"
+      }
+    }
+  },
+  "manifest_after_kill": {
+    "head": "ed9fe63055f62a7948f7316f332ca69b9be4f0f1",
+    "status_porcelain": " M a.py\n",
+    "files": {
+      "a.py": {
+        "exists": true,
+        "size": 32,
+        "sha256": "d8b13a57e22ead75e8e525e28381b572db5245cc8a79d515888e49ea0bc60e01"
+      },
+      "b.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "17c7796331a215e1b90c0f82796dc2d0d47fe85e74c5855bfdae76aefd405426"
+      },
+      "c.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "b0a2b11c87c0c218872154c74163c5da52906d2ba25aae3dc62402d08be65f48"
+      }
+    }
+  },
+  "a_py_patch_applied": true,
+  "b_py_patch_applied": false,
+  "c_py_patch_applied": false,
+  "b_py_untouched": true,
+  "c_py_untouched": true,
+  "head_unchanged": true,
+  "working_tree_dirty": true,
+  "classification": "partial_but_detectably_incomplete",
+  "worktree_removed_cleanly": true
+}

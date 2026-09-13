@@ -881,3 +881,37 @@ Docker tests passed, 0 skipped; full suite 873 passed; final
 leftover-container check found none. This is the first real evidence
 of this project running anywhere other than the author's macOS/arm64
 machine.**
+
+---
+
+## Session: S3 spike — multi-file patch atomicity — decision accepted as ADR 0003
+
+**Outcome**: Stage-2 spike S3 (`spikes/s3/`) found three genuinely
+different guarantees, not one: (1) prevalidation atomicity is real —
+an invalid proposal is rejected byte-for-byte unchanged before any
+write; (2) a handled mid-application failure leaves a genuinely
+observable partial state before any rollback runs, and in-place `git
+checkout` rollback was demonstrated only for one tracked,
+previously-clean file; (3) a SIGKILL leaves a partial worktree
+detectable only by convention (no lock file, no atomic rename, no
+transaction marker backs it) — correctly named "interruption
+detection," not "crash consistency."
+
+**Decision**: author accepted **B2 + C** for v1 — recorded as
+`docs/adr/0003-recover-partial-patches-by-replacing-worktree.md`
+(Accepted). On a handled failure, discard and recreate the disposable
+worktree from the last accepted checkpoint rather than per-file
+rollback (**B1 rejected**: more untested failure modes — new files,
+a rollback command that itself fails — than B2's single primitive).
+Gate new/resumed patch attempts on expected HEAD + a clean tree/index.
+True crash-consistent filesystem mutation (**option D**) is explicitly
+deferred beyond v1 as out of scope/complexity, not guaranteed.
+
+- **Verification**: 15 spike-specific tests passed; main suite
+  unaffected at 873 passed; `git diff --check` clean; scratch root
+  removal verified.
+- **Remaining Milestone 2 obligations** (no implementation yet):
+  failure-path tests for disposal/recreation failure, file
+  add/delete/rename, and unexpected dirty/index states at resume —
+  none covered by S3's evidence. Full narrative in the ADR and
+  `spikes/s3/S3_RESULT.md`.

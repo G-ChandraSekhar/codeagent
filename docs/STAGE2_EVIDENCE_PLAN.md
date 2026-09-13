@@ -1,9 +1,17 @@
 # CodeAgent — Stage 2 Evidence Plan
 
-Status: Stage 2 planning only. No spike has been run. No production
-code exists. This document does not authorize implementation — it
-authorizes deciding, in writing, what evidence each open uncertainty
-needs before it becomes a design decision.
+Status: Stage 2 is underway. S1 and S3 have executed and produced
+retained evidence; S3's resulting decision is accepted as
+`docs/adr/0003-recover-partial-patches-by-replacing-worktree.md`. The
+remaining spikes below (S2a, S2b, S4, S5, S7, S8, plus the non-spike
+S6) are still pending. Production code exists for Milestone 0 and
+Milestone 1 (see `CLAUDE.md`'s current status), but nothing from S3's
+accepted decision has been implemented yet. This document does not
+authorize implementation on its own — each spike still individually
+authorizes deciding, in writing, what evidence an open uncertainty
+needs before it becomes a design decision; the experiment plans below
+are retained as originally written for that purpose, including for
+the two spikes that have already run.
 
 Read alongside the frozen `PROJECT_BRIEF.md` (accepted Stage 1
 baseline), `CODEAGENT_IMPLEMENTATION_GUIDE.md`, `DESIGN_SPEC.md`, and
@@ -229,6 +237,16 @@ non-deterministic model.
 ---
 
 ## S3 — Patch atomicity: three distinct properties, not one
+
+**Status: executed, decision accepted.** Evidence:
+`spikes/s3/S3_RESULT.md` and its retained JSON. Decision:
+`docs/adr/0003-recover-partial-patches-by-replacing-worktree.md`
+(Accepted) — v1 requires abandon-and-recreate recovery (not per-file
+rollback) plus a checked interruption-detection invariant before
+trusting a worktree; true crash-consistent filesystem mutation is
+explicitly not guaranteed. The planning text below is retained as
+written before the spike ran, for the rationale it captures — it is no
+longer the current status.
 
 **Question**: Does CodeAgent's patch mechanism provide three genuinely
 different guarantees — (a) **prevalidation atomicity**: rejecting an

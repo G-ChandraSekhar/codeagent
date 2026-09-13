@@ -1,0 +1,54 @@
+{
+  "run_id": "s3-exp1-eb285c7a",
+  "errors": [
+    {
+      "relative_path": "c.py",
+      "reason": "expected_text not found"
+    }
+  ],
+  "rejected_before_any_write": true,
+  "manifest_before": {
+    "head": "ed9fe63055f62a7948f7316f332ca69b9be4f0f1",
+    "status_porcelain": "",
+    "files": {
+      "a.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "a7f160b1af1e8dec36f5d4519befec5a6d17087dbbeb10a10b19fb2cbcbf962d"
+      },
+      "b.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "17c7796331a215e1b90c0f82796dc2d0d47fe85e74c5855bfdae76aefd405426"
+      },
+      "c.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "b0a2b11c87c0c218872154c74163c5da52906d2ba25aae3dc62402d08be65f48"
+      }
+    }
+  },
+  "manifest_after": {
+    "head": "ed9fe63055f62a7948f7316f332ca69b9be4f0f1",
+    "status_porcelain": "",
+    "files": {
+      "a.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "a7f160b1af1e8dec36f5d4519befec5a6d17087dbbeb10a10b19fb2cbcbf962d"
+      },
+      "b.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "17c7796331a215e1b90c0f82796dc2d0d47fe85e74c5855bfdae76aefd405426"
+      },
+      "c.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "b0a2b11c87c0c218872154c74163c5da52906d2ba25aae3dc62402d08be65f48"
+      }
+    }
+  },
+  "worktree_byte_for_byte_unchanged": true,
+  "worktree_removed_cleanly": true
+}

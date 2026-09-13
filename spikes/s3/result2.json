@@ -1,0 +1,71 @@
+{
+  "run_id": "s3-exp2-16465b53",
+  "caught_exception": "deterministic injected failure after op 1, before op 2",
+  "manifest_before": {
+    "head": "ed9fe63055f62a7948f7316f332ca69b9be4f0f1",
+    "status_porcelain": "",
+    "files": {
+      "a.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "a7f160b1af1e8dec36f5d4519befec5a6d17087dbbeb10a10b19fb2cbcbf962d"
+      },
+      "b.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "17c7796331a215e1b90c0f82796dc2d0d47fe85e74c5855bfdae76aefd405426"
+      },
+      "c.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "b0a2b11c87c0c218872154c74163c5da52906d2ba25aae3dc62402d08be65f48"
+      }
+    }
+  },
+  "mid_state_manifest_before_rollback": {
+    "head": "ed9fe63055f62a7948f7316f332ca69b9be4f0f1",
+    "status_porcelain": " M a.py\n",
+    "files": {
+      "a.py": {
+        "exists": true,
+        "size": 32,
+        "sha256": "d8b13a57e22ead75e8e525e28381b572db5245cc8a79d515888e49ea0bc60e01"
+      },
+      "b.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "17c7796331a215e1b90c0f82796dc2d0d47fe85e74c5855bfdae76aefd405426"
+      },
+      "c.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "b0a2b11c87c0c218872154c74163c5da52906d2ba25aae3dc62402d08be65f48"
+      }
+    }
+  },
+  "intermediate_state_was_inconsistent": true,
+  "rollback_command_succeeded": true,
+  "manifest_after_rollback": {
+    "head": "ed9fe63055f62a7948f7316f332ca69b9be4f0f1",
+    "status_porcelain": "",
+    "files": {
+      "a.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "a7f160b1af1e8dec36f5d4519befec5a6d17087dbbeb10a10b19fb2cbcbf962d"
+      },
+      "b.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "17c7796331a215e1b90c0f82796dc2d0d47fe85e74c5855bfdae76aefd405426"
+      },
+      "c.py": {
+        "exists": true,
+        "size": 33,
+        "sha256": "b0a2b11c87c0c218872154c74163c5da52906d2ba25aae3dc62402d08be65f48"
+      }
+    }
+  },
+  "fully_restored_to_pre_apply_state": true,
+  "worktree_removed_cleanly": true
+}

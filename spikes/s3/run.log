@@ -1,0 +1,94 @@
+scratch_root = /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q
+$ git init -q
+$ git config user.email spike@example.com
+$ git config user.name Spike
+$ git add -A
+$ git commit -q -m scratch fixture
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo worktree list
+/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo ed9fe63 [main]
+
+
+--- EXPERIMENT 1: prevalidation atomicity ---
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo worktree add /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp1-eb285c7a HEAD
+HEAD is now at ed9fe63 scratch fixture
+
+Preparing worktree (detached HEAD ed9fe63)
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp1-eb285c7a rev-parse HEAD
+ed9fe63055f62a7948f7316f332ca69b9be4f0f1
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp1-eb285c7a status --porcelain=v1
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp1-eb285c7a rev-parse HEAD
+ed9fe63055f62a7948f7316f332ca69b9be4f0f1
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp1-eb285c7a status --porcelain=v1
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo worktree remove /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp1-eb285c7a --force
+
+--- EXPERIMENT 2: handled mid-application failure + rollback ---
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo worktree add /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp2-16465b53 HEAD
+HEAD is now at ed9fe63 scratch fixture
+
+Preparing worktree (detached HEAD ed9fe63)
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp2-16465b53 rev-parse HEAD
+ed9fe63055f62a7948f7316f332ca69b9be4f0f1
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp2-16465b53 status --porcelain=v1
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp2-16465b53 rev-parse HEAD
+ed9fe63055f62a7948f7316f332ca69b9be4f0f1
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp2-16465b53 status --porcelain=v1
+ M a.py
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp2-16465b53 checkout -- a.py
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp2-16465b53 rev-parse HEAD
+ed9fe63055f62a7948f7316f332ca69b9be4f0f1
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp2-16465b53 status --porcelain=v1
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo worktree remove /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp2-16465b53 --force
+
+--- EXPERIMENT 3: interruption (SIGKILL) detection ---
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo worktree add /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp3-251fc429 HEAD
+HEAD is now at ed9fe63 scratch fixture
+
+Preparing worktree (detached HEAD ed9fe63)
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp3-251fc429 rev-parse HEAD
+ed9fe63055f62a7948f7316f332ca69b9be4f0f1
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp3-251fc429 status --porcelain=v1
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp3-251fc429 rev-parse HEAD
+ed9fe63055f62a7948f7316f332ca69b9be4f0f1
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp3-251fc429 status --porcelain=v1
+ M a.py
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo worktree remove /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/worktree-s3-exp3-251fc429 --force
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo worktree list
+/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo ed9fe63 [main]
+
+$ git -C /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo worktree list --porcelain
+worktree /private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q/scratch-repo
+HEAD ed9fe63055f62a7948f7316f332ca69b9be4f0f1
+branch refs/heads/main
+
+
+
+
+SUMMARY:
+{
+  "host": {
+    "system": "Darwin",
+    "release": "25.6.0",
+    "machine": "arm64",
+    "python_version": "3.12.14"
+  },
+  "experiment_1_classification": "PASS",
+  "experiment_2_classification": "ROLLBACK_RESTORED_STATE",
+  "experiment_2_intermediate_state_was_inconsistent": true,
+  "experiment_3_classification": "partial_but_detectably_incomplete",
+  "no_leftover_worktrees_before_scratch_root_removal": true,
+  "leftover_worktree_dirs": [],
+  "scratch_root": "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q",
+  "scratch_root_removed": true
+}

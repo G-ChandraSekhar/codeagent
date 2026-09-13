@@ -1,0 +1,16 @@
+{
+  "host": {
+    "system": "Darwin",
+    "release": "25.6.0",
+    "machine": "arm64",
+    "python_version": "3.12.14"
+  },
+  "experiment_1_classification": "PASS",
+  "experiment_2_classification": "ROLLBACK_RESTORED_STATE",
+  "experiment_2_intermediate_state_was_inconsistent": true,
+  "experiment_3_classification": "partial_but_detectably_incomplete",
+  "no_leftover_worktrees_before_scratch_root_removal": true,
+  "leftover_worktree_dirs": [],
+  "scratch_root": "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s3-k85e794q",
+  "scratch_root_removed": true
+}
