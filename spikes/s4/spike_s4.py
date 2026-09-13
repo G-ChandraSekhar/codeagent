@@ -59,6 +59,7 @@ from __future__ import annotations
 import json
 import platform
 import shutil
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -408,13 +409,63 @@ def check_network_blocked() -> dict:
 # --------------------------------------------------------------------
 
 
+def classify_mounts_check(
+    mounts_ok: bool,
+    tmpfs_ok: bool,
+    exec_returncode: int,
+    probe: dict | None,
+) -> str:
+    """Classification semantics for the mounts/host-isolation check:
+    incorrect/unexpected mount configuration or a visible host canary
+    is a real security FAIL. An inaccessible intended fixture,
+    malformed probe output, or a docker-exec infrastructure failure is
+    a TECHNICAL_FAILURE -- this harness's own problem, not a security
+    finding, and must never be reported as if it were one."""
+    if not mounts_ok or not tmpfs_ok:
+        return FAIL
+    if exec_returncode != 0 or probe is None:
+        return TECHNICAL_FAILURE
+    if probe.get("host_secret_absent_at_root") is False:
+        return FAIL
+    if probe.get("host_secret_absent_at_host_path") is False:
+        return FAIL
+    if not probe.get("expected_readable") or not probe.get("expected_content_matches"):
+        return TECHNICAL_FAILURE
+    if probe.get("host_secret_absent_at_root") is not True:
+        return TECHNICAL_FAILURE
+    if probe.get("host_secret_absent_at_host_path") is not True:
+        return TECHNICAL_FAILURE
+    return PASS
+
+
 def check_mounts_and_host_isolation() -> dict:
     name = new_name("mounts")
     workdir = new_scratch_dir("mounts-workspace")
-    (workdir / "expected.txt").write_text("expected content\n")
+    expected_file = workdir / "expected.txt"
+    expected_file.write_text("expected content\n")
+    # tempfile.mkdtemp() creates directories mode 0700, owned by
+    # whichever host UID ran this script. Native Linux bind mounts
+    # preserve those numeric permissions as-is inside the container --
+    # if the host UID differs from the container's configured UID
+    # 1000 (routinely true on a CI runner), 1000 cannot even traverse
+    # a 0700 directory it doesn't own, regardless of the file's own
+    # permissions. This is the intended-to-be-readable fixture for
+    # this check specifically, so it (and only it) is loosened to
+    # 0755/0644 -- not a general scratch-directory policy change, and
+    # the secret-canary directory below is deliberately left alone.
+    workdir.chmod(0o755)
+    expected_file.chmod(0o644)
+
     canary_host_dir = new_scratch_dir("mounts-canary")
     canary_file = canary_host_dir / "host-secret.txt"
     canary_file.write_text("host secret content\n")
+
+    workdir_stat = workdir.stat()
+    host_mount_source_mode_and_owner = {
+        "path": str(workdir),
+        "mode_octal": oct(stat_module.S_IMODE(workdir_stat.st_mode)),
+        "uid": workdir_stat.st_uid,
+    }
 
     run(
         [
@@ -439,31 +490,52 @@ def check_mounts_and_host_isolation() -> dict:
     tmpfs_ok = "/tmp" in tmpfs
 
     run(["docker", "start", name])
-    check_script = (
-        "import os,sys\n"
-        "assert os.path.exists('/workspace/expected.txt'), 'expected file missing'\n"
-        "assert not os.path.exists('/host-secret.txt'), 'canary leaked at root'\n"
-        f"assert not os.path.exists({str(canary_file)!r}), 'canary leaked at host path'\n"
-        "print('OK')\n"
+    # A structured probe reporting each fact independently, rather than
+    # one combined assertion that aborts at the first failure -- every
+    # field is retained as individual machine-readable evidence even
+    # if one of the others fails.
+    probe_script = (
+        "import json, os\n"
+        "result = {}\n"
+        "try:\n"
+        "    with open('/workspace/expected.txt') as f:\n"
+        "        content = f.read()\n"
+        "    result['expected_readable'] = True\n"
+        "    result['expected_content_matches'] = (content == 'expected content\\n')\n"
+        "except Exception as exc:\n"
+        "    result['expected_readable'] = False\n"
+        "    result['expected_content_matches'] = False\n"
+        "    result['expected_error'] = repr(exc)\n"
+        "result['host_secret_absent_at_root'] = not os.path.exists('/host-secret.txt')\n"
+        f"result['host_secret_absent_at_host_path'] = not os.path.exists({str(canary_file)!r})\n"
+        "print(json.dumps(result))\n"
     )
-    exec_result = run(["docker", "exec", name, "python3", "-B", "-c", check_script], check=False)
-    host_isolation_ok = exec_result.returncode == 0
+    exec_result = run(["docker", "exec", name, "python3", "-B", "-c", probe_script], check=False)
+
+    probe: dict | None
+    try:
+        probe = json.loads(exec_result.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        probe = None
 
     run(["docker", "kill", name], check=False)
 
-    primary = PASS if (mounts_ok and tmpfs_ok and host_isolation_ok) else FAIL
+    classification = classify_mounts_check(mounts_ok, tmpfs_ok, exec_result.returncode, probe)
     return {
         "check": "mounts_and_host_isolation",
         "primary": {
-            "result": primary,
+            "result": classification,
             "mounts": mounts,
             "tmpfs": tmpfs,
             "mounts_ok": mounts_ok,
             "tmpfs_ok": tmpfs_ok,
+            "host_mount_source_mode_and_owner": host_mount_source_mode_and_owner,
+            "exec_returncode": exec_result.returncode,
+            "probe": probe,
             "host_isolation_stdout": exec_result.stdout,
             "host_isolation_stderr": exec_result.stderr,
         },
-        "classification": primary,
+        "classification": classification,
     }
 
 
@@ -1161,14 +1233,16 @@ def check_memory_limit() -> dict:
         notes.append(
             "the 600 MB allocation did not trigger an OOM kill (State.OOMKilled: "
             "false). --memory=512m limits this container's own memory usage to "
-            "512 MiB, but Docker Desktop's default "
+            "512 MiB, but the observed Docker HostConfig on this host sets "
             f"MemorySwap={experiment_600['configured_memswap_bytes']} bytes "
-            f"(Memory={experiment_600['configured_memory_bytes']} bytes) permits "
-            "additional swap on top of that, so the combined memory+swap allowance "
-            "available to this container is larger than 512 MiB alone. "
+            f"(Memory={experiment_600['configured_memory_bytes']} bytes), which "
+            "permits additional swap on top of that, so the combined memory+swap "
+            "allowance available to this container is larger than 512 MiB alone. "
+            "This is reported as an observation on this specific host, not "
+            "generalized into a claim about every Docker Engine installation. "
             "--memory-swap=512m would prevent that additional swap and cap the "
-            "combined allowance at 512 MiB. Not fixed here -- src/codeagent is not "
-            "modified during this spike."
+            "combined allowance at 512 MiB. Not fixed here -- src/codeagent is "
+            "not modified during this spike."
         )
 
     # Experiment 2: a second, separate hand-controlled container with a

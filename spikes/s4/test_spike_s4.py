@@ -138,3 +138,70 @@ def test_exit_code_for_overall_verdict_pass_with_open_risks_is_zero() -> None:
     an inconclusive check is reported accurately, not treated as a
     workflow failure."""
     assert s.exit_code_for_overall_verdict("PASS_WITH_OPEN_RISKS") == 0
+
+
+# --------------------------------------------------------------------
+# classify_mounts_check: incorrect/unexpected mount config or a
+# visible host canary is a real security FAIL; an inaccessible
+# intended fixture, malformed probe output, or a docker-exec
+# infrastructure failure is a TECHNICAL_FAILURE, never a security FAIL.
+# --------------------------------------------------------------------
+
+_GOOD_PROBE = {
+    "expected_readable": True,
+    "expected_content_matches": True,
+    "host_secret_absent_at_root": True,
+    "host_secret_absent_at_host_path": True,
+}
+
+
+def test_classify_mounts_check_all_good_is_pass() -> None:
+    assert s.classify_mounts_check(True, True, 0, _GOOD_PROBE) == s.PASS
+
+
+def test_classify_mounts_check_bad_mounts_config_is_fail() -> None:
+    assert s.classify_mounts_check(False, True, 0, _GOOD_PROBE) == s.FAIL
+
+
+def test_classify_mounts_check_bad_tmpfs_config_is_fail() -> None:
+    assert s.classify_mounts_check(True, False, 0, _GOOD_PROBE) == s.FAIL
+
+
+def test_classify_mounts_check_visible_canary_at_root_is_fail() -> None:
+    probe = {**_GOOD_PROBE, "host_secret_absent_at_root": False}
+    assert s.classify_mounts_check(True, True, 0, probe) == s.FAIL
+
+
+def test_classify_mounts_check_visible_canary_at_host_path_is_fail() -> None:
+    probe = {**_GOOD_PROBE, "host_secret_absent_at_host_path": False}
+    assert s.classify_mounts_check(True, True, 0, probe) == s.FAIL
+
+
+def test_classify_mounts_check_exec_infra_failure_is_technical_failure_not_fail() -> None:
+    """A docker-exec failure means we learned nothing about isolation
+    -- it must never be reported as if a security check failed."""
+    assert s.classify_mounts_check(True, True, 1, None) == s.TECHNICAL_FAILURE
+
+
+def test_classify_mounts_check_unparseable_probe_is_technical_failure() -> None:
+    assert s.classify_mounts_check(True, True, 0, None) == s.TECHNICAL_FAILURE
+
+
+def test_classify_mounts_check_unreadable_intended_fixture_is_technical_failure() -> None:
+    """The intended-readable fixture being unreadable is this
+    harness's own problem (e.g. a permissions fix regression), not a
+    security finding about the container's isolation."""
+    probe = {**_GOOD_PROBE, "expected_readable": False}
+    assert s.classify_mounts_check(True, True, 0, probe) == s.TECHNICAL_FAILURE
+
+
+def test_classify_mounts_check_wrong_fixture_content_is_technical_failure() -> None:
+    probe = {**_GOOD_PROBE, "expected_content_matches": False}
+    assert s.classify_mounts_check(True, True, 0, probe) == s.TECHNICAL_FAILURE
+
+
+def test_classify_mounts_check_bad_mounts_config_beats_exec_failure() -> None:
+    """A real security-relevant config problem is reported as FAIL
+    even if the exec step also failed -- the mount misconfiguration is
+    the more important fact to surface."""
+    assert s.classify_mounts_check(False, True, 1, None) == s.FAIL
