@@ -187,6 +187,28 @@ def _validate_error_for_verification_outcome(
         )
 
 
+def validate_verification_outcome_shape(
+    outcome: VerificationOutcome,
+    exit_code: int | None,
+    error: OperationalError | None,
+) -> None:
+    """The single, public rule set for whether an (outcome, exit_code,
+    error) triple is internally consistent — shared by BaselineRecorded,
+    VerificationCompleted, and controller.VerificationResult.
+
+    This is the one function outside this module that production code
+    (controller.py, executor.py) may call to validate a verification
+    outcome's shape; the two underscore-prefixed helpers above are this
+    module's own implementation detail. Keeping validation behind one
+    public entry point, rather than two private functions called
+    directly from another module, is what makes it impossible for
+    VerificationResult's rules to quietly drift from these events'
+    rules — see tests/unit/test_verification_result_parity.py.
+    """
+    _validate_exit_code_for_outcome(outcome, exit_code)
+    _validate_error_for_verification_outcome(outcome, error)
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     seen: set[str] = set()
     result: dict[str, object] = {}
@@ -296,8 +318,7 @@ class BaselineRecorded(Event):
         super().__post_init__()
         _require_nonempty_tuple("command", self.command)
         _require_nonnegative("duration_seconds", self.duration_seconds)
-        _validate_exit_code_for_outcome(self.outcome, self.exit_code)
-        _validate_error_for_verification_outcome(self.outcome, self.error)
+        validate_verification_outcome_shape(self.outcome, self.exit_code, self.error)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -585,8 +606,7 @@ class VerificationCompleted(Event):
         super().__post_init__()
         _require_nonempty_tuple("command", self.command)
         _require_nonnegative("duration_seconds", self.duration_seconds)
-        _validate_exit_code_for_outcome(self.outcome, self.exit_code)
-        _validate_error_for_verification_outcome(self.outcome, self.error)
+        validate_verification_outcome_shape(self.outcome, self.exit_code, self.error)
 
 
 @dataclass(frozen=True, kw_only=True)

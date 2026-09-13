@@ -982,7 +982,7 @@ def test_plan_proposed_construction() -> None:
         problem_hypothesis="idempotency key dropped on retry",
         evidence_refs=("jobs/worker.py:42",),
         proposed_file_paths=("jobs/worker.py",),
-        verification_intent="pytest tests/test_worker.py",
+        verification_intent="python3 -B -m unittest tests.test_worker",
         risk_notes="none identified",
     )
     assert e.proposed_file_paths == ("jobs/worker.py",)

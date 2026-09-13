@@ -21,7 +21,13 @@ from codeagent import domain, events
 from codeagent.controller import RunConfig, RunController, PlanProposal
 from codeagent.patch import GitPatchApplier, PatchOperation
 from codeagent.workspace import GitWorktree
-from tests.support.fakes import FakeApprovalProvider, FakeModel, FakeVerifier, SteppingClock
+from tests.support.fakes import (
+    FakeApprovalProvider,
+    FakeModel,
+    FakeRepositoryReader,
+    FakeVerifier,
+    SteppingClock,
+)
 from tests.support.fixture_repo import real_fixture_repo
 
 ORIGINAL_SNIPPET = (
@@ -36,7 +42,7 @@ FIXED_SNIPPET = (
 PLAN = PlanProposal(
     problem_hypothesis="idempotency key dropped on retry",
     proposed_file_paths=("jobs/worker.py",),
-    verification_intent="pytest tests/test_worker.py",
+    verification_intent="python3 -B -m unittest tests.test_worker",
 )
 
 
@@ -69,7 +75,6 @@ def test_real_repo_to_worktree_to_patch_to_checkpoint_to_cleanup() -> None:
             config = RunConfig(
                 run_id="r-slice-b",
                 task_statement="fix retry bug",
-                verify_command=("pytest", "-q"),
                 approval_mode=domain.ApprovalMode.INTERACTIVE,
                 repository_path=str(worktree_path),
                 initial_checkpoint_id=source_snapshot.head,
@@ -80,6 +85,7 @@ def test_real_repo_to_worktree_to_patch_to_checkpoint_to_cleanup() -> None:
                 FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
                 FakeVerifier((events.VerificationOutcome.PASSED,)),
                 applier,
+                FakeRepositoryReader(),
                 clock=SteppingClock(),
             )
 
@@ -141,7 +147,6 @@ def test_patch_validation_failure_leaves_worktree_and_original_unchanged_via_con
             config = RunConfig(
                 run_id="r-slice-b-fail",
                 task_statement="fix retry bug",
-                verify_command=("pytest", "-q"),
                 approval_mode=domain.ApprovalMode.INTERACTIVE,
                 repository_path=str(worktree_path),
             )
@@ -151,6 +156,7 @@ def test_patch_validation_failure_leaves_worktree_and_original_unchanged_via_con
                 FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
                 FakeVerifier((events.VerificationOutcome.PASSED,)),
                 applier,
+                FakeRepositoryReader(),
                 clock=SteppingClock(),
             )
 

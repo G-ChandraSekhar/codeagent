@@ -470,3 +470,374 @@ force-pushing that already-pushed commit — that rewrites shared history
 for a wording-only fix in a message, not the code. If this project ever
 writes public-facing prose (README, portfolio writeup) that references
 tool count, say five, not six.
+
+---
+
+## Session: Milestone 1 slice C — real Docker verification, real E2E, report
+
+**Outcome**: `src/codeagent/executor.py` (`DockerVerifier`), a
+`VerificationResult` frozen dataclass replacing the old
+`SUPPORTED_VERIFICATION_OUTCOMES`/`baseline_outcome`-on-`RunConfig`
+scheme, `src/codeagent/report.py`, and one real end-to-end
+demonstration: temporary Git worktree → real failing baseline in
+Docker → fake model plan → fake approval → real controlled patch and
+checkpoint → real passing verification in Docker → typed events →
+text/JSON report → unconditional cleanup. Model and approval remain
+fake; everything else in this flow is real.
+
+- Two rounds of user-authored design correction were incorporated
+  before any implementation: (1) stdlib `unittest` instead of pytest
+  inside the container (no dependency install), read-only worktree
+  mount, generated container name with guaranteed `docker rm -f` in a
+  `finally`, `VerificationResult` as a frozen dataclass rather than a
+  Protocol; (2) replacing `docker run --rm` with an inspectable
+  lifecycle — `create` → `start --attach` (streamed, bounded output) →
+  `inspect` for the container's own recorded exit state → `rm --force`
+  in `finally` → a second `inspect` to *confirm* absence — because a
+  cleanup attempt is not a cleanup guarantee. A Docker CLI client's own
+  exit code is never used to classify PASSED/TEST_FAILURE; only the
+  container's inspected `State.Status`/`State.ExitCode` are trusted.
+  If absence can't be confirmed after cleanup, the outcome is always
+  `ENVIRONMENT_FAILURE`, overriding what would otherwise have been a
+  passing result.
+- `VerificationResult.__post_init__` reuses `events.py`'s own
+  `_validate_exit_code_for_outcome`/`_validate_error_for_verification_outcome`
+  directly, so its validation cannot silently drift from
+  `BaselineRecorded`/`VerificationCompleted`'s — parity by
+  construction, not by two independently written rule sets.
+  `tests/unit/test_verification_result_parity.py` sweeps every
+  (outcome, exit_code, error) combination against both and asserts
+  they always agree, specifically to catch a future regression where
+  someone inlines a second copy of the rules.
+- Controller disposition, corrected per the second round: a baseline
+  or final-verification outcome that isn't PASSED/TEST_FAILURE (i.e.
+  TIMEOUT/ENVIRONMENT_FAILURE/COMMAND_START_FAILURE) always aborts via
+  `UNRECOVERABLE_ERROR` and does **not** consume repair-iteration
+  budget — only a genuine TEST_FAILURE enters the normal repair loop.
+- Bounded output collection (`_BoundedCollector`) drains stdout/stderr
+  continuously through daemon threads while the container runs,
+  capping each stream at 64 KiB with a deterministic truncation
+  marker and safe (never-raising) UTF-8 decoding — not
+  capture-then-truncate after the fact, which would defeat the point
+  of a bound under adversarial output volume.
+- Found and fixed a real bug during manual verification, not by
+  inspection: `DockerVerifier` failed with `ENVIRONMENT_FAILURE`
+  against a relative worktree path — Docker requires bind-mount
+  sources to be absolute. Fixed by resolving the path in `__init__`;
+  re-verified both the relative-path call and the full real E2E flow
+  afterward.
+- Found and fixed a second real bug, this time in the test suite
+  itself: adding `tests/fixtures/retry_worker/tests/__init__.py` (a
+  package marker needed so the fixture's own
+  `python3 -m unittest tests.test_worker` resolves inside the
+  container) made pytest collect that file *on the host* too, where
+  its bare `tests` package name collides with and shadows the real
+  top-level `tests` package, breaking every test that does
+  `from tests.support import ...`. Fixed with
+  `norecursedirs = ["tests/fixtures"]` in `pyproject.toml` — the
+  fixture's `tests` package is only ever meant to run inside the
+  verification container, never collected by the host's pytest.
+- Rejected: leaving `RunConfig.baseline_outcome`'s validation in place
+  after removing the field — the "unsupported baseline outcome"
+  concern moved to `FakeVerifier`'s own construction-time validation
+  instead, since it was always a synthetic-harness restriction
+  (`FakeVerifier` only fabricates PASSED/TEST_FAILURE; a real executor
+  like `DockerVerifier` is not restricted this way), not a domain rule
+  belonging on `RunConfig`.
+- Explicitly provisional, unchanged from the correction rounds: the
+  configured resource limits (`--memory`, `--cpus`, `--pids-limit`,
+  `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges`,
+  `--network none`) have not been adversarially tested, and behavior
+  under a host-process kill mid-verification is untested — both remain
+  the Stage-2 isolation/interruption spikes' job. Only exercised on
+  macOS/arm64 (Docker Desktop); no Linux-parity claim is made.
+- **Verification performed**: `tests/unit/test_executor.py` (14 tests,
+  mocked `docker` CLI boundary — OSError launch failures at both
+  `create` and `start`, nonzero `create`, timeout, unparseable
+  `inspect` output, PASSED, TEST_FAILURE, unconfirmed-cleanup override,
+  bounded-collector truncation/UTF-8 safety);
+  `tests/unit/test_verification_result_parity.py` (61 parametrized
+  cases); `tests/unit/test_report.py` (6 tests, built from real
+  controller runs against fakes, not hand-assembled events);
+  `tests/integration/test_slice_c.py` (3 tests against a real local
+  Docker daemon — full E2E, baseline-only, and a cleanup-after-
+  container-level-failure check — skipped, not weakened, on a machine
+  without Docker). Full suite: 819 passed. `git diff --check`: clean.
+  Manually confirmed via `docker ps -a` before and after both the ad
+  hoc smoke run and the formal integration-test run: no leftover
+  `codeagent-verify-*` containers in either case.
+- No new ADR: the corrected Docker lifecycle and outcome-classification
+  rules were fully specified by the user before implementation began:
+  translating an already-made decision into code isn't a new
+  consequential decision with credible alternatives left undiscussed.
+
+**Not yet done**: `report.py` has no persistence (JSONL) and no CLI
+entry point — out of slice C's stated scope. The Stage-2 isolation and
+interruption spikes remain unrun; nothing in this slice's sandboxing
+should be read as passing them in advance.
+
+---
+
+## Session: Milestone 1 slice C — correction pass (pre-review)
+
+**Outcome**: seven real defects in the uncommitted slice C
+implementation, found by user-directed review before first commit, all
+fixed and re-verified against real Docker. No scope change; still
+Milestone 1 slice C.
+
+- **Real bug (unsafe cleanup confirmation)**: `_cleanup()` treated any
+  nonzero `docker inspect <name>` as proof of absence — but a broken
+  Docker daemon/client also returns nonzero, which would have been
+  misread as "confirmed removed." Fixed by confirming via
+  `docker ps -a --format "{{.Names}}"` and an exact string match
+  against the generated name; a nonzero listing, an OSError launching
+  it, or the name still present are all "unconfirmed," never
+  "confirmed absent." Covered by five new `_cleanup()`-level tests
+  (absence, still-present, nonzero listing, launch OSError, similarly-
+  named-but-distinct containers — the last specifically to prove the
+  match is exact, not substring/prefix).
+- **Real bug (cleanup could be skipped by an early return)**:
+  `_execute()` returned directly from inside the create/start
+  exception handlers in some paths, which meant cleanup's ordering
+  relative to the returned outcome wasn't structurally guaranteed —
+  correct by the specific cases tested, not by construction. Restructured
+  into `_attempt()` (never raises; converts every failure into a
+  returned provisional outcome) plus `_execute()` (always calls cleanup
+  on the provisional result, unconditionally, before constructing the
+  final `VerificationResult`). Added a combined test: `start` fails to
+  launch *and* cleanup is unconfirmed → final outcome is
+  ENVIRONMENT_FAILURE, not COMMAND_START_FAILURE — proving the
+  cleanup-unconfirmed override applies regardless of which provisional
+  outcome preceded it.
+- **Design gap (two sources of truth for the verify command)**:
+  `RunConfig.verify_command` and `DockerVerifier`'s own configured
+  command could disagree, and the event trace recorded the former even
+  though the latter is what actually ran. Fixed by making `Verifier` a
+  read-only `command` property — the single source of truth — removing
+  `RunConfig.verify_command` entirely, and recording
+  `verifier.command` on `RunStarted`/`BaselineRecorded`/
+  `VerificationCompleted`. `FakeVerifier` gained the same property
+  (defaulting to `tests.support.fakes.FIXTURE_VERIFY_COMMAND`, the same
+  value as `executor.DEFAULT_COMMAND`). New test asserts the event
+  trace always records exactly what `verifier.command` exposes.
+- **Layering violation**: `controller.VerificationResult` was calling
+  two underscore-prefixed events.py functions directly — production
+  code reaching into another module's private internals. Fixed by
+  adding `events.validate_verification_outcome_shape()` as the one
+  public entry point, used by `BaselineRecorded`, `VerificationCompleted`,
+  and `VerificationResult` alike; parity is unchanged (still by
+  construction, same shared function) and a new test monkeypatches the
+  public function to always raise, proving `VerificationResult` really
+  calls it rather than a same-named local copy.
+- **Real bug (fabricated real-world duration)**: the slice C
+  integration tests used `SteppingClock` (a fixed 1ms-per-call fake)
+  for a *real* Docker execution, which would have reported a fabricated
+  sub-millisecond duration for work that actually takes over a second.
+  Fixed by switching `tests/integration/test_slice_c.py` to
+  `SystemClock` for the verifier and controller, asserting durations
+  are finite and non-negative rather than pinning an exact value.
+  `SteppingClock` remains correct and unchanged for the deterministic
+  unit/controller tests, which have no real operation to time.
+- **Hardened `report.build_report()`** (previously accepted any
+  nonempty list with a `RunFinished` in it, including mixed run_ids,
+  reordered/gapped sequences, and events after the finish): now
+  requires a single run_id, list-order-contiguous sequence numbers,
+  exactly one `RunStarted`, exactly one `RunFinished`, and that
+  `RunFinished` is the final event. Multiple `PatchApplied` events (a
+  repair loop) now aggregate `changed_paths` as a deduplicated,
+  first-seen-order union, with `checkpoint_commit` taken from the
+  *latest* `PatchApplied`, not the first. Eight new failure-path tests
+  built by mutating one real, valid trace via `dataclasses.replace`
+  (mixed run_id, sequence gap, reordering, missing start, missing
+  finish, duplicate finish, trailing event after finish) plus one
+  multi-patch aggregation test.
+- **Hardened `DockerVerifier.__init__`**: now rejects a missing or
+  non-directory worktree, an empty image, an image not pinned by
+  digest (`"@sha256:" not in image`), an empty command or a command
+  containing an empty element, and a non-finite or non-positive
+  `timeout_seconds` — all previously unchecked at construction time.
+  Nine new construction tests, one per rejected case plus one
+  confirming the pinned default image still passes.
+- **Verification performed**: full suite 845 passed (was 819; +26 net
+  new tests across the corrections above, no test count regression).
+  `tests/integration/test_slice_c.py`'s 3 real-Docker tests re-run and
+  passed individually and as part of the full suite. `py_compile` on
+  every touched file. `git diff --check` clean. `docker ps -a` showed
+  no `codeagent-verify-*` containers before or after every run in this
+  session.
+- No new ADR: every correction here is a bug fix or a tightening of an
+  already-agreed design (single-source-of-truth command, public
+  validator, stricter construction/report validation) — none introduces
+  a new consequential decision with credible alternatives left
+  undiscussed.
+
+**Still nothing committed or pushed** — this correction pass, like the
+slice C implementation it corrects, remains uncommitted pending
+explicit user go-ahead.
+
+---
+
+## Session: Milestone 1 completion — real read-before-plan
+
+**Outcome**: closed a real acceptance-criterion gap identified by
+review, not by inspection of my own prior work: the implementation
+guide's exact Milestone 1 requirement is "Using a deterministic fake
+model and a real fixture repository, perform a full
+read-plan-approve-patch-verify-report flow," and the controller never
+performed or recorded a repository read — plan-approve-patch-verify-
+report only. Fixed with the smallest slice that satisfies the wording,
+explicitly not Milestone 2's general repository-read/multi-tool
+system.
+
+- New `src/codeagent/controller.py` additions: `ReadResult` (frozen
+  dataclass, same verbatim-report discipline as `PatchResult`/
+  `VerificationResult`), `RepositoryReader` Protocol (`read_file`
+  only — no listing/pagination/search), and `ModelClient` changed from
+  one-shot `propose_plan()` to two-step `request_read_path()` then
+  `propose_plan(read_result)`. Documented explicitly on both new
+  Protocols: this is not the future live-provider shape (arbitrary,
+  budget-aware multi-tool calls in any order) — it exists only to make
+  today's deterministic fake model genuinely evidence-driven.
+- New `src/codeagent/reader.py`: `WorktreeFileReader`, the real
+  implementation — one UTF-8 file, `MAX_READ_BYTES = 64 KiB`, rejects
+  absolute paths, `..`, and symlink escape (mirrors
+  `codeagent.patch.GitPatchApplier`'s path-validation discipline,
+  deliberately duplicated rather than shared — sharing would have
+  meant widening patch.py's private surface for a few dozen lines).
+  Every failure returns a structured `ReadResult`, never a propagated
+  filesystem exception.
+- `RunController` gained a required `reader: RepositoryReader`
+  constructor parameter and now dispatches READ_FILE in EXPLORE (full
+  ToolRequested/PolicyDecisionRecorded/ToolCompleted audit trail)
+  *before* the existing PROPOSE_PLAN dispatch, passing the real
+  `ReadResult` into `propose_plan`. `PlanProposed.evidence_refs` now
+  carries the read's `tool_call_id` — a real cross-reference the schema
+  already supported but nothing populated until now. Persisted
+  `ToolCompleted.result_summary` is bounded metadata only ("read N
+  byte(s) from `path`") — never raw file content; verified by a test
+  that scans every string field of every event in a full run for a
+  planted secret marker.
+  A failed read aborts the run as UNRECOVERABLE_ERROR without
+  consuming repair/revision budget — same placeholder-disposition
+  shape as a failed patch (`_dispatch_apply_patch`), not a considered
+  retry policy.
+- `tests/support/fakes.py`: `FakeModel` updated to the two-step
+  Protocol (defaults its read path to the plan's own first proposed
+  file, records `last_read_result` for inspection); new
+  `FakeRepositoryReader`; new `MarkerGatedFakeModel` — a test-only
+  model whose `propose_plan` raises unless it actually received the
+  expected marker in real read content, used specifically to prove the
+  controller passes genuine evidence through rather than the model
+  proposing independently of the read it triggered (with its own
+  "does this gate actually fail" sanity test, so the proof isn't
+  vacuous).
+- `tests/integration/test_slice_c.py`'s real Docker E2E test now
+  demonstrates the complete real sequence end to end: real worktree →
+  real READ_FILE → real content compared byte-for-byte against the
+  original checkout → `MarkerGatedFakeModel` gated on the fixture's
+  actual `# BUG:` comment → fake approval → real patch + checkpoint →
+  real Docker verification → report, with read-before-plan sequence
+  ordering asserted by event sequence number, and the original
+  checkout/Docker-cleanup guarantees re-verified intact.
+- New `tests/unit/test_reader.py` (17 tests): real file read from a
+  real fixture repo; absolute path, `..`, symlink escape, and a
+  nonexistent nested path all rejected without ever touching or
+  leaking the host content they'd otherwise expose (asserted directly:
+  a planted "secret" file's content never appears in the error
+  message); oversized (over `MAX_READ_BYTES`) and non-UTF-8 files fail
+  structurally, not via a propagated exception; `ReadResult`
+  construction invariants.
+- Small corrections bundled into the same pass (item 7 of this
+  session's review): `test_slice_c.py`'s `_no_stray_containers` now
+  requires `docker ps` itself to have exited 0 before trusting empty
+  stdout as "confirmed clean" (a failed listing's empty output would
+  otherwise look identical to genuine cleanliness); `DockerVerifier`'s
+  digest-pin check now requires the complete shape (`@sha256:` plus
+  exactly 64 hex characters via a regex, anchored at the string's end)
+  instead of `"@sha256:" in image` substring presence, which would
+  have accepted a truncated or malformed digest; four stale
+  `"pytest tests/test_worker.py"` `verification_intent` strings
+  (left over from before the fixture's real command became
+  unittest-based) replaced with `"python3 -B -m unittest
+  tests.test_worker"`.
+- **Verification performed**: full suite 871 passed (was 849 before
+  this slice's tests; +22 net new tests: 17 in test_reader.py, 5 new
+  read-flow tests in test_controller.py, offset by 0 removed — the two
+  pre-existing tests that needed updating for the new event count/
+  constructor signature were fixed in place, not replaced).
+  `tests/integration/test_slice_c.py`'s 3 real-Docker tests re-run and
+  passed individually and in the full suite. `py_compile` clean on
+  every touched file. `git diff --check` clean. `docker ps -a` showed
+  no `codeagent-verify-*` containers after every run.
+- Two real bugs found while wiring this in (not by inspection —  by
+  running the new real E2E assertions and watching them fail): (1) the
+  existing `test_every_tool_dispatch_emits_policy_decision_between_
+  request_and_completion` test asserted exactly 2 ToolRequested events
+  by a stale hardcoded count; fixed to 3 (read_file, propose_plan,
+  apply_patch). (2) The real E2E test's first attempt at proving
+  "real content reached the model" compared the model's captured
+  `ReadResult.content` against the worktree's file *after* `controller.
+  run()` returned — by then the patch had already been applied, so it
+  compared post-patch content against a read that happened pre-patch,
+  and failed. Fixed by comparing against `before_content`, captured
+  from the original checkout before the worktree or any patch existed
+  — the actually-correct expected value, since the read happens in
+  EXPLORE, strictly before EXECUTE applies the patch.
+- No new ADR: `ModelClient`'s two-step shape and `RepositoryReader`'s
+  narrow surface are both explicitly documented as provisional
+  stand-ins for later, undesigned work (the real multi-tool model loop,
+  Milestone 2's general repository toolkit) — not durable decisions
+  with credible alternatives being chosen between now.
+
+**Still nothing committed or pushed** — remains uncommitted pending
+explicit user go-ahead, per this project's git safety rule.
+
+---
+
+## Session: pre-commit correction pass — reader bound, report position check
+
+**Outcome**: four correctness/documentation fixes on the still-uncommitted
+Milestone 1 work, found by review. No ADR — correctness fixes and
+documentation precision, not new decisions.
+
+- `WorktreeFileReader.read_file` no longer `stat()`s then
+  `read_bytes()`s the whole file: it opens in binary mode and reads at
+  most `MAX_READ_BYTES + 1` bytes, rejecting on the extra byte. The old
+  stat-then-read-all pattern would have read and held an arbitrarily
+  large file in memory if it grew between the stat and the read;
+  bounding the read call itself removes that. Proven by a new test that
+  monkeypatches the file object's `read` to record the requested size
+  against a file 5x the limit, asserting exactly one `read(MAX_READ_BYTES
+  + 1)` call — not merely that a big file is rejected, but that the
+  mechanism itself is bounded.
+- Documented the remaining TOCTOU race honestly in reader.py's module
+  docstring: path validation and the actual open are still two separate
+  filesystem operations, so a concurrent replacement of a path
+  component between them is a real, unclosed race. Assigned to
+  Milestone 2 (descriptor-relative/openat-style resolution); explicitly
+  not attempted here. No documentation now claims this reader is
+  TOCTOU-safe.
+- `report.build_report()` now requires `RunStarted` to be the *first*
+  event, not merely present exactly once — a trace with one RunStarted
+  event sitting in the middle previously passed validation. New test
+  moves RunStarted to the midpoint of an otherwise-valid trace,
+  re-sequences by list order, and proves rejection.
+- Fixed a misleadingly-named reader test:
+  `test_rejects_resolved_outside_worktree_path_without_reading_host_content`
+  set up an unused "secret file" and claimed to test containment escape
+  via resolution, but a bare nonexistent nested path never exercises
+  escape at all (no `..`, no symlink — `Path.resolve()` has nothing to
+  escape through). Renamed to
+  `test_rejects_nonexistent_nested_target_path` with a docstring
+  stating plainly what it does and doesn't prove, pointing at the real
+  symlink-escape test as the actual containment-boundary evidence.
+- **Verification performed**: `py_compile` clean on every touched file
+  (`reader.py`, `report.py`, `test_reader.py`, `test_report.py`).
+  Focused reader tests: 18 passed. Focused report tests: 15 passed.
+  `tests/integration/test_slice_c.py` against a real local Docker
+  daemon: all 3 executed (none skipped) and passed. Full suite: 873
+  passed (was 871; +2 net new tests). `docker ps -a --filter
+  name=codeagent-verify`: empty. `git diff --check`: clean.
+- No new ADR.
+
+**Still nothing committed or pushed.**

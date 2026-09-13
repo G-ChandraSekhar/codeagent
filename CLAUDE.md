@@ -91,12 +91,100 @@ Milestone 0 ("Contracts and threats") core deliverables are done:
 - `docs/threat-model.md` — Accepted (2026-09-12).
 - `ENGINEERING_LOG.md` — session-level decision trail, per the
   documentation ladder above.
-- `tests/unit/{test_domain,test_events,test_errors}.py` — 677 tests,
-  all passing as of the last full run.
+- `tests/unit/{test_domain,test_events,test_errors}.py` — Milestone 0
+  contract tests.
 
 Further ADRs are not inherently required — per the documentation ladder
 above, another ADR is created only when a future consequential decision
 actually meets the ADR threshold, not as a standing checklist item.
+
+Milestone 1 ("First real vertical slice") is complete. Its exact
+acceptance criterion (implementation guide §12: "Using a deterministic
+fake model and a real fixture repository, perform a full
+read-plan-approve-patch-verify-report flow") is now demonstrated for
+real by `tests/integration/test_slice_c.py`'s end-to-end test — the
+controller previously performed plan-approve-patch-verify-report
+without ever recording a real repository read; that gap is closed
+below.
+
+- **Slice A** — deterministic `RunController` (`src/codeagent/
+  controller.py`) driving the domain FSM against fake collaborators
+  only (`ModelClient`/`ApprovalProvider`/`Verifier`/`PatchApplier`/
+  `Clock` Protocols; fakes live under `tests/support/fakes.py`, never
+  in production code).
+- **Slice B** — real Git worktree lifecycle (`src/codeagent/
+  workspace.py`: `GitWorktree`) and real controlled patch application
+  with a real checkpoint commit (`src/codeagent/patch.py`:
+  `GitPatchApplier`), exercised against a real throwaway fixture repo
+  (`tests/support/fixture_repo.py`, `tests/fixtures/retry_worker/`).
+- **Slice C** — real Docker-based verification (`src/codeagent/
+  executor.py`: `DockerVerifier`), an inspectable
+  create/start/inspect/cleanup container lifecycle with bounded
+  streamed output, and a typed-event-derived run report
+  (`src/codeagent/report.py`). One real end-to-end demonstration is
+  covered by `tests/integration/test_slice_c.py`: temporary worktree →
+  real failing baseline in Docker → fake model plan/approval → real
+  patch + checkpoint → real passing verification in Docker → report.
+  Model and approval collaborators are still fake — Docker sandbox
+  claims are explicitly provisional pending the Stage-2 isolation/
+  interruption spikes below.
+- A pre-commit correction pass on slice C (still uncommitted) fixed
+  seven real defects found by review: an unsafe cleanup-confirmation
+  check (`docker ps -a` exact-name match replacing a `docker inspect`
+  exit code, which couldn't distinguish "confirmed absent" from "the
+  daemon is broken"); a cleanup-ordering restructure so cleanup always
+  runs and its unconfirmed-removal result always overrides any
+  provisional outcome, including COMMAND_START_FAILURE; `Verifier`
+  gaining a `command` property as the single source of truth (removing
+  `RunConfig.verify_command`, which could disagree with what actually
+  ran); a public `events.validate_verification_outcome_shape()`
+  replacing two underscore-prefixed cross-module calls from
+  controller.py; `report.build_report()` validating trace shape
+  (single run_id, contiguous sequence, exactly one start/finish,
+  finish last) and aggregating multiple `PatchApplied` events
+  correctly; `DockerVerifier.__init__` validating its own configuration
+  (real directory, digest-pinned image, nonempty command, finite
+  positive timeout); and `test_slice_c.py` switched from a fake
+  stepping clock to `SystemClock` so real Docker durations aren't
+  fabricated. See `ENGINEERING_LOG.md`'s "correction pass" entry.
+- **Read completion slice** (still uncommitted) — closes Milestone 1's
+  actual acceptance gap: a narrow `RepositoryReader` Protocol and
+  `ReadResult` type (`src/codeagent/controller.py`), a real bounded,
+  path-validated worktree reader (`src/codeagent/reader.py`:
+  `WorktreeFileReader` — one UTF-8 file, small fixed byte limit,
+  absolute/`..`/symlink-escape rejection, structured failures, no
+  listing/pagination/search), and a genuinely two-step `ModelClient`
+  Protocol (`request_read_path` then `propose_plan(read_result)`) so
+  the deterministic fake model is evidence-driven rather than
+  proposing a plan independently of the read it triggers.
+  `RunController` now dispatches READ_FILE in EXPLORE (full
+  ToolRequested/PolicyDecisionRecorded/ToolCompleted audit trail, a
+  bounded result summary and the read's tool_call_id as
+  `PlanProposed.evidence_refs` — never raw file content) before ever
+  asking the model to propose a plan; a failed read aborts the run as
+  UNRECOVERABLE_ERROR without consuming repair/revision budget, same
+  placeholder disposition as a failed patch. `tests/integration/
+  test_slice_c.py`'s real E2E test now demonstrates the complete real
+  sequence: real worktree → real READ_FILE → real content passed to a
+  marker-gated fake model that only proposes its plan after seeing the
+  fixture's actual `# BUG:` comment → fake approval → real patch +
+  checkpoint → real Docker verification → report — with the original
+  checkout and Docker cleanup guarantees intact. This is explicitly
+  the narrowest slice that satisfies the guide's wording, not
+  Milestone 2's general repository-read/tool-loop system.
+- A pre-commit correction pass (still uncommitted) fixed the reader's
+  size enforcement (bounded `read()` instead of stat-then-read-whole-
+  file), documented the reader's remaining TOCTOU race honestly rather
+  than claiming safety it doesn't have (real fix assigned to Milestone
+  2's descriptor-relative resolution), tightened `report.build_report()`
+  to require `RunStarted` first (not merely present), and corrected a
+  misleadingly-named reader test. See `ENGINEERING_LOG.md`'s
+  "pre-commit correction pass" entry.
+- Full suite: 873 tests passing as of the last full run (`git diff
+  --check` clean); the 3 real-Docker tests in `test_slice_c.py` skip
+  cleanly on a machine without a Docker daemon rather than weakening
+  what they check, and executed (none skipped) and passed against a
+  real local daemon in the last run.
 
 Stage 2 (of the four-stage planning process in
 `docs/CODEAGENT_LLM_HANDOFF.md`) spikes remain separately unstarted
@@ -113,5 +201,7 @@ except S1:
   (A sixth spike, JSONL replay into the first frontend view, is also
   listed in the handoff and unstarted.)
 
-The flagship fixture repository does not exist yet and has not been
-empirically validated (see `docs/PROJECT_BRIEF.md`).
+The flagship fixture repository used by slice B/C
+(`tests/fixtures/retry_worker/`) is a narrow, hand-built stand-in for
+this and has not yet been replaced by the empirically validated
+flagship fixture repository named in `docs/PROJECT_BRIEF.md`.

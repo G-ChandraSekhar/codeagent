@@ -13,3 +13,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
 testpaths = ["tests"]
+# tests/fixtures/retry_worker/tests/ is a fixture-owned package meant
+# only to run inside the verification container (see executor.py's
+# DEFAULT_COMMAND) via `python3 -m unittest tests.test_worker`. Its own
+# tests/__init__.py collides with the real top-level tests package if
+# pytest collects it on the host, so it's excluded here.
+norecursedirs = ["tests/fixtures"]

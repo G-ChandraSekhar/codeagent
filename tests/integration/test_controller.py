@@ -12,20 +12,22 @@ from __future__ import annotations
 import pytest
 
 from codeagent import domain, events
-from codeagent.controller import EventLog, PlanProposal, RunConfig, RunController
+from codeagent.controller import EventLog, ModelClient, PlanProposal, RunConfig, RunController
 from codeagent.errors import ErrorCode
 from tests.support.fakes import (
     FakeApprovalProvider,
     FakeModel,
     FakePatchApplier,
+    FakeRepositoryReader,
     FakeVerifier,
+    MarkerGatedFakeModel,
     SteppingClock,
 )
 
 PLAN = PlanProposal(
     problem_hypothesis="idempotency key dropped on retry",
     proposed_file_paths=("jobs/worker.py",),
-    verification_intent="pytest tests/test_worker.py",
+    verification_intent="python3 -B -m unittest tests.test_worker",
 )
 
 
@@ -36,25 +38,28 @@ def _build(
     verification_outcomes: tuple[events.VerificationOutcome, ...] = (
         events.VerificationOutcome.PASSED,
     ),
+    baseline_outcome: events.VerificationOutcome = events.VerificationOutcome.TEST_FAILURE,
     max_repair_iterations: int = 3,
     max_plan_revisions: int = 2,
     patch_should_fail: bool = False,
     approval_mode: domain.ApprovalMode = domain.ApprovalMode.INTERACTIVE,
+    model: ModelClient | None = None,
+    reader: object | None = None,
 ) -> RunController:
     config = RunConfig(
         run_id=run_id,
         task_statement="fix retry bug",
-        verify_command=("pytest", "-q"),
         approval_mode=approval_mode,
         max_repair_iterations=max_repair_iterations,
         max_plan_revisions=max_plan_revisions,
     )
     return RunController(
         config,
-        FakeModel(PLAN),
+        model if model is not None else FakeModel(PLAN),
         FakeApprovalProvider(approval_decisions),
-        FakeVerifier(verification_outcomes),
+        FakeVerifier(verification_outcomes, baseline_outcome=baseline_outcome),
         FakePatchApplier(patch_should_fail),
+        reader if reader is not None else FakeRepositoryReader(),
         clock=SteppingClock(),
     )
 
@@ -267,7 +272,6 @@ def test_run_config_rejects_negative_budget_limits(field: str) -> None:
     kwargs = dict(
         run_id="r",
         task_statement="x",
-        verify_command=("pytest",),
         approval_mode=domain.ApprovalMode.NONE,
         max_repair_iterations=1,
         max_plan_revisions=1,
@@ -277,13 +281,13 @@ def test_run_config_rejects_negative_budget_limits(field: str) -> None:
         RunConfig(**kwargs)
 
 
-def test_run_config_rejects_unsupported_baseline_outcome() -> None:
+def test_fake_verifier_rejects_unsupported_baseline_outcome() -> None:
+    """baseline_outcome moved from RunConfig to FakeVerifier in slice C
+    — the fake still only fabricates PASSED/TEST_FAILURE; a real
+    DockerVerifier is not restricted this way (see test_executor.py)."""
     with pytest.raises(ValueError):
-        RunConfig(
-            run_id="r",
-            task_statement="x",
-            verify_command=("pytest",),
-            approval_mode=domain.ApprovalMode.NONE,
+        FakeVerifier(
+            (events.VerificationOutcome.PASSED,),
             baseline_outcome=events.VerificationOutcome.TIMEOUT,
         )
 
@@ -300,7 +304,7 @@ def test_every_tool_dispatch_emits_policy_decision_between_request_and_completio
 
     event_types = [type(e).__name__ for e in controller.log.events]
     tool_requested_indices = [i for i, t in enumerate(event_types) if t == "ToolRequested"]
-    assert len(tool_requested_indices) == 2  # propose_plan, apply_patch
+    assert len(tool_requested_indices) == 3  # read_file, propose_plan, apply_patch
     for i in tool_requested_indices:
         assert event_types[i : i + 3] == ["ToolRequested", "PolicyDecisionRecorded", "ToolCompleted"]
 
@@ -406,7 +410,6 @@ def test_patch_reporting_files_outside_the_approved_plan_aborts_the_run() -> Non
     config = RunConfig(
         run_id="r-scope-violation",
         task_statement="fix retry bug",
-        verify_command=("pytest", "-q"),
         approval_mode=domain.ApprovalMode.INTERACTIVE,
     )
     # PLAN approves only "jobs/worker.py"; the patch applier (mis)reports
@@ -417,6 +420,7 @@ def test_patch_reporting_files_outside_the_approved_plan_aborts_the_run() -> Non
         FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
         FakeVerifier((events.VerificationOutcome.PASSED,)),
         FakePatchApplier(changed_paths=("unrelated_file.py",)),
+        FakeRepositoryReader(),
         clock=SteppingClock(),
     )
 
@@ -440,7 +444,6 @@ def test_patch_reporting_a_subset_of_approved_files_is_accepted() -> None:
     config = RunConfig(
         run_id="r-scope-subset",
         task_statement="fix retry bug",
-        verify_command=("pytest", "-q"),
         approval_mode=domain.ApprovalMode.INTERACTIVE,
     )
     plan_with_two_files = PlanProposal(
@@ -454,6 +457,7 @@ def test_patch_reporting_a_subset_of_approved_files_is_accepted() -> None:
         FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
         FakeVerifier((events.VerificationOutcome.PASSED,)),
         FakePatchApplier(changed_paths=("jobs/worker.py",)),
+        FakeRepositoryReader(),
         clock=SteppingClock(),
     )
 
@@ -461,3 +465,127 @@ def test_patch_reporting_a_subset_of_approved_files_is_accepted() -> None:
 
     assert finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED
     assert finished.error is None
+
+
+# --------------------------------------------------------------------
+# Milestone 1 completion: the implementation guide's exact requirement
+# is "Using a deterministic fake model and a real fixture repository,
+# perform a full read-plan-approve-patch-verify-report flow" — these
+# tests target the read step specifically (fast, fake-repository
+# versions of what tests/integration/test_slice_c.py demonstrates for
+# real against a real worktree and real Docker).
+# --------------------------------------------------------------------
+
+
+def test_read_file_occurs_before_propose_plan() -> None:
+    controller = _build("r-read-before-plan")
+    controller.run()
+
+    read_requested = next(
+        e
+        for e in controller.log.events
+        if isinstance(e, events.ToolRequested) and e.tool is domain.ToolName.READ_FILE
+    )
+    read_completed = next(
+        e
+        for e in controller.log.events
+        if isinstance(e, events.ToolCompleted) and e.tool is domain.ToolName.READ_FILE
+    )
+    plan_requested = next(
+        e
+        for e in controller.log.events
+        if isinstance(e, events.ToolRequested) and e.tool is domain.ToolName.PROPOSE_PLAN
+    )
+    plan_proposed = next(e for e in controller.log.events if isinstance(e, events.PlanProposed))
+
+    assert read_requested.sequence < read_completed.sequence < plan_requested.sequence
+    assert plan_requested.sequence < plan_proposed.sequence
+    assert read_completed.success
+    assert plan_proposed.evidence_refs == (read_requested.tool_call_id,)
+
+
+def test_read_file_result_summary_never_contains_raw_content() -> None:
+    """Only a bounded summary and the tool_call_id (already a distinct
+    event field, i.e. the evidence reference) are persisted — never the
+    file's actual content."""
+    secret_content = "SECRET_MARKER_never_persisted"
+    controller = _build(
+        "r-read-no-leak", reader=FakeRepositoryReader(content=secret_content)
+    )
+    controller.run()
+
+    read_completed = next(
+        e
+        for e in controller.log.events
+        if isinstance(e, events.ToolCompleted) and e.tool is domain.ToolName.READ_FILE
+    )
+    assert secret_content not in read_completed.result_summary
+    for event in controller.log.events:
+        for field_value in vars(event).values():
+            if isinstance(field_value, str):
+                assert secret_content not in field_value
+
+
+def test_fake_model_derives_plan_only_after_seeing_real_read_evidence() -> None:
+    """MarkerGatedFakeModel.propose_plan raises unless it was actually
+    given the expected marker in real ReadResult content — proving the
+    controller passes genuine evidence through rather than the model
+    proposing its plan independently of the read it triggered."""
+    marker = "BUG-MARKER-XYZ"
+    gated_model = MarkerGatedFakeModel(
+        read_path="jobs/worker.py", marker=marker, plan=PLAN
+    )
+    controller = _build(
+        "r-evidence-gated",
+        model=gated_model,
+        reader=FakeRepositoryReader(content=f"...\n{marker}\n..."),
+    )
+
+    finished = controller.run()
+
+    assert finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED
+    assert gated_model.last_read_result is not None
+    assert gated_model.last_read_result.success
+    assert marker in gated_model.last_read_result.content
+
+
+def test_fake_model_gate_actually_fails_without_the_marker() -> None:
+    """Sanity check for the test above: MarkerGatedFakeModel must
+    actually be capable of failing when evidence is missing — otherwise
+    the "proves evidence was passed" claim is vacuous."""
+    gated_model = MarkerGatedFakeModel(
+        read_path="jobs/worker.py", marker="MARKER_NOT_PRESENT", plan=PLAN
+    )
+    controller = _build(
+        "r-evidence-gate-fails",
+        model=gated_model,
+        reader=FakeRepositoryReader(content="content without the marker"),
+    )
+
+    with pytest.raises(AssertionError):
+        controller.run()
+
+
+def test_illegal_read_path_aborts_the_run_without_reading_host_content() -> None:
+    """A read failure (bad path, symlink escape, oversized, non-UTF-8,
+    etc.) is an operational failure: the run aborts as
+    UNRECOVERABLE_ERROR without ever reaching PROPOSE_PLAN, PLAN, or
+    APPROVAL, and without consuming any repair/revision budget."""
+    controller = _build("r-read-fails", reader=FakeRepositoryReader(should_fail=True))
+
+    finished = controller.run()
+
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.TOOL_INPUT_INVALID
+    assert not any(isinstance(e, events.PlanProposed) for e in controller.log.events)
+    assert not any(isinstance(e, events.ApprovalRecorded) for e in controller.log.events)
+    assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
+
+    read_completed = next(
+        e
+        for e in controller.log.events
+        if isinstance(e, events.ToolCompleted) and e.tool is domain.ToolName.READ_FILE
+    )
+    assert not read_completed.success
+    assert read_completed.error is not None
