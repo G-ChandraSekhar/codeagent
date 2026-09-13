@@ -1007,6 +1007,8 @@ def _make_fake_docker_git_run(registry: "_FakeDockerRegistry", fail_on_container
         if argv[0] == "docker":
             if "version" in argv:
                 return _FakeCompleted(0, stdout="99.0.0\n")
+            if argv[1] == "info":
+                return _FakeCompleted(0, stdout='"2"\n')
             if argv[1] == "pull":
                 return _FakeCompleted(0)
             if argv[1:3] == ["run", "-d"]:
@@ -1511,3 +1513,892 @@ def test_default_image_is_imported_not_retyped() -> None:
     from codeagent import executor
 
     assert s.DEFAULT_IMAGE is executor.DEFAULT_IMAGE
+
+
+# --------------------------------------------------------------------
+# Linux/x86-64 portability infrastructure: platform gating, Actions-
+# context validation, baseline-commit ancestry, strict Docker/cgroup
+# provenance, findmnt-based filesystem observation, and the
+# ProvenanceIncomplete -> TECHNICAL_FAILURE path. All Docker-free.
+# --------------------------------------------------------------------
+
+
+def test_is_supported_platform_accepts_darwin_any_machine(monkeypatch) -> None:
+    monkeypatch.setattr(s.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(s.platform, "machine", lambda: "arm64")
+    ok, reason = s.is_supported_platform()
+    assert ok is True
+    assert "Darwin" in reason
+
+
+def test_is_supported_platform_accepts_linux_x86_64(monkeypatch) -> None:
+    monkeypatch.setattr(s.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(s.platform, "machine", lambda: "x86_64")
+    ok, reason = s.is_supported_platform()
+    assert ok is True
+    assert "Linux/x86_64" in reason
+
+
+def test_is_supported_platform_rejects_linux_aarch64(monkeypatch) -> None:
+    monkeypatch.setattr(s.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(s.platform, "machine", lambda: "aarch64")
+    ok, reason = s.is_supported_platform()
+    assert ok is False
+    assert "aarch64" in reason
+
+
+def test_is_supported_platform_rejects_other_systems(monkeypatch) -> None:
+    monkeypatch.setattr(s.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(s.platform, "machine", lambda: "AMD64")
+    ok, reason = s.is_supported_platform()
+    assert ok is False
+    assert "Windows" in reason
+
+
+def test_platform_key_still_correct_for_linux_x86_64(monkeypatch) -> None:
+    monkeypatch.setattr(s.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(s.platform, "machine", lambda: "x86_64")
+    assert s.platform_key() == "linux-x86_64"
+
+
+def test_platform_key_still_correct_for_darwin_arm64(monkeypatch) -> None:
+    """Preservation of existing macOS behavior: the Linux
+    generalization must not have altered platform_key()'s macOS
+    output, which every retained macOS evidence directory's path
+    depends on."""
+    monkeypatch.setattr(s.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(s.platform, "machine", lambda: "arm64")
+    assert s.platform_key() == "macos-docker-desktop-arm64"
+
+
+# ---- Actions-context validation ----
+
+
+def test_validate_actions_context_absent_when_no_vars_set() -> None:
+    assert s.validate_actions_context({}) == {"present": False}
+
+
+def test_validate_actions_context_valid_full_context() -> None:
+    env = {
+        "GITHUB_RUN_ID": "12345",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "org/repo",
+    }
+    ctx = s.validate_actions_context(env)
+    assert ctx["present"] is True
+    assert ctx["run_id"] == "12345"
+    assert ctx["run_attempt"] == "2"
+    assert ctx["workflow_url"] == "https://github.com/org/repo/actions/runs/12345"
+
+
+def test_validate_actions_context_rejects_partial_context() -> None:
+    env = {"GITHUB_RUN_ID": "12345"}  # missing attempt/server_url/repository
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(env)
+
+
+def test_validate_actions_context_rejects_non_numeric_run_id() -> None:
+    env = {
+        "GITHUB_RUN_ID": "not-a-number",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "org/repo",
+    }
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(env)
+
+
+def test_validate_actions_context_rejects_non_numeric_run_attempt() -> None:
+    env = {
+        "GITHUB_RUN_ID": "12345",
+        "GITHUB_RUN_ATTEMPT": "one",
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "org/repo",
+    }
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(env)
+
+
+def test_validate_actions_context_rejects_missing_server_url() -> None:
+    env = {"GITHUB_RUN_ID": "12345", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_REPOSITORY": "org/repo"}
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(env)
+
+
+def test_validate_actions_context_rejects_missing_repository() -> None:
+    env = {"GITHUB_RUN_ID": "12345", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SERVER_URL": "https://github.com"}
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(env)
+
+
+def _valid_env(**overrides) -> dict:
+    env = {
+        "GITHUB_RUN_ID": "12345",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "org/repo",
+    }
+    env.update(overrides)
+    return env
+
+
+def test_validate_actions_context_normalizes_trailing_slash_on_server_url() -> None:
+    ctx = s.validate_actions_context(_valid_env(GITHUB_SERVER_URL="https://github.com/"))
+    assert ctx["workflow_url"] == "https://github.com/org/repo/actions/runs/12345"
+
+
+def test_validate_actions_context_rejects_non_http_scheme() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_SERVER_URL="ftp://github.com"))
+
+
+def test_validate_actions_context_rejects_url_with_empty_host() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_SERVER_URL="https:///no-host"))
+
+
+def test_validate_actions_context_rejects_url_with_embedded_credentials() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_SERVER_URL="https://user:pass@github.com"))
+
+
+def test_validate_actions_context_rejects_relative_server_url() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_SERVER_URL="github.com"))
+
+
+def test_validate_actions_context_rejects_repository_with_too_many_components() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_REPOSITORY="org/repo/extra"))
+
+
+def test_validate_actions_context_rejects_repository_with_empty_owner() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_REPOSITORY="/repo"))
+
+
+def test_validate_actions_context_rejects_repository_with_empty_name() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_REPOSITORY="org/"))
+
+
+def test_validate_actions_context_rejects_repository_with_whitespace() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_REPOSITORY="org /repo"))
+
+
+def test_validate_actions_context_rejects_repository_with_traversal_component() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_REPOSITORY="../repo"))
+
+
+def test_validate_actions_context_rejects_repository_with_query_string() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_REPOSITORY="org/repo?x=1"))
+
+
+def test_validate_actions_context_rejects_repository_with_fragment() -> None:
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.validate_actions_context(_valid_env(GITHUB_REPOSITORY="org/repo#frag"))
+
+
+def test_validate_actions_context_accepts_well_formed_repository_with_dots_and_hyphens() -> None:
+    ctx = s.validate_actions_context(_valid_env(GITHUB_REPOSITORY="my-org/my.repo_name"))
+    assert ctx["present"] is True
+
+
+# ---- --validate-actions-context / --normalize-docker-inventory CLI modes ----
+
+
+def test_main_validate_actions_context_cli_success(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {
+            "GITHUB_RUN_ID": "1",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_REPOSITORY": "org/repo",
+        },
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        s.main(["--validate-actions-context"])
+    assert exc_info.value.code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["present"] is True
+
+
+def test_main_validate_actions_context_cli_failure_exits_nonzero(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(os, "environ", {"GITHUB_RUN_ID": "1"})  # partial
+    with pytest.raises(SystemExit) as exc_info:
+        s.main(["--validate-actions-context"])
+    assert exc_info.value.code == 1
+    assert "TECHNICAL_FAILURE" in capsys.readouterr().err
+
+
+def test_evidence_run_dir_name_uses_uuid_when_absent() -> None:
+    name = s.evidence_run_dir_name({"present": False})
+    assert name.startswith("run-")
+    assert "attempt" not in name
+
+
+def test_evidence_run_dir_name_uses_run_id_and_attempt_when_present() -> None:
+    name = s.evidence_run_dir_name({"present": True, "run_id": "999", "run_attempt": "3"})
+    assert name == "run-999-attempt-3"
+
+
+# ---- Baseline-commit ancestry ----
+
+
+def test_check_ancestor_confirmed(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0))
+    status, detail = s.check_ancestor("deadbeef", "/fake/repo")
+    assert status == "ancestor"
+
+
+def test_check_ancestor_confirmed_not_ancestor(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(1))
+    status, detail = s.check_ancestor("deadbeef", "/fake/repo")
+    assert status == "not_ancestor"
+    assert "NOT an ancestor" in detail
+
+
+def test_check_ancestor_technical_failure_on_other_exit_code(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(128, stderr="unknown revision"))
+    status, detail = s.check_ancestor("deadbeef", "/fake/repo")
+    assert status == "technical_failure"
+    assert "128" in detail
+
+
+# ---- Strict Docker/cgroup provenance parsing ----
+
+
+def test_docker_client_version_success(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout="27.3.1\n"))
+    assert s.docker_client_version() == "27.3.1"
+
+
+def test_docker_client_version_fails_closed_on_nonzero_exit(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(1, stderr="daemon unreachable"))
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.docker_client_version()
+
+
+def test_docker_client_version_fails_closed_on_empty_output(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=""))
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.docker_client_version()
+
+
+def test_docker_server_version_success(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout="27.3.1\n"))
+    assert s.docker_server_version() == "27.3.1"
+
+
+def test_docker_server_version_fails_closed_on_nonzero_exit(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(1))
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.docker_server_version()
+
+
+def test_docker_daemon_cgroup_version_success(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout='"2"\n'))
+    assert s.docker_daemon_cgroup_version() == "2"
+
+
+def test_docker_daemon_cgroup_version_fails_closed_on_nonzero_exit(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(1))
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.docker_daemon_cgroup_version()
+
+
+def test_docker_daemon_cgroup_version_fails_closed_on_malformed_json(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout="not json at all"))
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.docker_daemon_cgroup_version()
+
+
+def test_docker_daemon_cgroup_version_fails_closed_on_empty_string_value(monkeypatch) -> None:
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout='""\n'))
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.docker_daemon_cgroup_version()
+
+
+def test_collect_kernel_and_architecture_success(monkeypatch) -> None:
+    monkeypatch.setattr(s.platform, "release", lambda: "6.8.0-generic")
+    monkeypatch.setattr(s.platform, "machine", lambda: "x86_64")
+    kernel, machine = s.collect_kernel_and_architecture()
+    assert kernel == "6.8.0-generic"
+    assert machine == "x86_64"
+
+
+def test_collect_kernel_and_architecture_fails_closed_on_empty_release(monkeypatch) -> None:
+    monkeypatch.setattr(s.platform, "release", lambda: "")
+    monkeypatch.setattr(s.platform, "machine", lambda: "x86_64")
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.collect_kernel_and_architecture()
+
+
+# ---- findmnt --json-based Linux filesystem observation ----
+
+
+def _findmnt_json(target: str, fstype: str) -> str:
+    """A real-shaped `findmnt --json --output TARGET,FSTYPE --target
+    <path>` fixture, matching util-linux's actual output shape."""
+    return json.dumps({"filesystems": [{"target": target, "fstype": fstype}]})
+
+
+def test_observe_filesystem_linux_success_real_shaped_json(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "worktrees" / "abc"
+    target.mkdir(parents=True)
+
+    def fake_run(argv, **kw):
+        if argv[0] == "findmnt":
+            return _FakeCompleted(0, stdout=_findmnt_json(str(tmp_path), "ext4"))
+        return _FakeCompleted(1)
+
+    monkeypatch.setattr(s, "run", fake_run)
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is True
+    assert obs.fs_type == "ext4"
+    assert obs.mountpoint == str(tmp_path)
+    assert obs.resolved_path == str(target.resolve())
+
+
+def test_observe_filesystem_linux_fails_closed_on_nonexistent_path(tmp_path) -> None:
+    """Proves the precondition: filesystem observation cannot succeed
+    before the target path exists -- exactly why the real call site in
+    run_full_experiment is placed only after the child has created its
+    worktree/lock file and reached READY, never before. The error is a
+    fixed categorical string, never a raw host path."""
+    missing = tmp_path / "does-not-exist-yet" / "lock"
+    obs = s.observe_filesystem_linux(missing)
+    assert obs.ok is False
+    assert obs.error == "path_does_not_exist"
+    assert obs.resolved_path is None
+
+
+def test_observe_filesystem_linux_then_succeeds_once_path_exists(tmp_path, monkeypatch) -> None:
+    """Direct proof of the ordering requirement: the exact same path
+    fails closed before creation and succeeds after -- there is no
+    silent 'describes the wrong enclosing directory' outcome in
+    between."""
+    target = tmp_path / "locks" / "abc.lock"
+
+    def fake_run(argv, **kw):
+        return _FakeCompleted(0, stdout=_findmnt_json(str(tmp_path), "apfs"))
+
+    monkeypatch.setattr(s, "run", fake_run)
+
+    before = s.observe_filesystem_linux(target)
+    assert before.ok is False
+
+    target.parent.mkdir(parents=True)
+    target.write_text("x")
+    after = s.observe_filesystem_linux(target)
+    assert after.ok is True
+    assert after.fs_type == "apfs"
+
+
+def test_observe_filesystem_linux_fails_closed_on_findmnt_command_failure(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(1))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_command_failed"
+
+
+def test_observe_filesystem_linux_fails_closed_on_malformed_json(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout="not json at all"))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_output_not_valid_json"
+
+
+def test_observe_filesystem_linux_fails_closed_on_empty_output(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=""))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_output_not_valid_json"
+
+
+def test_observe_filesystem_linux_fails_closed_on_missing_filesystems_key(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=json.dumps({"other": []})))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_json_missing_filesystems_array"
+
+
+def test_observe_filesystem_linux_fails_closed_on_zero_records(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=json.dumps({"filesystems": []})))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_json_did_not_contain_exactly_one_record"
+
+
+def test_observe_filesystem_linux_fails_closed_on_multiple_records(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    raw = json.dumps({"filesystems": [{"target": "/a", "fstype": "ext4"}, {"target": "/b", "fstype": "ext4"}]})
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=raw))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_json_did_not_contain_exactly_one_record"
+
+
+def test_observe_filesystem_linux_fails_closed_on_record_not_an_object(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    raw = json.dumps({"filesystems": ["not-an-object"]})
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=raw))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_json_record_not_an_object"
+
+
+def test_observe_filesystem_linux_fails_closed_on_missing_target_field(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    raw = json.dumps({"filesystems": [{"fstype": "ext4"}]})
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=raw))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_json_target_missing_or_empty"
+
+
+def test_observe_filesystem_linux_fails_closed_on_wrong_typed_target_field(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    raw = json.dumps({"filesystems": [{"target": 12345, "fstype": "ext4"}]})
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=raw))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_json_target_missing_or_empty"
+
+
+def test_observe_filesystem_linux_fails_closed_on_missing_fstype_field(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    raw = json.dumps({"filesystems": [{"target": "/mnt"}]})
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=raw))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_json_fstype_missing_or_empty"
+
+
+def test_observe_filesystem_linux_fails_closed_on_empty_string_fstype(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "x"
+    target.write_text("x")
+    raw = json.dumps({"filesystems": [{"target": "/mnt", "fstype": ""}]})
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=raw))
+    obs = s.observe_filesystem_linux(target)
+    assert obs.ok is False
+    assert obs.error == "findmnt_json_fstype_missing_or_empty"
+
+
+def test_observe_filesystem_linux_error_never_contains_host_path() -> None:
+    """Every FilesystemObservation.error value used across this file's
+    fail-closed tests is a fixed categorical token -- never an
+    interpolated path or raw command output -- so folding it into
+    ProvenanceIncomplete's message (and eventually
+    technical_failure_reason) never leaks host filesystem layout."""
+    categorical_errors = {
+        "path_does_not_exist",
+        "findmnt_command_failed",
+        "findmnt_output_not_valid_json",
+        "findmnt_json_missing_filesystems_array",
+        "findmnt_json_did_not_contain_exactly_one_record",
+        "findmnt_json_record_not_an_object",
+        "findmnt_json_target_missing_or_empty",
+        "findmnt_json_fstype_missing_or_empty",
+    }
+    for err in categorical_errors:
+        assert "/" not in err  # no path separator ever appears in a fixed categorical token
+
+
+# ---- Workflow-diagnostic normalization helper: exact `docker inspect`
+# based (implemented in Python). Replaces an earlier comma-separated
+# `docker ps .Labels` string-parsing approach -- that mechanism's own
+# "round-trip" ambiguity check was not a valid detector: a comma
+# embedded in one label's value can still split into ANOTHER
+# syntactically valid key=value pair from the remainder, which passes
+# a naive round-trip comparison while silently misattributing label
+# data. Structured `docker inspect` JSON has no such ambiguity. ----
+
+ID_A = "a" * 64
+ID_B = "b" * 64
+
+
+def _inspect_record(container_id: str, name: str = "/mycontainer", image: str = "sha256:" + "d" * 64, labels=None) -> list:
+    return [{"Id": container_id, "Name": name, "Image": image, "Config": {"Labels": labels if labels is not None else {}}}]
+
+
+def _fake_docker_inspect(outcomes: dict, monkeypatch) -> None:
+    """outcomes maps container_id -> one of: a list (the parsed
+    `docker inspect` JSON array, dumped to JSON stdout), a raw string
+    (malformed/unparseable stdout used as-is), or the sentinel
+    "FAIL" (simulates `docker inspect` itself exiting nonzero). Any
+    container_id not present in `outcomes` also simulates a missing
+    container (nonzero exit)."""
+
+    def fake_run(argv, **kw):
+        assert argv[0] == "docker" and argv[1] == "inspect"
+        cid = argv[2]
+        outcome = outcomes.get(cid, "FAIL")
+        if outcome == "FAIL":
+            return _FakeCompleted(1, stderr="no such object")
+        if isinstance(outcome, str):
+            return _FakeCompleted(0, stdout=outcome)
+        return _FakeCompleted(0, stdout=json.dumps(outcome))
+
+    monkeypatch.setattr(s, "run", fake_run)
+
+
+def test_normalize_container_listing_empty_list_is_valid_empty_inventory() -> None:
+    assert s.normalize_container_listing([]) == []
+
+
+def test_normalize_container_listing_success_strips_leading_slash_from_name(monkeypatch) -> None:
+    _fake_docker_inspect({ID_A: _inspect_record(ID_A, name="/mycontainer")}, monkeypatch)
+    entries = s.normalize_container_listing([ID_A])
+    assert entries == [{"id": ID_A, "name": "mycontainer", "image": "sha256:" + "d" * 64, "codeagent_labels": {}}]
+
+
+def test_normalize_container_listing_sorts_by_id(monkeypatch) -> None:
+    _fake_docker_inspect({ID_A: _inspect_record(ID_A), ID_B: _inspect_record(ID_B)}, monkeypatch)
+    entries = s.normalize_container_listing([ID_B, ID_A])
+    assert [e["id"] for e in entries] == [ID_A, ID_B]
+
+
+def test_normalize_container_listing_preserves_label_values_with_commas_and_equals_signs(monkeypatch) -> None:
+    """The whole point of using structured docker inspect JSON instead
+    of comma-joined `docker ps .Labels` text: a label value containing
+    a literal comma or equals sign is preserved EXACTLY, with no
+    ambiguity or misparsing possible."""
+    labels = {"codeagent.spike": "s5,weird=value,with=commas", "codeagent.s5_session": "a=b,c=d"}
+    _fake_docker_inspect({ID_A: _inspect_record(ID_A, labels=labels)}, monkeypatch)
+    entries = s.normalize_container_listing([ID_A])
+    assert entries[0]["codeagent_labels"] == labels
+
+
+def test_normalize_container_listing_only_emits_codeagent_relevant_labels(monkeypatch) -> None:
+    labels = {"codeagent.spike": "s5", "unrelated.label": "should-not-appear", "other": "x"}
+    _fake_docker_inspect({ID_A: _inspect_record(ID_A, labels=labels)}, monkeypatch)
+    entries = s.normalize_container_listing([ID_A])
+    assert entries[0]["codeagent_labels"] == {"codeagent.spike": "s5"}
+
+
+def test_normalize_container_listing_never_emits_full_config_or_env(monkeypatch) -> None:
+    """Only the four documented fields are ever emitted -- never the
+    full inspect record, Config.Env, Mounts, or anything else that
+    could contain container environment values."""
+    record = _inspect_record(ID_A, labels={"codeagent.spike": "s5"})
+    record[0]["Config"]["Env"] = ["SECRET_TOKEN=abc123", "PATH=/usr/bin"]
+    record[0]["Mounts"] = [{"Source": "/host/secret/path"}]
+    _fake_docker_inspect({ID_A: record}, monkeypatch)
+    entries = s.normalize_container_listing([ID_A])
+    assert set(entries[0].keys()) == {"id", "name", "image", "codeagent_labels"}
+    dumped = json.dumps(entries)
+    assert "SECRET_TOKEN" not in dumped
+    assert "/host/secret/path" not in dumped
+
+
+def test_normalize_container_listing_rejects_duplicate_ids() -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        s.normalize_container_listing([ID_A, ID_A])
+
+
+def test_normalize_container_listing_rejects_malformed_id() -> None:
+    with pytest.raises(ValueError, match="malformed"):
+        s.normalize_container_listing(["not-a-hex-id!!"])
+
+
+def test_normalize_container_listing_rejects_empty_string_id() -> None:
+    with pytest.raises(ValueError, match="malformed"):
+        s.normalize_container_listing([""])
+
+
+def test_normalize_container_listing_rejects_inspect_command_failure(monkeypatch) -> None:
+    _fake_docker_inspect({}, monkeypatch)  # ID_A absent -> simulated inspect failure
+    with pytest.raises(ValueError, match="failed"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_rejects_malformed_json(monkeypatch) -> None:
+    _fake_docker_inspect({ID_A: "not json at all"}, monkeypatch)
+    with pytest.raises(ValueError, match="malformed JSON"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_rejects_zero_results(monkeypatch) -> None:
+    _fake_docker_inspect({ID_A: []}, monkeypatch)
+    with pytest.raises(ValueError, match="exactly one result"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_rejects_multiple_results(monkeypatch) -> None:
+    _fake_docker_inspect({ID_A: _inspect_record(ID_A) + _inspect_record(ID_A)}, monkeypatch)
+    with pytest.raises(ValueError, match="exactly one result"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_rejects_missing_id_field(monkeypatch) -> None:
+    record = [{"Name": "/x", "Image": "sha256:dead", "Config": {"Labels": {}}}]
+    _fake_docker_inspect({ID_A: record}, monkeypatch)
+    with pytest.raises(ValueError, match="Id"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_rejects_id_mismatch(monkeypatch) -> None:
+    """The inspected record's own Id must match the requested ID
+    exactly -- catches an index/argument mixup rather than silently
+    trusting whatever docker inspect happened to return."""
+    _fake_docker_inspect({ID_A: _inspect_record(ID_B)}, monkeypatch)
+    with pytest.raises(ValueError, match="does not match"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_rejects_missing_name_field(monkeypatch) -> None:
+    record = [{"Id": ID_A, "Image": "sha256:dead", "Config": {"Labels": {}}}]
+    _fake_docker_inspect({ID_A: record}, monkeypatch)
+    with pytest.raises(ValueError, match="Name"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_rejects_missing_image_field(monkeypatch) -> None:
+    record = [{"Id": ID_A, "Name": "/x", "Config": {"Labels": {}}}]
+    _fake_docker_inspect({ID_A: record}, monkeypatch)
+    with pytest.raises(ValueError, match="Image"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_rejects_missing_config_object(monkeypatch) -> None:
+    record = [{"Id": ID_A, "Name": "/x", "Image": "sha256:dead"}]
+    _fake_docker_inspect({ID_A: record}, monkeypatch)
+    with pytest.raises(ValueError, match="Config"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_rejects_non_object_labels(monkeypatch) -> None:
+    record = [{"Id": ID_A, "Name": "/x", "Image": "sha256:dead", "Config": {"Labels": "not-an-object"}}]
+    _fake_docker_inspect({ID_A: record}, monkeypatch)
+    with pytest.raises(ValueError, match="Labels"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_rejects_non_string_label_value(monkeypatch) -> None:
+    record = [{"Id": ID_A, "Name": "/x", "Image": "sha256:dead", "Config": {"Labels": {"codeagent.spike": 123}}}]
+    _fake_docker_inspect({ID_A: record}, monkeypatch)
+    with pytest.raises(ValueError, match="not a string"):
+        s.normalize_container_listing([ID_A])
+
+
+def test_normalize_container_listing_treats_missing_labels_key_as_empty(monkeypatch) -> None:
+    """Config.Labels can legitimately be absent entirely (docker
+    reports null/omits it for a container with no labels at all) --
+    this is a valid empty-labels case, not a missing-field error."""
+    record = [{"Id": ID_A, "Name": "/x", "Image": "sha256:dead", "Config": {}}]
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(0, stdout=json.dumps(record)))
+    entries = s.normalize_container_listing([ID_A])
+    assert entries[0]["codeagent_labels"] == {}
+
+
+# ---- ProvenanceIncomplete -> TECHNICAL_FAILURE end-to-end ----
+
+
+def test_run_full_experiment_ancestor_check_failure_raises_before_evidence_created(tmp_path, monkeypatch) -> None:
+    """A PRE-EVIDENCE precondition (ancestor-check) failure happens
+    before any evidence directory or resource is created -- there is
+    nothing yet to finalize, no try/except/finally scope exists yet at
+    this point in the function, and the exception propagates directly
+    to the caller (the workflow's own shell-level provenance preflight,
+    or a local invocation's process exit). This is NOT a harness
+    overall_verdict=TECHNICAL_FAILURE case -- there is no summary.json
+    at all, by construction, only a raised exception. Contrast with
+    test_run_full_experiment_technical_failure_when_host_provenance_
+    collection_fails below, where the SAME exception type raised LATER
+    (after evidence/finalization scope exists) does produce a real
+    summary.json with that overall_verdict."""
+    fake_spike_dir = tmp_path / "repo" / "spikes" / "s5"
+    fake_spike_dir.mkdir(parents=True)
+    fake_this_file = fake_spike_dir / "spike_s5.py"
+    fake_this_file.write_bytes(b"# fake\n")
+
+    monkeypatch.setattr(s, "SPIKE_DIR", fake_spike_dir)
+    monkeypatch.setattr(s, "THIS_FILE", fake_this_file)
+    monkeypatch.setattr(s, "run", lambda argv, **kw: _FakeCompleted(1))  # ancestor check: not_ancestor
+    monkeypatch.setattr(os, "environ", {})
+
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.run_full_experiment()
+
+    # No evidence directory at all -- never a summary.json, never any
+    # overall_verdict value (TECHNICAL_FAILURE included).
+    assert not (fake_spike_dir / "evidence").exists()
+
+
+def test_run_full_experiment_malformed_actions_context_raises_before_evidence_created(tmp_path, monkeypatch) -> None:
+    """A PRE-EVIDENCE precondition failure, exactly like the ancestor-
+    check test above: a partial Actions context must never fall back
+    to local UUID naming, raises before any evidence directory exists,
+    and produces no harness summary.json/overall_verdict of any kind --
+    only a raised exception, caught by the workflow's own shell-level
+    `--validate-actions-context` preflight before the real experiment
+    ever starts."""
+    fake_spike_dir = tmp_path / "repo" / "spikes" / "s5"
+    fake_spike_dir.mkdir(parents=True)
+    fake_this_file = fake_spike_dir / "spike_s5.py"
+    fake_this_file.write_bytes(b"# fake\n")
+
+    monkeypatch.setattr(s, "SPIKE_DIR", fake_spike_dir)
+    monkeypatch.setattr(s, "THIS_FILE", fake_this_file)
+    monkeypatch.setattr(os, "environ", {"GITHUB_RUN_ID": "123"})  # partial
+
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.run_full_experiment()
+
+    assert not (fake_spike_dir / "evidence").exists()
+
+
+def test_run_full_experiment_technical_failure_when_host_provenance_collection_fails(tmp_path, monkeypatch) -> None:
+    """A provenance failure that happens AFTER the scratch root/fixture
+    repo already exist (docker cgroup-version collection, here) must
+    still run full finalization -- unlike the two precondition tests
+    above, evidence IS produced, overall_verdict is TECHNICAL_FAILURE
+    (never FAIL, never PASS), the CLI exit is nonzero (an uncaught
+    exception), and the reason is sanitized (no raw daemon stderr)."""
+    registry = _FakeDockerRegistry()
+
+    def fake_run(argv, **kw):
+        if argv[0] == "docker" and argv[1] == "info":
+            return _FakeCompleted(1, stderr="daemon exploded with secret token abc123")
+        return _make_fake_docker_git_run(registry, "")(argv, **kw)
+
+    fake_spike_dir = tmp_path / "repo" / "spikes" / "s5"
+    fake_spike_dir.mkdir(parents=True)
+    fake_this_file = fake_spike_dir / "spike_s5.py"
+    fake_this_file.write_bytes(b"# fake\n")
+
+    monkeypatch.setattr(s.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(s, "SPIKE_DIR", fake_spike_dir)
+    monkeypatch.setattr(s, "THIS_FILE", fake_this_file)
+    monkeypatch.setattr(s, "run", fake_run)
+    monkeypatch.setattr(os, "environ", {})
+
+    with pytest.raises(s.ProvenanceIncomplete):
+        s.run_full_experiment()
+
+    evidence_dirs = list((fake_spike_dir / "evidence").rglob("summary.json"))
+    assert len(evidence_dirs) == 1
+    summary = json.loads(evidence_dirs[0].read_text())
+    assert summary["overall_verdict"] == "TECHNICAL_FAILURE"
+    assert summary["technical_failure_reason"] is not None
+    assert "secret token" not in summary["technical_failure_reason"]
+    assert "exit=1" in summary["technical_failure_reason"]
+
+    # Finalization still ran fully: scratch root removed, emergency
+    # cleanup attempted the resources already created (fixture repo
+    # setup only got as far as `docker pull`, before host_info -- no
+    # canaries/children existed yet, so an empty-but-successful cleanup
+    # is the correct outcome here).
+    assert summary["scratch_root_removed_confirmed"] is True
+
+
+def test_run_full_experiment_run_info_includes_workflow_and_baseline_provenance(tmp_path, monkeypatch) -> None:
+    registry = _FakeDockerRegistry()
+
+    fake_spike_dir = tmp_path / "repo" / "spikes" / "s5"
+    fake_spike_dir.mkdir(parents=True)
+    fake_this_file = fake_spike_dir / "spike_s5.py"
+    fake_this_file.write_bytes(b"# fake\n")
+
+    def fake_run(argv, **kw):
+        if argv[0] == "docker" and argv[1:3] == ["run", "-d"]:
+            name = argv[argv.index("--name") + 1]
+            if name.startswith("codeagent-spike-s5-"):
+                return _FakeCompleted(1, stderr="stop before full run -- only RUN_INFO matters for this test")
+        return _make_fake_docker_git_run(registry, "")(argv, **kw)
+
+    monkeypatch.setattr(s.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(s, "SPIKE_DIR", fake_spike_dir)
+    monkeypatch.setattr(s, "THIS_FILE", fake_this_file)
+    monkeypatch.setattr(s, "run", fake_run)
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {
+            "GITHUB_RUN_ID": "555",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_REPOSITORY": "org/repo",
+        },
+    )
+
+    with pytest.raises(RuntimeError):
+        s.run_full_experiment()
+
+    run_info_files = list((fake_spike_dir / "evidence").rglob("RUN_INFO.json"))
+    assert len(run_info_files) == 1
+    run_info = json.loads(run_info_files[0].read_text())
+    assert run_info["s5_baseline_commit"] == s.S5_BASELINE_COMMIT
+    assert run_info["s5_baseline_commit_is_ancestor"] is True
+    assert run_info["workflow_run_id"] == "555"
+    assert run_info["workflow_run_attempt"] == "1"
+    assert run_info["workflow_run_url"] == "https://github.com/org/repo/actions/runs/555"
+    assert run_info["actions_context_present"] is True
+    assert run_info_files[0].parent.name == "run-555-attempt-1"
+
+
+def test_run_full_experiment_darwin_host_info_has_no_linux_filesystem_fields(tmp_path, monkeypatch) -> None:
+    """Preservation of existing macOS behavior: point 1 of this
+    correction pass explicitly forbids adding new macOS filesystem
+    detection in this Linux-only preparation pass. Drives
+    run_full_experiment far enough (through the new fail-closed
+    preconditions and the new fail-closed host-provenance collection)
+    to reach host.json, forced to Darwin, and confirms it contains the
+    new required client/server/cgroup provenance fields but NONE of
+    the Linux-only lock/worktree filesystem observation fields, which
+    are only ever added on the Linux branch inside the scenario-5
+    block."""
+    registry = _FakeDockerRegistry()
+
+    def fake_run(argv, **kw):
+        if argv[0] == "docker" and argv[1:3] == ["run", "-d"]:
+            name = argv[argv.index("--name") + 1]
+            if name.startswith("codeagent-spike-s5-"):
+                return _FakeCompleted(1, stderr="stop right after host_info -- only host.json matters here")
+        return _make_fake_docker_git_run(registry, "")(argv, **kw)
+
+    fake_spike_dir = tmp_path / "repo" / "spikes" / "s5"
+    fake_spike_dir.mkdir(parents=True)
+    fake_this_file = fake_spike_dir / "spike_s5.py"
+    fake_this_file.write_bytes(b"# fake\n")
+
+    monkeypatch.setattr(s.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(s.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(s, "SPIKE_DIR", fake_spike_dir)
+    monkeypatch.setattr(s, "THIS_FILE", fake_this_file)
+    monkeypatch.setattr(s, "run", fake_run)
+    monkeypatch.setattr(os, "environ", {})
+
+    with pytest.raises(RuntimeError):
+        s.run_full_experiment()
+
+    host_files = list((fake_spike_dir / "evidence").rglob("host.json"))
+    assert len(host_files) == 1
+    host_info = json.loads(host_files[0].read_text())
+    assert host_info["docker_client_version"] == "99.0.0"
+    assert host_info["docker_server_version"] == "99.0.0"
+    assert host_info["docker_daemon_cgroup_version"] == "2"
+    assert "lock_filesystem_type" not in host_info
+    assert "worktree_filesystem_type" not in host_info

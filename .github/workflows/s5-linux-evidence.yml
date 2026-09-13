@@ -1,0 +1,441 @@
+name: S5 Linux Evidence (manual)
+
+# Manual, evidence-gathering-only workflow -- workflow_dispatch only,
+# never part of ordinary push/PR CI, and it does not gate merges.
+# Repeats Stage-2 spike S5 (interruption, cancellation, and orphan-
+# resource reconciliation) on ubuntu-24.04 (linux/x86_64) to produce a
+# Linux evidence bundle comparable to the already-committed
+# macOS/Docker Desktop runs under
+# spikes/s5/evidence/macos-docker-desktop-arm64/. See
+# docs/threat-model.md's A9: Linux and macOS/Docker Desktop are
+# separate evidence domains -- this workflow exists to fill the Linux
+# side, not to replace or overwrite the macOS side.
+#
+# Everything spike_s5.py does remains throwaway spike scaffolding, not
+# production code -- see the harness's own module docstring. This
+# workflow does not implement, wire up, or accept any S5 production
+# lifecycle decision; it only reproduces the spike's own six scenarios
+# plus idempotency on a second platform and gathers evidence about it.
+#
+# The harness-produced evidence directory
+# (spikes/s5/evidence/linux-x86_64/run-<run_id>-attempt-<attempt>/) is
+# uploaded as a build artifact for inspection; it is NOT committed to
+# the repository by this workflow, and no status document
+# (S5_RESULT.md, CLAUDE.md, threat-model.md, STAGE2_EVIDENCE_PLAN.md)
+# is updated by it either -- that happens only after a human has
+# inspected and accepted the downloaded artifact as genuine evidence.
+#
+# A second, independent workflow-level diagnostics bundle is written
+# under a FIXED path ($S5_DIAG_DIR, initialized early and exported
+# through $GITHUB_ENV -- see the first step below), never inside the
+# harness's own evidence directory (which it owns and creates with
+# exist_ok=False), and is uploaded separately. Because this path is
+# computed once, immediately after checkout, and exported as an
+# ordinary environment variable for the rest of the job (not derived
+# from any later step's output), it exists from immediately after
+# checkout onward -- so the diagnostics artifact can still be produced
+# and uploaded even if architecture, Docker, Actions-context, provenance, focused-test, or
+# harness execution fails before baseline collection ever completes.
+# This bundle exists only to catch a bug in the harness's OWN cleanup
+# claim -- every step that touches it is strictly read-only and never
+# deletes a container, process, directory, or worktree.
+#
+# NOTE on provenance-failure scope: the Actions-context and baseline-
+# ancestry checks below (both the shell-level ones and the harness's
+# own internal re-checks at the very start of run_full_experiment)
+# happen BEFORE the harness's evidence directory and
+# try/except/finally finalization scope exist. A failure there is a
+# pure nonzero workflow-step failure -- captured in this workflow's
+# own logs and diagnostics artifact -- and is NEVER reported as a
+# harness summary.json with overall_verdict=TECHNICAL_FAILURE, because
+# no such summary.json is ever produced for it. Only a provenance
+# failure that occurs AFTER that scope is established inside the
+# harness (host-provenance collection, or the scenario-5 Linux
+# filesystem observation) produces a real summary.json recording
+# overall_verdict=TECHNICAL_FAILURE. See spike_s5.py's own comments at
+# the top of run_full_experiment for the precise boundary.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s5-linux:
+    name: S5 interruption/reconciliation evidence (ubuntu-24.04, Python 3.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository (full history, for merge-base ancestor check)
+        # actions/checkout v7.0.1 (same verified pin as ci.yml / s4-linux-evidence.yml)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Initialize workflow diagnostics directory
+        if: always()
+        # Runs immediately after checkout, before anything that could
+        # fail (architecture check, Docker, Actions-context/provenance
+        # validation, focused tests, the real spike). Computes a fixed,
+        # deterministic path under the runner's own temp directory,
+        # containing both github.run_id and github.run_attempt (so a
+        # re-run of this same workflow run never collides with the
+        # first attempt's diagnostics), and exports it via
+        # $GITHUB_ENV -- NOT a step `outputs` value -- so it becomes an
+        # ordinary environment variable (both `$S5_DIAG_DIR` in later
+        # shell steps and `${{ env.S5_DIAG_DIR }}` in expressions) for
+        # every remaining step in this job, independent of whether any
+        # of those steps succeed. This is what lets the final
+        # diagnostics-upload step still find and upload this directory
+        # even if every step in between fails outright. (The `runner`
+        # context is not permitted inside a job-level `env:` block,
+        # which is why this is computed here via a step and exported
+        # through $GITHUB_ENV instead -- `$RUNNER_TEMP` is the shell-
+        # visible equivalent, exactly as GitHub's own docs recommend.)
+        run: |
+          set -euo pipefail
+          DIAG="$RUNNER_TEMP/s5-diagnostics-${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          mkdir -p "$DIAG"
+          echo "S5_DIAG_DIR=$DIAG" >> "$GITHUB_ENV"
+
+      - name: Set up Python 3.12
+        # actions/setup-python v7.0.0 (same verified pin as ci.yml / s4-linux-evidence.yml)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Install project and test dependencies
+        run: pip install -e ".[test]"
+
+      - name: Docker preflight (mandatory)
+        run: docker info
+
+      - name: Confirm runner is linux/x86_64
+        run: |
+          set -euo pipefail
+          UNAME_M=$(uname -m)
+          echo "runner uname -m: $UNAME_M"
+          if [ "$UNAME_M" != "x86_64" ]; then
+            echo "expected runner architecture x86_64, got '$UNAME_M'" >&2
+            exit 1
+          fi
+
+      - name: Validate GitHub Actions context strictly
+        # Delegates to the SAME tested Python validation
+        # (validate_actions_context, including real URL/repository
+        # well-formedness checks) the harness itself uses internally --
+        # never a separately hand-rolled bash reimplementation that
+        # could drift from it. A failure here is a pure nonzero step
+        # failure; it happens before the harness's evidence directory
+        # exists, so it is never a harness summary.json/
+        # overall_verdict of any kind (see the provenance-failure-scope
+        # note near the top of this file).
+        run: python spikes/s5/spike_s5.py --validate-actions-context
+
+      - name: Verify provenance (fail loudly on either problem)
+        run: |
+          set -euo pipefail
+          ACTUAL_HEAD=$(git rev-parse HEAD)
+          echo "checked-out HEAD: $ACTUAL_HEAD"
+          echo "github.sha:       ${{ github.sha }}"
+          if [ "$ACTUAL_HEAD" != "${{ github.sha }}" ]; then
+            echo "checked-out HEAD ($ACTUAL_HEAD) does not match github.sha (${{ github.sha }}) -- failing." >&2
+            exit 1
+          fi
+          S5_BASELINE_COMMIT=d2a6f639826bb1368cc88a6233394b0c6b0ca7da
+          # Exact, non-collapsed exit-code interpretation: 0 means
+          # confirmed ancestor; 1 means CONFIRMED NOT an ancestor (a
+          # real negative answer, distinct from a broken check); any
+          # other code means the check itself is broken.
+          set +e
+          git merge-base --is-ancestor "$S5_BASELINE_COMMIT" HEAD
+          ANCESTOR_RC=$?
+          set -e
+          if [ "$ANCESTOR_RC" -eq 0 ]; then
+            echo "S5 macOS baseline commit $S5_BASELINE_COMMIT confirmed as an ancestor of HEAD."
+          elif [ "$ANCESTOR_RC" -eq 1 ]; then
+            echo "S5 macOS baseline commit $S5_BASELINE_COMMIT is CONFIRMED NOT an ancestor of HEAD ($ACTUAL_HEAD) -- failing." >&2
+            exit 1
+          else
+            echo "'git merge-base --is-ancestor' failed with unexpected exit code $ANCESTOR_RC (neither 0 nor 1) -- this is a provenance-check failure, not a confirmed ancestor/not-ancestor answer -- failing." >&2
+            exit 1
+          fi
+
+      - name: Capture workflow baselines (before focused tests)
+        # Deliberately does NOT use `set -e`: every capture below is
+        # independently guarded by its own `if`, so one failed capture
+        # never prevents the remaining captures from being attempted.
+        # A machine-readable baseline_summary.json records exactly
+        # which captures (if any) failed. Only AFTER every capture has
+        # been attempted does this step exit nonzero if any failed --
+        # which (via ordinary GitHub Actions step-skipping semantics)
+        # prevents the focused-tests and real-spike steps below (which
+        # have no `if: always()`) from running against an incomplete
+        # baseline.
+        run: |
+          set -uo pipefail
+          CAPTURE_FAILURES=()
+
+          if docker ps -a --no-trunc > "$S5_DIAG_DIR/docker_baseline_raw.txt" 2> "$S5_DIAG_DIR/docker_baseline_raw.err"; then
+            :
+          else
+            CAPTURE_FAILURES+=("docker_baseline_raw")
+          fi
+
+          # Normalized inventory: exact container IDs from `docker ps
+          # -aq --no-trunc`, each independently `docker inspect`ed by
+          # the same tested Python helper the harness itself is built
+          # with, emitting STABLE fields only (exact container ID,
+          # exact name, immutable image ID, CodeAgent-relevant labels
+          # from structured Config.Labels JSON -- never the volatile
+          # human-readable Status/CreatedAt columns, and never the full
+          # inspect object/Config.Env/mounts). `pipefail` (set above)
+          # ensures a failure in either half of this pipeline is
+          # detected.
+          if docker ps -aq --no-trunc \
+               | python spikes/s5/spike_s5.py --normalize-docker-inventory \
+               > "$S5_DIAG_DIR/docker_baseline_normalized.json" \
+               2> "$S5_DIAG_DIR/docker_baseline_normalized.err"; then
+            :
+          else
+            CAPTURE_FAILURES+=("docker_baseline_normalized")
+          fi
+
+          # /tmp scratch-root inventory, sorted for deterministic
+          # comparison against the final capture.
+          if find /tmp -maxdepth 1 -name 'codeagent-spike-s5-session-*' 2> "$S5_DIAG_DIR/tmp_scratch_baseline.err" \
+               | sort > "$S5_DIAG_DIR/tmp_scratch_baseline.txt"; then
+            :
+          else
+            CAPTURE_FAILURES+=("tmp_scratch_baseline")
+          fi
+
+          # S5 child/reconciler process inventory. The full listing is
+          # captured into a FILE FIRST (its own command), and every
+          # later filtering step reads that already-captured text --
+          # never a live `ps | grep` pipeline. This is what
+          # structurally excludes the diagnostic's own invocation: the
+          # grep commands below run strictly AFTER this snapshot was
+          # taken, so grep's own command line (which, if piped live,
+          # would contain the search pattern as a literal substring of
+          # itself) can never appear in the snapshot it is filtering.
+          if ps -eo pid,command > "$S5_DIAG_DIR/all_processes_baseline.txt" 2> "$S5_DIAG_DIR/all_processes_baseline.err"; then
+            {
+              grep -F 'spike_s5.py --child' "$S5_DIAG_DIR/all_processes_baseline.txt" || true
+              grep -F 'spike_s5.py --reconcile' "$S5_DIAG_DIR/all_processes_baseline.txt" || true
+              grep -F 'spike_s5.py --hold-lock' "$S5_DIAG_DIR/all_processes_baseline.txt" || true
+            } > "$S5_DIAG_DIR/process_baseline.txt"
+          else
+            CAPTURE_FAILURES+=("process_baseline")
+          fi
+
+          # CodeAgent-checkout worktree listing. This protects the
+          # CodeAgent checkout ONLY -- it cannot and does not detect
+          # fixture-repository worktree leaks, because the fixture
+          # scratch root (and any worktrees registered against it) is
+          # created and deleted entirely underneath /tmp by the
+          # harness, never touching this checkout. Fixture-worktree
+          # cleanup is proven exclusively by the harness's own retained
+          # fixture_worktree_check.json, captured before its scratch
+          # root is deleted.
+          if git worktree list --porcelain > "$S5_DIAG_DIR/codeagent_checkout_worktrees_baseline.txt" \
+               2> "$S5_DIAG_DIR/codeagent_checkout_worktrees_baseline.err"; then
+            :
+          else
+            CAPTURE_FAILURES+=("codeagent_checkout_worktrees_baseline")
+          fi
+
+          json_array() {
+            local arr=("$@")
+            if [ "${#arr[@]}" -eq 0 ]; then printf '[]'; return; fi
+            printf '['
+            printf '"%s",' "${arr[@]}" | sed 's/,$//'
+            printf ']'
+          }
+
+          {
+            echo "{"
+            echo "  \"capture_failures\": $(json_array "${CAPTURE_FAILURES[@]}"),"
+            if [ "${#CAPTURE_FAILURES[@]}" -eq 0 ]; then echo "  \"ok\": true"; else echo "  \"ok\": false"; fi
+            echo "}"
+          } > "$S5_DIAG_DIR/baseline_summary.json"
+          cat "$S5_DIAG_DIR/baseline_summary.json"
+
+          if [ "${#CAPTURE_FAILURES[@]}" -ne 0 ]; then
+            echo "baseline capture incomplete -- failed: ${CAPTURE_FAILURES[*]} -- failing (focused tests and the real spike must not proceed against an incomplete baseline)." >&2
+            exit 1
+          fi
+          echo "baseline capture complete: all checks succeeded."
+
+      - name: Run spike_s5 focused tests
+        run: python -m pytest spikes/s5/test_spike_s5.py -v
+
+      - name: Run the real S5 interruption/reconciliation spike (writes Linux evidence)
+        # The harness itself independently re-verifies the same
+        # provenance facts checked in the shell/CLI steps above
+        # (Actions context validity, the S5 baseline commit's
+        # ancestry) at the very start of run_full_experiment, before
+        # its own evidence directory exists -- a failure there is
+        # likewise never a harness summary.json. Only a
+        # ProvenanceIncomplete raised LATER, once that scope is
+        # established (host-provenance collection, or the scenario-5
+        # Linux filesystem observation), produces a real summary.json
+        # with overall_verdict=TECHNICAL_FAILURE.
+        run: python spikes/s5/spike_s5.py
+
+      - name: Upload Linux S5 evidence
+        if: always()
+        # actions/upload-artifact v7.0.1, resolved via gh api (not guessed) --
+        # same verified pin as s4-linux-evidence.yml / s4-m3-followup-linux-evidence.yml
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: s5-linux-evidence-run${{ github.run_id }}-attempt${{ github.run_attempt }}
+          path: spikes/s5/evidence/linux-x86_64/run-${{ github.run_id }}-attempt-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Capture final workflow diagnostics and compare against baseline
+        if: always()
+        # Runs even if the architecture/Docker/Actions-context/
+        # provenance checks, baseline capture, focused tests, the real
+        # spike, or the evidence upload above failed -- cleanup
+        # verification must never be skipped just because something
+        # upstream already failed. Deliberately does NOT use `set -e`:
+        # every capture and every comparison is independently guarded,
+        # so one failure never prevents the remaining ones from being
+        # attempted. Three distinct categories are recorded separately
+        # in a machine-readable final_diagnostics_summary.json: capture
+        # failures (a diagnostic command itself could not be run),
+        # comparison failures (baseline vs. final differs, or a file
+        # needed for the comparison is missing), and leftovers_detected
+        # (a real S5/CodeAgent-owned resource was found in the final
+        # state). This step exits nonzero only after every capture and
+        # comparison has been attempted. Entirely read-only throughout:
+        # never deletes a container, process, directory, or worktree.
+        run: |
+          set -uo pipefail
+          CAPTURE_FAILURES=()
+          COMPARISON_FAILURES=()
+          LEFTOVERS_DETECTED=()
+
+          if docker ps -a --no-trunc > "$S5_DIAG_DIR/docker_final_raw.txt" 2> "$S5_DIAG_DIR/docker_final_raw.err"; then
+            :
+          else
+            CAPTURE_FAILURES+=("docker_final_raw")
+          fi
+
+          if docker ps -aq --no-trunc \
+               | python spikes/s5/spike_s5.py --normalize-docker-inventory \
+               > "$S5_DIAG_DIR/docker_final_normalized.json" \
+               2> "$S5_DIAG_DIR/docker_final_normalized.err"; then
+            :
+          else
+            CAPTURE_FAILURES+=("docker_final_normalized")
+          fi
+
+          if find /tmp -maxdepth 1 -name 'codeagent-spike-s5-session-*' 2> "$S5_DIAG_DIR/tmp_scratch_final.err" \
+               | sort > "$S5_DIAG_DIR/tmp_scratch_final.txt"; then
+            :
+          else
+            CAPTURE_FAILURES+=("tmp_scratch_final")
+          fi
+
+          if ps -eo pid,command > "$S5_DIAG_DIR/all_processes_final.txt" 2> "$S5_DIAG_DIR/all_processes_final.err"; then
+            {
+              grep -F 'spike_s5.py --child' "$S5_DIAG_DIR/all_processes_final.txt" || true
+              grep -F 'spike_s5.py --reconcile' "$S5_DIAG_DIR/all_processes_final.txt" || true
+              grep -F 'spike_s5.py --hold-lock' "$S5_DIAG_DIR/all_processes_final.txt" || true
+            } > "$S5_DIAG_DIR/process_final.txt"
+          else
+            CAPTURE_FAILURES+=("process_final")
+          fi
+
+          if git worktree list --porcelain > "$S5_DIAG_DIR/codeagent_checkout_worktrees_final.txt" \
+               2> "$S5_DIAG_DIR/codeagent_checkout_worktrees_final.err"; then
+            :
+          else
+            CAPTURE_FAILURES+=("codeagent_checkout_worktrees_final")
+          fi
+
+          # Each comparison is independently guarded: a missing
+          # baseline (or final) file -- e.g. because baseline capture
+          # itself failed/never completed -- is its OWN recorded
+          # comparison_failure, never silently skipped or treated as
+          # "equal".
+          compare() {
+            local name="$1" baseline_file="$2" final_file="$3"
+            if [ ! -f "$baseline_file" ] || [ ! -f "$final_file" ]; then
+              COMPARISON_FAILURES+=("${name}:missing_file")
+              return
+            fi
+            if ! diff -u "$baseline_file" "$final_file" > "$S5_DIAG_DIR/${name}_diff.txt"; then
+              COMPARISON_FAILURES+=("${name}:differs")
+            fi
+          }
+
+          compare docker_normalized "$S5_DIAG_DIR/docker_baseline_normalized.json" "$S5_DIAG_DIR/docker_final_normalized.json"
+          compare tmp_scratch "$S5_DIAG_DIR/tmp_scratch_baseline.txt" "$S5_DIAG_DIR/tmp_scratch_final.txt"
+          compare codeagent_checkout_worktrees "$S5_DIAG_DIR/codeagent_checkout_worktrees_baseline.txt" "$S5_DIAG_DIR/codeagent_checkout_worktrees_final.txt"
+
+          # Leftover detection: independent of the comparisons above --
+          # belt-and-suspenders against a baseline that itself already
+          # (wrongly) contained a matching resource.
+          if [ -f "$S5_DIAG_DIR/docker_final_raw.txt" ]; then
+            LEFTOVER=$(grep -E 'codeagent-canary-a-unlabeled-|codeagent-verify-baseline-|codeagent-spike-s5-' "$S5_DIAG_DIR/docker_final_raw.txt" || true)
+            if [ -n "$LEFTOVER" ]; then
+              LEFTOVERS_DETECTED+=("docker_containers")
+              echo "leftover S5/CodeAgent-owned container(s) found in final Docker listing:" >&2
+              echo "$LEFTOVER" >&2
+            fi
+          fi
+          if [ -f "$S5_DIAG_DIR/process_final.txt" ] && [ -s "$S5_DIAG_DIR/process_final.txt" ]; then
+            LEFTOVERS_DETECTED+=("s5_processes")
+            echo "leftover S5 child/reconciler process(es) found:" >&2
+            cat "$S5_DIAG_DIR/process_final.txt" >&2
+          fi
+
+          json_array() {
+            local arr=("$@")
+            if [ "${#arr[@]}" -eq 0 ]; then printf '[]'; return; fi
+            printf '['
+            printf '"%s",' "${arr[@]}" | sed 's/,$//'
+            printf ']'
+          }
+
+          OVERALL_OK=true
+          if [ "${#CAPTURE_FAILURES[@]}" -ne 0 ] || [ "${#COMPARISON_FAILURES[@]}" -ne 0 ] || [ "${#LEFTOVERS_DETECTED[@]}" -ne 0 ]; then
+            OVERALL_OK=false
+          fi
+
+          {
+            echo "{"
+            echo "  \"capture_failures\": $(json_array "${CAPTURE_FAILURES[@]}"),"
+            echo "  \"comparison_failures\": $(json_array "${COMPARISON_FAILURES[@]}"),"
+            echo "  \"leftovers_detected\": $(json_array "${LEFTOVERS_DETECTED[@]}"),"
+            echo "  \"ok\": $OVERALL_OK"
+            echo "}"
+          } > "$S5_DIAG_DIR/final_diagnostics_summary.json"
+          cat "$S5_DIAG_DIR/final_diagnostics_summary.json"
+
+          if [ "$OVERALL_OK" != "true" ]; then
+            echo "one or more final workflow diagnostics failed -- see final_diagnostics_summary.json and the *_diff.txt/*.err files for detail." >&2
+            exit 1
+          fi
+          echo "all final workflow diagnostics passed: Docker/process/scratch/worktree state matches baseline, no leftovers detected."
+
+      - name: Upload workflow diagnostics
+        if: always()
+        # actions/upload-artifact v7.0.1, same verified pin as above.
+        # Uses the SAME fixed $S5_DIAG_DIR initialized early and
+        # exported through $GITHUB_ENV -- never a step output -- so
+        # this upload can succeed even if every step before "Capture
+        # final workflow diagnostics" above failed outright (the
+        # directory itself was created immediately after checkout,
+        # before anything else could fail).
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: s5-linux-workflow-diagnostics-run${{ github.run_id }}-attempt${{ github.run_attempt }}
+          path: ${{ env.S5_DIAG_DIR }}
+          if-no-files-found: error
+          retention-days: 14

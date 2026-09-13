@@ -66,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -105,6 +106,364 @@ def platform_key() -> str:
     if system == "Linux":
         return f"linux-{machine}"
     return f"{system.lower()}-{machine}"
+
+
+def is_supported_platform() -> tuple[bool, str]:
+    """Darwin (any machine, matching every macOS run gathered so far)
+    or Linux/x86_64 specifically -- never Linux on any other
+    architecture, and never any other OS. Kept as a pure, independently
+    testable predicate rather than inlined into run_full_experiment so
+    a future platform addition/removal is a one-function change."""
+    system = platform.system()
+    machine = platform.machine()
+    if system == "Darwin":
+        return True, f"Darwin/{machine} supported"
+    if system == "Linux" and machine == "x86_64":
+        return True, "Linux/x86_64 supported"
+    if system == "Linux":
+        return False, f"Linux/{machine} is not supported (only Linux/x86_64)"
+    return False, f"{system}/{machine} is not supported"
+
+
+class ProvenanceIncomplete(Exception):
+    """Raised when a required piece of host/workflow/git provenance
+    cannot be collected or fails strict validation. Always converted to
+    overall_verdict TECHNICAL_FAILURE (never silently degraded to an
+    'unknown' value that would still permit a PASS) wherever it is
+    caught -- see run_full_experiment's except/finally handling."""
+
+
+S5_BASELINE_COMMIT = "d2a6f639826bb1368cc88a6233394b0c6b0ca7da"
+_DIGITS_ONLY_RE = re.compile(r"^[0-9]+$")
+
+
+def check_ancestor(candidate_commit: str, repo: str) -> tuple[str, str]:
+    """Independent `git merge-base --is-ancestor` check with exact,
+    non-collapsed exit-code interpretation: 0 means confirmed ancestor,
+    1 means CONFIRMED NOT an ancestor (a real, meaningful negative
+    answer -- not a technical failure), and any other exit code means
+    the check itself is broken (a technical failure, not an answer at
+    all). Returns (status, detail) with status in
+    {"ancestor", "not_ancestor", "technical_failure"}."""
+    result = run(["git", "-C", repo, "merge-base", "--is-ancestor", candidate_commit, "HEAD"])
+    if result.returncode == 0:
+        return "ancestor", ""
+    if result.returncode == 1:
+        return "not_ancestor", f"git merge-base --is-ancestor confirmed {candidate_commit} is NOT an ancestor of HEAD"
+    return (
+        "technical_failure",
+        f"git merge-base --is-ancestor exited {result.returncode} (neither 0 nor 1) -- the check itself is broken",
+    )
+
+
+_REPO_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_server_url(url: str) -> str:
+    """Requires an absolute http(s) URL with a nonempty host, no
+    embedded credentials, and no query string or fragment (rejected
+    outright -- never silently discarded while still accepting the
+    rest of the URL as valid). Returns the URL normalized with any
+    trailing slash removed (so `workflow_url` construction never
+    produces a doubled `//`). Raises ValueError with a fixed, non-
+    echoing message on any problem -- GITHUB_SERVER_URL is CI-
+    controlled, not attacker-secret, but there is no reason to echo
+    malformed input back into evidence either."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("GITHUB_SERVER_URL must be an absolute http(s) URL")
+    if not parsed.hostname:
+        raise ValueError("GITHUB_SERVER_URL must have a nonempty host")
+    if parsed.username or parsed.password:
+        raise ValueError("GITHUB_SERVER_URL must not contain embedded credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("GITHUB_SERVER_URL must not contain a query string or fragment")
+    normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    return normalized.rstrip("/")
+
+
+def _validate_repository(repository: str) -> str:
+    """Requires exactly one owner/name pair: both components nonempty,
+    no whitespace, no query string or fragment, no traversal-like
+    ('.'/'..') components, no extra path segments, and restricted to
+    GitHub's own allowed repository-name character set."""
+    if not repository or repository != repository.strip() or any(c.isspace() for c in repository):
+        raise ValueError("GITHUB_REPOSITORY must be nonempty and contain no whitespace")
+    if "?" in repository or "#" in repository:
+        raise ValueError("GITHUB_REPOSITORY must not contain a query string or fragment")
+    parts = repository.split("/")
+    if len(parts) != 2:
+        raise ValueError("GITHUB_REPOSITORY must be exactly one owner/name pair")
+    owner, name = parts
+    if not owner or not name:
+        raise ValueError("GITHUB_REPOSITORY owner and name must both be nonempty")
+    if owner in (".", "..") or name in (".", ".."):
+        raise ValueError("GITHUB_REPOSITORY must not contain traversal-like components")
+    if not _REPO_COMPONENT_RE.fullmatch(owner) or not _REPO_COMPONENT_RE.fullmatch(name):
+        raise ValueError("GITHUB_REPOSITORY components contain disallowed characters")
+    return repository
+
+
+def validate_actions_context(env) -> dict:
+    """Fail-closed validation of the four GitHub Actions provenance
+    variables. Returns {"present": False} ONLY when none of the four
+    are set at all (a genuinely local, non-Actions invocation, which
+    may legitimately fall back to local UUID evidence-directory
+    naming). Any other combination -- one or more present but not all
+    four well-formed -- raises ProvenanceIncomplete: a partial or
+    malformed Actions context is refused outright, never silently
+    downgraded to local-UUID naming that could be mistaken for a
+    genuinely local run.
+
+    IMPORTANT: a ProvenanceIncomplete raised BY THIS FUNCTION, when
+    called from run_full_experiment's own precondition check (before
+    any evidence directory exists), is never converted into a harness
+    summary.json/overall_verdict -- there is no evidence-directory or
+    finalization scope for it to be recorded into yet. It propagates
+    as an uncaught exception (nonzero process exit), and in the
+    workflow it is caught by the shell-level `--validate-actions-
+    context` preflight before the harness's real experiment ever
+    starts. Only a ProvenanceIncomplete raised AFTER that scope is
+    established (e.g. host-provenance collection, or scenario-5
+    filesystem observation, both deep inside the try/except/finally)
+    produces overall_verdict TECHNICAL_FAILURE."""
+    run_id = env.get("GITHUB_RUN_ID")
+    run_attempt = env.get("GITHUB_RUN_ATTEMPT")
+    server_url = env.get("GITHUB_SERVER_URL")
+    repository = env.get("GITHUB_REPOSITORY")
+
+    if not any((run_id, run_attempt, server_url, repository)):
+        return {"present": False}
+
+    problems = []
+    if not run_id or not _DIGITS_ONLY_RE.fullmatch(run_id):
+        problems.append(f"GITHUB_RUN_ID missing or non-numeric: {run_id!r}")
+    if not run_attempt or not _DIGITS_ONLY_RE.fullmatch(run_attempt):
+        problems.append(f"GITHUB_RUN_ATTEMPT missing or non-numeric: {run_attempt!r}")
+
+    normalized_server_url = None
+    if not server_url:
+        problems.append("GITHUB_SERVER_URL missing")
+    else:
+        try:
+            normalized_server_url = _validate_server_url(server_url)
+        except ValueError as exc:
+            problems.append(str(exc))
+
+    if not repository:
+        problems.append("GITHUB_REPOSITORY missing")
+    else:
+        try:
+            _validate_repository(repository)
+        except ValueError as exc:
+            problems.append(str(exc))
+
+    if problems:
+        raise ProvenanceIncomplete(f"partial/malformed GitHub Actions context: {'; '.join(problems)}")
+
+    return {
+        "present": True,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "workflow_url": f"{normalized_server_url}/{repository}/actions/runs/{run_id}",
+    }
+
+
+def evidence_run_dir_name(actions_context: dict) -> str:
+    if actions_context.get("present"):
+        return f"run-{actions_context['run_id']}-attempt-{actions_context['run_attempt']}"
+    return f"run-{uuid.uuid4().hex[:12]}"
+
+
+def docker_client_version() -> str:
+    result = run(["docker", "version", "--format", "{{.Client.Version}}"])
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value:
+        raise ProvenanceIncomplete(f"docker client version collection failed: exit={result.returncode}")
+    return value
+
+
+def docker_server_version() -> str:
+    result = run(["docker", "version", "--format", "{{.Server.Version}}"])
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value:
+        raise ProvenanceIncomplete(f"docker server version collection failed: exit={result.returncode}")
+    return value
+
+
+def docker_daemon_cgroup_version() -> str:
+    """Docker's OWN reported cgroup version (the daemon's view), not an
+    inference from the host's /sys/fs/cgroup -- this is what actually
+    governs container resource accounting, and on Docker Desktop for
+    macOS it correctly reflects the VM's kernel, not the macOS host's
+    (which has no cgroups at all)."""
+    result = run(["docker", "info", "--format", "{{json .CgroupVersion}}"])
+    if result.returncode != 0:
+        raise ProvenanceIncomplete(f"docker info cgroup-version collection failed: exit={result.returncode}")
+    try:
+        value = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise ProvenanceIncomplete(f"unparseable docker cgroup-version output: {exc}") from exc
+    if not isinstance(value, str) or not value:
+        raise ProvenanceIncomplete(f"empty/invalid docker cgroup-version value: {value!r}")
+    return value
+
+
+def collect_kernel_and_architecture() -> tuple[str, str]:
+    kernel_release = platform.release()
+    machine = platform.machine()
+    if not kernel_release or not machine:
+        raise ProvenanceIncomplete(
+            f"platform.release()/platform.machine() returned an empty value: {kernel_release!r}/{machine!r}"
+        )
+    return kernel_release, machine
+
+
+@dataclass
+class FilesystemObservation:
+    ok: bool
+    resolved_path: str | None = None
+    mountpoint: str | None = None
+    fs_type: str | None = None
+    error: str | None = None
+
+
+def observe_filesystem_linux(path: Path) -> FilesystemObservation:
+    """Linux-only: resolves an EXISTING path with `Path.resolve(strict=
+    True)` and queries `findmnt --json` for the containing mountpoint
+    and filesystem type. Deliberately requires the path to already
+    exist -- this must never be called for a scenario-5 lock file or
+    worktree before the dedicated child has actually created it and
+    reached the READY barrier; calling it earlier would either raise on
+    a nonexistent path or (worse) silently observe the WRONG, enclosing
+    directory's filesystem instead of the real target once it exists.
+    `findmnt --target <path>` itself already resolves to the innermost
+    (longest-prefix) containing mount, so no separate manual longest-
+    match logic is needed here.
+
+    Strictly requires, in order: the `findmnt` command to succeed;
+    its stdout to be valid JSON; a `filesystems` array with EXACTLY one
+    record (zero means findmnt matched nothing, more than one is an
+    unexpected/ambiguous shape neither of which this harness trusts);
+    that record to be an object with nonempty STRING `target` and
+    `fstype` fields. Every failure mode returns a fixed, categorical,
+    sanitized `error` string only -- never raw findmnt stdout/stderr
+    and never a host path -- so a caller that folds this into
+    `technical_failure_reason` (itself potentially retained in evidence
+    and workflow logs) never leaks unvalidated command output or
+    filesystem layout detail."""
+    try:
+        resolved = Path(path).resolve(strict=True)
+    except OSError:
+        return FilesystemObservation(ok=False, error="path_does_not_exist")
+    result = run(["findmnt", "--json", "--output", "TARGET,FSTYPE", "--target", str(resolved)])
+    if result.returncode != 0:
+        return FilesystemObservation(ok=False, resolved_path=str(resolved), error="findmnt_command_failed")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return FilesystemObservation(ok=False, resolved_path=str(resolved), error="findmnt_output_not_valid_json")
+    if not isinstance(data, dict) or not isinstance(data.get("filesystems"), list):
+        return FilesystemObservation(ok=False, resolved_path=str(resolved), error="findmnt_json_missing_filesystems_array")
+    filesystems = data["filesystems"]
+    if len(filesystems) != 1:
+        return FilesystemObservation(
+            ok=False, resolved_path=str(resolved), error="findmnt_json_did_not_contain_exactly_one_record"
+        )
+    record = filesystems[0]
+    if not isinstance(record, dict):
+        return FilesystemObservation(ok=False, resolved_path=str(resolved), error="findmnt_json_record_not_an_object")
+    mountpoint = record.get("target")
+    fs_type = record.get("fstype")
+    if not isinstance(mountpoint, str) or not mountpoint:
+        return FilesystemObservation(ok=False, resolved_path=str(resolved), error="findmnt_json_target_missing_or_empty")
+    if not isinstance(fs_type, str) or not fs_type:
+        return FilesystemObservation(ok=False, resolved_path=str(resolved), error="findmnt_json_fstype_missing_or_empty")
+    return FilesystemObservation(ok=True, resolved_path=str(resolved), mountpoint=mountpoint, fs_type=fs_type)
+
+
+_DOCKER_ID_RE = re.compile(r"^[0-9a-f]+$")
+
+
+def normalize_container_listing(container_ids: list[str]) -> list[dict]:
+    """Takes exact container IDs (as produced by `docker ps -aq
+    --no-trunc`, one per line) and independently `docker inspect`s
+    EACH ONE via structured argv, returning a normalized,
+    deterministically sorted list keyed on STABLE identity fields
+    only -- exact container ID, exact name, the immutable image ID,
+    and CodeAgent-relevant labels.
+
+    This deliberately does NOT use `docker ps --format '{{json .}}'`'s
+    comma-joined `.Labels` string: a comma embedded in one label's
+    value does not just fail to round-trip cleanly -- it can produce
+    ANOTHER syntactically valid `key=value` pair from the remainder,
+    which passes a naive round-trip check while silently misattributing
+    label data. Full structured `docker inspect` JSON has no such
+    ambiguity, since Config.Labels is a real JSON object.
+
+    Every inspect result is parsed ONLY in memory -- the full inspect
+    object, `Config.Env`, mounts, and any other field beyond the four
+    listed above are never retained or printed, since they can contain
+    container environment values.
+
+    Fails closed (raises ValueError) on: a duplicate or malformed
+    (non-hex) input ID; a failed `docker inspect` invocation; malformed
+    JSON; a result count other than exactly one; an inspected ID that
+    does not match the requested ID; or a missing/wrong-typed identity
+    field (Id/Name/Image) or Labels object. An empty `container_ids`
+    list is a valid, normalized empty inventory -- not an error."""
+    if len(set(container_ids)) != len(container_ids):
+        raise ValueError("duplicate container ID in input list")
+
+    entries = []
+    for container_id in container_ids:
+        if not isinstance(container_id, str) or not container_id or not _DOCKER_ID_RE.fullmatch(container_id):
+            raise ValueError("malformed (non-hex) container ID in input list")
+
+        result = run(["docker", "inspect", container_id])
+        if result.returncode != 0:
+            raise ValueError("docker inspect failed for a requested container ID")
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ValueError("docker inspect produced malformed JSON") from exc
+        if not isinstance(data, list) or len(data) != 1:
+            raise ValueError("docker inspect did not return exactly one result")
+        record = data[0]
+        if not isinstance(record, dict):
+            raise ValueError("docker inspect result is not an object")
+
+        actual_id = record.get("Id")
+        name = record.get("Name")
+        image_id = record.get("Image")
+        if not isinstance(actual_id, str) or not actual_id:
+            raise ValueError("docker inspect result has a missing/invalid Id field")
+        if actual_id != container_id:
+            raise ValueError("docker inspect result Id does not match the requested container ID")
+        if not isinstance(name, str) or not name:
+            raise ValueError("docker inspect result has a missing/invalid Name field")
+        if not isinstance(image_id, str) or not image_id:
+            raise ValueError("docker inspect result has a missing/invalid Image field")
+
+        config = record.get("Config")
+        if not isinstance(config, dict):
+            raise ValueError("docker inspect result has a missing/invalid Config object")
+        labels = config.get("Labels")
+        if labels is None:
+            labels = {}
+        if not isinstance(labels, dict):
+            raise ValueError("docker inspect result has a non-object Config.Labels field")
+
+        codeagent_labels: dict[str, str] = {}
+        for k, v in labels.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise ValueError("a Config.Labels key/value is not a string")
+            if k.startswith("codeagent."):
+                codeagent_labels[k] = v
+
+        entries.append({"id": actual_id, "name": name.lstrip("/"), "image": image_id, "codeagent_labels": codeagent_labels})
+    entries.sort(key=lambda e: e["id"])
+    return entries
 
 
 # --------------------------------------------------------------------
@@ -990,8 +1349,43 @@ def emergency_cleanup(inventory: list[dict], source_repo: str) -> dict:
 
 
 def run_full_experiment() -> dict:
-    if platform.system() != "Darwin":
-        raise RuntimeError(f"this pass is macOS-only -- refusing to run on {platform.system()!r}")
+    supported, platform_reason = is_supported_platform()
+    if not supported:
+        raise RuntimeError(f"unsupported platform for S5 spike: {platform_reason}")
+
+    codeagent_repo_root = SPIKE_DIR.parents[1]
+
+    # ---- Fail-closed preconditions, checked BEFORE any evidence
+    # directory or resource is created. Both are pure environment/git
+    # facts, independent of anything this run is about to create, so
+    # there is nothing to clean up if either fails here -- exactly like
+    # the platform gate above. A partial/malformed Actions context is
+    # refused outright, never silently downgraded to a local-UUID-named
+    # run that could be mistaken for a genuinely local invocation.
+    #
+    # IMPORTANT: a ProvenanceIncomplete (or RuntimeError, for the
+    # platform gate) raised by either check below propagates as an
+    # uncaught exception -- there is no evidence directory, no
+    # try/except/finally scope, and no summary.json for it to be
+    # recorded into. It is NEVER reported as a harness
+    # overall_verdict=TECHNICAL_FAILURE; it is only a nonzero process
+    # exit. In the workflow, both facts are additionally (and
+    # independently) checked by dedicated shell-level preflight steps
+    # before this Python process's real experiment ever starts, so a
+    # failure here is caught there too. Only a ProvenanceIncomplete
+    # raised LATER -- after the evidence directory and the
+    # try/except/finally finalization scope below are established
+    # (host-provenance collection, or scenario-5 filesystem
+    # observation) -- is caught by that scope and DOES produce
+    # overall_verdict=TECHNICAL_FAILURE in a real summary.json. ----
+    actions_context = validate_actions_context(os.environ)
+
+    ancestor_status, ancestor_detail = check_ancestor(S5_BASELINE_COMMIT, str(codeagent_repo_root))
+    if ancestor_status != "ancestor":
+        raise ProvenanceIncomplete(
+            f"S5 baseline commit {S5_BASELINE_COMMIT} provenance check did not confirm ancestry: "
+            f"status={ancestor_status} detail={ancestor_detail}"
+        )
 
     log_lines: list[str] = []
 
@@ -1000,7 +1394,7 @@ def run_full_experiment() -> dict:
         log_lines.append(text)
 
     session_id = uuid.uuid4().hex[:12]
-    evidence_dir = SPIKE_DIR / "evidence" / platform_key() / f"run-{session_id}"
+    evidence_dir = SPIKE_DIR / "evidence" / platform_key() / evidence_run_dir_name(actions_context)
     evidence_dir.mkdir(parents=True, exist_ok=False)
     snapshot_dir = evidence_dir / "manifest_snapshots"
     snapshot_dir.mkdir()
@@ -1009,7 +1403,6 @@ def run_full_experiment() -> dict:
         (evidence_dir / name).write_text(json.dumps(data, indent=2, default=str))
 
     # ---- Baseline, captured before this run creates anything at all ----
-    codeagent_repo_root = SPIKE_DIR.parents[1]
     baseline_ps_ok, baseline_ps_raw = raw_docker_ps_a()
     baseline_wt_ok, baseline_wt_raw = raw_git_worktree_list(str(codeagent_repo_root))
 
@@ -1024,6 +1417,12 @@ def run_full_experiment() -> dict:
         "repository_dirty": bool(repo_status_porcelain.strip()),
         "harness_file": str(THIS_FILE.relative_to(codeagent_repo_root)),
         "harness_sha256": harness_sha256,
+        "s5_baseline_commit": S5_BASELINE_COMMIT,
+        "s5_baseline_commit_is_ancestor": True,  # otherwise we already raised above
+        "workflow_run_id": actions_context.get("run_id"),
+        "workflow_run_attempt": actions_context.get("run_attempt"),
+        "workflow_run_url": actions_context.get("workflow_url"),
+        "actions_context_present": actions_context.get("present", False),
         "note": (
             "repository_head does NOT represent the harness that produced this "
             "evidence unless repository_dirty is false and this exact "
@@ -1083,14 +1482,27 @@ def run_full_experiment() -> dict:
         if pull.returncode != 0:
             raise RuntimeError(f"docker pull failed: {pull.stderr}")
 
-        docker_version = run(["docker", "version", "--format", "{{.Server.Version}}"]).stdout.strip()
+        # Fail-closed: each of these raises ProvenanceIncomplete on a
+        # missing/failing command or unparseable output rather than
+        # recording "unknown" while still permitting a PASS. Required
+        # on both platforms -- by this point the fixture repo and
+        # session scratch root already exist, so a failure here is
+        # handled exactly like any other mid-run exception: caught
+        # below, recorded as overall_verdict TECHNICAL_FAILURE, and
+        # still fully finalized/cleaned up.
+        docker_client = docker_client_version()
+        docker_server = docker_server_version()
+        cgroup_version = docker_daemon_cgroup_version()
+        kernel_release, machine = collect_kernel_and_architecture()
         host_info.update(
             {
                 "system": platform.system(),
-                "release": platform.release(),
-                "machine": platform.machine(),
+                "release": kernel_release,
+                "machine": machine,
                 "python_version": platform.python_version(),
-                "docker_version": docker_version,
+                "docker_client_version": docker_client,
+                "docker_server_version": docker_server,
+                "docker_daemon_cgroup_version": cgroup_version,
             }
         )
         write_evidence("host.json", host_info)
@@ -1226,6 +1638,36 @@ def run_full_experiment() -> dict:
             scenario5["reason"] = "READY barrier not reached"
         else:
             pre_manifest = safe_read_manifest(sigkill_identity.manifest_path)
+
+            # Linux-only, and deliberately placed HERE -- only after
+            # wait_for_ready has already independently confirmed the
+            # child reached READY with its worktree registered/present
+            # and its container present, i.e. only once the exact
+            # scenario-5 lock file and worktree path are confirmed to
+            # exist. Observing them any earlier would either raise on a
+            # nonexistent path or silently describe the wrong (parent)
+            # directory's filesystem instead. A collection failure here
+            # is a required-provenance failure like any other: it
+            # raises, is caught below, and still runs full finalization
+            # (the still-alive sigkill child is a real resource that
+            # emergency cleanup must still tear down).
+            if platform.system() == "Linux":
+                lock_fs_obs = observe_filesystem_linux(sigkill_identity.lock_path)
+                worktree_fs_obs = observe_filesystem_linux(sigkill_identity.worktree_path)
+                if not (lock_fs_obs.ok and worktree_fs_obs.ok):
+                    raise ProvenanceIncomplete(
+                        "scenario-5 Linux filesystem observation failed: "
+                        f"lock_ok={lock_fs_obs.ok} lock_error={lock_fs_obs.error} "
+                        f"worktree_ok={worktree_fs_obs.ok} worktree_error={worktree_fs_obs.error}"
+                    )
+                host_info["lock_resolved_path"] = lock_fs_obs.resolved_path
+                host_info["lock_mountpoint"] = lock_fs_obs.mountpoint
+                host_info["lock_filesystem_type"] = lock_fs_obs.fs_type
+                host_info["worktree_resolved_path"] = worktree_fs_obs.resolved_path
+                host_info["worktree_mountpoint"] = worktree_fs_obs.mountpoint
+                host_info["worktree_filesystem_type"] = worktree_fs_obs.fs_type
+                write_evidence("host.json", host_info)
+
             probe_fd = open_lock_file(sigkill_identity.lock_path)
             busy_before = not try_lock_nonblocking(probe_fd)
             if busy_before:
@@ -1498,6 +1940,28 @@ def run_full_experiment() -> dict:
             if "classification" in idempotency:
                 scenario_classifications["idempotency"] = idempotency["classification"]
 
+            if experiment_exception is not None:
+                # A required-provenance collection/validation failure
+                # (ProvenanceIncomplete) is a TECHNICAL_FAILURE, not a
+                # behavioral FAIL -- it means the measurement/setup was
+                # broken, not that a safety property was observed to
+                # fail. Any other exception (e.g. a genuine setup
+                # RuntimeError from canary creation) remains FAIL, as
+                # before this correction.
+                overall_verdict = "TECHNICAL_FAILURE" if isinstance(experiment_exception, ProvenanceIncomplete) else "FAIL"
+            elif not (
+                not secondary_failures
+                and scenario_classifications
+                and all(v == "PASS" for v in scenario_classifications.values())
+                and emergency_results["all_clean"]
+                and scratch_root_removed_confirmed
+                and fixture_repo_has_only_main_worktree
+                and baseline_final_equal
+            ):
+                overall_verdict = "FAIL"
+            else:
+                overall_verdict = "PASS"
+
             summary = {
                 "host": host_info,
                 "session_id": session_id,
@@ -1512,21 +1976,11 @@ def run_full_experiment() -> dict:
                     if experiment_exception is not None
                     else None
                 ),
-                "secondary_cleanup_failures": list(secondary_failures),
-                "overall_verdict": (
-                    "PASS"
-                    if (
-                        experiment_exception is None
-                        and not secondary_failures
-                        and scenario_classifications
-                        and all(v == "PASS" for v in scenario_classifications.values())
-                        and emergency_results["all_clean"]
-                        and scratch_root_removed_confirmed
-                        and fixture_repo_has_only_main_worktree
-                        and baseline_final_equal
-                    )
-                    else "FAIL"
+                "technical_failure_reason": (
+                    str(experiment_exception) if isinstance(experiment_exception, ProvenanceIncomplete) else None
                 ),
+                "secondary_cleanup_failures": list(secondary_failures),
+                "overall_verdict": overall_verdict,
             }
             write_evidence("summary.json", summary)
         except BaseException as exc:  # noqa: BLE001
@@ -1596,6 +2050,42 @@ def main(argv: list[str] | None = None) -> None:
         Path(str(lock_path) + ".acquired").write_text("1")
         while True:
             time.sleep(0.05)
+
+    if argv and argv[0] == "--normalize-docker-inventory":
+        # Workflow-diagnostic helper, implemented in Python so it is
+        # independently unit-testable: reads exact container IDs (one
+        # per line, as produced by `docker ps -aq --no-trunc`) from
+        # stdin, independently `docker inspect`s each one, and prints a
+        # normalized, stably sorted inventory (stable identity fields
+        # only) to stdout. Fails loud (exit 1) on any inspect failure,
+        # malformed data, or identity mismatch rather than silently
+        # dropping or misparsing an entry.
+        container_ids = [line.strip() for line in sys.stdin.read().splitlines() if line.strip()]
+        try:
+            normalized = normalize_container_listing(container_ids)
+        except ValueError as exc:
+            print(f"TECHNICAL_FAILURE: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(normalized, indent=2, sort_keys=True))
+        sys.exit(0)
+
+    if argv and argv[0] == "--validate-actions-context":
+        # A single, tested Python implementation of Actions-context
+        # validation, invoked by the workflow's own shell preflight so
+        # the well-formedness rule (URL scheme/host/credentials,
+        # repository owner/name shape) is never independently
+        # reimplemented -- and potentially drifted -- in bash. A
+        # failure here happens before any harness evidence directory
+        # exists, so it is reported only as a nonzero exit and a
+        # stderr message -- never as a harness summary.json/
+        # overall_verdict.
+        try:
+            ctx = validate_actions_context(os.environ)
+        except ProvenanceIncomplete as exc:
+            print(f"TECHNICAL_FAILURE: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(ctx, indent=2, sort_keys=True))
+        sys.exit(0)
 
     run_full_experiment()
 
