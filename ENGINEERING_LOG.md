@@ -841,3 +841,35 @@ documentation precision, not new decisions.
 - No new ADR.
 
 **Still nothing committed or pushed.**
+
+---
+
+## Session: narrow Linux CI slice
+
+**Outcome**: `.github/workflows/ci.yml` — one job running the full
+suite, including real Docker verification, on GitHub-hosted
+`ubuntu-24.04` (x86_64) + Python 3.12. Evidence for that platform only
+— not a general Linux or ARM64 claim.
+
+- `permissions: contents: read`; `timeout-minutes: 20`.
+- `actions/checkout`/`actions/setup-python` pinned to commit SHAs
+  (resolved via `gh api`, not guessed), each with a `# vX.Y.Z` comment.
+- `pytest==9.1.1` pinned via a new `[project.optional-dependencies]
+  test` group in `pyproject.toml` — the test runner's version is
+  pinned; this is not a full reproducible-install/lockfile guarantee.
+- `docker info` runs as a mandatory preflight before anything
+  Docker-dependent. The pinned verification image is pulled and its
+  platform checked equals `linux/amd64` (confirmed via `docker
+  manifest inspect` that the digest is a multi-arch index containing
+  that platform).
+- New `CODEAGENT_REQUIRE_DOCKER=1` mechanism in `test_slice_c.py`:
+  fails instead of skipping when Docker is unavailable, used only in
+  CI. Final `if: always()` step lists `codeagent-verify` containers
+  and fails on any leftover, without deleting anything.
+- **Verification**: `actionlint` clean; full local suite 873 passed;
+  the 3 real-Docker tests executed (not skipped) under
+  `CODEAGENT_REQUIRE_DOCKER=1`; no leftover containers; `git diff
+  --check` clean. Not yet run on GitHub Actions itself.
+- No new ADR.
+
+**Nothing committed or pushed yet.**

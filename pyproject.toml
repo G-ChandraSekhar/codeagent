@@ -3,6 +3,13 @@ name = "codeagent"
 version = "0.0.0"
 requires-python = ">=3.12"
 
+[project.optional-dependencies]
+# Pins the test-runner dependency to the exact version this project's
+# test suite is developed and verified against (see
+# .github/workflows/ci.yml). This pins pytest itself, not a full
+# reproducible install: no hashes, no transitive-dependency lockfile.
+test = ["pytest==9.1.1"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

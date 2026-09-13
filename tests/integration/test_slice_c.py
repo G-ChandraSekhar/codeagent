@@ -20,7 +20,10 @@ worktree, the patch, the checkpoint, and the verification are all real.
 Requires a working local Docker daemon; skipped otherwise so the suite
 still runs on machines without Docker (no security or correctness
 claim is weakened by skipping — there's simply no infrastructure to
-test against).
+test against). On CI (CODEAGENT_REQUIRE_DOCKER=1, see
+.github/workflows/ci.yml), a missing daemon is instead a hard failure
+— see `_docker_required` below — since Docker there is a verified
+precondition, not an optional local convenience.
 
 Uses `codeagent.controller.SystemClock` (the real clock), not
 `SteppingClock`, for the Docker verifier and the controller driving it
@@ -33,6 +36,7 @@ an exact value.
 from __future__ import annotations
 
 import math
+import os
 import shutil
 import subprocess
 
@@ -65,6 +69,25 @@ def _docker_available() -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
 
+
+def _docker_required() -> bool:
+    """CI-only escape hatch (CODEAGENT_REQUIRE_DOCKER=1): on a runner
+    where Docker is a mandatory, already-verified precondition (see the
+    workflow's own `docker info` preflight step), a missing daemon here
+    means the environment is broken, not merely "no infrastructure to
+    test against" — these tests must fail loudly instead of silently
+    skipping. Unset or any other value keeps the default local-dev
+    behavior of skipping cleanly."""
+    return os.environ.get("CODEAGENT_REQUIRE_DOCKER") == "1"
+
+
+if not _docker_available() and _docker_required():
+    pytest.fail(
+        "CODEAGENT_REQUIRE_DOCKER=1 but no Docker daemon is available — "
+        "this environment is expected to guarantee Docker; failing "
+        "instead of skipping.",
+        pytrace=False,
+    )
 
 pytestmark = pytest.mark.skipif(
     not _docker_available(), reason="requires a running local Docker daemon"

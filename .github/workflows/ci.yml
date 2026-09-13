@@ -1,0 +1,91 @@
+# Narrow Linux CI slice for CodeAgent.
+#
+# Scope: this job provides evidence that the test suite — including
+# real Docker-based verification (codeagent.executor.DockerVerifier) —
+# passes specifically on GitHub-hosted Ubuntu 24.04 x86_64 runners with
+# Python 3.12. It is NOT a claim of general Linux support and NOT a
+# claim of Linux ARM64 support; only ubuntu-24.04 (x86_64) is exercised
+# here. Deliberately minimal: no deployment, no caching, no coverage
+# service, no badges, no build matrix — see ENGINEERING_LOG.md for the
+# session this was added in.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (ubuntu-24.04, Python 3.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Python 3.12
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Install project and test dependencies
+        # The test-runner dependency (pytest) is version-pinned via
+        # pyproject.toml's [project.optional-dependencies] "test"
+        # group — this is not a full reproducible-install/lockfile
+        # guarantee (no hashes, no transitive-dependency pinning).
+        run: pip install -e ".[test]"
+
+      - name: Docker preflight (mandatory)
+        run: docker info
+
+      - name: Resolve pinned verification image
+        id: image
+        run: |
+          IMAGE=$(python -c "from codeagent.executor import DEFAULT_IMAGE; print(DEFAULT_IMAGE)")
+          echo "Resolved DEFAULT_IMAGE: $IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Pull pinned verification image and confirm linux/amd64
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          PLATFORM=$(docker inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")
+          echo "Pulled image reports platform: $PLATFORM"
+          if [ "$PLATFORM" != "linux/amd64" ]; then
+            echo "expected linux/amd64, got '$PLATFORM'" >&2
+            exit 1
+          fi
+
+      - name: Run real Docker verification tests (must execute, not skip)
+        env:
+          CODEAGENT_REQUIRE_DOCKER: "1"
+        run: python -m pytest tests/integration/test_slice_c.py -v
+
+      - name: Run complete test suite
+        env:
+          CODEAGENT_REQUIRE_DOCKER: "1"
+        run: python -m pytest -q
+
+      - name: Verify no leftover codeagent-verify containers
+        if: always()
+        run: |
+          set -euo pipefail
+          LEFTOVER=$(docker ps -a --filter "name=codeagent-verify" --format '{{.Names}}')
+          echo "codeagent-verify containers currently present (expected: none):"
+          echo "$LEFTOVER"
+          if [ -n "$LEFTOVER" ]; then
+            echo "leftover codeagent-verify container(s) found — failing." >&2
+            echo "Not deleting them here: this check exists to catch a real cleanup bug," >&2
+            echo "and unrelated containers on the runner are never touched by this job." >&2
+            exit 1
+          fi
