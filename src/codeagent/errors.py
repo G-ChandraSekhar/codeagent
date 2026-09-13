@@ -19,11 +19,14 @@ errors here:
 ErrorDomain classifies *what kind of thing failed*. It carries no
 disposition semantics: whether a given occurrence should be retried,
 escalated, or made terminal depends on controller state, remaining
-budgets, and attempt count — none of which exist yet, since no
-controller has been built. A future controller makes that decision
-using an ErrorCode plus that runtime context; this module deliberately
-does not, and no field here should be read as an unconditional retry
-rule.
+budgets, and attempt count. A controller (`codeagent.controller.
+RunController`) exists as of Milestone 1, but it has no *considered*
+retry/abort/escalation policy yet — its current behavior (documented at
+`RunController._dispatch_apply_patch`) is an explicit placeholder, not
+a decision this module should be read as endorsing. A future revision
+of that policy makes the real decision using an ErrorCode plus runtime
+context; this module deliberately does not, and no field here should be
+read as an unconditional retry rule.
 
 domain.IllegalTransitionError and domain.IllegalToolCallError remain
 local Python exceptions in domain.py, unrelated to this taxonomy — they

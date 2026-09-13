@@ -1,30 +1,39 @@
-"""Milestone 1, slice A: a deterministic run controller.
+"""Milestone 1: a deterministic run controller.
 
 This is production orchestration code — it depends only on narrow
-Protocols (`ModelClient`, `ApprovalProvider`, `Verifier`, `Clock`), never
-on any concrete test double. Deterministic fakes implementing those
-Protocols live in `tests/support/fakes.py`, not here.
+Protocols (`ModelClient`, `ApprovalProvider`, `Verifier`, `PatchApplier`,
+`Clock`), never on any concrete test double. Deterministic fakes
+implementing those Protocols live in `tests/support/fakes.py`, not
+here. `codeagent.patch.GitPatchApplier` and `codeagent.workspace.GitWorktree`
+are real (non-fake) implementations of part of this seam, added in
+slice B.
 
-Scope: exercises domain.py's state machine, events.py's schemas, and
-errors.py's taxonomy together, end-to-end, through one real callable
-code path. This intentionally narrows the guide's Milestone 1 paragraph
-("a real fixture repository ... temporary worktree ... Docker may
-initially run only a fixed verification command") per explicit
-instruction: no worktree and no Docker exist yet, and none is built
-here. Treat this module as "Milestone 1, slice A" — a contract-
-integration harness — not Milestone 1 completion.
+Scope so far:
+- Slice A: exercises domain.py's state machine, events.py's schemas,
+  and errors.py's taxonomy together, end-to-end, through one real
+  callable code path — with every collaborator faked.
+- Slice B: `PatchApplier` can now be a real implementation
+  (`codeagent.patch.GitPatchApplier`) that validates and applies one
+  controlled patch operation inside a real, disposable `git worktree`
+  (`codeagent.workspace.GitWorktree`) and commits it as the checkpoint.
+  `RunController` itself is unchanged by this — it already only ever
+  used `PatchResult`'s fields, never invented data.
 
-Not implemented here (later milestones): a real workspace/worktree, a
-process executor, a model provider adapter, redaction, persistence (the
-`EventLog` below is in-memory only, not the real EventSink), or a
-considered retry/disposition policy for operational errors — this
-controller's placeholder policy is documented at the one place it
+This still isn't full Milestone 1 completion: no Docker verification,
+no live model provider, no report generation (slice C).
+
+Not implemented here: a process executor, a model provider adapter,
+redaction, persistence (the `EventLog` below is in-memory only, not the
+real EventSink), or a *considered* retry/abort/escalation policy for
+operational errors — a controller now exists, but it has no such policy
+yet; this controller's placeholder is documented at the one place it
 applies (`_dispatch_apply_patch`).
 """
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
@@ -69,17 +78,68 @@ class PlanProposal:
     verification_intent: str
 
 
+@dataclass(frozen=True)
+class PatchResult:
+    """What actually happened when a PatchApplier ran — RunController
+    only ever reports these fields; it never invents a checkpoint id,
+    diff size, or changed-file list itself.
+
+    Invariants (enforced in __post_init__, not just documented): a
+    successful result has a real commit hash, a positive operation
+    count, at least one changed path, a positive diff size, and no
+    error. A failed result has none of that success-shaped metadata —
+    only an error.
+    """
+
+    success: bool
+    operation_count: int
+    changed_paths: tuple[str, ...]
+    diff_bytes: int
+    commit_hash: str | None = None
+    error: OperationalError | None = None
+
+    def __post_init__(self) -> None:
+        if self.success:
+            if not self.commit_hash:
+                raise ValueError("a successful PatchResult must have a nonempty commit_hash")
+            if self.operation_count <= 0:
+                raise ValueError("a successful PatchResult must have operation_count > 0")
+            if not self.changed_paths:
+                raise ValueError("a successful PatchResult must have nonempty changed_paths")
+            if self.diff_bytes <= 0:
+                raise ValueError("a successful PatchResult must have diff_bytes > 0")
+            if self.error is not None:
+                raise ValueError("a successful PatchResult must not carry an error")
+        else:
+            if self.operation_count != 0:
+                raise ValueError("a failed PatchResult must have operation_count == 0")
+            if self.changed_paths != ():
+                raise ValueError("a failed PatchResult must have changed_paths == ()")
+            if self.diff_bytes != 0:
+                raise ValueError("a failed PatchResult must have diff_bytes == 0")
+            if self.commit_hash is not None:
+                raise ValueError("a failed PatchResult must have commit_hash is None")
+            if self.error is None:
+                raise ValueError("a failed PatchResult must carry an error")
+
+
 class Clock(Protocol):
     def now(self) -> datetime: ...
+    def monotonic(self) -> float: ...
 
 
 class SystemClock:
-    """Production default: real wall-clock time. Tests inject a
-    deterministic Clock instead (see tests/support/fakes.SteppingClock)
-    so traces are reproducible without sleeping or patching datetime."""
+    """Production default: real wall-clock time (`now`) and a real
+    monotonic clock (`monotonic`, for measuring actual operation
+    durations). Tests inject a deterministic Clock instead (see
+    tests/support/fakes.SteppingClock) so traces are reproducible
+    without sleeping or patching datetime/time."""
 
     def now(self) -> datetime:
         return datetime.now(timezone.utc)
+
+    def monotonic(self) -> float:
+        return time.monotonic()
 
 
 class ModelClient(Protocol):
@@ -95,13 +155,23 @@ class Verifier(Protocol):
 
 
 class PatchApplier(Protocol):
-    """Whether applying the plan's patch succeeded. No real workspace
-    exists yet (Milestone 2); a real implementation will need to return
-    enough detail to distinguish PATCH_VALIDATION_FAILED from
-    PATCH_APPLICATION_FAILED, but this slice's controller treats any
-    failure uniformly (see _dispatch_apply_patch)."""
+    """Applies whatever patch the implementation is configured with and
+    reports what actually happened. Deliberately does not take the full
+    `plan` as an argument: `codeagent.patch.GitPatchApplier` (slice B)
+    is configured with its PatchOperation at construction, not derived
+    from the model's plan — see patch.py's module docstring for why
+    that's the right scope for this milestone.
 
-    def apply(self, iteration: int, plan: PlanProposal) -> bool: ...
+    `approved_paths` *is* passed, and is the primary, preventive
+    authorization boundary: an implementation must reject an operation
+    whose target isn't in this set before making any change at all —
+    see `codeagent.patch.GitPatchApplier.apply`'s docstring. It is not
+    merely advisory data for a postcondition check.
+    """
+
+    def apply(
+        self, run_id: str, iteration: int, approved_paths: frozenset[str]
+    ) -> PatchResult: ...
 
 
 @dataclass(frozen=True)
@@ -114,7 +184,14 @@ class RunConfig:
     task_statement: str
     verify_command: tuple[str, ...]
     approval_mode: domain.ApprovalMode
+    # Real worktree path when one exists (slice B); a placeholder URI
+    # when the run has no real repository at all (slice A, fully faked).
+    repository_path: str = "fixture://synthetic"
     baseline_outcome: events.VerificationOutcome = events.VerificationOutcome.TEST_FAILURE
+    # The commit RunController should cite as the first patch's parent
+    # checkpoint — the real worktree's starting commit, when known.
+    # None when there's no real repository (slice A).
+    initial_checkpoint_id: str | None = None
     # Repairs allowed *after* the initial verification attempt: max=0
     # permits the initial attempt but no repair; max=2 permits the
     # initial attempt plus two repairs (3 verification attempts total).
@@ -130,6 +207,8 @@ class RunConfig:
             raise ValueError("run_id must be a nonempty string")
         if not self.task_statement:
             raise ValueError("task_statement must be a nonempty string")
+        if not self.repository_path:
+            raise ValueError("repository_path must be a nonempty string")
         if not self.verify_command:
             raise ValueError("verify_command must be a nonempty tuple")
         if self.baseline_outcome not in SUPPORTED_VERIFICATION_OUTCOMES:
@@ -208,19 +287,19 @@ class RunController:
         self.log = event_log or EventLog()
         self.state = domain.RunState.INIT
         self._total_duration = 0.0
-        self._last_checkpoint_id: str | None = None
-        self._error_id_counter = 0
+        self._last_checkpoint_id: str | None = config.initial_checkpoint_id
 
     def _now(self) -> datetime:
         return self._clock.now()
 
-    def _tick(self, amount: float = 0.01) -> float:
+    def _fake_tick(self, amount: float = 0.01) -> float:
+        """Fabricated duration for a still-fake collaborator (model,
+        approval, verifier) — there is no real operation to time. Real
+        operations (patch application, slice B onward) measure actual
+        elapsed time via `self._clock.monotonic()` instead; see
+        `_dispatch_apply_patch`."""
         self._total_duration += amount
         return amount
-
-    def _next_error_id(self) -> str:
-        self._error_id_counter += 1
-        return f"{self._c.run_id}-err-{self._error_id_counter}"
 
     def _emit(self, event: events.Event) -> None:
         self.log.append(event)
@@ -288,7 +367,7 @@ class RunController:
                 timestamp=self._now(),
                 state=domain.RunState.INIT,
                 iteration=0,
-                repository_path="fixture://synthetic",
+                repository_path=c.repository_path,
                 task_statement=c.task_statement,
                 verify_command=c.verify_command,
                 approval_mode=c.approval_mode,
@@ -306,7 +385,7 @@ class RunController:
                 outcome=c.baseline_outcome,
                 command=c.verify_command,
                 exit_code=_exit_code_for(c.baseline_outcome),
-                duration_seconds=self._tick(),
+                duration_seconds=self._fake_tick(),
             )
         )
         self._transition(0, domain.Trigger.BASELINE_RECORDED)
@@ -381,7 +460,7 @@ class RunController:
                     outcome=outcome,
                     command=c.verify_command,
                     exit_code=_exit_code_for(outcome),
-                    duration_seconds=self._tick(),
+                    duration_seconds=self._fake_tick(),
                     fail_to_pass=(),
                     pass_to_pass_broken=(),
                 )
@@ -438,7 +517,7 @@ class RunController:
                 model_name="fake-model-v1",
                 response_id=f"{c.run_id}-resp-{iteration}",
                 status=events.ModelResponseStatus.COMPLETED,
-                latency_seconds=self._tick(),
+                latency_seconds=self._fake_tick(),
                 tool_call_count=1,
             )
         )
@@ -460,7 +539,7 @@ class RunController:
                 tool=domain.ToolName.PROPOSE_PLAN,
                 tool_call_id=tool_call_id,
                 success=True,
-                duration_seconds=self._tick(),
+                duration_seconds=self._fake_tick(),
                 result_summary="plan proposed",
             )
         )
@@ -483,7 +562,9 @@ class RunController:
     def _dispatch_apply_patch(
         self, iteration: int, plan: PlanProposal
     ) -> tuple[bool, OperationalError | None]:
-        """Dispatch the plan's patch as a tool call. Returns (ok, error).
+        """Dispatch the patch as a tool call and report exactly what the
+        PatchApplier says happened — never invented data. Returns
+        (ok, error).
 
         No retry/disposition policy exists yet (deferred by design — see
         errors.py's module docstring: that decision belongs to a future
@@ -503,13 +584,17 @@ class RunController:
             {"file_paths": list(plan.proposed_file_paths)},
         )
 
-        applied = self._patch_applier.apply(iteration, plan)
-        if not applied:
-            error = OperationalError(
-                code=ErrorCode.PATCH_VALIDATION_FAILED,
-                error_id=self._next_error_id(),
-                message="patch validation failed",
-            )
+        # Real elapsed time — applying a patch is real I/O from slice B
+        # onward (git add/diff/commit for GitPatchApplier), unlike the
+        # still-fake model/approval/verifier durations above.
+        start = self._clock.monotonic()
+        result = self._patch_applier.apply(
+            c.run_id, iteration, frozenset(plan.proposed_file_paths)
+        )
+        duration = self._clock.monotonic() - start
+        self._total_duration += duration
+
+        if not result.success:
             self._emit(
                 events.ToolCompleted(
                     run_id=c.run_id,
@@ -520,12 +605,12 @@ class RunController:
                     tool=domain.ToolName.APPLY_PATCH,
                     tool_call_id=tool_call_id,
                     success=False,
-                    duration_seconds=self._tick(),
+                    duration_seconds=duration,
                     result_summary="",
-                    error=error,
+                    error=result.error,
                 )
             )
-            return False, error
+            return False, result.error
 
         self._emit(
             events.ToolCompleted(
@@ -537,11 +622,13 @@ class RunController:
                 tool=domain.ToolName.APPLY_PATCH,
                 tool_call_id=tool_call_id,
                 success=True,
-                duration_seconds=self._tick(),
-                result_summary="patch applied",
+                duration_seconds=duration,
+                result_summary=f"{result.operation_count} operation(s) applied",
             )
         )
-        checkpoint_id = f"{c.run_id}-ckpt-{iteration}"
+        # The checkpoint's identity is the real commit hash — no
+        # separately invented id.
+        checkpoint_id = result.commit_hash
         self._emit(
             events.CheckpointCreated(
                 run_id=c.run_id,
@@ -551,7 +638,7 @@ class RunController:
                 iteration=iteration,
                 checkpoint_id=checkpoint_id,
                 parent_checkpoint_id=self._last_checkpoint_id,
-                commit_hash=f"fixture-commit-{iteration}",
+                commit_hash=result.commit_hash,
             )
         )
         self._last_checkpoint_id = checkpoint_id
@@ -562,12 +649,36 @@ class RunController:
                 timestamp=self._now(),
                 state=self.state,
                 iteration=iteration,
-                operation_count=max(1, len(plan.proposed_file_paths)),
-                files_changed=plan.proposed_file_paths,
+                operation_count=result.operation_count,
+                files_changed=result.changed_paths,
                 checkpoint_id=checkpoint_id,
-                diff_bytes=64,
+                diff_bytes=result.diff_bytes,
             )
         )
+
+        # Defense-in-depth postcondition, NOT the primary enforcement:
+        # the primary, preventive check is inside PatchApplier.apply
+        # itself (see PatchApplier's docstring and
+        # codeagent.patch.GitPatchApplier.apply) — it must reject an
+        # unapproved target before any write or commit happens at all.
+        # This check only catches a PatchApplier implementation that
+        # got that wrong (or a future implementation that doesn't
+        # enforce it as strictly) — by the time this runs, the mutation
+        # this checks for would already have happened. What it *does*
+        # still guarantee even then: an out-of-scope change is never
+        # treated as a legitimate step by the rest of the run — the run
+        # is aborted here, before any further budget (a verification
+        # attempt) is spent on it.
+        approved_paths = set(plan.proposed_file_paths)
+        actual_paths = set(result.changed_paths)
+        if not actual_paths.issubset(approved_paths):
+            scope_error = OperationalError(
+                code=ErrorCode.INTERNAL_INVARIANT_VIOLATION,
+                error_id=f"{c.run_id}-scope-{iteration}",
+                message="patch changed files outside the approved plan's proposed_file_paths",
+            )
+            return False, scope_error
+
         return True, None
 
     def _finish(

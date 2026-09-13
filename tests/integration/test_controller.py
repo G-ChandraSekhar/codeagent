@@ -14,7 +14,7 @@ import pytest
 from codeagent import domain, events
 from codeagent.controller import EventLog, PlanProposal, RunConfig, RunController
 from codeagent.errors import ErrorCode
-from support.fakes import (
+from tests.support.fakes import (
     FakeApprovalProvider,
     FakeModel,
     FakePatchApplier,
@@ -391,3 +391,73 @@ def test_patch_failure_reuses_the_same_error_id_across_events() -> None:
     assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
     assert not any(isinstance(e, events.CheckpointCreated) for e in controller.log.events)
     assert not any(isinstance(e, events.VerificationCompleted) for e in controller.log.events)
+
+
+# --------------------------------------------------------------------
+# Plan-scope consistency: a patch reporting files outside what the
+# approved plan declared must abort the run, not be treated as a
+# legitimate step. See controller.py's _dispatch_apply_patch docstring
+# for exactly where this check runs relative to the real mutation and
+# why it can't run *before* the mutation in this slice's architecture.
+# --------------------------------------------------------------------
+
+
+def test_patch_reporting_files_outside_the_approved_plan_aborts_the_run() -> None:
+    config = RunConfig(
+        run_id="r-scope-violation",
+        task_statement="fix retry bug",
+        verify_command=("pytest", "-q"),
+        approval_mode=domain.ApprovalMode.INTERACTIVE,
+    )
+    # PLAN approves only "jobs/worker.py"; the patch applier (mis)reports
+    # having changed a different file entirely.
+    controller = RunController(
+        config,
+        FakeModel(PLAN),
+        FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
+        FakeVerifier((events.VerificationOutcome.PASSED,)),
+        FakePatchApplier(changed_paths=("unrelated_file.py",)),
+        clock=SteppingClock(),
+    )
+
+    finished = controller.run()
+
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.INTERNAL_INVARIANT_VIOLATION
+
+    # The real (fake, but truthful) PatchApplied/CheckpointCreated
+    # events still appear — they genuinely happened — but verification
+    # is never reached: the run is stopped before spending further
+    # budget on an out-of-scope change.
+    assert any(isinstance(e, events.PatchApplied) for e in controller.log.events)
+    assert not any(isinstance(e, events.VerificationCompleted) for e in controller.log.events)
+
+
+def test_patch_reporting_a_subset_of_approved_files_is_accepted() -> None:
+    """The check is issubset, not equality — a plan may approve several
+    files while a given patch only touches one of them."""
+    config = RunConfig(
+        run_id="r-scope-subset",
+        task_statement="fix retry bug",
+        verify_command=("pytest", "-q"),
+        approval_mode=domain.ApprovalMode.INTERACTIVE,
+    )
+    plan_with_two_files = PlanProposal(
+        problem_hypothesis=PLAN.problem_hypothesis,
+        proposed_file_paths=("jobs/worker.py", "jobs/other.py"),
+        verification_intent=PLAN.verification_intent,
+    )
+    controller = RunController(
+        config,
+        FakeModel(plan_with_two_files),
+        FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
+        FakeVerifier((events.VerificationOutcome.PASSED,)),
+        FakePatchApplier(changed_paths=("jobs/worker.py",)),
+        clock=SteppingClock(),
+    )
+
+    finished = controller.run()
+
+    assert finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED
+    assert finished.error is None

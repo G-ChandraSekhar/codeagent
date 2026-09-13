@@ -287,3 +287,174 @@ verified. 677 tests passing, `git diff --check` clean.
 - This is still explicitly "Milestone 1, slice A," not Milestone 1
   completion — no real worktree, executor, or model integration exists;
   see controller.py's module docstring.
+
+## Session: Milestone 1 slice B — real worktree, real patch, real checkpoint
+
+**Outcome**: `src/codeagent/workspace.py` (GitWorktree), `src/codeagent/
+patch.py` (GitPatchApplier), a version-controlled `tests/fixtures/
+retry_worker` fixture materialized into a real throwaway Git repo per
+test, and 20 new focused tests. 717 tests passing.
+
+- `PatchApplier.apply()` changed from `(iteration, plan) -> bool` to
+  `(run_id, iteration) -> PatchResult` — a structured result carrying
+  real success/failure, the specific error code, actual changed paths,
+  a real diff byte count, and a real commit hash. `RunController` was
+  already written to only ever report what a `PatchResult` gave it, so
+  this was a clean swap, not a `RunController` rewrite.
+- Decision: a checkpoint's `checkpoint_id` *is* its real Git commit
+  hash, not a separately invented id. Considered a synthetic id
+  alongside the commit hash instead; rejected — two identifiers for the
+  same thing invites drift, and the commit hash already is a stable,
+  unique, verifiable identity. Not promoted to an ADR: real but narrow,
+  reversible if a future milestone needs a synthetic id for reasons
+  that don't exist yet (e.g. content-addressing before a commit
+  exists).
+- `RunConfig` gained `repository_path` and `initial_checkpoint_id` so a
+  real run can report its real worktree path and chain its first
+  checkpoint to the worktree's actual starting commit — previously
+  `repository_path` was a hardcoded placeholder string and the first
+  checkpoint's parent was always `None`.
+- Timing: replaced the fixed `_tick(0.01)` fabrication for the
+  apply_patch step specifically with real `Clock.monotonic()`-measured
+  elapsed time, since that step can now do real I/O. Other steps
+  (model/approval/verifier) stay on the renamed `_fake_tick()` — they
+  still have no real operation to time; inventing "real-looking"
+  numbers for fake work would be its own dishonesty.
+- Fixed the `tests.support` import path to be `tests.support.fakes`
+  (via `tests/__init__.py` + `pythonpath = ["src", "."]`) instead of a
+  bare top-level `support` module — the prior name was one `sys.path`
+  collision away from silently importing the wrong package.
+- Corrected `errors.py`'s wording: it said "no controller has been
+  built," which stopped being true at slice A. The real gap is a
+  *considered* retry/abort/escalation policy and real integrations, not
+  the controller's existence.
+- Validated by hand before writing formal tests (per this project's
+  established discipline): the full real flow (fixture repo → worktree
+  → patch → commit → original-checkout diff → cleanup), every
+  validation-failure path (absolute path, `..`, missing file, ambiguous
+  match, symlink escape), a path containing spaces, and a source repo
+  with pre-existing uncommitted/untracked changes — all confirmed
+  working via a throwaway script before any test asserted it.
+
+## Session: Milestone 1 slice B — correction pass (not yet committed)
+
+**Outcome**: `workspace.py`/`patch.py`/`controller.py` hardened against
+10 gaps the 717-test slice-B suite didn't cover, found by the user
+reading the actual code rather than trusting green tests. 731 tests
+passing. Held uncommitted for review before this becomes part of
+slice B's commit — the corrections aren't optional polish, they're
+what makes the "one controlled patch" claim actually true.
+
+- **Author decision, recorded not re-litigated**: `GitPatchApplier`
+  now enforces exactly one `PatchOperation` at construction
+  (`len(operations) != 1` raises). Multiple operations against the
+  same file each started from the original content and could silently
+  overwrite each other — real multi-file transactional patching stays
+  Milestone 2 / the atomic-patch spike's job, not something to
+  half-build here under time pressure.
+- `git add -A` → `git add -- <validated target>`: staging everything
+  in the worktree could have swept an unrelated change (from a prior
+  failed attempt, a concurrent process) into the checkpoint commit.
+- Sanitization: `OperationalError.message` no longer includes raw git
+  stderr (replaced with fixed, per-step categorical messages: "failed
+  to stage the patched file", "failed to commit the patch", etc.) or
+  absolute worktree paths; caller-supplied path values are stripped of
+  non-printable characters and length-bounded before inclusion.
+  Verified by a test that forces a git failure and asserts the
+  worktree's real absolute path and the word "fatal:" never appear in
+  the persisted message.
+- `GitWorktree.__exit__` was claiming success it hadn't earned: a
+  failed `git worktree remove` was silently ignored (`check=False` with
+  no return-code check). Now: physically remove the directory as a
+  fallback, run `git worktree prune` to clean the now-stale
+  registration, and only if that still doesn't resolve it, raise
+  `GitWorktreeCleanupError` — but never when an exception is already
+  propagating from the `with`-block (that would replace/mask the real
+  failure); the cleanup outcome is always recorded on
+  `self.cleanup_error` regardless of whether it's raised. Temp-dir
+  removal moved into a `finally` so it happens even if the git-level
+  recovery logic itself throws.
+- Temp-directory prefix is now a constant (`codeagent-worktree-`), not
+  `f"...{run_id}..."` — an unsanitized, unbounded caller-supplied
+  string had no business being a filesystem path component.
+- `PatchResult.__post_init__` now enforces its own success/failure
+  shape (nonempty commit hash + positive counts on success; all-zero/
+  `None` on failure) — this used to only be true by convention.
+- Added a controller-level fail-closed check: a patch reporting changed
+  files outside `PlanProposal.proposed_file_paths` aborts the run
+  (`INTERNAL_INVARIANT_VIOLATION`) rather than proceeding to
+  verification. Documented explicitly where this runs relative to the
+  mutation: *after* it, not before — true prevention would require
+  passing approved paths into the `PatchApplier` before it acts, which
+  needs a richer interface than this slice builds. What this check
+  actually guarantees: an out-of-scope change is never treated as
+  legitimate, and no further budget is spent verifying it.
+- The original-checkout-protection claim was narrower than what was
+  actually being tested: prior tests checked one fixture file plus HEAD
+  plus status. Added a test comparing a full sha256 manifest of every
+  file in the source repo, a full `git for-each-ref` inventory, and the
+  worktree-list snapshot before creation vs. after cleanup — the claim
+  is now backed by what's actually inventoried and compared, not
+  asserted past what was checked.
+- No new ADR: none of the ten corrections is a durable decision with a
+  credible alternative someone would reasonably choose differently —
+  they're bug fixes and hardening of the slice-B design already
+  recorded in the prior session's entry.
+
+## Session: Milestone 1 slice B — second correction pass (not yet committed)
+
+**Outcome**: approved-path enforcement is now genuinely preventive, not
+just a postcondition; several remaining honesty/robustness gaps closed.
+735 tests passing.
+
+- `PatchApplier.apply()` gained a third parameter, `approved_paths`,
+  checked by `GitPatchApplier` *before* any validation, read, write, or
+  git command — proven with a test asserting byte-identical content, an
+  unchanged HEAD, and empty `git status` after an unapproved-target
+  attempt. The controller's existing post-mutation check is now
+  documented and named as defense in depth only — its docstring no
+  longer calls it "fail-closed," since by the time it runs the mutation
+  it's checking for would already have happened.
+- Found and fixed a real bug while adding the exact-match worktree-
+  registration parser (correction 4): comparing an unresolved temp path
+  (`/var/...`) against git's own porcelain output (which resolves
+  `/var` → `/private/var` on macOS) never matched, so the two cleanup-
+  failure tests from the *previous* correction pass were silently
+  passing for the wrong reason — `_registration_status` was returning
+  "not registered" via a false negative, not via a real check. Fixed by
+  resolving the path before comparison; both tests now fail loudly if
+  the detection logic regresses.
+- `_registration_status` returns a tri-state (`True`/`False`/`None`)
+  instead of a bool: a failed `git worktree list` is `None` (unknown),
+  never coerced to `False` (confirmed absent) — an unknown cleanup
+  state now blocks a false "cleanup succeeded" claim.
+- `GitWorktree.__enter__` rejects re-entry of an already-active
+  instance, and now catches `OSError` alongside `CalledProcessError`
+  (matching `__exit__`'s existing tempdir-cleanup-in-`finally`
+  guarantee against the same class of failure).
+- `GitPatchApplier` catches `OSError` alongside `CalledProcessError`
+  around every git subprocess stage (add/diff/commit/rev-parse), not
+  just some of them.
+- Documented explicitly, not just implicitly: a git failure *after* a
+  successful file write (during add/diff/commit/rev-parse) leaves that
+  write uncommitted in the worktree until the surrounding `GitWorktree`
+  tears the whole thing down. No in-place rollback within one `apply()`
+  call — real transactional rollback is Milestone 2 work, not
+  something this narrow slice claims to provide.
+- No new ADR: `approved_paths` becoming a real parameter closes a gap
+  already named and reasoned about in the prior session's entry — it
+  isn't a new decision with alternatives, it's finishing the one
+  already made.
+
+**Tracked limitation, accepted for now**: `GitWorktree.__exit__`'s
+`git worktree remove`/`prune` calls run through `_run_git(..., check=False)`,
+which still lets an OS-level failure to even *launch* git (e.g. the
+binary missing or unexecutable, raising `OSError`/`FileNotFoundError`
+before any `CompletedProcess` exists) propagate out of `__exit__`
+unnormalized — not caught and turned into `GitWorktreeCleanupError`
+the way a nonzero exit code is. `__enter__`'s equivalent call is
+already hardened against this (this session's correction 3); `__exit__`
+is not, and Slice B accepts that gap rather than fixing it
+speculatively. Validate and close it during the Stage-2 interruption/
+orphan-cleanup spike, where this class of failure is the actual subject
+under test.

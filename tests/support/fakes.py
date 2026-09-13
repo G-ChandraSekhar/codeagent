@@ -12,7 +12,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from codeagent import domain, events
-from codeagent.controller import PlanProposal, SUPPORTED_VERIFICATION_OUTCOMES
+from codeagent.controller import PatchResult, PlanProposal, SUPPORTED_VERIFICATION_OUTCOMES
+from codeagent.errors import ErrorCode, OperationalError
 
 
 class FakeModel:
@@ -59,27 +60,77 @@ class FakeVerifier:
 
 
 class FakePatchApplier:
-    def __init__(self, should_fail: bool = False) -> None:
-        self._should_fail = should_fail
+    """No real filesystem/git involved — see codeagent.patch.GitPatchApplier
+    (slice B) for the real implementation this fakes.
 
-    def apply(self, iteration: int, plan: PlanProposal) -> bool:
-        return not self._should_fail
+    `changed_paths` defaults to the fixture's usual single file, but is
+    overridable so a test can construct a PatchApplier that (mis)reports
+    a file outside whatever the plan actually approved — see
+    test_controller.py's plan-scope consistency test.
+    """
+
+    def __init__(
+        self,
+        should_fail: bool = False,
+        changed_paths: tuple[str, ...] = ("jobs/worker.py",),
+    ) -> None:
+        self._should_fail = should_fail
+        self._changed_paths = changed_paths
+        self._n = 0
+
+    def apply(
+        self, run_id: str, iteration: int, approved_paths: frozenset[str]
+    ) -> PatchResult:
+        # Deliberately does NOT enforce approved_paths itself — this
+        # fake exists partly to let test_controller.py's plan-scope
+        # test simulate a PatchApplier that fails to do the real,
+        # preventive check GitPatchApplier does, exercising the
+        # controller's defense-in-depth postcondition instead.
+        self._n += 1
+        if self._should_fail:
+            return PatchResult(
+                success=False,
+                operation_count=0,
+                changed_paths=(),
+                diff_bytes=0,
+                error=OperationalError(
+                    code=ErrorCode.PATCH_VALIDATION_FAILED,
+                    error_id=f"{run_id}-fake-patch-err-{self._n}",
+                    message="fixture-forced patch validation failure",
+                ),
+            )
+        return PatchResult(
+            success=True,
+            operation_count=1,
+            changed_paths=self._changed_paths,
+            diff_bytes=42,
+            commit_hash=f"{run_id}-fake-commit-{iteration}",
+        )
 
 
 class SteppingClock:
-    """Deterministic Clock: each call to now() advances by a fixed step
-    from a fixed epoch. Fully reproducible — no real time, no sleeping,
-    no monkeypatching datetime."""
+    """Deterministic Clock: each call to now() advances a fixed step
+    from a fixed epoch, and each call to monotonic() advances a fixed
+    step from zero — two independent counters, fully reproducible. No
+    real time, no sleeping, no monkeypatching datetime/time."""
 
     def __init__(
         self,
         epoch: datetime | None = None,
         step: timedelta = timedelta(milliseconds=1),
+        monotonic_step: float = 0.001,
     ) -> None:
         self._next = epoch or datetime(2026, 1, 1, tzinfo=timezone.utc)
         self._step = step
+        self._next_monotonic = 0.0
+        self._monotonic_step = monotonic_step
 
     def now(self) -> datetime:
         current = self._next
         self._next = self._next + self._step
+        return current
+
+    def monotonic(self) -> float:
+        current = self._next_monotonic
+        self._next_monotonic += self._monotonic_step
         return current
