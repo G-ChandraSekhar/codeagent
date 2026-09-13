@@ -869,7 +869,15 @@ suite, including real Docker verification, on GitHub-hosted
 - **Verification**: `actionlint` clean; full local suite 873 passed;
   the 3 real-Docker tests executed (not skipped) under
   `CODEAGENT_REQUIRE_DOCKER=1`; no leftover containers; `git diff
-  --check` clean. Not yet run on GitHub Actions itself.
+  --check` clean.
 - No new ADR.
 
-**Nothing committed or pushed yet.**
+**Committed as `ci: validate Docker flow on Ubuntu`; pushed to
+`origin/main`. First real GitHub Actions run — commit `a845cb3`, run
+[34734760525](https://github.com/G-ChandraSekhar/codeagent/actions/runs/34734760525)
+— concluded `success`: Docker preflight passed (Docker Engine
+28.0.4); pulled verification image confirmed `linux/amd64`; the 3 real
+Docker tests passed, 0 skipped; full suite 873 passed; final
+leftover-container check found none. This is the first real evidence
+of this project running anywhere other than the author's macOS/arm64
+machine.**

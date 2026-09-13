@@ -172,7 +172,7 @@ below.
   checkout and Docker cleanup guarantees intact. This is explicitly
   the narrowest slice that satisfies the guide's wording, not
   Milestone 2's general repository-read/tool-loop system.
-- A pre-commit correction pass (still uncommitted) fixed the reader's
+- A pre-commit correction pass fixed the reader's
   size enforcement (bounded `read()` instead of stat-then-read-whole-
   file), documented the reader's remaining TOCTOU race honestly rather
   than claiming safety it doesn't have (real fix assigned to Milestone
@@ -185,6 +185,16 @@ below.
   cleanly on a machine without a Docker daemon rather than weakening
   what they check, and executed (none skipped) and passed against a
   real local daemon in the last run.
+- A narrow Linux CI slice (`.github/workflows/ci.yml`) now runs this
+  suite on GitHub-hosted `ubuntu-24.04` x86_64 with Python 3.12. Its
+  first real run — commit `a845cb3`, run
+  [34734760525](https://github.com/G-ChandraSekhar/codeagent/actions/runs/34734760525)
+  — concluded `success`: Docker preflight passed, the pulled
+  verification image confirmed `linux/amd64`, the 3 real Docker tests
+  passed with 0 skipped, the full suite passed all 873, and no
+  `codeagent-verify` containers were left behind. This is evidence for
+  ubuntu-24.04 x86_64 specifically, not a general Linux or ARM64
+  claim; see `ENGINEERING_LOG.md`'s "narrow Linux CI slice" entry.
 
 Stage 2 (of the four-stage planning process in
 `docs/CODEAGENT_LLM_HANDOFF.md`) spikes remain separately unstarted

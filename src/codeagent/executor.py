@@ -14,8 +14,18 @@ failure, command-start failure). Whether these limits actually hold
 under adversarial load, and what happens if the host process is killed
 mid-`docker run`, are the Stage-2 isolation and interruption spikes'
 job — both still unrun. This module does not claim Milestone-3-grade
-sandboxing, and has only been exercised on macOS/arm64 (Docker Desktop)
-— no Linux-parity claim is made (see the threat model's A9).
+sandboxing.
+
+Ordinary Docker verification (the happy/expected-failure paths this
+module's own tests and the real end-to-end slice-C test exercise) has
+now passed on two platforms: macOS/arm64 (Docker Desktop, manual/local
+verification) and GitHub-hosted Ubuntu 24.04 x86_64 (`.github/
+workflows/ci.yml`, run 34734760525, commit a845cb3). That is evidence
+of ordinary correctness on both, not of adversarial resource-limit
+enforcement or interruption safety on either — those remain
+unvalidated on both platforms pending the Stage-2 isolation and
+interruption spikes, and no other OS/architecture combination has been
+exercised at all (see the threat model's A9).
 
 Container lifecycle, deliberately inspectable rather than a single
 `docker run`: `create` → `start --attach` (bounded, streaming output
