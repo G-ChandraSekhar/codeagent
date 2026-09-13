@@ -1,0 +1,8 @@
+{
+  "check": "docker_socket_absent",
+  "primary": {
+    "result": "PASS",
+    "verifier_outcome": "passed"
+  },
+  "classification": "PASS"
+}

@@ -1,0 +1,15 @@
+{
+  "check": "cpu_limit",
+  "primary": {
+    "result": "PASS",
+    "measured_cores": 1.013,
+    "stdout": "CORES=1.013\n"
+  },
+  "control": {
+    "result": "PASS",
+    "measured_cores": 3.985,
+    "stdout": "CORES=3.985\n"
+  },
+  "notes": [],
+  "classification": "PASS"
+}

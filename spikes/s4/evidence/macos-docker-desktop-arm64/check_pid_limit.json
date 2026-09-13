@@ -1,0 +1,17 @@
+{
+  "check": "pid_limit",
+  "primary": {
+    "result": "PASS",
+    "raw_stdout": "RESULT succeeded=127 failed_at=128 pids_current=128 pids_max=128",
+    "parsed": {
+      "succeeded": "127",
+      "failed_at": "128",
+      "pids_current": "128",
+      "pids_max": "128"
+    },
+    "hit_limit_within_bounded_attempts": true,
+    "pids_current_never_exceeded_limit": true,
+    "verifier_outcome": "passed"
+  },
+  "classification": "PASS"
+}

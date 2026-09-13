@@ -1,0 +1,49 @@
+{
+  "host": {
+    "system": "Darwin",
+    "release": "25.6.0",
+    "machine": "arm64",
+    "python_version": "3.12.14",
+    "docker_version": "29.7.2",
+    "cgroup_version": "2"
+  },
+  "tested_image": "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+  "tested_security_flags": [
+    "--network",
+    "none",
+    "--read-only",
+    "--tmpfs",
+    "/tmp:rw,size=64m",
+    "--memory",
+    "512m",
+    "--cpus",
+    "1",
+    "--pids-limit",
+    "128",
+    "--user",
+    "1000:1000",
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges"
+  ],
+  "classifications": {
+    "network_blocked": "PASS",
+    "mounts_and_host_isolation": "PASS",
+    "non_root": "PASS",
+    "cap_sys_admin": "PASS",
+    "no_new_privileges": "PASS",
+    "read_only_fs": "PASS",
+    "workspace_readonly_bind": "PASS",
+    "docker_socket_absent": "PASS",
+    "env_non_inheritance": "PASS",
+    "bounded_output": "PASS",
+    "timeout_enforcement": "PASS",
+    "pid_limit": "PASS",
+    "cpu_limit": "PASS",
+    "memory_limit": "INCONCLUSIVE"
+  },
+  "cleanup_all_clean": true,
+  "class_a_clean": true,
+  "overall_verdict": "PASS_WITH_OPEN_RISKS"
+}

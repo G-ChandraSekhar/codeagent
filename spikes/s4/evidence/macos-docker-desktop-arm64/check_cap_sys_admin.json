@@ -1,0 +1,18 @@
+{
+  "check": "cap_sys_admin",
+  "primary": {
+    "result": "PASS",
+    "stdout": "MOUNT_FAILED 1 Operation not permitted\n",
+    "returncode": 1
+  },
+  "control": {
+    "result": "PASS",
+    "stdout": "MOUNT_SUCCEEDED\n",
+    "returncode": 0
+  },
+  "supporting_evidence": {
+    "production_container_capeff": "CapEff:\t0000000000000000"
+  },
+  "notes": [],
+  "classification": "PASS"
+}

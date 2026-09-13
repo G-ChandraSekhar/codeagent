@@ -1,0 +1,411 @@
+$ docker version --format {{.Server.Version}}
+29.7.2
+
+$ docker info --format {{.CgroupVersion}}
+2
+
+host: {"system": "Darwin", "release": "25.6.0", "machine": "arm64", "python_version": "3.12.14", "docker_version": "29.7.2", "cgroup_version": "2"}
+PLATFORM SCOPE: this run is macOS/Docker Desktop evidence only (threat-model.md A9) -- not a Linux claim. Evidence directory: /Users/chandrasekhar/code/codeagent/spikes/s4/evidence/macos-docker-desktop-arm64
+tested production config: {"image": "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea", "security_flags": ["--network", "none", "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--memory", "512m", "--cpus", "1", "--pids-limit", "128", "--user", "1000:1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges"]}
+$ docker ps -a --format {{.Names}}
+$ docker build --no-cache -t codeagent-spike-s4-setuid:cbdab683 -f /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-image-build-0usf5scq/Dockerfile /var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-image-build-0usf5scq
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 450B done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [1/2] FROM docker.io/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+#4 resolve docker.io/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea done
+#4 CACHED
+
+#5 [2/2] RUN cp $(which python3) /usr/local/bin/python3-setuid-test  && chown root:root /usr/local/bin/python3-setuid-test  && chmod 4755 /usr/local/bin/python3-setuid-test  && mkdir -m 0777 /canary-writable  && echo secret-content > /canary-secret  && chown root:root /canary-secret  && chmod 0600 /canary-secret
+#5 DONE 0.1s
+
+#6 exporting to image
+#6 exporting layers 0.0s done
+#6 exporting manifest sha256:41e42064a35cedb2cfcb4e9da228bb1f287804c140eb722b30077a6d5a39720b done
+#6 exporting config sha256:845eb3fb7146a07d837b945e2611d4f30a111884cc6e9d07c9c38077a22bf51f done
+#6 exporting attestation manifest sha256:458c55eb89fcfc33ee3414905592b0bdd9c520de18f0ea60c7a95aff4017a774 done
+#6 exporting manifest list sha256:7de39210f82fd9586ff69d58a74f39e474b2d5e3fa0ccdd6fa0fc3c84aeb4d3d done
+#6 naming to docker.io/library/codeagent-spike-s4-setuid:cbdab683 done
+#6 unpacking to docker.io/library/codeagent-spike-s4-setuid:cbdab683 done
+#6 DONE 0.0s
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/hyxl80zrkch3qaec18rvluxh8
+
+
+--- CHECK: network_blocked ---
+$ docker network create --label codeagent.spike=s4 codeagent-spike-s4-net-693d1793
+39594840cd5d6daf13827041532e0c7d787f25ff144c7b3d0601569bd5170478
+
+$ docker run -d --name codeagent-spike-s4-server-f261356e --label codeagent.spike=s4 --network codeagent-spike-s4-net-693d1793 python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -m http.server 8000
+da006a7c94ab91d6152b831ac56d51a70fc355ec4277f1f791144c9e35514a5d
+
+$ docker inspect --format {{(index .NetworkSettings.Networks "codeagent-spike-s4-net-693d1793").IPAddress}} codeagent-spike-s4-server-f261356e
+172.18.0.2
+
+$ docker run --rm --name codeagent-spike-s4-netctl-b372e99e --label codeagent.spike=s4 --network codeagent-spike-s4-net-693d1793 python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -c import socket,sys
+s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+try:
+    s.connect(('172.18.0.2', 8000))
+    sys.exit(0)
+except Exception as e:
+    print('CONNECT_FAILED', repr(e))
+    sys.exit(1)
+
+$ docker rm --force codeagent-spike-s4-server-f261356e
+codeagent-spike-s4-server-f261356e
+
+$ docker network rm codeagent-spike-s4-net-693d1793
+codeagent-spike-s4-net-693d1793
+
+
+--- CHECK: mounts_and_host_isolation ---
+$ docker create --name codeagent-spike-s4-mounts-53d37a7f --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --mount type=bind,source=/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-mounts-workspace-29tlhg5b,target=/workspace,readonly --workdir /workspace python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea sleep 30
+f1febf17283a61f87f984db934d80b28b3ca9365075cfdb59c5d7697ff90173a
+
+$ docker inspect --format {{json .Mounts}} codeagent-spike-s4-mounts-53d37a7f
+[{"Type":"bind","Source":"/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-mounts-workspace-29tlhg5b","Destination":"/workspace","Mode":"","RW":false,"Propagation":"rprivate"}]
+
+$ docker inspect --format {{json .HostConfig.Tmpfs}} codeagent-spike-s4-mounts-53d37a7f
+{"/tmp":"rw,size=64m"}
+
+$ docker start codeagent-spike-s4-mounts-53d37a7f
+codeagent-spike-s4-mounts-53d37a7f
+
+$ docker exec codeagent-spike-s4-mounts-53d37a7f python3 -B -c import os,sys
+assert os.path.exists('/workspace/expected.txt'), 'expected file missing'
+assert not os.path.exists('/host-secret.txt'), 'canary leaked at root'
+assert not os.path.exists('/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-mounts-canary-cocifu61/host-secret.txt'), 'canary leaked at host path'
+print('OK')
+
+OK
+
+$ docker kill codeagent-spike-s4-mounts-53d37a7f
+codeagent-spike-s4-mounts-53d37a7f
+
+
+--- CHECK: non_root ---
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges codeagent-spike-s4-setuid:cbdab683 python3 -B -c import os, sys
+print('uid', os.getuid(), 'euid', os.geteuid())
+try:
+    open('/canary-secret').read()
+    sys.exit(1)
+except PermissionError:
+    sys.exit(0)
+
+uid 1000 euid 1000
+
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --cap-drop ALL --security-opt no-new-privileges --user 0:0 codeagent-spike-s4-setuid:cbdab683 python3 -B -c import os; print('uid', os.getuid(), 'euid', os.geteuid()); print(open('/canary-secret').read())
+uid 0 euid 0
+secret-content
+
+
+
+--- CHECK: cap_sys_admin ---
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --cap-drop ALL --security-opt no-new-privileges --user 0:0 python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -B -c import ctypes, os, sys
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+os.makedirs('/tmp/spiketest', exist_ok=True)
+res = libc.mount(b'tmpfs', b'/tmp/spiketest', b'tmpfs', 0, None)
+if res != 0:
+    e = ctypes.get_errno()
+    print('MOUNT_FAILED', e, os.strerror(e))
+    sys.exit(1)
+else:
+    print('MOUNT_SUCCEEDED')
+    sys.exit(0)
+
+MOUNT_FAILED 1 Operation not permitted
+
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --cap-drop ALL --security-opt no-new-privileges --user 0:0 --cap-add SYS_ADMIN python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -B -c import ctypes, os, sys
+libc = ctypes.CDLL('libc.so.6', use_errno=True)
+os.makedirs('/tmp/spiketest', exist_ok=True)
+res = libc.mount(b'tmpfs', b'/tmp/spiketest', b'tmpfs', 0, None)
+if res != 0:
+    e = ctypes.get_errno()
+    print('MOUNT_FAILED', e, os.strerror(e))
+    sys.exit(1)
+else:
+    print('MOUNT_SUCCEEDED')
+    sys.exit(0)
+
+MOUNT_SUCCEEDED
+
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea sh -c grep CapEff /proc/self/status
+CapEff:	0000000000000000
+
+
+--- CHECK: no_new_privileges ---
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges codeagent-spike-s4-setuid:cbdab683 /usr/local/bin/python3-setuid-test -c import os; print('uid', os.getuid(), 'euid', os.geteuid())
+uid 1000 euid 1000
+
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL codeagent-spike-s4-setuid:cbdab683 /usr/local/bin/python3-setuid-test -c import os; print('uid', os.getuid(), 'euid', os.geteuid())
+uid 1000 euid 0
+
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges codeagent-spike-s4-setuid:cbdab683 sh -c grep NoNewPrivs /proc/self/status
+NoNewPrivs:	1
+
+
+--- CHECK: read_only_fs ---
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges codeagent-spike-s4-setuid:cbdab683 python3 -B -c open('/canary-writable/f.txt','w').write('x'); print('WRITE_SUCCEEDED')
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+OSError: [Errno 30] Read-only file system: '/canary-writable/f.txt'
+
+$ docker run --rm --label codeagent.spike=s4 --network none --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges codeagent-spike-s4-setuid:cbdab683 python3 -B -c open('/canary-writable/f.txt','w').write('x'); print('WRITE_SUCCEEDED')
+WRITE_SUCCEEDED
+
+
+--- CHECK: workspace_readonly_bind ---
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --mount type=bind,source=/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-workspace-bind-f34j9kcm,target=/workspace,readonly --workdir /workspace python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -B -c open('canary.txt','a').write('MUTATED'); print('WRITE_SUCCEEDED')
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+OSError: [Errno 30] Read-only file system: 'canary.txt'
+
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --mount type=bind,source=/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-workspace-bind-f34j9kcm,target=/workspace,readonly --workdir /workspace python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -B -c open('/tmp/f.txt','w').write('x'); print('TMP_WRITE_SUCCEEDED')
+TMP_WRITE_SUCCEEDED
+
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --mount type=bind,source=/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-workspace-bind-control-yqkwfa14,target=/workspace --workdir /workspace python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -B -c open('canary.txt','a').write('MUTATED'); print('WRITE_SUCCEEDED')
+WRITE_SUCCEEDED
+
+
+--- CHECK: docker_socket_absent ---
+
+--- CHECK: env_non_inheritance ---
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --env CODEAGENT_SPIKE_ALLOWED=present-value python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea sh -c env
+HOSTNAME=8f24845bd0bb
+CODEAGENT_SPIKE_ALLOWED=present-value
+HOME=/
+GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305
+PYTHON_SHA256=5c8462af5790baf43a321a1559dbe0db06d1be4300fb85fb53c40060668e548a
+PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LANG=C.UTF-8
+PYTHON_VERSION=3.12.14
+PWD=/
+
+
+--- CHECK: bounded_output ---
+
+--- CHECK: timeout_enforcement ---
+$ docker ps -a --format {{.Names}}
+codeagent-spike-s4-mounts-53d37a7f
+
+$ docker ps -a --format {{.Names}}
+codeagent-spike-s4-mounts-53d37a7f
+
+$ docker ps -a --format {{.Names}}
+codeagent-verify-baseline-ba2c2cf3297c
+codeagent-spike-s4-mounts-53d37a7f
+
+$ docker inspect --format {{.State.Status}} codeagent-verify-baseline-ba2c2cf3297c
+running
+
+$ docker ps -a --format {{.Names}}
+codeagent-spike-s4-mounts-53d37a7f
+
+
+--- CHECK: pid_limit ---
+
+--- CHECK: cpu_limit ---
+$ docker run --rm --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -B -c import time, subprocess
+def usage_usec():
+    with open('/sys/fs/cgroup/cpu.stat') as f:
+        for line in f:
+            if line.startswith('usage_usec'):
+                return int(line.split()[1])
+start_wall = time.time()
+start_usage = usage_usec()
+procs = [subprocess.Popen(['python3','-B','-c','import time\nt=time.time()\nwhile time.time()-t<4: pass']) for _ in range(4)]
+for p in procs: p.wait()
+end_wall = time.time()
+end_usage = usage_usec()
+cores = (end_usage-start_usage)/1_000_000 / (end_wall-start_wall)
+print(f'CORES={cores:.3f}')
+
+CORES=3.985
+
+
+--- CHECK: memory_limit ---
+$ docker create --name codeagent-spike-s4-mem-600-87327c90 --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --mount type=bind,source=/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-memory-workdir-600mb-bihq4vjc,target=/workspace,readonly --workdir /workspace python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -B -c chunks = []
+try:
+    for _ in range(600):
+        b = bytearray(1024 * 1024)
+        for i in range(0, len(b), 4096):
+            b[i] = 1
+        chunks.append(b)
+    print('ALLOCATION_SURVIVED', len(chunks))
+except MemoryError:
+    print('MEMORY_ERROR_RAISED')
+
+cbca9e5cc3258d3192c624789737f9e6d5d16d3b00be0d2f5ca4a1d782087ea2
+
+$ docker start codeagent-spike-s4-mem-600-87327c90
+codeagent-spike-s4-mem-600-87327c90
+
+$ docker inspect --format {{.State.OOMKilled}} codeagent-spike-s4-mem-600-87327c90
+false
+
+$ docker inspect --format {{.State.ExitCode}} codeagent-spike-s4-mem-600-87327c90
+0
+
+$ docker inspect --format {{.HostConfig.Memory}} codeagent-spike-s4-mem-600-87327c90
+536870912
+
+$ docker inspect --format {{.HostConfig.MemorySwap}} codeagent-spike-s4-mem-600-87327c90
+1073741824
+
+$ docker logs codeagent-spike-s4-mem-600-87327c90
+ALLOCATION_SURVIVED 600
+
+$ docker create --name codeagent-spike-s4-mem-1900-43a47949 --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --mount type=bind,source=/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-memory-workdir-1900mb-0o0nmhkj,target=/workspace,readonly --workdir /workspace python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -B -c chunks = []
+try:
+    for _ in range(1900):
+        b = bytearray(1024 * 1024)
+        for i in range(0, len(b), 4096):
+            b[i] = 1
+        chunks.append(b)
+    print('ALLOCATION_SURVIVED', len(chunks))
+except MemoryError:
+    print('MEMORY_ERROR_RAISED')
+
+d451a8f5b1e8b8e93337509f0c78e87cfb94f3149f7e612cdaf7116b4ef4b114
+
+$ docker start codeagent-spike-s4-mem-1900-43a47949
+codeagent-spike-s4-mem-1900-43a47949
+
+$ docker inspect --format {{.State.OOMKilled}} codeagent-spike-s4-mem-1900-43a47949
+true
+
+$ docker inspect --format {{.State.ExitCode}} codeagent-spike-s4-mem-1900-43a47949
+137
+
+$ docker inspect --format {{.HostConfig.Memory}} codeagent-spike-s4-mem-1900-43a47949
+536870912
+
+$ docker inspect --format {{.HostConfig.MemorySwap}} codeagent-spike-s4-mem-1900-43a47949
+1073741824
+
+$ docker logs codeagent-spike-s4-mem-1900-43a47949
+$ docker ps -a --format {{.Names}}
+codeagent-spike-s4-mem-1900-43a47949
+codeagent-spike-s4-mem-600-87327c90
+codeagent-spike-s4-mounts-53d37a7f
+
+$ docker ps -a --format {{.Names}}
+codeagent-spike-s4-mem-1900-43a47949
+codeagent-spike-s4-mem-600-87327c90
+codeagent-spike-s4-mounts-53d37a7f
+
+$ docker rm --force codeagent-spike-s4-mounts-53d37a7f
+codeagent-spike-s4-mounts-53d37a7f
+
+$ docker ps -a --format {{.Names}}
+codeagent-spike-s4-mem-1900-43a47949
+codeagent-spike-s4-mem-600-87327c90
+
+$ docker rm --force codeagent-spike-s4-mem-600-87327c90
+codeagent-spike-s4-mem-600-87327c90
+
+$ docker ps -a --format {{.Names}}
+codeagent-spike-s4-mem-1900-43a47949
+
+$ docker rm --force codeagent-spike-s4-mem-1900-43a47949
+codeagent-spike-s4-mem-1900-43a47949
+
+$ docker network ls --format {{.Name}}
+bridge
+host
+none
+
+$ docker images --format {{.Repository}}:{{.Tag}}
+codeagent-spike-s4-setuid:cbdab683
+llm-gateway-gateway:latest
+llm-gateway-migrate:latest
+python:3.12-slim
+redis:7-alpine
+postgres:16-alpine
+hello-world:latest
+
+$ docker rmi --force codeagent-spike-s4-setuid:cbdab683
+Untagged: codeagent-spike-s4-setuid:cbdab683
+Deleted: sha256:7de39210f82fd9586ff69d58a74f39e474b2d5e3fa0ccdd6fa0fc3c84aeb4d3d
+
+$ docker ps -a --format {{.Names}}
+$ docker ps -a --format {{.Names}}
+$ docker ps -a --format {{.Names}}
+$ docker ps -a --format {{.Names}}
+$ docker network ls --format {{.Name}}
+bridge
+host
+none
+
+$ docker images --format {{.Repository}}:{{.Tag}}
+llm-gateway-migrate:latest
+llm-gateway-gateway:latest
+python:3.12-slim
+redis:7-alpine
+postgres:16-alpine
+hello-world:latest
+
+$ docker ps -a --format {{.Names}}
+
+
+SUMMARY:
+{
+  "host": {
+    "system": "Darwin",
+    "release": "25.6.0",
+    "machine": "arm64",
+    "python_version": "3.12.14",
+    "docker_version": "29.7.2",
+    "cgroup_version": "2"
+  },
+  "tested_image": "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+  "tested_security_flags": [
+    "--network",
+    "none",
+    "--read-only",
+    "--tmpfs",
+    "/tmp:rw,size=64m",
+    "--memory",
+    "512m",
+    "--cpus",
+    "1",
+    "--pids-limit",
+    "128",
+    "--user",
+    "1000:1000",
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges"
+  ],
+  "classifications": {
+    "network_blocked": "PASS",
+    "mounts_and_host_isolation": "PASS",
+    "non_root": "PASS",
+    "cap_sys_admin": "PASS",
+    "no_new_privileges": "PASS",
+    "read_only_fs": "PASS",
+    "workspace_readonly_bind": "PASS",
+    "docker_socket_absent": "PASS",
+    "env_non_inheritance": "PASS",
+    "bounded_output": "PASS",
+    "timeout_enforcement": "PASS",
+    "pid_limit": "PASS",
+    "cpu_limit": "PASS",
+    "memory_limit": "INCONCLUSIVE"
+  },
+  "cleanup_all_clean": true,
+  "class_a_clean": true,
+  "overall_verdict": "PASS_WITH_OPEN_RISKS"
+}

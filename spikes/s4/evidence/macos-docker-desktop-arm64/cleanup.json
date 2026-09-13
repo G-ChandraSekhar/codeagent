@@ -1,0 +1,41 @@
+{
+  "containers_tracked": [
+    "codeagent-spike-s4-server-f261356e",
+    "codeagent-spike-s4-mounts-53d37a7f",
+    "codeagent-spike-s4-mem-600-87327c90",
+    "codeagent-spike-s4-mem-1900-43a47949"
+  ],
+  "networks_tracked": [
+    "codeagent-spike-s4-net-693d1793"
+  ],
+  "images_tracked": [
+    "codeagent-spike-s4-setuid:cbdab683"
+  ],
+  "dirs_tracked": [
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-image-build-0usf5scq",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-network-primary-workdir-bs6r5_k2",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-mounts-workspace-29tlhg5b",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-mounts-canary-cocifu61",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-workspace-bind-f34j9kcm",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-workspace-bind-control-yqkwfa14",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-dockersock-workdir-bwl9_jcl",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-output-workdir-n2qr5f0e",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-timeout-workdir-lmvodszp",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-pidlimit-workdir-uxqgkdhn",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-cpu-workdir-v3qbdv1b",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-memory-workdir-600mb-bihq4vjc",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-memory-workdir-1900mb-0o0nmhkj",
+    "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s4-memory-disposition-workdir-uh9yc3wi"
+  ],
+  "leftover_containers": [],
+  "leftover_networks": [],
+  "leftover_images": [],
+  "leftover_dirs": [],
+  "all_clean": true,
+  "class_a_baseline_names": [],
+  "class_a_final_names_before_extra_cleanup": [],
+  "class_a_unexpected_delta": [],
+  "class_a_removed_by_extra_cleanup": {},
+  "class_a_leftover_after_extra_cleanup": [],
+  "class_a_clean": true
+}

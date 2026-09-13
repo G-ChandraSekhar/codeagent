@@ -1,0 +1,13 @@
+{
+  "check": "read_only_fs",
+  "primary": {
+    "result": "PASS",
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nOSError: [Errno 30] Read-only file system: '/canary-writable/f.txt'\n"
+  },
+  "control": {
+    "result": "PASS",
+    "stdout": "WRITE_SUCCEEDED\n"
+  },
+  "classification": "PASS"
+}
