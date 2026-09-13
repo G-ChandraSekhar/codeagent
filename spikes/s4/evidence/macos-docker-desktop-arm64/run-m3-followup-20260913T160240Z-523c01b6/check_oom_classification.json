@@ -1,0 +1,16 @@
+{
+  "check": "oom_classification",
+  "verifier_outcome": "environment_failure",
+  "outcome_is_environment_failure": true,
+  "error_present": true,
+  "error_code": "executor_oom_killed",
+  "error_code_is_oom": true,
+  "exit_code": 137,
+  "exit_code_preserved_137": true,
+  "error_message": "verification container was killed for exceeding its memory limit",
+  "message_sanitized": true,
+  "message_matches_expected_literal": true,
+  "not_test_failure": true,
+  "notes": [],
+  "classification": "PASS"
+}

@@ -342,3 +342,107 @@ overclaimed. Cleanup was fully confirmed clean for both Class A and
 Class B resources on both platforms, so it does not override either
 verdict. No src/codeagent, production tests, production security
 flags, or ADR files were modified in gathering this evidence.
+
+---
+
+## Post-hardening follow-up (macOS only) — commit `00063d445d9c25f957c0c6474701fb61d1217f67`
+
+**This section is a distinct, later run, not part of the original S4
+experiment above.** Everything before this heading describes the
+original spike as it was run and evaluated at the time; it is
+unmodified. This section records a narrower follow-up, run with a
+separate driver (`spike_s4_m3_followup.py`, not `spike_s4.py`), against
+the production code *after* the Milestone 3 hardening commit
+(`security: enforce Docker memory ceiling and classify OOM`,
+`00063d445d9c25f957c0c6474701fb61d1217f67`) that was made in direct
+response to this spike's own `memory_limit` finding above. It validates
+the fix, it does not redo the original 14-check sweep.
+
+**Scope**: macOS/Docker Desktop only in this pass (per this document's
+own A9 platform-separation rule). A Linux repetition of this follow-up
+is separate, later work and has not been done.
+
+**What changed in production and what this follow-up checked**:
+1. `_SECURITY_FLAGS` gained `--memory-swap 512m` alongside the existing
+   `--memory 512m`.
+2. `DockerVerifier._attempt` now classifies a Docker-confirmed OOM kill
+   as `ENVIRONMENT_FAILURE` / `ErrorCode.EXECUTOR_OOM_KILLED`, ahead of
+   the ordinary nonzero-exit → `TEST_FAILURE` rule.
+
+**Evidence**: `spikes/s4/evidence/macos-docker-desktop-arm64/run-m3-followup-20260913T160240Z-523c01b6/`
+(a new run-specific subdirectory of the existing macOS platform
+directory — the original flat evidence files one level up are
+untouched). Host: Darwin 25.6.0 (arm64), Docker Desktop, Docker Engine
+29.7.2, cgroup v2, Python 3.12.14. `RUN_INFO.json` confirms the actual
+git `HEAD` at run time matched the expected commit above.
+
+**Check 1 — `memory_swap_configuration`: PASS.** Two independent
+direct observations, not one fused into the other:
+  - A hand-controlled Class B twin container, built from the real
+    imported `_SECURITY_FLAGS` (the same `spike_s4._memory_experiment`
+    machinery the original run used), directly inspected before
+    removal: `HostConfig.Memory=536870912`, `HostConfig.MemorySwap=
+    536870912` (both exactly 512 MiB — no additional swap headroom).
+  - The REAL `DockerVerifier`'s own container (not a twin): observed
+    via an evidence-only interception kept entirely inside
+    `spike_s4_m3_followup.py` — it temporarily wraps
+    `codeagent.executor._run_docker` (the same module attribute the
+    project's own unit tests patch) so that, only on the exact `rm
+    --force <name>` call `DockerVerifier._cleanup` was already about
+    to make, a read-only `docker inspect` runs first and the result is
+    recorded before the real removal proceeds unmodified. This is
+    direct observation of the actual production code path's own
+    container, distinct from the twin above (which uses the same
+    flags but not the same code path). Result: `HostConfig.Memory=
+    536870912`, `HostConfig.MemorySwap=536870912` — identical to the
+    twin. This closes the exact gap the original run found above
+    (`Memory=536870912`, `MemorySwap=1073741824`).
+
+**Check 2 — `oom_classification`: PASS.** A real 1900 MB allocation
+(the same fixed script the original spike used) run through the
+genuine public `DockerVerifier.run()` API: `outcome=environment_
+failure`, `error.code=executor_oom_killed`, `exit_code=137` (preserved,
+not nulled), `error.message="verification container was killed for
+exceeding its memory limit"` (the fixed literal defined in
+`executor.py`, confirmed both by exact match and by a mechanical
+sanitization check — no raw `OOMKilled`/`HostConfig`/JSON payload
+fragments). Not classified as `test_failure`. This directly observes,
+for the first time, what the original run could only infer from a
+separate confirmed-OOM twin plus a same-flags `DockerVerifier` run that
+happened to also exit 137.
+
+**Check 3 — `negative_control_ordinary_test_failure`: PASS.** An
+ordinary `sys.exit(1)` command through the same real `DockerVerifier`
+API: `outcome=test_failure`, `exit_code=1`, `error=None` — proving the
+OOM classification above is a real, narrow distinction and not simply
+"every nonzero exit is now an operational error."
+
+**Cleanup**: fully confirmed clean, distinguishing the two resource
+classes exactly as the original spike did — Class A (three real
+`DockerVerifier` containers: the HostConfig-observation run, the OOM
+run, and the negative control) confirmed via an empty baseline/final
+container-name-prefix delta; Class B (the one hand-controlled twin
+container plus its four scratch directories) confirmed via
+`spike_s4.Manifest.cleanup_and_verify()`'s independent
+re-verification. Both `all_clean: true`. A failed listing is never
+treated as confirmed-clean here: `all_container_names()` is reused
+unmodified from `spike_s4.py`, which raises on a nonzero `docker ps -a`
+rather than returning an empty set.
+
+**Follow-up verdict**: **`PASS`** — all three checks PASS, cleanup
+fully confirmed, no `INCONCLUSIVE`/`FAIL`/`TECHNICAL_FAILURE` observed.
+
+**Limitations, stated plainly**:
+- macOS/Docker Desktop only. Linux is not yet re-validated against the
+  hardened configuration in this pass.
+- This does not re-run or reopen the original 14-check S4 sweep;
+  `cap_sys_admin`'s Linux `INCONCLUSIVE` finding (unrelated to memory/
+  OOM) is untouched and remains open.
+- The `HostConfig.Memory`/`MemorySwap` interception observes exactly
+  one `DockerVerifier` container per run by construction (the harness
+  asserts this and fails loudly otherwise); it has not been exercised
+  against concurrent `DockerVerifier` instances.
+- `message_matches_expected_literal` pins today's exact wording of the
+  fixed OOM message as a convenience signal for noticing future
+  wording drift; the property this follow-up actually depends on is
+  sanitization (checked independently), not the exact string.

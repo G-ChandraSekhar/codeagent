@@ -1,0 +1,8 @@
+{
+  "purpose": "S4 post-hardening follow-up: validate the Milestone 3 executor changes (--memory-swap, OOM classification) made in direct response to the original S4 spike's open questions.",
+  "run_id": "run-m3-followup-20260913T160240Z-523c01b6",
+  "expected_source_commit": "00063d445d9c25f957c0c6474701fb61d1217f67",
+  "actual_source_commit": "00063d445d9c25f957c0c6474701fb61d1217f67",
+  "source_commit_matches_expected": true,
+  "triggered_at": "2026-09-13T16:02:41Z"
+}

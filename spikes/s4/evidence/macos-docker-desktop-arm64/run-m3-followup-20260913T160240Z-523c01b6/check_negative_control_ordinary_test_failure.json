@@ -1,0 +1,9 @@
+{
+  "check": "negative_control_ordinary_test_failure",
+  "verifier_outcome": "test_failure",
+  "outcome_is_test_failure": true,
+  "exit_code": 1,
+  "exit_code_is_1": true,
+  "error_is_none": true,
+  "classification": "PASS"
+}
