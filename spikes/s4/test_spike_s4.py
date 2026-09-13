@@ -123,3 +123,18 @@ def test_tested_production_values_are_imported_not_retyped() -> None:
     assert s._MAX_STREAM_BYTES is executor._MAX_STREAM_BYTES
     assert s.DockerVerifier is executor.DockerVerifier
     assert s.CONTAINER_NAME_PREFIX is executor.CONTAINER_NAME_PREFIX
+
+
+def test_exit_code_for_overall_verdict_fail_is_nonzero() -> None:
+    assert s.exit_code_for_overall_verdict(s.FAIL) == 1
+
+
+def test_exit_code_for_overall_verdict_pass_is_zero() -> None:
+    assert s.exit_code_for_overall_verdict(s.PASS) == 0
+
+
+def test_exit_code_for_overall_verdict_pass_with_open_risks_is_zero() -> None:
+    """PASS_WITH_OPEN_RISKS is a successful evidence-gathering run --
+    an inconclusive check is reported accurately, not treated as a
+    workflow failure."""
+    assert s.exit_code_for_overall_verdict("PASS_WITH_OPEN_RISKS") == 0

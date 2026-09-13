@@ -128,6 +128,15 @@ def write(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def exit_code_for_overall_verdict(overall: str) -> int:
+    """The process exit code main() should use for a given overall
+    verdict, AFTER all evidence has already been written. FAIL must
+    make the invoking workflow fail; PASS and PASS_WITH_OPEN_RISKS are
+    both a successful evidence-gathering run (an open risk is reported
+    accurately, not treated as a run failure) and exit 0."""
+    return 1 if overall == FAIL else 0
+
+
 def combine(primary: str, control: str | None = None) -> str:
     """Combines a primary observation with an optional negative
     control into one classification. A failed/inconclusive control
@@ -1379,6 +1388,8 @@ def main() -> None:
     log("\n\nSUMMARY:\n" + json.dumps(summary, indent=2))
 
     write(EVIDENCE_DIR / "run.log", "\n".join(_LOG_LINES) + "\n")
+
+    sys.exit(exit_code_for_overall_verdict(overall))
 
 
 if __name__ == "__main__":

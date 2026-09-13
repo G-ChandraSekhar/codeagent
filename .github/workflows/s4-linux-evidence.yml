@@ -1,0 +1,89 @@
+name: S4 Linux Evidence (manual)
+
+# Manual, evidence-gathering-only workflow -- workflow_dispatch only,
+# never part of ordinary push/PR CI, and it does not gate merges.
+# Repeats Stage-2 spike S4 (executor/container isolation) on
+# ubuntu-24.04 (linux/amd64) to produce a Linux evidence bundle
+# comparable to the already-committed macOS/Docker Desktop run under
+# spikes/s4/evidence/macos-docker-desktop-arm64/. See
+# docs/threat-model.md's A9: Linux and macOS/Docker Desktop are
+# separate evidence domains -- this workflow exists to fill the Linux
+# side, not to replace or overwrite the macOS side. The evidence
+# produced here is uploaded as a build artifact for inspection; it is
+# not committed to the repository by this workflow.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s4-linux:
+    name: S4 isolation evidence (ubuntu-24.04, Python 3.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        # actions/checkout v7.0.1 (same verified pin as ci.yml)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Python 3.12
+        # actions/setup-python v7.0.0 (same verified pin as ci.yml)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Install project and test dependencies
+        run: pip install -e ".[test]"
+
+      - name: Docker preflight (mandatory)
+        run: docker info
+
+      - name: Confirm runner and pinned image are linux/amd64
+        id: image
+        run: |
+          set -euo pipefail
+          UNAME_M=$(uname -m)
+          echo "runner uname -m: $UNAME_M"
+          if [ "$UNAME_M" != "x86_64" ]; then
+            echo "expected runner architecture x86_64, got '$UNAME_M'" >&2
+            exit 1
+          fi
+          IMAGE=$(python -c "from codeagent.executor import DEFAULT_IMAGE; print(DEFAULT_IMAGE)")
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          docker pull "$IMAGE"
+          PLATFORM=$(docker inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")
+          echo "Pulled image reports platform: $PLATFORM"
+          if [ "$PLATFORM" != "linux/amd64" ]; then
+            echo "expected image platform linux/amd64, got '$PLATFORM'" >&2
+            exit 1
+          fi
+
+      - name: Run spike_s4 focused tests
+        run: python -m pytest spikes/s4/test_spike_s4.py -v
+
+      - name: Run the real S4 isolation spike (writes Linux evidence)
+        run: python spikes/s4/spike_s4.py
+
+      - name: Upload Linux S4 evidence
+        if: always()
+        # actions/upload-artifact v7.0.1, resolved via gh api (not guessed)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: s4-linux-evidence
+          path: spikes/s4/evidence/linux-x86_64/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Verify no leftover CodeAgent-owned containers
+        if: always()
+        run: |
+          set -euo pipefail
+          LEFTOVER=$(docker ps -a --format '{{.Names}}' | grep -E '^(codeagent-verify-|codeagent-spike-s4-)' || true)
+          echo "CodeAgent-owned containers currently present (expected: none):"
+          echo "$LEFTOVER"
+          if [ -n "$LEFTOVER" ]; then
+            echo "leftover CodeAgent-owned container(s) found -- failing." >&2
+            exit 1
+          fi
