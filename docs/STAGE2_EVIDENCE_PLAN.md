@@ -9,9 +9,13 @@ memory+swap and that a Docker-confirmed OOM kill could not be
 distinguished from an ordinary test failure, and both were resolved in
 Milestone 3 commit `00063d4` (`security: enforce Docker memory ceiling
 and classify OOM`) — a post-hardening follow-up then directly validated
-that resolution on both platforms (`spikes/s4/S4_RESULT.md`). The
-remaining spikes below (S2a, S2b, S5, S7, S8, plus the non-spike S6)
-are still pending. Production code exists for Milestone 0, Milestone 1,
+that resolution on both platforms (`spikes/s4/S4_RESULT.md`). S5
+(interrupt and lifecycle scenarios) has macOS/arm64 spike evidence
+complete and committed (`spikes/s5/S5_RESULT.md`, status DRAFT); a
+Linux/x86-64 reproduction is planned but not yet run, and no production
+decision or implementation has followed from it. The remaining spikes
+below (S2a, S2b, S7, S8, plus the non-spike S6) are still pending.
+Production code exists for Milestone 0, Milestone 1,
 and the Milestone 3 memory/OOM hardening (see `CLAUDE.md`'s current
 status), but nothing from S3's accepted decision has been implemented
 yet. This document does not authorize implementation on its own — each
@@ -409,6 +413,17 @@ and can be written and tested at any point.
 ---
 
 ## S5 — Interrupt and lifecycle scenarios
+
+**Status (factual, added after the fact — the experiment plan below is
+retained as originally written and is not itself updated to describe
+current behavior)**: macOS/arm64 spike evidence for all six scenarios
+(five lifecycle outcomes plus fresh-process reconciliation), followed
+by a separate idempotency check, is complete and committed
+(`spikes/s5/S5_RESULT.md`, status DRAFT). Linux/x86-64 reproduction is
+planned but not yet run. No production decision has been made from
+this evidence, and no S5 mechanism is implemented in
+`src/codeagent/executor.py`, `src/codeagent/workspace.py`, or anywhere
+else in production code.
 
 **Question**: Under each of six distinct lifecycle scenarios — normal
 completion, explicit cancellation, SIGINT, SIGTERM, an uncatchable

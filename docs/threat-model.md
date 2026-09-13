@@ -690,18 +690,38 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
 - Impact: resource leak (CPU/memory held by an orphaned container
   indefinitely)
 - Implemented control: S1's spike already demonstrates clean removal in the
-  *normal* (non-crash) path — 3/3 trials showed no leftover containers
+  *normal* (non-crash) path — 3/3 trials showed no leftover containers.
+  The dedicated Stage-2 interruption spike (S5) has since run on
+  macOS/arm64 against a real Docker daemon and disposable worktree,
+  in scaffolding built for the spike only: it demonstrates the expected
+  SIGKILL orphan (an uncatchable signal genuinely leaves a labeled
+  container behind, as this entry already predicted) and a successful
+  fresh-process reconciliation that removes exactly that orphan while
+  leaving unrelated/foreign-labeled/unlabeled canary resources
+  untouched (`spikes/s5/S5_RESULT.md`, status DRAFT). A Linux/x86-64
+  repetition of the same spike is planned but not yet run.
 - Planned control: labeled containers (`codeagent.spike=...`-style labels,
-  already used by S1) enabling a cleanup sweep on next startup; the
-  dedicated Stage-2 spike "interruption without orphaned containers" is
-  unstarted and specifically targets the *abnormal*-termination case
-- Evidence/future test: the unstarted interruption spike — kill `-9` the
-  controller mid-run, assert eventual cleanup (either immediate signal
-  handling or a startup sweep)
+  already used by S1 and by the S5 spike scaffolding) enabling a cleanup
+  sweep on next startup. Production Docker labeling, a durable
+  manifest/registry, the advisory-locking liveness mechanism,
+  cancellation, and startup reconciliation itself remain entirely
+  unimplemented in `src/codeagent/executor.py`,
+  `src/codeagent/workspace.py`, or anywhere else in production code —
+  S5's spike harness is throwaway evidence-gathering code, not a
+  production mechanism, and no candidate design from it has been
+  accepted
+- Evidence/future test: S5's macOS evidence as described above; the
+  planned Linux/x86-64 repetition; then, separately, real Milestone-2/3
+  implementation and failure-path tests once a production design is
+  accepted
 - Residual risk: a signal handler cannot guarantee cleanup against SIGKILL
   (which cannot be caught) — the only honest mitigation is a startup-time
-  reconciliation sweep, not prevention
-- Owning milestone/spike: Stage-2 interruption spike (unstarted)
+  reconciliation sweep, not prevention. This risk is not resolved or
+  mitigated in production by S5's evidence alone — no reconciliation
+  mechanism exists in production code yet
+- Owning milestone/spike: Stage-2 interruption spike (S5) — macOS
+  evidence gathered, Linux repetition pending, production implementation
+  not started
 
 **T-F2 — Orphaned disposable worktree after crash.**
 - Asset/objective: O7, O1
@@ -712,12 +732,24 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
 - Planned control: worktrees created under a task-specific, discoverable
   temporary directory; a startup or explicit `cleanup` sweep removes
   worktrees whose parent run is confirmed dead
-- Evidence/future test: kill `-9` mid-run, assert a later sweep removes the
-  worktree
+- Evidence/future test: the S5 spike's macOS/arm64 evidence covers the
+  worktree side of this too, in spike scaffolding only — it demonstrates
+  a fresh-process reconciler correctly identifying and removing an
+  orphaned disposable worktree left behind by a SIGKILLed child, using
+  independent Git-registration and filesystem-existence checks before
+  any removal, without touching unrelated worktrees
+  (`spikes/s5/S5_RESULT.md`, status DRAFT). A Linux/x86-64 repetition is
+  planned but not yet run. As with T-F1, this is spike evidence only —
+  no production worktree-reconciliation sweep exists in
+  `src/codeagent/executor.py`/`src/codeagent/workspace.py` yet, and no
+  candidate design has been accepted
 - Residual risk: between the crash and the next sweep, content sits on disk
   — acceptable for a local single-user tool, not acceptable if this were
-  ever multi-tenant (explicitly out of scope, A5)
-- Owning milestone/spike: Stage-2 interruption spike
+  ever multi-tenant (explicitly out of scope, A5). Neither this nor T-F1
+  is fully mitigated or resolved by S5's spike evidence alone
+- Owning milestone/spike: Stage-2 interruption spike (S5) — macOS
+  evidence gathered, Linux repetition pending, production implementation
+  not started
 
 **T-F3 — Corrupt/partial JSONL event log after crash mid-write.**
 - Asset/objective: O5, O7

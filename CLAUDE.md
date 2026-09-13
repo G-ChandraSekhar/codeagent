@@ -128,7 +128,7 @@ below.
   Model and approval collaborators are still fake — Docker sandbox
   claims are explicitly provisional pending the Stage-2 isolation/
   interruption spikes below.
-- A pre-commit correction pass on slice C (still uncommitted) fixed
+- A pre-commit correction pass on slice C (committed) fixed
   seven real defects found by review: an unsafe cleanup-confirmation
   check (`docker ps -a` exact-name match replacing a `docker inspect`
   exit code, which couldn't distinguish "confirmed absent" from "the
@@ -147,7 +147,7 @@ below.
   positive timeout); and `test_slice_c.py` switched from a fake
   stepping clock to `SystemClock` so real Docker durations aren't
   fabricated. See `ENGINEERING_LOG.md`'s "correction pass" entry.
-- **Read completion slice** (still uncommitted) — closes Milestone 1's
+- **Read completion slice** (committed) — closes Milestone 1's
   actual acceptance gap: a narrow `RepositoryReader` Protocol and
   `ReadResult` type (`src/codeagent/controller.py`), a real bounded,
   path-validated worktree reader (`src/codeagent/reader.py`:
@@ -180,7 +180,7 @@ below.
   to require `RunStarted` first (not merely present), and corrected a
   misleadingly-named reader test. See `ENGINEERING_LOG.md`'s
   "pre-commit correction pass" entry.
-- Full suite: 873 tests passing as of the last full run (`git diff
+- Full suite: 931 tests passing as of the last full run (`git diff
   --check` clean); the 3 real-Docker tests in `test_slice_c.py` skip
   cleanly on a machine without a Docker daemon rather than weakening
   what they check, and executed (none skipped) and passed against a
@@ -232,11 +232,20 @@ Stage 2 (of the four-stage planning process in
   post-hardening follow-up passed all checks on both platforms. Linux
   `cap_sys_admin` remains `INCONCLUSIVE` (unrelated). Full record:
   `spikes/s4/S4_RESULT.md`.
-- Remaining two Stage-2 spikes are unstarted:
-  1. Responses API strict function tools and multiple tool calls.
-  2. Interruption without orphaned containers (S5) — still unstarted.
-  (A sixth spike, JSONL replay into the first frontend view, is also
-  listed in the handoff and unstarted.)
+- **S5 — interruption without orphaned containers**: macOS/arm64 spike
+  evidence is complete and committed at `d2a6f63` (six scenarios total:
+  five lifecycle outcomes — normal completion, cooperative
+  cancellation, SIGINT, SIGTERM, SIGKILL — plus fresh-process
+  reconciliation, followed by a separate second-pass idempotency check,
+  all against real Docker and a real throwaway worktree; see
+  `spikes/s5/S5_RESULT.md`, status DRAFT). Linux/x86-64
+  reproduction of the same spike is planned but not yet run. No S5
+  mechanism (labeling, manifest/registry, locking, cancellation,
+  startup reconciliation) is implemented in production, and no
+  candidate architecture decision from this spike has been accepted.
+- One Stage-2 spike is unstarted: Responses API strict function tools
+  and multiple tool calls. (A sixth spike, JSONL replay into the first
+  frontend view, is also listed in the handoff and unstarted.)
 
 The flagship fixture repository used by slice B/C
 (`tests/fixtures/retry_worker/`) is a narrow, hand-built stand-in for

@@ -1034,3 +1034,44 @@ and
 - **Still open**: Linux `cap_sys_admin` remains `INCONCLUSIVE`
   (unrelated). S5 remains unstarted. No ADR (closes an already-recorded
   question with evidence, not a new decision).
+
+---
+
+## Session (2026-09-13): factual status reconciliation (S5, test count, Milestone 1 commit status)
+
+Documentation-only correction, not a new decision — no ADR. `CLAUDE.md`,
+`docs/STAGE2_EVIDENCE_PLAN.md`, and `docs/threat-model.md` (T-F1/T-F2)
+had drifted from actual repository state: slice C's pre-commit
+correction pass and the read-completion slice were both described as
+"still uncommitted" despite having been committed since (Milestone 1 is
+and remains complete); the current-status test count read `873` where
+`931` is what the full suite now actually reports; and S5 (interruption
+without orphaned containers) was still described as wholly "unstarted"
+even though its macOS/arm64 spike evidence — six scenarios total (five
+lifecycle outcomes plus fresh-process reconciliation), followed by a
+separate idempotency check, against a real Docker daemon and a real
+throwaway worktree — is complete and
+committed at `d2a6f639826bb1368cc88a6233394b0c6b0ca7da`
+(`spikes/s5/S5_RESULT.md`, status DRAFT). Corrected all three files to
+state plainly: S5 macOS evidence exists and demonstrates the expected
+SIGKILL orphan plus successful reconciliation, in throwaway spike
+scaffolding only; Linux/x86-64 repetition is planned but not yet run;
+no S5 mechanism (labeling, manifest/registry, locking, cancellation,
+startup reconciliation) is implemented in production; and no candidate
+architecture decision from the spike has been accepted. Neither T-F1
+nor T-F2 is marked mitigated or resolved. `docs/STAGE2_EVIDENCE_PLAN.md`'s
+original S5 experiment plan/hypothesis text is left as originally
+written, with only a short factual status note added above it.
+
+- **Verification**: `git status` confirmed clean at
+  `d2a6f639826bb1368cc88a6233394b0c6b0ca7da` before editing; full suite
+  re-run and confirmed at 931 passed; every corrected sentence checked
+  against actual commit history (`git log`, `git ls-files`) and the
+  retained `spikes/s5/S5_RESULT.md`; exactly four files changed in
+  total — `CLAUDE.md`, `ENGINEERING_LOG.md`,
+  `docs/STAGE2_EVIDENCE_PLAN.md`, and `docs/threat-model.md` — no code,
+  tests, workflows, or ADRs touched.
+- **Still open**: everything S5 already listed as open (Linux
+  repetition, production implementation, candidate-decision acceptance)
+  remains open — this session only corrected wording, it made no new
+  decision.
