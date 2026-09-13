@@ -345,22 +345,27 @@ flags, or ADR files were modified in gathering this evidence.
 
 ---
 
-## Post-hardening follow-up (macOS only) — commit `00063d445d9c25f957c0c6474701fb61d1217f67`
+## Post-hardening follow-up (macOS AND Linux) — commit `00063d445d9c25f957c0c6474701fb61d1217f67`
 
 **This section is a distinct, later run, not part of the original S4
 experiment above.** Everything before this heading describes the
 original spike as it was run and evaluated at the time; it is
-unmodified. This section records a narrower follow-up, run with a
+unmodified, and none of its 14 check classifications are reopened or
+rewritten here. This section records a narrower follow-up, run with a
 separate driver (`spike_s4_m3_followup.py`, not `spike_s4.py`), against
 the production code *after* the Milestone 3 hardening commit
 (`security: enforce Docker memory ceiling and classify OOM`,
 `00063d445d9c25f957c0c6474701fb61d1217f67`) that was made in direct
 response to this spike's own `memory_limit` finding above. It validates
-the fix, it does not redo the original 14-check sweep.
+the fix; it does not redo the original 14-check sweep.
 
-**Scope**: macOS/Docker Desktop only in this pass (per this document's
-own A9 platform-separation rule). A Linux repetition of this follow-up
-is separate, later work and has not been done.
+**Scope**: both platforms named in this document's own A9
+platform-separation rule now have retained follow-up evidence —
+macOS/Docker Desktop (this section's original run) and Linux/x86_64
+(a later, separate run described in its own subsection below,
+produced by the manual `.github/workflows/s4-m3-followup-linux-evidence.yml`
+workflow). Each platform's evidence is independent; neither is inferred
+from the other.
 
 **What changed in production and what this follow-up checked**:
 1. `_SECURITY_FLAGS` gained `--memory-swap 512m` alongside the existing
@@ -369,12 +374,16 @@ is separate, later work and has not been done.
    as `ENVIRONMENT_FAILURE` / `ErrorCode.EXECUTOR_OOM_KILLED`, ahead of
    the ordinary nonzero-exit → `TEST_FAILURE` rule.
 
+### macOS/arm64 run
+
 **Evidence**: `spikes/s4/evidence/macos-docker-desktop-arm64/run-m3-followup-20260913T160240Z-523c01b6/`
 (a new run-specific subdirectory of the existing macOS platform
 directory — the original flat evidence files one level up are
 untouched). Host: Darwin 25.6.0 (arm64), Docker Desktop, Docker Engine
 29.7.2, cgroup v2, Python 3.12.14. `RUN_INFO.json` confirms the actual
-git `HEAD` at run time matched the expected commit above.
+git `HEAD` at run time matched the expected commit above. Run manually
+on the author's machine (no workflow — this predates the Linux
+manual-workflow infrastructure added afterward).
 
 **Check 1 — `memory_swap_configuration`: PASS.** Two independent
 direct observations, not one fused into the other:
@@ -429,20 +438,90 @@ treated as confirmed-clean here: `all_container_names()` is reused
 unmodified from `spike_s4.py`, which raises on a nonzero `docker ps -a`
 rather than returning an empty set.
 
-**Follow-up verdict**: **`PASS`** — all three checks PASS, cleanup
-fully confirmed, no `INCONCLUSIVE`/`FAIL`/`TECHNICAL_FAILURE` observed.
+**macOS follow-up verdict**: **`PASS`** — all three checks PASS,
+cleanup fully confirmed, no `INCONCLUSIVE`/`FAIL`/`TECHNICAL_FAILURE`
+observed.
+
+### Linux/x86_64 run
+
+**Evidence**: `spikes/s4/evidence/linux-x86_64/run-m3-followup-34769425851-attempt-1/`
+(byte-for-byte identical to the downloaded workflow artifact — verified
+by SHA-256 before being committed). Host: Linux 6.17.0-1022-azure
+(GitHub-hosted `ubuntu-24.04` runner), x86_64, Docker client/server
+28.0.4, cgroup v2, pulled verification image confirmed
+`linux/amd64`. Produced by the manual
+`.github/workflows/s4-m3-followup-linux-evidence.yml` workflow, run id
+`34769425851`, attempt `1`
+([workflow run](https://github.com/G-ChandraSekhar/codeagent/actions/runs/34769425851)).
+`RUN_INFO.json` records both provenance commits: `production_hardening_commit=
+00063d445d9c25f957c0c6474701fb61d1217f67` (confirmed, via `git
+merge-base --is-ancestor`, as a real ancestor of the checkout) and
+`harness_source_commit=e7c9933eae4291f7b21fd6a1f25b2adb04c4d6ca` (the
+actual checked-out commit, confirmed equal to the workflow's own
+`GITHUB_SHA`).
+
+**Check 1 — `memory_swap_configuration`: PASS.** Same two independent
+direct observations as the macOS run (a hand-controlled Class B twin
+built from the real imported `_SECURITY_FLAGS`, plus the real
+`DockerVerifier`'s own container observed via the same evidence-only
+`rm --force` interception): both report `HostConfig.Memory=536870912`,
+`HostConfig.MemorySwap=536870912` — identical values to macOS.
+
+**Check 2 — `oom_classification`: PASS.** The same real 1900 MB
+allocation through the genuine `DockerVerifier.run()` API:
+`outcome=environment_failure`, `error.code=executor_oom_killed`,
+`exit_code=137` (preserved), `error.message="verification container
+was killed for exceeding its memory limit"` (identical literal to
+macOS, confirmed sanitized). Not classified as `test_failure`.
+
+**Check 3 — `negative_control_ordinary_test_failure`: PASS.** Same
+`sys.exit(1)` command: `outcome=test_failure`, `exit_code=1`,
+`error=None` — identical to macOS.
+
+**Cleanup**: fully confirmed clean, same Class A/Class B distinction as
+macOS — Class A (three real `DockerVerifier` containers) via an empty
+baseline/final container-name-prefix delta; Class B (one hand-controlled
+twin container plus four scratch directories) via
+`spike_s4.Manifest.cleanup_and_verify()`. Both `all_clean: true`. The
+workflow's own final leftover-container check (a separate,
+fail-closed `docker ps -a` listing at the job level, distinct from the
+harness's own check) also reported empty.
+
+**Linux follow-up verdict**: **`PASS`** — all three checks PASS,
+cleanup fully confirmed, no `INCONCLUSIVE`/`FAIL`/`TECHNICAL_FAILURE`
+observed.
+
+### Cross-platform comparison
+
+| | macOS/arm64 | Linux/x86_64 |
+|---|---|---|
+| `memory_swap_configuration` | PASS (`Memory=536870912`, `MemorySwap=536870912`) | PASS (`Memory=536870912`, `MemorySwap=536870912`) |
+| `oom_classification` | PASS (`environment_failure`/`executor_oom_killed`, exit `137`) | PASS (`environment_failure`/`executor_oom_killed`, exit `137`) |
+| `negative_control_ordinary_test_failure` | PASS (`test_failure`, exit `1`, no error) | PASS (`test_failure`, exit `1`, no error) |
+| Cleanup | confirmed clean | confirmed clean |
+| Overall | `PASS` | `PASS` |
+
+Both platforms independently and directly observed identical
+`HostConfig.Memory`/`HostConfig.MemorySwap` values, identical OOM
+classification behavior, and identical negative-control behavior —
+the Milestone 3 hardening (commit `00063d445d9c25f957c0c6474701fb61d1217f67`)
+is now validated as resolving both open questions the original S4 run
+raised, on both platforms this project has ever tested. This does not
+reopen or revise the original 14-check classifications above,
+including Linux's own `cap_sys_admin` finding, which remains
+`INCONCLUSIVE` and is unrelated to memory/OOM.
 
 **Limitations, stated plainly**:
-- macOS/Docker Desktop only. Linux is not yet re-validated against the
-  hardened configuration in this pass.
 - This does not re-run or reopen the original 14-check S4 sweep;
   `cap_sys_admin`'s Linux `INCONCLUSIVE` finding (unrelated to memory/
   OOM) is untouched and remains open.
 - The `HostConfig.Memory`/`MemorySwap` interception observes exactly
   one `DockerVerifier` container per run by construction (the harness
   asserts this and fails loudly otherwise); it has not been exercised
-  against concurrent `DockerVerifier` instances.
+  against concurrent `DockerVerifier` instances, on either platform.
 - `message_matches_expected_literal` pins today's exact wording of the
   fixed OOM message as a convenience signal for noticing future
   wording drift; the property this follow-up actually depends on is
   sanitization (checked independently), not the exact string.
+- S5 (interruption without orphaned containers) remains unstarted and
+  is unaffected by this follow-up.

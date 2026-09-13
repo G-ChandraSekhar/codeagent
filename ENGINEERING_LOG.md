@@ -1008,3 +1008,29 @@ no capability/seccomp/AppArmor/runtime change.
   with new adversarial S4-style evidence on either platform (S4's
   bundle is retained, not rerun). Linux CAP_SYS_ADMIN attribution and
   S5 (interruption without orphaned containers) remain open.
+
+---
+
+## Session (2026-09-13): S4 post-hardening follow-up validated on both platforms
+
+Closes the Milestone 3 entry's re-verification gap above:
+`--memory-swap`/OOM classification are now confirmed with real
+adversarial Docker evidence on **both** macOS/arm64 and Linux/x86_64
+(`s4-m3-followup-linux-evidence.yml` run `34769425851` attempt `1`),
+via `spikes/s4/spike_s4_m3_followup.py` against the real unmodified
+`DockerVerifier`. All three checks passed identically on both:
+`HostConfig.Memory=536870912`/`MemorySwap=536870912` (exactly 512 MiB,
+no extra swap, on both a hand-controlled twin and the real production
+container); a genuine 1900 MB allocation → `ENVIRONMENT_FAILURE`/
+`EXECUTOR_OOM_KILLED`, exit `137` preserved, fixed sanitized message;
+an ordinary `sys.exit(1)` → `TEST_FAILURE`, no error. Cleanup clean on
+both. Evidence:
+`spikes/s4/evidence/macos-docker-desktop-arm64/run-m3-followup-20260913T160240Z-523c01b6/`
+and
+`spikes/s4/evidence/linux-x86_64/run-m3-followup-34769425851-attempt-1/`
+(SHA-256-verified copy of the workflow artifact); full narrative in
+`spikes/s4/S4_RESULT.md`.
+
+- **Still open**: Linux `cap_sys_admin` remains `INCONCLUSIVE`
+  (unrelated). S5 remains unstarted. No ADR (closes an already-recorded
+  question with evidence, not a new decision).

@@ -1091,13 +1091,28 @@ by repository-supplied configuration.
 - Source: Repository's own code inside the container
 - Impact: host or container OOM, potentially affecting other host processes
   if the container isn't memory-capped
-- Implemented control: none yet
-- Planned control: container memory limit (guide §8)
-- Evidence/future test: Stage-2 isolation spike ("resource" case)
-- Residual risk: substantially mitigated once implemented and tested;
-  residual exposure from a misconfigured limit or host-level OOM behavior
-  outside CodeAgent's control, not claimed to be zero
-- Owning milestone/spike: Stage-2 isolation spike, Milestone 3
+- Implemented control: `DockerVerifier`'s `_SECURITY_FLAGS` set a 512 MiB
+  `--memory` limit together with `--memory-swap` equal to `--memory`,
+  preventing additional swap beyond the configured memory limit (Stage-2
+  spike S4 found that `--memory` alone permitted ~512 MiB of extra swap
+  headroom on both platforms tested). A Docker-confirmed OOM kill
+  (`State.OOMKilled == true`) is classified as
+  `VerificationOutcome.ENVIRONMENT_FAILURE` with
+  `ErrorCode.EXECUTOR_OOM_KILLED`, taking precedence over the ordinary
+  nonzero-exit → `TEST_FAILURE` rule, so an OOM kill is never mistaken for
+  a genuine failing test.
+- Evidence: Stage-2 spike S4's original finding
+  (`spikes/s4/S4_RESULT.md`'s memory-limit section) plus its post-hardening
+  follow-up, which directly validated both the memory/swap configuration
+  and the OOM classification on both macOS/arm64 and Linux/x86_64
+  (`spikes/s4/S4_RESULT.md`'s post-hardening section;
+  `spikes/s4/evidence/{macos-docker-desktop-arm64,linux-x86_64}/
+  run-m3-followup-*/`).
+- Residual risk: substantially mitigated and directly evidenced on both
+  tested platforms; residual exposure remains from a Docker/kernel-level
+  memory-accounting defect, an unforeseen host-level OOM interaction, or a
+  future misconfiguration of the security flags — not claimed to be zero.
+- Owning milestone/spike: Stage-2 isolation spike S4, Milestone 3
 
 **T-J6 — CPU exhaustion / spin loops.**
 - Asset/objective: O7

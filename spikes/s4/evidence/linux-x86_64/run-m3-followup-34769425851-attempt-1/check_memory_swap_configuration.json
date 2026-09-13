@@ -1,0 +1,25 @@
+{
+  "check": "memory_swap_configuration",
+  "expected_bytes": 536870912,
+  "hand_controlled_twin": {
+    "method": "spike_s4._memory_experiment against the real imported _SECURITY_FLAGS -- direct docker inspect of a Class B container, NOT the real DockerVerifier code path.",
+    "name": "codeagent-spike-s4-m3-followup-twin-cadef02e",
+    "configured_memory_bytes": "536870912",
+    "configured_memswap_bytes": "536870912",
+    "matches_expected": true
+  },
+  "real_docker_verifier_container": {
+    "method": "evidence-only interception of DockerVerifier._cleanup's own 'rm --force' call -- DIRECT observation of the real production code path's own container, not a twin/inference.",
+    "captured_name": "codeagent-verify-baseline-f3a218580d22",
+    "capture_ok": true,
+    "capture_error": null,
+    "HostConfig.Memory": 536870912,
+    "HostConfig.MemorySwap": 536870912,
+    "matches_expected": true,
+    "verifier_outcome": "passed"
+  },
+  "notes": [
+    "both the hand-controlled twin (built from the real imported _SECURITY_FLAGS) and the real DockerVerifier's own container (observed via evidence-only interception of its self-cleanup call) report Memory=536870912 MemorySwap=536870912 -- no additional swap beyond the configured 512 MiB memory limit, closing the gap the original S4 run found (Memory=536870912, MemorySwap=1073741824)."
+  ],
+  "classification": "PASS"
+}

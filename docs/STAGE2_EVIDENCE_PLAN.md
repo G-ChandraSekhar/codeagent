@@ -1,17 +1,24 @@
 # CodeAgent — Stage 2 Evidence Plan
 
-Status: Stage 2 is underway. S1 and S3 have executed and produced
+Status: Stage 2 is underway. S1, S3, and S4 have executed and produced
 retained evidence; S3's resulting decision is accepted as
-`docs/adr/0003-recover-partial-patches-by-replacing-worktree.md`. The
-remaining spikes below (S2a, S2b, S4, S5, S7, S8, plus the non-spike
-S6) are still pending. Production code exists for Milestone 0 and
-Milestone 1 (see `CLAUDE.md`'s current status), but nothing from S3's
-accepted decision has been implemented yet. This document does not
-authorize implementation on its own — each spike still individually
-authorizes deciding, in writing, what evidence an open uncertainty
-needs before it becomes a design decision; the experiment plans below
-are retained as originally written for that purpose, including for
-the two spikes that have already run.
+`docs/adr/0003-recover-partial-patches-by-replacing-worktree.md`. S4
+(container/executor isolation) executed on both macOS/Docker Desktop
+and Linux/x86_64, found that `--memory` alone did not cap combined
+memory+swap and that a Docker-confirmed OOM kill could not be
+distinguished from an ordinary test failure, and both were resolved in
+Milestone 3 commit `00063d4` (`security: enforce Docker memory ceiling
+and classify OOM`) — a post-hardening follow-up then directly validated
+that resolution on both platforms (`spikes/s4/S4_RESULT.md`). The
+remaining spikes below (S2a, S2b, S5, S7, S8, plus the non-spike S6)
+are still pending. Production code exists for Milestone 0, Milestone 1,
+and the Milestone 3 memory/OOM hardening (see `CLAUDE.md`'s current
+status), but nothing from S3's accepted decision has been implemented
+yet. This document does not authorize implementation on its own — each
+spike still individually authorizes deciding, in writing, what evidence
+an open uncertainty needs before it becomes a design decision; the
+experiment plans below are retained as originally written for that
+purpose, including for the spikes that have already run.
 
 Read alongside the frozen `PROJECT_BRIEF.md` (accepted Stage 1
 baseline), `CODEAGENT_IMPLEMENTATION_GUIDE.md`, `DESIGN_SPEC.md`, and
@@ -312,6 +319,18 @@ likely substantially reused (refactored, not copied) in `tools/patch.py`.
 ---
 
 ## S4 — Executor/container isolation
+
+**Status: executed, retained, followed by a successful cross-platform
+post-hardening validation.** Evidence: `spikes/s4/S4_RESULT.md` and its
+retained JSON under `spikes/s4/evidence/{macos-docker-desktop-arm64,
+linux-x86_64}/`. The original run found two open questions (combined
+memory+swap not capped by `--memory` alone; OOM-kill vs. ordinary
+test-failure disposition), both resolved in Milestone 3 commit
+`00063d4` and then directly validated by a separate post-hardening
+follow-up on both platforms — see `S4_RESULT.md`'s own post-hardening
+section for the full record. The experiment plan below is retained as
+originally written, for the reason stated in this document's own
+status paragraph above.
 
 **Question**: Do Docker's container-level isolation primitives —
 network disabled, non-root execution, dropped Linux capabilities,

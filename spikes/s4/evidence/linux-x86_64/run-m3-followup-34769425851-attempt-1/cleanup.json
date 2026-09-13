@@ -1,0 +1,31 @@
+{
+  "class_a_self_cleanup": {
+    "description": "Real DockerVerifier containers (memory_swap_configuration's HostConfig-observation run, oom_classification, negative_control_ordinary_test_failure) confirm their own removal internally -- never tracked in a manifest here, caught instead by this baseline/final container-name-prefix delta.",
+    "baseline_names": [],
+    "final_names": [],
+    "unexpected_delta": [],
+    "removed_by_extra_cleanup": {},
+    "leftover_after_extra_cleanup": [],
+    "clean": true
+  },
+  "class_b_hand_controlled_cleanup": {
+    "description": "The memory_swap_configuration check's hand-controlled twin container, tracked in spike_s4.MANIFEST and verified absent independently of Class A's prefix-delta check.",
+    "containers_tracked": [
+      "codeagent-spike-s4-m3-followup-twin-cadef02e"
+    ],
+    "networks_tracked": [],
+    "images_tracked": [],
+    "dirs_tracked": [
+      "/tmp/codeagent-spike-s4-memory-workdir-200mb-nxw_7i1x",
+      "/tmp/codeagent-spike-s4-m3-followup-hostconfig-workdir-3cels_ib",
+      "/tmp/codeagent-spike-s4-m3-followup-oom-workdir-perehuu8",
+      "/tmp/codeagent-spike-s4-m3-followup-negctrl-workdir-9jce6xfo"
+    ],
+    "leftover_containers": [],
+    "leftover_networks": [],
+    "leftover_images": [],
+    "leftover_dirs": [],
+    "all_clean": true
+  },
+  "all_clean": true
+}

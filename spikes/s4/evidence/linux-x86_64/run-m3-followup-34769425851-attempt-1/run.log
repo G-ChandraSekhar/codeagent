@@ -1,0 +1,144 @@
+$ git rev-parse HEAD
+e7c9933eae4291f7b21fd6a1f25b2adb04c4d6ca
+
+$ git merge-base --is-ancestor 00063d445d9c25f957c0c6474701fb61d1217f67 HEAD
+$ docker version --format {{.Client.Version}}
+28.0.4
+
+$ docker version --format {{.Server.Version}}
+28.0.4
+
+$ docker info --format {{.CgroupVersion}}
+2
+
+$ docker pull python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+docker.io/library/python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea: Pulling from library/python
+6310eb16bf42: Pulling fs layer
+dbd0b7849e6c: Pulling fs layer
+1560cfed01dc: Pulling fs layer
+56235e424563: Pulling fs layer
+56235e424563: Waiting
+dbd0b7849e6c: Verifying Checksum
+dbd0b7849e6c: Download complete
+1560cfed01dc: Verifying Checksum
+1560cfed01dc: Download complete
+6310eb16bf42: Verifying Checksum
+6310eb16bf42: Download complete
+56235e424563: Verifying Checksum
+56235e424563: Download complete
+6310eb16bf42: Pull complete
+dbd0b7849e6c: Pull complete
+1560cfed01dc: Pull complete
+56235e424563: Pull complete
+Digest: sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+Status: Downloaded newer image for python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+docker.io/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+
+$ docker inspect --format {{.Os}}/{{.Architecture}} python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+linux/amd64
+
+host: {"system": "Linux", "release": "6.17.0-1022-azure", "machine": "x86_64", "python_version": "3.12.14", "docker_client_version": "28.0.4", "docker_server_version": "28.0.4", "cgroup_version": "2", "image_platform": "linux/amd64"}
+PLATFORM: linux-x86_64 (threat-model.md A9 -- a separate evidence domain from any other platform). Evidence directory: /home/runner/work/codeagent/codeagent/spikes/s4/evidence/linux-x86_64/run-m3-followup-34769425851-attempt-1
+run info: {"purpose": "S4 post-hardening follow-up: validate the Milestone 3 executor changes (--memory-swap, OOM classification) made in direct response to the original S4 spike's open questions.", "run_id": "run-m3-followup-34769425851-attempt-1", "production_hardening_commit": "00063d445d9c25f957c0c6474701fb61d1217f67", "harness_source_commit": "e7c9933eae4291f7b21fd6a1f25b2adb04c4d6ca", "production_hardening_is_ancestor": true, "workflow_run_id": "34769425851", "workflow_run_attempt": "1", "workflow_url": "https://github.com/G-ChandraSekhar/codeagent/actions/runs/34769425851", "triggered_at": "2026-09-13T16:43:29Z"}
+tested production config: {"image": "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea", "security_flags": ["--network", "none", "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "--user", "1000:1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges"]}
+$ docker ps -a --format {{.Names}}
+
+--- CHECK: memory_swap_configuration ---
+$ docker create --name codeagent-spike-s4-m3-followup-twin-cadef02e --label codeagent.spike=s4 --network none --read-only --tmpfs /tmp:rw,size=64m --memory 512m --memory-swap 512m --cpus 1 --pids-limit 128 --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --mount type=bind,source=/tmp/codeagent-spike-s4-memory-workdir-200mb-nxw_7i1x,target=/workspace,readonly --workdir /workspace python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea python3 -B -c chunks = []
+try:
+    for _ in range(200):
+        b = bytearray(1024 * 1024)
+        for i in range(0, len(b), 4096):
+            b[i] = 1
+        chunks.append(b)
+    print('ALLOCATION_SURVIVED', len(chunks))
+except MemoryError:
+    print('MEMORY_ERROR_RAISED')
+
+6f63c98ba99e028e29c0f14b52795e98061bbf3d3eca1ea58699da2a9bfda811
+
+$ docker start codeagent-spike-s4-m3-followup-twin-cadef02e
+codeagent-spike-s4-m3-followup-twin-cadef02e
+
+$ docker inspect --format {{.State.OOMKilled}} codeagent-spike-s4-m3-followup-twin-cadef02e
+false
+
+$ docker inspect --format {{.State.ExitCode}} codeagent-spike-s4-m3-followup-twin-cadef02e
+0
+
+$ docker inspect --format {{.HostConfig.Memory}} codeagent-spike-s4-m3-followup-twin-cadef02e
+536870912
+
+$ docker inspect --format {{.HostConfig.MemorySwap}} codeagent-spike-s4-m3-followup-twin-cadef02e
+536870912
+
+$ docker logs codeagent-spike-s4-m3-followup-twin-cadef02e
+ALLOCATION_SURVIVED 200
+
+
+--- CHECK: oom_classification ---
+
+--- CHECK: negative_control_ordinary_test_failure ---
+$ docker ps -a --format {{.Names}}
+codeagent-spike-s4-m3-followup-twin-cadef02e
+
+$ docker rm --force codeagent-spike-s4-m3-followup-twin-cadef02e
+codeagent-spike-s4-m3-followup-twin-cadef02e
+
+$ docker ps -a --format {{.Names}}
+$ docker ps -a --format {{.Names}}
+
+
+SUMMARY:
+{
+  "host": {
+    "system": "Linux",
+    "release": "6.17.0-1022-azure",
+    "machine": "x86_64",
+    "python_version": "3.12.14",
+    "docker_client_version": "28.0.4",
+    "docker_server_version": "28.0.4",
+    "cgroup_version": "2",
+    "image_platform": "linux/amd64"
+  },
+  "run_info": {
+    "purpose": "S4 post-hardening follow-up: validate the Milestone 3 executor changes (--memory-swap, OOM classification) made in direct response to the original S4 spike's open questions.",
+    "run_id": "run-m3-followup-34769425851-attempt-1",
+    "production_hardening_commit": "00063d445d9c25f957c0c6474701fb61d1217f67",
+    "harness_source_commit": "e7c9933eae4291f7b21fd6a1f25b2adb04c4d6ca",
+    "production_hardening_is_ancestor": true,
+    "workflow_run_id": "34769425851",
+    "workflow_run_attempt": "1",
+    "workflow_url": "https://github.com/G-ChandraSekhar/codeagent/actions/runs/34769425851",
+    "triggered_at": "2026-09-13T16:43:29Z"
+  },
+  "tested_image": "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+  "tested_security_flags": [
+    "--network",
+    "none",
+    "--read-only",
+    "--tmpfs",
+    "/tmp:rw,size=64m",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--cpus",
+    "1",
+    "--pids-limit",
+    "128",
+    "--user",
+    "1000:1000",
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges"
+  ],
+  "classifications": {
+    "memory_swap_configuration": "PASS",
+    "oom_classification": "PASS",
+    "negative_control_ordinary_test_failure": "PASS"
+  },
+  "cleanup_all_clean": true,
+  "overall_verdict": "PASS"
+}
