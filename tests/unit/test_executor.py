@@ -18,6 +18,7 @@ that do or don't contain it.
 from __future__ import annotations
 
 import io
+import json
 import subprocess
 import uuid
 
@@ -29,6 +30,7 @@ from codeagent.executor import (
     CONTAINER_NAME_PREFIX,
     DEFAULT_IMAGE,
     _MAX_STREAM_BYTES,
+    _SECURITY_FLAGS,
     DockerVerifier,
     _BoundedCollector,
     _DockerLaunchError,
@@ -41,6 +43,12 @@ _FIXED_UUID = uuid.UUID(int=0)
 
 def _container_name(label: str) -> str:
     return f"{CONTAINER_NAME_PREFIX}{label}-{_FIXED_UUID.hex[:12]}"
+
+
+def _state_json(status: str = "exited", exit_code: int = 0, oom_killed: bool = False) -> str:
+    """Builds the `docker inspect --format '{{json .State}}'` stdout the
+    real Docker CLI would produce for a given final container state."""
+    return json.dumps({"Status": status, "ExitCode": exit_code, "OOMKilled": oom_killed})
 
 
 class _FakeCompleted:
@@ -361,7 +369,7 @@ def test_unparseable_inspect_output_is_environment_failure(monkeypatch, tmp_path
         tmp_path,
         docker_calls=[
             _FakeCompleted(returncode=0),  # create
-            _FakeCompleted(returncode=0, stdout="garbage-not-tab-separated"),  # inspect
+            _FakeCompleted(returncode=0, stdout="not-json-at-all"),  # inspect
             _FakeCompleted(returncode=0),  # rm
             _listing(["unrelated"]),  # confirmed gone
         ],
@@ -372,6 +380,62 @@ def test_unparseable_inspect_output_is_environment_failure(monkeypatch, tmp_path
 
     assert result.outcome == events.VerificationOutcome.ENVIRONMENT_FAILURE
     assert result.exit_code is None
+    assert result.error.code == ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE
+
+
+def test_inspect_command_nonzero_exit_is_environment_failure(monkeypatch, tmp_path) -> None:
+    verifier = _make_verifier(
+        monkeypatch,
+        tmp_path,
+        docker_calls=[
+            _FakeCompleted(returncode=0),  # create
+            _FakeCompleted(returncode=1, stderr="no such container"),  # inspect fails
+            _FakeCompleted(returncode=0),  # rm
+            _listing(["unrelated"]),  # confirmed gone
+        ],
+        popen_factory=lambda: _FakeProc(),
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.outcome == events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.exit_code is None
+    assert result.error.code == ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE
+
+
+@pytest.mark.parametrize(
+    "raw_state",
+    [
+        json.dumps({"ExitCode": 0, "OOMKilled": False}),  # missing Status
+        json.dumps({"Status": "exited", "OOMKilled": False}),  # missing ExitCode
+        json.dumps({"Status": "exited", "ExitCode": 0}),  # missing OOMKilled
+        json.dumps({"Status": 1, "ExitCode": 0, "OOMKilled": False}),  # Status wrong type
+        json.dumps({"Status": "exited", "ExitCode": "0", "OOMKilled": False}),  # ExitCode wrong type
+        json.dumps({"Status": "exited", "ExitCode": False, "OOMKilled": False}),  # ExitCode is bool
+        json.dumps({"Status": "exited", "ExitCode": 0, "OOMKilled": "false"}),  # OOMKilled wrong type
+        json.dumps(["exited", 0, False]),  # not a dict at all
+    ],
+)
+def test_malformed_or_wrong_typed_inspect_state_is_environment_failure(
+    monkeypatch, tmp_path, raw_state: str
+) -> None:
+    verifier = _make_verifier(
+        monkeypatch,
+        tmp_path,
+        docker_calls=[
+            _FakeCompleted(returncode=0),  # create
+            _FakeCompleted(returncode=0, stdout=raw_state),  # inspect
+            _FakeCompleted(returncode=0),  # rm
+            _listing(["unrelated"]),  # confirmed gone
+        ],
+        popen_factory=lambda: _FakeProc(),
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.outcome == events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.exit_code is None
+    assert result.error.code == ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE
 
 
 def test_exited_zero_is_passed(monkeypatch, tmp_path) -> None:
@@ -380,7 +444,7 @@ def test_exited_zero_is_passed(monkeypatch, tmp_path) -> None:
         tmp_path,
         docker_calls=[
             _FakeCompleted(returncode=0),  # create
-            _FakeCompleted(returncode=0, stdout="exited\t0"),  # inspect
+            _FakeCompleted(returncode=0, stdout=_state_json(exit_code=0, oom_killed=False)),
             _FakeCompleted(returncode=0),  # rm
             _listing(["unrelated"]),  # confirmed gone
         ],
@@ -401,7 +465,7 @@ def test_exited_nonzero_is_test_failure(monkeypatch, tmp_path) -> None:
         tmp_path,
         docker_calls=[
             _FakeCompleted(returncode=0),  # create
-            _FakeCompleted(returncode=0, stdout="exited\t1"),  # inspect
+            _FakeCompleted(returncode=0, stdout=_state_json(exit_code=1, oom_killed=False)),
             _FakeCompleted(returncode=0),  # rm
             _listing(["unrelated"]),  # confirmed gone
         ],
@@ -415,6 +479,154 @@ def test_exited_nonzero_is_test_failure(monkeypatch, tmp_path) -> None:
     assert result.error is None
 
 
+def test_confirmed_oom_kill_is_environment_failure_with_oom_error_code(
+    monkeypatch, tmp_path
+) -> None:
+    verifier = _make_verifier(
+        monkeypatch,
+        tmp_path,
+        docker_calls=[
+            _FakeCompleted(returncode=0),  # create
+            _FakeCompleted(returncode=0, stdout=_state_json(exit_code=137, oom_killed=True)),
+            _FakeCompleted(returncode=0),  # rm
+            _listing(["unrelated"]),  # confirmed gone
+        ],
+        popen_factory=lambda: _FakeProc(),
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.outcome == events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.exit_code == 137
+    assert result.error is not None
+    assert result.error.code == ErrorCode.EXECUTOR_OOM_KILLED
+    # Only a fixed, sanitized message is persisted -- never raw Docker
+    # inspect payloads or daemon output.
+    assert "OOMKilled" not in result.error.message
+    assert "{" not in result.error.message
+
+
+def test_oom_classification_takes_precedence_over_would_be_passed(monkeypatch, tmp_path) -> None:
+    """An OOM-killed container that happens to report exit code 0 must
+    still be classified as the OOM environment failure, never PASSED —
+    the exit code of a killed container cannot be trusted as a real
+    test result."""
+    verifier = _make_verifier(
+        monkeypatch,
+        tmp_path,
+        docker_calls=[
+            _FakeCompleted(returncode=0),  # create
+            _FakeCompleted(returncode=0, stdout=_state_json(exit_code=0, oom_killed=True)),
+            _FakeCompleted(returncode=0),  # rm
+            _listing(["unrelated"]),  # confirmed gone
+        ],
+        popen_factory=lambda: _FakeProc(),
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.outcome == events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.error.code == ErrorCode.EXECUTOR_OOM_KILLED
+
+
+def test_oom_classification_takes_precedence_over_would_be_test_failure(
+    monkeypatch, tmp_path
+) -> None:
+    verifier = _make_verifier(
+        monkeypatch,
+        tmp_path,
+        docker_calls=[
+            _FakeCompleted(returncode=0),  # create
+            _FakeCompleted(returncode=0, stdout=_state_json(exit_code=1, oom_killed=True)),
+            _FakeCompleted(returncode=0),  # rm
+            _listing(["unrelated"]),  # confirmed gone
+        ],
+        popen_factory=lambda: _FakeProc(),
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.outcome == events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.error.code == ErrorCode.EXECUTOR_OOM_KILLED
+
+
+def test_unconfirmed_cleanup_overrides_an_oom_result(monkeypatch, tmp_path) -> None:
+    """Cleanup confirmation remains authoritative over every provisional
+    result, including a would-be OOM classification: if the container
+    still shows up in `docker ps -a` afterward, the final outcome must
+    be the generic unconfirmed-cleanup ENVIRONMENT_FAILURE, not the OOM
+    one."""
+    name = _container_name("baseline")
+    verifier = _make_verifier(
+        monkeypatch,
+        tmp_path,
+        docker_calls=[
+            _FakeCompleted(returncode=0),  # create
+            _FakeCompleted(returncode=0, stdout=_state_json(exit_code=137, oom_killed=True)),
+            _FakeCompleted(returncode=0),  # rm
+            _listing([name]),  # STILL PRESENT
+        ],
+        popen_factory=lambda: _FakeProc(),
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.outcome == events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.exit_code is None
+    assert result.error.code == ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE
+
+
+# --------------------------------------------------------------------
+# _SECURITY_FLAGS: --memory / --memory-swap
+# --------------------------------------------------------------------
+
+
+def test_security_flags_tuple_pins_memory_swap_immediately_beside_memory() -> None:
+    """Sanity check on the _SECURITY_FLAGS tuple itself. This proves the
+    tuple's own shape, not that a real `docker create` invocation
+    actually receives it — see
+    test_docker_create_argv_includes_memory_and_memory_swap_flags below
+    for that."""
+    assert "--memory" in _SECURITY_FLAGS
+    memory_index = _SECURITY_FLAGS.index("--memory")
+    assert _SECURITY_FLAGS[memory_index : memory_index + 4] == (
+        "--memory",
+        "512m",
+        "--memory-swap",
+        "512m",
+    )
+
+
+def test_docker_create_argv_includes_memory_and_memory_swap_flags(monkeypatch, tmp_path) -> None:
+    """Proves the flags actually cross the Docker command boundary: the
+    real argv passed to `_run_docker` for the `create` subcommand
+    (captured here, not just read back off _SECURITY_FLAGS) must
+    contain `--memory 512m --memory-swap 512m` in that exact order."""
+    captured_create_argv: list[str] = []
+    calls = [
+        _FakeCompleted(returncode=0),  # create
+        _FakeCompleted(returncode=0, stdout=_state_json(exit_code=0, oom_killed=False)),
+        _FakeCompleted(returncode=0),  # rm
+        _listing(["unrelated"]),  # confirmed gone
+    ]
+
+    def fake_run_docker(*args: str):
+        if args and args[0] == "create":
+            captured_create_argv.extend(args)
+        return calls.pop(0)
+
+    monkeypatch.setattr("codeagent.executor._run_docker", fake_run_docker)
+    monkeypatch.setattr("codeagent.executor.uuid4", lambda: _FIXED_UUID)
+    monkeypatch.setattr("codeagent.executor.subprocess.Popen", lambda *a, **k: _FakeProc())
+
+    verifier = DockerVerifier(tmp_path, clock=SteppingClock())
+    result = verifier.run_baseline()
+
+    assert result.outcome == events.VerificationOutcome.PASSED
+    joined = " ".join(captured_create_argv)
+    assert "--memory 512m --memory-swap 512m" in joined
+
+
 def test_unconfirmed_cleanup_overrides_a_would_be_passed_result(monkeypatch, tmp_path) -> None:
     """A cleanup attempt is not a cleanup guarantee: even though the
     container genuinely exited 0, if `docker ps -a` still lists it
@@ -426,7 +638,7 @@ def test_unconfirmed_cleanup_overrides_a_would_be_passed_result(monkeypatch, tmp
         tmp_path,
         docker_calls=[
             _FakeCompleted(returncode=0),  # create
-            _FakeCompleted(returncode=0, stdout="exited\t0"),  # inspect (would-be PASSED)
+            _FakeCompleted(returncode=0, stdout=_state_json(exit_code=0, oom_killed=False)),
             _FakeCompleted(returncode=0),  # rm
             _listing([name]),  # STILL PRESENT
         ],
@@ -483,7 +695,7 @@ def test_cleanup_launch_failure_does_not_crash_and_is_unconfirmed(monkeypatch, t
         tmp_path,
         docker_calls=[
             _FakeCompleted(returncode=0),  # create
-            _FakeCompleted(returncode=0, stdout="exited\t0"),  # inspect
+            _FakeCompleted(returncode=0, stdout=_state_json(exit_code=0, oom_killed=False)),
             _FakeCompleted(returncode=0),  # rm (best effort, succeeds)
             _DockerLaunchError("docker vanished"),  # confirm listing fails to launch
         ],

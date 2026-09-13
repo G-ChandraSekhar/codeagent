@@ -29,9 +29,12 @@ _SOME_ERROR = OperationalError(
 _OTHER_ERROR = OperationalError(
     code=ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE, error_id="err-2", message="env broke"
 )
+_OOM_ERROR = OperationalError(
+    code=ErrorCode.EXECUTOR_OOM_KILLED, error_id="err-3", message="oom killed"
+)
 
 _EXIT_CODE_CANDIDATES = (None, 0, 1, 137)
-_ERROR_CANDIDATES = (None, _SOME_ERROR, _OTHER_ERROR)
+_ERROR_CANDIDATES = (None, _SOME_ERROR, _OTHER_ERROR, _OOM_ERROR)
 
 
 def _build_baseline_event(outcome, exit_code, error) -> None:

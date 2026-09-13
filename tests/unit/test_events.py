@@ -254,6 +254,44 @@ def test_baseline_recorded_rejects_error_when_passed() -> None:
         )
 
 
+def test_baseline_recorded_accepts_environment_failure_with_oom_killed_code() -> None:
+    """ENVIRONMENT_FAILURE accepts either the general
+    EXECUTOR_ENVIRONMENT_FAILURE or the narrower, Milestone-3
+    EXECUTOR_OOM_KILLED (a Docker-confirmed OOM kill) -- both are still
+    ENVIRONMENT_FAILURE outcomes."""
+    e = _make_baseline_recorded(
+        outcome=events.VerificationOutcome.ENVIRONMENT_FAILURE,
+        exit_code=137,
+        error=OperationalError(
+            code=ErrorCode.EXECUTOR_OOM_KILLED, error_id="err-1", message="oom killed"
+        ),
+    )
+    assert e.error.code is ErrorCode.EXECUTOR_OOM_KILLED
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        events.VerificationOutcome.TIMEOUT,
+        events.VerificationOutcome.COMMAND_START_FAILURE,
+    ],
+)
+def test_baseline_recorded_rejects_oom_killed_code_for_non_environment_failure_outcomes(
+    outcome: events.VerificationOutcome,
+) -> None:
+    """EXECUTOR_OOM_KILLED is only ever valid alongside
+    ENVIRONMENT_FAILURE -- every other outcome stays fail-closed to its
+    own single expected code."""
+    with pytest.raises(ValueError):
+        _make_baseline_recorded(
+            outcome=outcome,
+            exit_code=None,
+            error=OperationalError(
+                code=ErrorCode.EXECUTOR_OOM_KILLED, error_id="err-1", message="oom killed"
+            ),
+        )
+
+
 # --------------------------------------------------------------------
 # StateTransitioned
 # --------------------------------------------------------------------
@@ -1242,6 +1280,37 @@ def test_verification_completed_rejects_error_when_passed() -> None:
     with pytest.raises(ValueError):
         _make_verification_completed(
             error=_executor_error_for(events.VerificationOutcome.TIMEOUT)
+        )
+
+
+def test_verification_completed_accepts_environment_failure_with_oom_killed_code() -> None:
+    e = _make_verification_completed(
+        outcome=events.VerificationOutcome.ENVIRONMENT_FAILURE,
+        exit_code=137,
+        error=OperationalError(
+            code=ErrorCode.EXECUTOR_OOM_KILLED, error_id="err-1", message="oom killed"
+        ),
+    )
+    assert e.error.code is ErrorCode.EXECUTOR_OOM_KILLED
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        events.VerificationOutcome.TIMEOUT,
+        events.VerificationOutcome.COMMAND_START_FAILURE,
+    ],
+)
+def test_verification_completed_rejects_oom_killed_code_for_non_environment_failure_outcomes(
+    outcome: events.VerificationOutcome,
+) -> None:
+    with pytest.raises(ValueError):
+        _make_verification_completed(
+            outcome=outcome,
+            exit_code=None,
+            error=OperationalError(
+                code=ErrorCode.EXECUTOR_OOM_KILLED, error_id="err-1", message="oom killed"
+            ),
         )
 
 

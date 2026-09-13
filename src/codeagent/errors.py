@@ -115,6 +115,17 @@ class ErrorCode(str, Enum):
     EXECUTOR_COMMAND_START_FAILED = "executor_command_start_failed"
     EXECUTOR_TIMEOUT = "executor_timeout"
     EXECUTOR_ENVIRONMENT_FAILURE = "executor_environment_failure"
+    # A Docker-confirmed OOM kill (State.OOMKilled == true) — a real,
+    # narrower cause within ENVIRONMENT_FAILURE (Milestone 3, following
+    # Stage-2 spike S4's finding that the verification container's
+    # configured --memory limit alone did not cap combined memory+swap
+    # usage; see spikes/s4/S4_RESULT.md). Deliberately not TEST_FAILURE
+    # (the repository's own tests did not fail; the container was
+    # killed by the kernel before any test result could be trusted) and
+    # not a controller-level BUDGET_EXCEEDED (this is the executor
+    # observing its own container being killed, not a budget the
+    # controller is tracking).
+    EXECUTOR_OOM_KILLED = "executor_oom_killed"
 
     # ErrorDomain.PERSISTENCE — the event log or checkpoint store could
     # not be durably written.
@@ -153,6 +164,7 @@ ERROR_DOMAIN_BY_CODE: dict[ErrorCode, ErrorDomain] = {
     ErrorCode.EXECUTOR_COMMAND_START_FAILED: ErrorDomain.EXECUTOR,
     ErrorCode.EXECUTOR_TIMEOUT: ErrorDomain.EXECUTOR,
     ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE: ErrorDomain.EXECUTOR,
+    ErrorCode.EXECUTOR_OOM_KILLED: ErrorDomain.EXECUTOR,
     ErrorCode.PERSISTENCE_WRITE_FAILED: ErrorDomain.PERSISTENCE,
     ErrorCode.POLICY_VIOLATION_SEVERE: ErrorDomain.POLICY,
     ErrorCode.INTERNAL_INVARIANT_VIOLATION: ErrorDomain.INTERNAL,

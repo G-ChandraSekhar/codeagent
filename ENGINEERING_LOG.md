@@ -972,3 +972,39 @@ failed listing, matching leftover) before pushing.
   restriction further. S5 (interruption without orphaned containers)
   remains unstarted. No ADR yet — these are still open questions, not
   decisions.
+
+---
+
+## Session: Milestone 3 — executor hardening from S4 evidence (memory/swap, OOM classification)
+
+**Outcome**: both S4-derived open questions are now resolved in
+`src/codeagent/executor.py` (no ADR — routine security-config
+tightening plus a mechanical taxonomy addition). S4's retained
+evidence observed `Memory=512 MiB` / `MemorySwap=1024 MiB` (~512 MiB of
+extra swap) on both macOS Docker Desktop and native Linux Docker
+Engine; `_SECURITY_FLAGS` now adds `--memory-swap 512m` to close that.
+Final-state inspection now parses `docker inspect --format
+'{{json .State}}'` (`Status`/`ExitCode`/`OOMKilled`, strictly typed,
+fail-closed to the existing `EXECUTOR_ENVIRONMENT_FAILURE` on any
+malformed field) instead of a fragile tab-separated format. A
+confirmed `OOMKilled` now takes precedence over `PASSED`/`TEST_FAILURE`,
+producing `ENVIRONMENT_FAILURE` with the new
+`ErrorCode.EXECUTOR_OOM_KILLED` and the observed exit code preserved —
+only a fixed sanitized message is persisted, never the raw inspect
+payload. `events.py` now accepts either `EXECUTOR_ENVIRONMENT_FAILURE`
+or `EXECUTOR_OOM_KILLED` for `ENVIRONMENT_FAILURE`; every other
+outcome/code pairing stays fail-closed. The unconditional
+cleanup-confirmation override is unchanged and still takes precedence
+over a would-be OOM result. Linux CAP_SYS_ADMIN stays `INCONCLUSIVE` —
+no capability/seccomp/AppArmor/runtime change.
+
+- **Verification**: full suite passing (unit + integration, including
+  a new controller test proving OOM propagates to `UNRECOVERABLE_ERROR`
+  without entering the repair loop or emitting `BudgetExceeded`); the 3
+  real-Docker `test_slice_c.py` tests pass against the new flag and
+  inspection format; `git diff --check` clean; no leftover
+  CodeAgent-owned containers.
+- **Remaining risk**: `--memory-swap` itself has not been re-verified
+  with new adversarial S4-style evidence on either platform (S4's
+  bundle is retained, not rerun). Linux CAP_SYS_ADMIN attribution and
+  S5 (interruption without orphaned containers) remain open.

@@ -160,29 +160,37 @@ def _validate_exit_code_for_outcome(outcome: VerificationOutcome, exit_code: int
     # TIMEOUT and ENVIRONMENT_FAILURE: any int or None is permitted.
 
 
-# The one ErrorCode each non-passing, non-test-failure outcome requires
+# The ErrorCode(s) each non-passing, non-test-failure outcome accepts
 # (point 7 of the error-taxonomy correction pass): `outcome` stays the
 # single source of truth, and `error.code` is validated against it
-# rather than being an independent, possibly-drifting fact.
-_EXECUTOR_ERROR_CODE_BY_OUTCOME: dict[VerificationOutcome, ErrorCode] = {
-    VerificationOutcome.TIMEOUT: ErrorCode.EXECUTOR_TIMEOUT,
-    VerificationOutcome.ENVIRONMENT_FAILURE: ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
-    VerificationOutcome.COMMAND_START_FAILURE: ErrorCode.EXECUTOR_COMMAND_START_FAILED,
+# rather than being an independent, possibly-drifting fact. Most
+# outcomes accept exactly one code; ENVIRONMENT_FAILURE accepts two —
+# the general EXECUTOR_ENVIRONMENT_FAILURE and the narrower, Milestone-3
+# EXECUTOR_OOM_KILLED (a Docker-confirmed OOM kill) — both are still
+# ENVIRONMENT_FAILURE outcomes, just with a more specific cause in the
+# OOM case. Every other outcome/error combination stays fail-closed.
+_EXECUTOR_ERROR_CODES_BY_OUTCOME: dict[VerificationOutcome, frozenset[ErrorCode]] = {
+    VerificationOutcome.TIMEOUT: frozenset({ErrorCode.EXECUTOR_TIMEOUT}),
+    VerificationOutcome.ENVIRONMENT_FAILURE: frozenset(
+        {ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE, ErrorCode.EXECUTOR_OOM_KILLED}
+    ),
+    VerificationOutcome.COMMAND_START_FAILURE: frozenset({ErrorCode.EXECUTOR_COMMAND_START_FAILED}),
 }
 
 
 def _validate_error_for_verification_outcome(
     outcome: VerificationOutcome, error: OperationalError | None
 ) -> None:
-    expected_code = _EXECUTOR_ERROR_CODE_BY_OUTCOME.get(outcome)
-    if expected_code is None:
+    expected_codes = _EXECUTOR_ERROR_CODES_BY_OUTCOME.get(outcome)
+    if expected_codes is None:
         # PASSED or TEST_FAILURE: both are expected domain outcomes, not
         # errors (error-taxonomy requirement 2) — no error permitted.
         if error is not None:
             raise ValueError(f"error must be None when outcome is {outcome!r}, got {error!r}")
-    elif error is None or error.code is not expected_code:
+    elif error is None or error.code not in expected_codes:
         raise ValueError(
-            f"error must be set with code {expected_code!r} when outcome is {outcome!r}, "
+            f"error must be set with a code in "
+            f"{sorted(c.value for c in expected_codes)!r} when outcome is {outcome!r}, "
             f"got {error!r}"
         )
 

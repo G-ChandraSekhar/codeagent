@@ -12,8 +12,15 @@ from __future__ import annotations
 import pytest
 
 from codeagent import domain, events
-from codeagent.controller import EventLog, ModelClient, PlanProposal, RunConfig, RunController
-from codeagent.errors import ErrorCode
+from codeagent.controller import (
+    EventLog,
+    ModelClient,
+    PlanProposal,
+    RunConfig,
+    RunController,
+    VerificationResult,
+)
+from codeagent.errors import ErrorCode, OperationalError
 from tests.support.fakes import (
     FakeApprovalProvider,
     FakeModel,
@@ -395,6 +402,112 @@ def test_patch_failure_reuses_the_same_error_id_across_events() -> None:
     assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
     assert not any(isinstance(e, events.CheckpointCreated) for e in controller.log.events)
     assert not any(isinstance(e, events.VerificationCompleted) for e in controller.log.events)
+
+
+# --------------------------------------------------------------------
+# Milestone 3: a Docker-confirmed OOM kill (ErrorCode.EXECUTOR_OOM_KILLED)
+# during verification is an operational failure like any other
+# TIMEOUT/ENVIRONMENT_FAILURE outcome, not an ordinary TEST_FAILURE — it
+# must abort the run outright rather than entering the repair loop, and
+# must never surface as BudgetExceeded. FakeVerifier is deliberately
+# restricted to PASSED/TEST_FAILURE (see fakes.py), so this uses a
+# small test-local Verifier double instead of weakening that fake.
+# --------------------------------------------------------------------
+
+
+class _OomVerifier:
+    """Test-local Verifier double: a real executor (e.g. DockerVerifier)
+    is the only thing that can genuinely produce ENVIRONMENT_FAILURE
+    with EXECUTOR_OOM_KILLED — this fabricates that exact shape without
+    touching Docker, to prove the controller propagates it correctly
+    end-to-end."""
+
+    def __init__(self) -> None:
+        self._command = ("python3", "-B", "-m", "unittest", "tests.test_worker")
+        self.oom_error = OperationalError(
+            code=ErrorCode.EXECUTOR_OOM_KILLED,
+            error_id="oom-occurrence-1",
+            message="verification container was killed for exceeding its memory limit",
+        )
+
+    @property
+    def command(self) -> tuple[str, ...]:
+        return self._command
+
+    def run_baseline(self) -> VerificationResult:
+        return VerificationResult(
+            outcome=events.VerificationOutcome.TEST_FAILURE,
+            exit_code=1,
+            duration_seconds=0.01,
+            stdout="",
+            stderr="",
+        )
+
+    def run(self, attempt_index: int) -> VerificationResult:
+        return VerificationResult(
+            outcome=events.VerificationOutcome.ENVIRONMENT_FAILURE,
+            exit_code=137,
+            duration_seconds=0.01,
+            stdout="",
+            stderr="",
+            error=self.oom_error,
+        )
+
+
+def test_confirmed_oom_kill_during_verification_aborts_the_run_without_repair_or_budget() -> None:
+    config = RunConfig(
+        run_id="r-oom",
+        task_statement="fix retry bug",
+        approval_mode=domain.ApprovalMode.INTERACTIVE,
+        max_repair_iterations=3,
+        max_plan_revisions=2,
+    )
+    verifier = _OomVerifier()
+    controller = RunController(
+        config,
+        FakeModel(PLAN),
+        FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
+        verifier,
+        FakePatchApplier(),
+        FakeRepositoryReader(),
+        clock=SteppingClock(),
+    )
+
+    finished = controller.run()
+
+    _assert_monotonic_sequence(controller)
+
+    # Baseline TEST_FAILURE is an expected outcome, so the run proceeds
+    # into exploration/plan/approve/patch/verify as normal...
+    assert any(
+        isinstance(e, events.BaselineRecorded)
+        and e.outcome is events.VerificationOutcome.TEST_FAILURE
+        for e in controller.log.events
+    )
+
+    # ...but the OOM-killed verification aborts the run outright.
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.EXECUTOR_OOM_KILLED
+
+    verification_completions = [
+        e for e in controller.log.events if isinstance(e, events.VerificationCompleted)
+    ]
+    assert len(verification_completions) == 1
+    completed = verification_completions[0]
+    assert completed.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert completed.error is not None
+    assert completed.error.code is ErrorCode.EXECUTOR_OOM_KILLED
+
+    # Same real failure occurrence, referenced identically from both
+    # events -- the same discipline as the patch-failure error_id
+    # reversal above.
+    assert completed.error.error_id == finished.error.error_id == verifier.oom_error.error_id
+
+    # Never treated as an ordinary repairable test failure: only one
+    # verification attempt happened, and no BudgetExceeded was ever
+    # emitted (repair budget was never consumed, let alone exhausted).
+    assert not any(isinstance(e, events.BudgetExceeded) for e in controller.log.events)
 
 
 # --------------------------------------------------------------------

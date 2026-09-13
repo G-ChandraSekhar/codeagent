@@ -46,6 +46,7 @@ container's own exit state would otherwise have produced: a cleanup
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import subprocess
@@ -76,6 +77,19 @@ _SECURITY_FLAGS: tuple[str, ...] = (
     "--tmpfs",
     "/tmp:rw,size=64m",
     "--memory",
+    "512m",
+    # Without --memory-swap, --memory alone does not cap the combined
+    # memory+swap allowance: Stage-2 spike S4's retained evidence
+    # observed HostConfig.Memory=512 MiB but
+    # HostConfig.MemorySwap=1024 MiB total (i.e. ~512 MiB of additional
+    # swap on top of the memory limit) on both macOS/Docker Desktop and
+    # native Linux Docker Engine (the specific hosts tested — see
+    # spikes/s4/S4_RESULT.md; this is an observed configuration on
+    # those hosts, not a claimed universal Docker default).
+    # --memory-swap set equal to --memory means "no additional swap
+    # beyond the memory limit," closing that gap for the combined
+    # memory+swap allowance.
+    "--memory-swap",
     "512m",
     "--cpus",
     "1",
@@ -254,7 +268,9 @@ class DockerVerifier:
             )
 
         try:
-            exit_code, status, stdout_text, stderr_text, timed_out = self._start_and_inspect(name)
+            exit_code, status, oom_killed, stdout_text, stderr_text, timed_out = (
+                self._start_and_inspect(name)
+            )
         except _DockerLaunchError:
             return (
                 True,
@@ -282,7 +298,7 @@ class DockerVerifier:
                     "verification container exceeded its time budget",
                 ),
             )
-        if status != "exited" or exit_code is None:
+        if status != "exited" or exit_code is None or oom_killed is None:
             return (
                 True,
                 events.VerificationOutcome.ENVIRONMENT_FAILURE,
@@ -293,6 +309,26 @@ class DockerVerifier:
                     ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
                     label,
                     "failed to inspect the verification container's final state",
+                ),
+            )
+        # A confirmed OOM kill takes precedence over both PASSED and
+        # TEST_FAILURE: the container was killed by the kernel before
+        # any exit code it reports can be trusted as a real test
+        # result (Milestone 3, following Stage-2 spike S4 — see
+        # spikes/s4/S4_RESULT.md). The exit code is preserved for the
+        # record, but only a fixed, sanitized message is persisted —
+        # never raw Docker inspect payloads or daemon output.
+        if oom_killed:
+            return (
+                True,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                exit_code,
+                stdout_text,
+                stderr_text,
+                self._error(
+                    ErrorCode.EXECUTOR_OOM_KILLED,
+                    label,
+                    "verification container was killed for exceeding its memory limit",
                 ),
             )
         if exit_code == 0:
@@ -340,7 +376,7 @@ class DockerVerifier:
 
     def _start_and_inspect(
         self, name: str
-    ) -> tuple[int | None, str | None, str, str, bool]:
+    ) -> tuple[int | None, str | None, bool | None, str, str, bool]:
         stdout_collector = _BoundedCollector(_MAX_STREAM_BYTES)
         stderr_collector = _BoundedCollector(_MAX_STREAM_BYTES)
         try:
@@ -375,25 +411,48 @@ class DockerVerifier:
         stderr_text = stderr_collector.text()
 
         if timed_out:
-            return None, None, stdout_text, stderr_text, True
+            return None, None, None, stdout_text, stderr_text, True
 
         try:
-            inspect_result = _run_docker(
-                "inspect", "--format", "{{.State.Status}}\t{{.State.ExitCode}}", name
-            )
+            inspect_result = _run_docker("inspect", "--format", "{{json .State}}", name)
         except _DockerLaunchError:
-            return None, None, stdout_text, stderr_text, False
+            return None, None, None, stdout_text, stderr_text, False
         if inspect_result.returncode != 0:
-            return None, None, stdout_text, stderr_text, False
-        parts = inspect_result.stdout.strip().split("\t")
-        if len(parts) != 2:
-            return None, None, stdout_text, stderr_text, False
-        status, exit_code_str = parts
+            return None, None, None, stdout_text, stderr_text, False
+
+        exit_code, status, oom_killed = self._parse_state(inspect_result.stdout)
+        return exit_code, status, oom_killed, stdout_text, stderr_text, False
+
+    @staticmethod
+    def _parse_state(raw_state: str) -> tuple[int | None, str | None, bool | None]:
+        """Parses `docker inspect --format '{{json .State}}'`'s output
+        and validates it strictly, fail-closed: any parse error, wrong
+        shape, missing field, or wrong field type returns
+        (None, None, None) uniformly rather than a partially-trusted
+        value — the caller then treats that as a malformed inspection
+        (ENVIRONMENT_FAILURE), the same outcome as any other inspection
+        failure. `ExitCode` must be an actual int, not a bool (`bool`
+        is a subclass of `int` in Python, so `isinstance(x, int)` alone
+        would silently accept `True`/`False` as an exit code)."""
         try:
-            exit_code = int(exit_code_str)
-        except ValueError:
-            return None, status, stdout_text, stderr_text, False
-        return exit_code, status, stdout_text, stderr_text, False
+            state = json.loads(raw_state)
+        except (json.JSONDecodeError, ValueError):
+            return None, None, None
+        if not isinstance(state, dict):
+            return None, None, None
+
+        status = state.get("Status")
+        exit_code = state.get("ExitCode")
+        oom_killed = state.get("OOMKilled")
+
+        if not isinstance(status, str):
+            return None, None, None
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            return None, None, None
+        if not isinstance(oom_killed, bool):
+            return None, None, None
+
+        return exit_code, status, oom_killed
 
     def _cleanup(self, name: str) -> bool:
         """Best-effort removal, followed by a genuine confirmation check
