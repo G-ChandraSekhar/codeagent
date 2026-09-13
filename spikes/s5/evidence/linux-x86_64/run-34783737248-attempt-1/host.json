@@ -1,0 +1,15 @@
+{
+  "system": "Linux",
+  "release": "6.17.0-1022-azure",
+  "machine": "x86_64",
+  "python_version": "3.12.14",
+  "docker_client_version": "28.0.4",
+  "docker_server_version": "28.0.4",
+  "docker_daemon_cgroup_version": "2",
+  "lock_resolved_path": "/tmp/codeagent-spike-s5-session-dfll1g93/locks/6400e84538c6.lock",
+  "lock_mountpoint": "/",
+  "lock_filesystem_type": "ext4",
+  "worktree_resolved_path": "/tmp/codeagent-spike-s5-session-dfll1g93/worktrees/6400e84538c6",
+  "worktree_mountpoint": "/",
+  "worktree_filesystem_type": "ext4"
+}

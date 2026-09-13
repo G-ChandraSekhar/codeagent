@@ -1,0 +1,15 @@
+{
+  "session_id": "b486204aeeae",
+  "repository_head": "3d25fa6a6ec2575c97c716aeccc3bbbea18fc9b7",
+  "repository_dirty": false,
+  "harness_file": "spikes/s5/spike_s5.py",
+  "harness_sha256": "443a1cb79281a5433c6b3dc223a082d63b93cb8c5868edc0537ca1466b3175ca",
+  "s5_baseline_commit": "d2a6f639826bb1368cc88a6233394b0c6b0ca7da",
+  "s5_baseline_commit_is_ancestor": true,
+  "workflow_run_id": "34783737248",
+  "workflow_run_attempt": "1",
+  "workflow_run_url": "https://github.com/G-ChandraSekhar/codeagent/actions/runs/34783737248",
+  "actions_context_present": true,
+  "note": "repository_head does NOT represent the harness that produced this evidence unless repository_dirty is false and this exact harness_sha256 matches the tracked file at that commit -- the harness may be uncommitted/modified relative to HEAD; harness_sha256 is the authoritative pointer to the exact code that ran.",
+  "triggered_at": "2026-09-13T21:24:54.765173+00:00"
+}

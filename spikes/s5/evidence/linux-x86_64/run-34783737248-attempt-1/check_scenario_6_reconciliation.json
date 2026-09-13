@@ -1,0 +1,171 @@
+{
+  "reconcile_result": {
+    "ok": true,
+    "results": [
+      {
+        "run_token": "01f55ac221b6",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      },
+      {
+        "run_token": "266b3eec6a50",
+        "action": "skipped_active"
+      },
+      {
+        "run_token": "6400e84538c6",
+        "action": "reconciled",
+        "snapshot": {
+          "container_created": true,
+          "container_id": "f641f06ef64e015de3f16a2a8ed1a2aa14527b18a2daba02d1c48941975ed301",
+          "container_name": "codeagent-spike-s5-6400e84538c6",
+          "created_at": "2026-09-13T21:25:02.490579+00:00",
+          "failure_history": [],
+          "labels": {
+            "codeagent.s5_run": "6400e84538c6",
+            "codeagent.s5_session": "b486204aeeae",
+            "codeagent.spike": "s5"
+          },
+          "lock_path": "/tmp/codeagent-spike-s5-session-dfll1g93/locks/6400e84538c6.lock",
+          "pid": 3117,
+          "ready_barrier_ack_at": "2026-09-13T21:25:02.633974+00:00",
+          "reconciliation_attempts": 0,
+          "run_token": "6400e84538c6",
+          "scenario": "sigkill",
+          "session_id": "b486204aeeae",
+          "source_repo_path": "/tmp/codeagent-spike-s5-session-dfll1g93/fixture-repo",
+          "state": "READY",
+          "updated_at": "2026-09-13T21:25:02.633996+00:00",
+          "worktree_created": true,
+          "worktree_path": "/tmp/codeagent-spike-s5-session-dfll1g93/worktrees/6400e84538c6"
+        },
+        "manifest": {
+          "container_created": true,
+          "container_id": "f641f06ef64e015de3f16a2a8ed1a2aa14527b18a2daba02d1c48941975ed301",
+          "container_name": "codeagent-spike-s5-6400e84538c6",
+          "created_at": "2026-09-13T21:25:02.490579+00:00",
+          "failure_history": [],
+          "labels": {
+            "codeagent.s5_run": "6400e84538c6",
+            "codeagent.s5_session": "b486204aeeae",
+            "codeagent.spike": "s5"
+          },
+          "lock_path": "/tmp/codeagent-spike-s5-session-dfll1g93/locks/6400e84538c6.lock",
+          "pid": 3117,
+          "ready_barrier_ack_at": "2026-09-13T21:25:02.633974+00:00",
+          "reconciliation_attempts": 1,
+          "run_token": "6400e84538c6",
+          "scenario": "sigkill",
+          "session_id": "b486204aeeae",
+          "source_repo_path": "/tmp/codeagent-spike-s5-session-dfll1g93/fixture-repo",
+          "state": "RECONCILED",
+          "updated_at": "2026-09-13T21:25:02.964372+00:00",
+          "worktree_created": true,
+          "worktree_path": "/tmp/codeagent-spike-s5-session-dfll1g93/worktrees/6400e84538c6"
+        }
+      },
+      {
+        "run_token": "9d371c03de54",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      },
+      {
+        "run_token": "a9e0938d180b",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      },
+      {
+        "run_token": "f4c78cbbb540",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      }
+    ]
+  },
+  "reconcile_returncode": 0,
+  "target_entry": {
+    "run_token": "6400e84538c6",
+    "action": "reconciled",
+    "snapshot": {
+      "container_created": true,
+      "container_id": "f641f06ef64e015de3f16a2a8ed1a2aa14527b18a2daba02d1c48941975ed301",
+      "container_name": "codeagent-spike-s5-6400e84538c6",
+      "created_at": "2026-09-13T21:25:02.490579+00:00",
+      "failure_history": [],
+      "labels": {
+        "codeagent.s5_run": "6400e84538c6",
+        "codeagent.s5_session": "b486204aeeae",
+        "codeagent.spike": "s5"
+      },
+      "lock_path": "/tmp/codeagent-spike-s5-session-dfll1g93/locks/6400e84538c6.lock",
+      "pid": 3117,
+      "ready_barrier_ack_at": "2026-09-13T21:25:02.633974+00:00",
+      "reconciliation_attempts": 0,
+      "run_token": "6400e84538c6",
+      "scenario": "sigkill",
+      "session_id": "b486204aeeae",
+      "source_repo_path": "/tmp/codeagent-spike-s5-session-dfll1g93/fixture-repo",
+      "state": "READY",
+      "updated_at": "2026-09-13T21:25:02.633996+00:00",
+      "worktree_created": true,
+      "worktree_path": "/tmp/codeagent-spike-s5-session-dfll1g93/worktrees/6400e84538c6"
+    },
+    "manifest": {
+      "container_created": true,
+      "container_id": "f641f06ef64e015de3f16a2a8ed1a2aa14527b18a2daba02d1c48941975ed301",
+      "container_name": "codeagent-spike-s5-6400e84538c6",
+      "created_at": "2026-09-13T21:25:02.490579+00:00",
+      "failure_history": [],
+      "labels": {
+        "codeagent.s5_run": "6400e84538c6",
+        "codeagent.s5_session": "b486204aeeae",
+        "codeagent.spike": "s5"
+      },
+      "lock_path": "/tmp/codeagent-spike-s5-session-dfll1g93/locks/6400e84538c6.lock",
+      "pid": 3117,
+      "ready_barrier_ack_at": "2026-09-13T21:25:02.633974+00:00",
+      "reconciliation_attempts": 1,
+      "run_token": "6400e84538c6",
+      "scenario": "sigkill",
+      "session_id": "b486204aeeae",
+      "source_repo_path": "/tmp/codeagent-spike-s5-session-dfll1g93/fixture-repo",
+      "state": "RECONCILED",
+      "updated_at": "2026-09-13T21:25:02.964372+00:00",
+      "worktree_created": true,
+      "worktree_path": "/tmp/codeagent-spike-s5-session-dfll1g93/worktrees/6400e84538c6"
+    }
+  },
+  "worktree_removed": true,
+  "container_removed": true,
+  "canaries_unchanged": true,
+  "canary_snapshot_after": {
+    "codeagent-canary-a-unlabeled-8d736736": {
+      "present": true,
+      "id": "79ade76a9f8a2f8771320a8c49cb6a06b4c4bfb16e0a7102e14d4d766256f175",
+      "labels": {}
+    },
+    "codeagent-verify-baseline-8e20b92815c8": {
+      "present": true,
+      "id": "0507aaf6053eaa227aeb584542c2022e949180a764f3362cfe59956fa99a1c16",
+      "labels": {}
+    },
+    "codeagent-spike-s5-6b9d96810481": {
+      "present": true,
+      "id": "6c861ef0a87a8f2b7d8d3076dad7249fc814a7fa7c6111a5e0f1a7b2e84ce0a5",
+      "labels": {
+        "codeagent.s5_run": "6b9d96810481",
+        "codeagent.s5_session": "b4238231cb18",
+        "codeagent.spike": "s5"
+      }
+    },
+    "266b3eec6a50": {
+      "worktree_registered": true,
+      "worktree_dir": true,
+      "container_present": true,
+      "container_labels": {
+        "codeagent.s5_run": "266b3eec6a50",
+        "codeagent.s5_session": "b486204aeeae",
+        "codeagent.spike": "s5"
+      }
+    }
+  },
+  "classification": "PASS"
+}

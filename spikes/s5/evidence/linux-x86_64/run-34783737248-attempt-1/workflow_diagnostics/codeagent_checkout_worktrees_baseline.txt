@@ -1,0 +1,3 @@
+worktree /home/runner/work/codeagent/codeagent
+HEAD 3d25fa6a6ec2575c97c716aeccc3bbbea18fc9b7
+branch refs/heads/main

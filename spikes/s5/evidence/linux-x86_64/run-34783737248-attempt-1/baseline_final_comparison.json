@@ -1,0 +1,14 @@
+{
+  "purpose": "Host-integrity check on the real CodeAgent checkout (codeagent_repo_root) -- proves this run never registered a worktree there or left a stray Docker container globally visible. It does NOT prove the fixture repository's own per-scenario worktrees were removed; see fixture_worktree_check.json for that.",
+  "baseline_ps_ok": true,
+  "baseline_ps_raw": "CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES\n",
+  "baseline_worktree_ok": true,
+  "baseline_worktree_raw": "worktree /home/runner/work/codeagent/codeagent\nHEAD 3d25fa6a6ec2575c97c716aeccc3bbbea18fc9b7\nbranch refs/heads/main\n\n",
+  "final_ps_ok": true,
+  "final_ps_raw": "CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES\n",
+  "final_worktree_ok": true,
+  "final_worktree_raw": "worktree /home/runner/work/codeagent/codeagent\nHEAD 3d25fa6a6ec2575c97c716aeccc3bbbea18fc9b7\nbranch refs/heads/main\n\n",
+  "listings_ok": true,
+  "exactly_equal": true,
+  "scratch_root_removed_confirmed": true
+}

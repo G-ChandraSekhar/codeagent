@@ -1,0 +1,25 @@
+{
+  "container_created": true,
+  "container_id": "db4148519606f2682f00d1f709d7388cd77ea7a4af5ea3a927d4033c8b891f36",
+  "container_name": "codeagent-spike-s5-f4c78cbbb540",
+  "created_at": "2026-09-13T21:25:01.611920+00:00",
+  "failure_history": [],
+  "labels": {
+    "codeagent.s5_run": "f4c78cbbb540",
+    "codeagent.s5_session": "b486204aeeae",
+    "codeagent.spike": "s5"
+  },
+  "lock_path": "/tmp/codeagent-spike-s5-session-dfll1g93/locks/f4c78cbbb540.lock",
+  "pid": 2854,
+  "ready_barrier_ack_at": "2026-09-13T21:25:01.754505+00:00",
+  "reconciliation_attempts": 0,
+  "run_token": "f4c78cbbb540",
+  "scenario": "sigint",
+  "session_id": "b486204aeeae",
+  "sigint_received_at": "2026-09-13T21:25:01.817525+00:00",
+  "source_repo_path": "/tmp/codeagent-spike-s5-session-dfll1g93/fixture-repo",
+  "state": "READY",
+  "updated_at": "2026-09-13T21:25:01.817548+00:00",
+  "worktree_created": true,
+  "worktree_path": "/tmp/codeagent-spike-s5-session-dfll1g93/worktrees/f4c78cbbb540"
+}

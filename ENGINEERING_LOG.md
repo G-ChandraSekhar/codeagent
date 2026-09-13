@@ -1075,3 +1075,27 @@ written, with only a short factual status note added above it.
   repetition, production implementation, candidate-decision acceptance)
   remains open — this session only corrected wording, it made no new
   decision.
+
+---
+
+## Session (2026-09-13): S5 interruption evidence reproduced on Linux/x86_64
+
+Manual GitHub Actions run `34783737248` (attempt 1, source `3d25fa6`)
+reproduced the macOS S5 result on Ubuntu 24.04/Linux x86_64 with real
+Docker and a real throwaway Git worktree. All seven classifications
+passed: normal completion, cooperative cancellation, SIGINT, SIGTERM,
+expected SIGKILL orphaning, fresh-process reconciliation, and the
+separate idempotency check. The SIGKILL child left its labeled
+container and registered worktree exactly as expected; a fresh
+reconciler removed them without changing the four canaries.
+
+- **Evidence**: retained under
+  `spikes/s5/evidence/linux-x86_64/run-34783737248-attempt-1/`, including
+  the separately uploaded workflow diagnostics. Provenance and harness
+  SHA-256 matched source commit `3d25fa6`; 175 focused S5 tests passed;
+  harness cleanup and independent workflow baseline/final checks were
+  clean, with no capture/comparison failures or leftovers.
+- **Decision/scope**: evidence only. No label, registry, lock,
+  cancellation, signal-ownership, or startup-reconciliation design is
+  accepted; nothing is implemented in production. `S5_RESULT.md`
+  remains DRAFT pending author review.

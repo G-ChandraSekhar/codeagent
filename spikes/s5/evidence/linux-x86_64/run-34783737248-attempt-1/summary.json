@@ -1,0 +1,36 @@
+{
+  "host": {
+    "system": "Linux",
+    "release": "6.17.0-1022-azure",
+    "machine": "x86_64",
+    "python_version": "3.12.14",
+    "docker_client_version": "28.0.4",
+    "docker_server_version": "28.0.4",
+    "docker_daemon_cgroup_version": "2",
+    "lock_resolved_path": "/tmp/codeagent-spike-s5-session-dfll1g93/locks/6400e84538c6.lock",
+    "lock_mountpoint": "/",
+    "lock_filesystem_type": "ext4",
+    "worktree_resolved_path": "/tmp/codeagent-spike-s5-session-dfll1g93/worktrees/6400e84538c6",
+    "worktree_mountpoint": "/",
+    "worktree_filesystem_type": "ext4"
+  },
+  "session_id": "b486204aeeae",
+  "scenario_classifications": {
+    "normal_completion": "PASS",
+    "cooperative_cancellation": "PASS",
+    "sigint": "PASS",
+    "sigterm": "PASS",
+    "sigkill": "PASS",
+    "reconciliation": "PASS",
+    "idempotency": "PASS"
+  },
+  "emergency_cleanup_all_clean": true,
+  "scratch_root_removed_confirmed": true,
+  "fixture_repo_has_only_main_worktree": true,
+  "baseline_final_listings_ok": true,
+  "baseline_final_equal": true,
+  "experiment_exception": null,
+  "technical_failure_reason": null,
+  "secondary_cleanup_failures": [],
+  "overall_verdict": "PASS"
+}

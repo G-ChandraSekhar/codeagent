@@ -232,14 +232,15 @@ Stage 2 (of the four-stage planning process in
   post-hardening follow-up passed all checks on both platforms. Linux
   `cap_sys_admin` remains `INCONCLUSIVE` (unrelated). Full record:
   `spikes/s4/S4_RESULT.md`.
-- **S5 — interruption without orphaned containers**: macOS/arm64 spike
-  evidence is complete and committed at `d2a6f63` (six scenarios total:
+- **S5 — interruption without orphaned containers**: spike evidence is
+  complete on both macOS/arm64 and Linux/x86_64 (six scenarios total:
   five lifecycle outcomes — normal completion, cooperative
   cancellation, SIGINT, SIGTERM, SIGKILL — plus fresh-process
   reconciliation, followed by a separate second-pass idempotency check,
-  all against real Docker and a real throwaway worktree; see
-  `spikes/s5/S5_RESULT.md`, status DRAFT). Linux/x86-64
-  reproduction of the same spike is planned but not yet run. No S5
+  all against real Docker and a real throwaway worktree; macOS evidence
+  was committed at `d2a6f63`, and Linux workflow run `34783737248`
+  passed with independently clean workflow diagnostics; see
+  `spikes/s5/S5_RESULT.md`, status DRAFT). No S5
   mechanism (labeling, manifest/registry, locking, cancellation,
   startup reconciliation) is implemented in production, and no
   candidate architecture decision from this spike has been accepted.

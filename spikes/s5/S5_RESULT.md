@@ -1,20 +1,22 @@
 # S5_RESULT.md — interruption, cancellation, orphan-resource reconciliation
 
 **Status: DRAFT / author review pending.** This document reports what
-was directly observed across one authoritative run plus seven
-preserved historical runs (one of which failed on a real bug and is
-retained deliberately), all on macOS/arm64. It does not itself decide
-anything — no label schema, registry location, lock mechanism,
+was directly observed on both macOS/arm64 and Linux/x86_64. The macOS
+record contains one authoritative run plus seven preserved historical
+runs (one of which failed on a real bug and is retained deliberately);
+the Linux record contains one authoritative GitHub Actions run and its
+independent workflow diagnostics. It does not itself decide anything —
+no label schema, registry location, lock mechanism,
 startup-reconciliation policy, or signal-handling policy is accepted
 on the author's behalf by this document. See "Candidate decisions"
 below for what this evidence could inform, not what it settles.
 
 ## Scope
 
-macOS/Docker Desktop only, this pass (docs/threat-model.md's A9 —
-Linux and macOS are separate evidence domains; a Linux repetition is
-separate, unstarted work). Implements Planning Proposal Revision 4
-only (this session's four-pass review). Every mechanism exercised here
+Linux and macOS remain separate evidence domains under
+`docs/threat-model.md` A9. The original macOS/Docker Desktop evidence
+and the later Linux/x86_64 reproduction are reported separately below;
+neither substitutes for the other. Every mechanism exercised here
 — the three-tier Docker label schema, the durable JSON manifest, the
 `fcntl.flock` advisory lock, cooperative signal handling, and
 reconciliation — is **spike-only scaffolding**. Current production
@@ -113,6 +115,48 @@ failure; otherwise, if any secondary failure occurred, a new
 All seven prior runs are retained rather than deleted, per this
 project's rule against silently overwriting or discarding a prior
 run's evidence — including the one that failed.
+
+## Linux/x86_64 reproduction
+
+**Authoritative run**: GitHub Actions workflow run
+[`34783737248`](https://github.com/G-ChandraSekhar/codeagent/actions/runs/34783737248),
+attempt 1, from source commit
+`3d25fa6a6ec2575c97c716aeccc3bbbea18fc9b7`. Retained evidence:
+`spikes/s5/evidence/linux-x86_64/run-34783737248-attempt-1/`;
+independent workflow-level baseline/final diagnostics are retained
+under its `workflow_diagnostics/` subdirectory. Two raw Git-worktree
+listings have only their terminal blank record separator removed to
+satisfy the repository's whitespace check; their substantive lines
+remain identical to the downloaded artifact.
+
+The run completed successfully on Ubuntu 24.04 (`Linux
+6.17.0-1022-azure`, x86_64), Python 3.12.14, Docker client/server
+28.0.4, cgroup v2. The harness SHA-256 in `RUN_INFO.json` matches the
+tracked `spike_s5.py` at the source commit, the S5 baseline commit
+`d2a6f63` is recorded as an ancestor, and the workflow URL/run ID/run
+attempt all match the producing run. The scenario-5 lock and worktree
+were observed on ext4 at the `/` mount only after both exact paths
+existed and the child reached `READY`.
+
+All seven recorded classifications passed: normal completion,
+cooperative cancellation, SIGINT, SIGTERM, expected SIGKILL orphaning,
+fresh-process reconciliation, and the separate idempotency check.
+SIGKILL was confirmed by return code `-9`; the lock was busy before
+the signal and acquirable afterward; the labeled container and
+registered worktree remained until reconciliation; reconciliation
+removed exactly those resources while preserving all canaries.
+Harness cleanup reported `emergency_cleanup_all_clean: true`,
+`scratch_root_removed_confirmed: true`, a fixture repository with only
+its main worktree, and exact baseline/final equality. The independent
+workflow diagnostics likewise reported no capture failures, comparison
+failures, or leftovers. The workflow ran 175 focused S5 tests before
+the experiment. No production code was exercised as an S5 lifecycle
+implementation, and no candidate decision was accepted by this run.
+
+| Evidence domain | Lifecycle/reconciliation result | Independent cleanup result |
+| --- | --- | --- |
+| macOS/arm64, Docker Desktop | All seven classifications PASS | Harness cleanup and exact baseline/final checks PASS |
+| Linux/x86_64, GitHub Actions | All seven classifications PASS | Harness checks and workflow diagnostics PASS |
 
 ## Observations (directly inspected, not inferred)
 
@@ -302,11 +346,11 @@ every real process.
 
 - Scratch-local manifests only; no `~/.codeagent/...`-style real
   location was prototyped.
-- The advisory-lock mechanism's cross-process, PID-reuse-safe behavior
-  was empirically confirmed only on macOS/arm64/APFS this pass, both
-  in the focused test suite (a real dedicated subprocess) and in the
-  live scenario-5 evidence above; Linux/ext4 behavior is unconfirmed
-  until a later, separate run.
+- The advisory-lock mechanism's cross-process exclusion and automatic
+  release after the exact holder process dies were empirically
+  confirmed on macOS/arm64/APFS and Linux/x86_64/ext4. PID identity is
+  not the authority, but PID reuse itself was not induced or observed;
+  host-reboot behavior and network filesystems remain untested.
 - Host-reboot recovery remains explicitly out of scope (consistent
   with `docs/threat-model.md`'s T-F4); only an application-level
   restart (a fresh reconciler process) was exercised.
