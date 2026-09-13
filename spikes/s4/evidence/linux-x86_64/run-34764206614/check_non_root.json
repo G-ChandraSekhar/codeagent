@@ -1,0 +1,14 @@
+{
+  "check": "non_root",
+  "primary": {
+    "result": "PASS",
+    "stdout": "uid 1000 euid 1000\n",
+    "returncode": 0
+  },
+  "control": {
+    "result": "PASS",
+    "stdout": "uid 0 euid 0\nsecret-content\n\n",
+    "returncode": 0
+  },
+  "classification": "PASS"
+}

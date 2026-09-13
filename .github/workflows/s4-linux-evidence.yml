@@ -80,7 +80,21 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          LEFTOVER=$(docker ps -a --format '{{.Names}}' | grep -E '^(codeagent-verify-|codeagent-spike-s4-)' || true)
+          # Capture the listing as its OWN command first, so a failed
+          # `docker ps` (e.g. daemon unreachable) propagates and fails
+          # this step -- piping it straight into `grep ... || true`
+          # would have swallowed that failure (the pipeline's exit
+          # status would be grep's/true's, not docker ps's) and a
+          # silently-empty $ALL_CONTAINERS would have been
+          # indistinguishable from "confirmed no containers exist".
+          ALL_CONTAINERS=$(docker ps -a --format '{{.Names}}')
+          echo "All containers on runner:"
+          echo "$ALL_CONTAINERS"
+          # grep exiting 1 here means "no match" (a normal, successful
+          # empty result) -- `|| true` only swallows THAT, not a
+          # failure of the listing itself, which already happened (or
+          # didn't) on the line above.
+          LEFTOVER=$(echo "$ALL_CONTAINERS" | grep -E '^(codeagent-verify-|codeagent-spike-s4-)' || true)
           echo "CodeAgent-owned containers currently present (expected: none):"
           echo "$LEFTOVER"
           if [ -n "$LEFTOVER" ]; then

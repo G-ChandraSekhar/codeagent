@@ -1,0 +1,36 @@
+{
+  "check": "mounts_and_host_isolation",
+  "primary": {
+    "result": "PASS",
+    "mounts": [
+      {
+        "Type": "bind",
+        "Source": "/tmp/codeagent-spike-s4-mounts-workspace-h95hj8o_",
+        "Destination": "/workspace",
+        "Mode": "",
+        "RW": false,
+        "Propagation": "rprivate"
+      }
+    ],
+    "tmpfs": {
+      "/tmp": "rw,size=64m"
+    },
+    "mounts_ok": true,
+    "tmpfs_ok": true,
+    "host_mount_source_mode_and_owner": {
+      "path": "/tmp/codeagent-spike-s4-mounts-workspace-h95hj8o_",
+      "mode_octal": "0o755",
+      "uid": 1001
+    },
+    "exec_returncode": 0,
+    "probe": {
+      "expected_readable": true,
+      "expected_content_matches": true,
+      "host_secret_absent_at_root": true,
+      "host_secret_absent_at_host_path": true
+    },
+    "host_isolation_stdout": "{\"expected_readable\": true, \"expected_content_matches\": true, \"host_secret_absent_at_root\": true, \"host_secret_absent_at_host_path\": true}\n",
+    "host_isolation_stderr": ""
+  },
+  "classification": "PASS"
+}

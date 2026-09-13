@@ -1,0 +1,19 @@
+{
+  "check": "network_blocked",
+  "primary": {
+    "result": "PASS",
+    "verifier_outcome": "test_failure",
+    "stdout": "CONNECT_FAILED OSError(101, 'Network is unreachable')\n",
+    "exit_code": 1
+  },
+  "control": {
+    "result": "PASS",
+    "stdout": "",
+    "returncode": 0
+  },
+  "classification": "PASS",
+  "evidence": {
+    "network": "codeagent-spike-s4-net-7177d5b6",
+    "server_ip": "172.18.0.2"
+  }
+}

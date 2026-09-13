@@ -1,0 +1,9 @@
+{
+  "workflow": "s4-linux-evidence.yml (S4 Linux Evidence (manual))",
+  "run_id": "34764206614",
+  "workflow_url": "https://github.com/G-ChandraSekhar/codeagent/actions/runs/34764206614",
+  "source_commit": "8db44a960f03460e8cfe393acef6c854fe90aab8",
+  "triggered_at": "2026-09-13T14:58:37Z",
+  "job_conclusion": "failure",
+  "note": "First Linux attempt. Failed with overall_verdict=FAIL due to mounts_and_host_isolation. Diagnosed as a fixture-permission bug in the spike harness itself (tempfile.mkdtemp()'s default 0700 mode, combined with the scratch directory being owned by the runner's own UID rather than the container's configured UID 1000, blocked the container from traversing/reading its own intended-readable fixture file) -- not a finding about container isolation. Fixed in commit a557cf2 and re-run as run 34764768179. Retained here unmodified as the as-observed record of that attempt."
+}

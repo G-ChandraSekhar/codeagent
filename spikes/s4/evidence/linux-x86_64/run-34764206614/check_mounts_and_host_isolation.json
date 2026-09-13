@@ -1,0 +1,24 @@
+{
+  "check": "mounts_and_host_isolation",
+  "primary": {
+    "result": "FAIL",
+    "mounts": [
+      {
+        "Type": "bind",
+        "Source": "/tmp/codeagent-spike-s4-mounts-workspace-82qy_3ta",
+        "Destination": "/workspace",
+        "Mode": "",
+        "RW": false,
+        "Propagation": "rprivate"
+      }
+    ],
+    "tmpfs": {
+      "/tmp": "rw,size=64m"
+    },
+    "mounts_ok": true,
+    "tmpfs_ok": true,
+    "host_isolation_stdout": "",
+    "host_isolation_stderr": "Traceback (most recent call last):\n  File \"<string>\", line 2, in <module>\nAssertionError: expected file missing\n"
+  },
+  "classification": "FAIL"
+}

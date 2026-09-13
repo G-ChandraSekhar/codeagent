@@ -1,0 +1,12 @@
+{
+  "check": "timeout_enforcement",
+  "primary": {
+    "result": "PASS",
+    "outcome": "timeout",
+    "elapsed_seconds": 3.1208369731903076,
+    "observed_container_name": "codeagent-verify-baseline-40f139b0639a",
+    "observed_status_during_wait": "running",
+    "confirmed_gone_after": true
+  },
+  "classification": "PASS"
+}

@@ -1,0 +1,41 @@
+{
+  "containers_tracked": [
+    "codeagent-spike-s4-server-3c913cef",
+    "codeagent-spike-s4-mounts-9050d0fc",
+    "codeagent-spike-s4-mem-600-88bbb2c1",
+    "codeagent-spike-s4-mem-1900-23c2da5d"
+  ],
+  "networks_tracked": [
+    "codeagent-spike-s4-net-94399579"
+  ],
+  "images_tracked": [
+    "codeagent-spike-s4-setuid:a209afc2"
+  ],
+  "dirs_tracked": [
+    "/tmp/codeagent-spike-s4-image-build-blu7kddz",
+    "/tmp/codeagent-spike-s4-network-primary-workdir-8nxdfdor",
+    "/tmp/codeagent-spike-s4-mounts-workspace-h95hj8o_",
+    "/tmp/codeagent-spike-s4-mounts-canary-rzdpuxvd",
+    "/tmp/codeagent-spike-s4-workspace-bind-kizz_lg8",
+    "/tmp/codeagent-spike-s4-workspace-bind-control-px8bwu76",
+    "/tmp/codeagent-spike-s4-dockersock-workdir-lbzq_vj6",
+    "/tmp/codeagent-spike-s4-output-workdir-bhu54al3",
+    "/tmp/codeagent-spike-s4-timeout-workdir-9bo2f8rm",
+    "/tmp/codeagent-spike-s4-pidlimit-workdir-0k484jjs",
+    "/tmp/codeagent-spike-s4-cpu-workdir-ag_g4xxc",
+    "/tmp/codeagent-spike-s4-memory-workdir-600mb-wwo6qtyu",
+    "/tmp/codeagent-spike-s4-memory-workdir-1900mb-fjta4izb",
+    "/tmp/codeagent-spike-s4-memory-disposition-workdir-3hs4wi1t"
+  ],
+  "leftover_containers": [],
+  "leftover_networks": [],
+  "leftover_images": [],
+  "leftover_dirs": [],
+  "all_clean": true,
+  "class_a_baseline_names": [],
+  "class_a_final_names_before_extra_cleanup": [],
+  "class_a_unexpected_delta": [],
+  "class_a_removed_by_extra_cleanup": {},
+  "class_a_leftover_after_extra_cleanup": [],
+  "class_a_clean": true
+}

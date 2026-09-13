@@ -1,0 +1,12 @@
+{
+  "check": "bounded_output",
+  "primary": {
+    "result": "PASS",
+    "stdout_bytes": 65551,
+    "stderr_bytes": 65551,
+    "bound": 65551,
+    "marker_suffix": "\n...(truncated)",
+    "verifier_outcome": "passed"
+  },
+  "classification": "PASS"
+}

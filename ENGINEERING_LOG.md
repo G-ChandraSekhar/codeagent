@@ -915,3 +915,60 @@ deferred beyond v1 as out of scope/complexity, not guaranteed.
   add/delete/rename, and unexpected dirty/index states at resume —
   none covered by S3's evidence. Full narrative in the ADR and
   `spikes/s3/S3_RESULT.md`.
+
+---
+
+## Session: S4 spike — executor/container isolation, evidence on both platforms
+
+**Outcome**: Stage-2 spike S4 (`spikes/s4/`) behaviorally validated the
+actual production `DEFAULT_IMAGE`/`_SECURITY_FLAGS` (imported, never
+retyped) — real syscalls, real escalation attempts, real cgroup
+accounting, negative controls throughout — on macOS/Docker Desktop
+first, then on Linux/x86_64 via a new manual
+`.github/workflows/s4-linux-evidence.yml` workflow. 12–13 of 14 checks
+`PASS` on both platforms with a validated control; two things are
+genuinely open and not fixed (`src/codeagent` untouched throughout):
+(1) `--memory` doesn't cap the combined memory+swap allowance
+(reproduced on both platforms — same `MemorySwap`/`Memory` values),
+and `DockerVerifier` can't distinguish an OOM kill from an ordinary
+test failure (strongly inferred, not directly proven, on both); (2)
+Linux-only: a CAP_SYS_ADMIN negative control was blocked by an
+unidentified runner restriction (errno 13, `INCONCLUSIVE` — not
+attributed to seccomp/AppArmor without further evidence, never weakened
+to force a pass).
+
+**A real harness bug was found and fixed before the Linux evidence
+could be trusted**: `tempfile.mkdtemp()`'s default `0700` mode, owned
+by the runner's own UID (`1001`), blocked the container's configured
+UID `1000` from even traversing its own intended-readable test
+fixture — reported as `mounts_and_host_isolation: FAIL`, not a real
+isolation finding. Fixed by chmod-ing only that one fixture (not
+scratch directories generally, not the deliberately-restrictive
+secret-canary directory), replacing one combined assertion with four
+independently-reported probe fields, and adding a
+`classify_mounts_check()` function (unit-tested) that keeps a real
+security finding `FAIL` while treating an inaccessible fixture or
+`docker exec` infra failure as `TECHNICAL_FAILURE`, never a false
+security `FAIL`. Both the failed and corrected Linux runs are retained
+under `spikes/s4/evidence/linux-x86_64/run-<id>/`, each with its own
+`RUN_INFO.json` recording the workflow URL and source commit.
+
+Also fixed in this pass: the workflow's own leftover-container check
+used to pipe `docker ps -a` straight into `grep ... || true`, which
+would have silently swallowed a *failed* listing (daemon down) as if
+it were a confirmed-empty one; the listing is now captured as its own
+command so its failure propagates, with only `grep`'s "no match" exit
+code suppressed. Verified against three stubbed cases (empty listing,
+failed listing, matching leftover) before pushing.
+
+- **Verification**: 28 spike-specific tests pass (both locally and in
+  CI, both platforms); main suite unaffected at 873; `actionlint`
+  clean on the workflow; cleanup independently confirmed empty on both
+  platforms (Class A prefix-delta and Class B manifest tracking both
+  clean).
+- **Remaining author decisions** (none made yet): whether v1 needs an
+  explicit `--memory-swap` limit; how `DockerVerifier` should classify
+  an OOM kill; whether to investigate the Linux CAP_SYS_ADMIN
+  restriction further. S5 (interruption without orphaned containers)
+  remains unstarted. No ADR yet — these are still open questions, not
+  decisions.

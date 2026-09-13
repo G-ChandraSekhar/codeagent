@@ -1,0 +1,16 @@
+{
+  "check": "no_new_privileges",
+  "primary": {
+    "result": "PASS",
+    "stdout": "uid 1000 euid 1000\n"
+  },
+  "control": {
+    "result": "PASS",
+    "stdout": "uid 1000 euid 0\n"
+  },
+  "supporting_evidence": {
+    "proc_status_nonewprivs": "NoNewPrivs:\t1"
+  },
+  "notes": [],
+  "classification": "PASS"
+}

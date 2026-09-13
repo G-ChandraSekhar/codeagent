@@ -1,20 +1,25 @@
 # S4_RESULT.md — executor/container isolation
 
-Host: Darwin 25.6.0 (arm64), Docker Desktop, Docker Engine 29.7.2,
-cgroup v2, Python 3.12.14. Retained evidence for this run lives under
-`spikes/s4/evidence/macos-docker-desktop-arm64/` — a platform-keyed
-directory, so a later Linux run is written to its own
-`spikes/s4/evidence/linux-<arch>/` directory and can never overwrite
-this platform's evidence.
+This spike now has retained evidence on **both** platforms named in
+`docs/threat-model.md`'s A9 (Linux and macOS/Docker Desktop are
+separate evidence domains):
 
-**Platform scope: macOS/Docker Desktop only.** Per `docs/threat-model.md`'s
-A9, Linux and macOS/Docker Desktop are separate evidence domains.
-Nothing in this document is a claim about native Linux behavior —
-Docker Desktop runs containers inside a Linux VM whose networking,
-filesystem, and resource-limit behavior can differ from bare-metal
-Linux (this run's own CPU-limit and memory-swap findings are examples
-of platform-specific behavior worth re-checking on real Linux). A
-Linux repetition is future work, not performed in this pass.
+- **macOS/Docker Desktop** — Darwin 25.6.0 (arm64), Docker Desktop,
+  Docker Engine 29.7.2, cgroup v2, Python 3.12.14, run manually on the
+  author's machine. Evidence: `spikes/s4/evidence/macos-docker-desktop-arm64/`.
+- **Linux/x86_64** — Ubuntu 24.04 (GitHub-hosted Actions runner,
+  `6.17.0-1022-azure`), native Docker Engine 28.0.4, cgroup v2, Python
+  3.12.14, run via the manual `.github/workflows/s4-linux-evidence.yml`
+  workflow. Evidence: `spikes/s4/evidence/linux-x86_64/run-<run-id>/`,
+  one directory per workflow run — see "Platform comparison" below for
+  why there are two.
+
+Each platform's evidence lives under its own platform-keyed directory
+so neither can silently overwrite the other. The body of this document
+below (per-check results, memory-limit analysis, etc.) was written
+against the macOS run first; the "Platform comparison" section
+consolidates what changed and stayed the same on Linux rather than
+duplicating every check's narrative twice.
 
 ## What was tested
 
@@ -94,10 +99,14 @@ removal): did **not** trigger an OOM kill (`State.OOMKilled: false`,
 inspected `HostConfig` explains why: `Memory=536870912` (512 MiB) but
 `MemorySwap=1073741824` (1024 MiB). **`--memory=512m` does limit this
 container's own memory usage to 512 MiB** — that flag is not in
-question. What the swap value shows is that **Docker Desktop's default
-`MemorySwap=1024m` permits this container additional swap on top of
-that 512 MiB limit**, so the combined memory+swap allocation available
-to it is larger than 512 MiB alone. **`--memory-swap=512m` would
+question. What the swap value shows is that **the observed Docker
+HostConfig on this host sets `MemorySwap=1024m`, permitting this
+container additional swap on top of that 512 MiB limit** (this same
+observation reproduced on native Linux Docker Engine too — see
+"Platform comparison" below — so it is reported as an observation on
+the hosts actually tested, not attributed to Docker Desktop
+specifically), so the combined memory+swap allocation available to it
+is larger than 512 MiB alone. **`--memory-swap=512m` would
 prevent that additional swap and cap the combined allowance at
 512 MiB** — that flag is simply absent from the current production
 configuration. This is recorded as a finding, not fixed:
@@ -156,8 +165,9 @@ real, behavioral, adversarial-shaped tests — not merely by reading
 `docker inspect`'s configuration back.
 
 **Memory is the one open risk**: `--memory` alone does not cap the
-*combined* memory+swap allowance on this platform — Docker Desktop's
-default swap grant roughly doubles it — and the executor's outcome
+*combined* memory+swap allowance on either platform tested — the
+observed default swap grant roughly doubles it on both macOS/Docker
+Desktop and native Linux Docker Engine — and the executor's outcome
 classification cannot currently, even by strong inference, be *proven*
 to tell a real OOM kill apart from an ordinary failing test (though the
 evidence strongly suggests it cannot). Both are real, evidenced gaps
@@ -179,6 +189,91 @@ did show excess cores), but was never actually needed for
 CAP_SYS_ADMIN or no-new-privileges here — both got clean PASS/PASS
 results. Still only one platform's evidence, per the A9 scope note
 above.
+
+## Platform comparison: macOS vs Linux
+
+| | macOS/Docker Desktop | Linux/x86_64 (corrected) |
+|---|---|---|
+| Result | 13 PASS, 1 INCONCLUSIVE | 12 PASS, 2 INCONCLUSIVE |
+| Overall verdict | `PASS_WITH_OPEN_RISKS` | `PASS_WITH_OPEN_RISKS` |
+| Evidence | `evidence/macos-docker-desktop-arm64/` | `evidence/linux-x86_64/run-34764768179/` |
+
+Both platforms land on the same overall verdict. The one classification
+difference is `cap_sys_admin`: `PASS` on macOS, `INCONCLUSIVE` on
+Linux (see below). Every other check — network isolation, host-path
+isolation, non-root enforcement, no-new-privileges, read-only
+filesystem (both general and the workspace bind specifically), the
+absent Docker socket, environment non-inheritance, bounded output,
+timeout enforcement, PID limit, and CPU limit — is `PASS` on both.
+`memory_limit` is `INCONCLUSIVE` on both, for the same swap-headroom
+reason (see below).
+
+**Linux required one correction before reaching this result.** The
+first Linux workflow run
+([34764206614](https://github.com/G-ChandraSekhar/codeagent/actions/runs/34764206614),
+commit `8db44a9`) reported `mounts_and_host_isolation: FAIL` and
+`overall_verdict: FAIL`. Investigation (retained as
+`evidence/linux-x86_64/run-34764206614/`, plus that run's
+`RUN_INFO.json`) found this was **a bug in the spike harness's own
+test fixture, not a finding about container isolation**:
+`tempfile.mkdtemp()` creates directories mode `0700` by default, owned
+by whichever host user ran the script. On the GitHub-hosted runner
+that user's UID is `1001`; the test container runs as the production
+configuration's UID `1000`. A `0700` directory owned by `1001` is not
+even traversable by UID `1000`, so the container could never see its
+own intended-readable fixture file regardless of the bind mount itself
+being correctly configured (`.Mounts`/`.HostConfig.Tmpfs` were already
+correct in that first run). Locally on macOS this never manifested,
+because `tempfile.mkdtemp()`'s host-side owner UID there happened not
+to matter for the check as originally written.
+
+The fix (commit `a557cf2`) chmods only this one intended-readable
+fixture directory/file to `0755`/`0644` — not scratch directories in
+general, and not the deliberately-restrictive secret-canary directory
+used by other checks — and replaces the single combined assertion with
+a structured probe reporting four independent fields (`expected_readable`,
+`expected_content_matches`, `host_secret_absent_at_root`,
+`host_secret_absent_at_host_path`), plus a `classify_mounts_check()`
+function (with its own unit tests) that keeps a real security finding
+(bad mount config, a visible host canary) classified `FAIL`, while an
+inaccessible intended fixture, malformed probe output, or a
+`docker exec` infrastructure failure is classified `TECHNICAL_FAILURE`
+— never conflated with a security `FAIL`. The corrected run
+([34764768179](https://github.com/G-ChandraSekhar/codeagent/actions/runs/34764768179),
+commit `a557cf2`) shows `mounts_and_host_isolation: PASS` with all four
+probe fields `true`, and is retained as the current, authoritative
+Linux evidence.
+
+**`cap_sys_admin` is genuinely `INCONCLUSIVE` on Linux, for a reason
+this evidence does not fully identify.** The primary observation
+(`mount(2)` blocked under root + `--cap-drop ALL`) is `PASS` on both
+platforms. The negative control (`--cap-add SYS_ADMIN`, otherwise
+identical) succeeded on macOS but failed on Linux — and it failed
+differently: macOS's failure mode was `EPERM` (errno 1, "no
+capability"); Linux's was `EACCES` (errno 13, "Permission denied").
+That difference in errno is consistent with a runtime restriction
+layered on top of capabilities (a seccomp filter or an AppArmor policy
+blocking the `mount` syscall outright) — but **this evidence does not
+prove which mechanism, or confirm one is active at all**; `errno 13`
+alone does not identify its cause, and no further probing of the
+runner's seccomp/AppArmor configuration was performed. The harness
+correctly refused to weaken AppArmor, seccomp, or any other runner
+security setting to force the control to pass, and classified this
+`INCONCLUSIVE` rather than guessing. This remains a genuinely open
+question, not a resolved platform difference.
+
+**Memory/swap and the OOM disposition gap reproduced identically on
+Linux**, using the same 600 MB / 1900 MB two-experiment design: 600 MB
+survived (`MemorySwap=1073741824`, `Memory=536870912` — the same
+values as macOS), a separate 1900 MB hand-controlled container was
+directly confirmed OOM-killed, and the same `DockerVerifier`
+disposition gap was inferred. Confirming this on a second,
+architecturally different Docker installation (native Linux Engine vs.
+Docker Desktop's Linux VM) is why the finding is now described as "the
+observed Docker HostConfig on this host" rather than attributed to
+"Docker Desktop" specifically — it is not generalized further than
+that into a claim about every Docker Engine installation, since only
+two hosts have actually been observed.
 
 ## Cleanup evidence
 
@@ -211,25 +306,39 @@ deleted.
 ## Retained evidence
 
 `spike_s4.py` (self-contained driver, imports only from
-`codeagent.executor`, never modifies it), `test_spike_s4.py` (15
-focused tests, all passing, run separately from the main suite), and
-`spikes/s4/evidence/macos-docker-desktop-arm64/`: `host.json`,
-`tested_config.json`, `check_*.json` (one per check), `cleanup.json`,
-`summary.json`, `run.log` (complete command transcript generated by
-the script itself). Host metadata (`docker_version`, `cgroup_version`)
-is queried with `check=True` (the harness default) — a failed query
-raises immediately rather than being silently recorded as an empty
-string.
+`codeagent.executor`, never modifies it) and `test_spike_s4.py` (28
+focused tests, all passing on both platforms, run separately from the
+main suite). Per-platform evidence bundles (`host.json`,
+`tested_config.json`, `check_*.json` per check, `cleanup.json`,
+`summary.json`, `run.log`, the complete command transcript generated
+by the script itself):
+
+- `spikes/s4/evidence/macos-docker-desktop-arm64/` — the manual macOS
+  run described throughout this document.
+- `spikes/s4/evidence/linux-x86_64/run-34764206614/` — the first
+  (failed, harness-bug) Linux attempt, retained unmodified with its
+  own `RUN_INFO.json` recording the workflow URL and source commit.
+- `spikes/s4/evidence/linux-x86_64/run-34764768179/` — the corrected,
+  authoritative Linux run, likewise with its own `RUN_INFO.json`.
+
+Host metadata (`docker_version`, `cgroup_version`) is queried with
+`check=True` (the harness default) — a failed query raises immediately
+rather than being silently recorded as an empty string, on both
+platforms.
 
 ## Overall verdict
 
-`PASS_WITH_OPEN_RISKS` (`summary.json`): every mandatory check passed
-except memory, which is `INCONCLUSIVE` with three separately reported
+**`PASS_WITH_OPEN_RISKS` on both platforms** (`summary.json` in each
+evidence directory): macOS is 13 PASS + 1 INCONCLUSIVE (`memory_limit`);
+the corrected Linux run is 12 PASS + 2 INCONCLUSIVE (`memory_limit`,
+`cap_sys_admin`). `memory_limit`'s three separately reported
 observations (a real finding about swap headroom beyond the nominal
 `--memory` limit; a directly confirmed OOM kill on a larger allocation;
 a strongly-inferred-but-not-directly-proven disposition gap in
-`DockerVerifier`) carried forward as open risks rather than silently
-dropped or overclaimed. Cleanup was fully confirmed clean for both
-Class A and Class B resources, so it does not override this verdict.
-No src/codeagent, tests/, CI, or ADR files were modified. No Linux
-evidence is claimed.
+`DockerVerifier`) and Linux's additional `cap_sys_admin` finding (a
+negative control blocked by an unidentified runtime restriction) are
+carried forward as open risks rather than silently dropped or
+overclaimed. Cleanup was fully confirmed clean for both Class A and
+Class B resources on both platforms, so it does not override either
+verdict. No src/codeagent, production tests, production security
+flags, or ADR files were modified in gathering this evidence.

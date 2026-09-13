@@ -224,10 +224,30 @@ Stage 2 (of the four-stage planning process in
   failure-path testing obligations (disposal/recreation failure,
   additions, deletions, renames, unexpected dirty/index states) that
   S3's evidence does not cover.
-- Remaining three Stage-2 spikes are unstarted:
+- **S4 — executor/container isolation: evidence gathered on both
+  tested platforms** (macOS/Docker Desktop and Linux/x86_64 via a
+  manual `.github/workflows/s4-linux-evidence.yml` run), no decision
+  recorded yet. Validates the actual production `DEFAULT_IMAGE`/
+  `_SECURITY_FLAGS` (imported, never retyped) behaviorally — real
+  syscalls, real escalation attempts, real cgroup accounting, with
+  negative controls — for network isolation, host-path isolation,
+  non-root, capability dropping, no-new-privileges, read-only
+  filesystem, the absent Docker socket, environment non-inheritance,
+  bounded output, forceful timeout, and PID/CPU limits: `PASS` on both
+  platforms for all of these. Two things remain genuinely open, not
+  implemented and not yet decided: (1) `--memory` alone does not cap
+  the combined memory+swap allowance (observed on both platforms), and
+  the executor's outcome classification cannot distinguish an OOM kill
+  from an ordinary failing test (a disposition gap, strongly inferred
+  on both platforms); (2) on Linux only, a capability negative control
+  was blocked by an unidentified runner restriction (`INCONCLUSIVE`,
+  not attributed to seccomp/AppArmor without further evidence). See
+  `spikes/s4/S4_RESULT.md`. Author decision on any of this — including
+  whether `--memory-swap` should be added, and how the OOM disposition
+  gap should be classified — is not yet made or requested.
+- Remaining two Stage-2 spikes are unstarted:
   1. Responses API strict function tools and multiple tool calls.
-  2. Network/path/timeout/output/resource isolation.
-  3. Interruption without orphaned containers.
+  2. Interruption without orphaned containers (S5).
   (A sixth spike, JSONL replay into the first frontend view, is also
   listed in the handoff and unstarted.)
 

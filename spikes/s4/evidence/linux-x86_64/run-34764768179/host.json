@@ -1,0 +1,8 @@
+{
+  "system": "Linux",
+  "release": "6.17.0-1022-azure",
+  "machine": "x86_64",
+  "python_version": "3.12.14",
+  "docker_version": "28.0.4",
+  "cgroup_version": "2"
+}

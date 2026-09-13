@@ -1,0 +1,9 @@
+{
+  "workflow": "s4-linux-evidence.yml (S4 Linux Evidence (manual))",
+  "run_id": "34764768179",
+  "workflow_url": "https://github.com/G-ChandraSekhar/codeagent/actions/runs/34764768179",
+  "source_commit": "a557cf2cf614e0df54a9f232bc7daef16db03309",
+  "triggered_at": "2026-09-13T15:09:50Z",
+  "job_conclusion": "success",
+  "note": "Corrected Linux run, after fixing the mount-fixture-permission bug found in run 34764206614 (see that run's RUN_INFO.json). This is the current, retained-as-authoritative Linux evidence bundle: overall_verdict=PASS_WITH_OPEN_RISKS, 12 PASS + 2 INCONCLUSIVE (cap_sys_admin, memory_limit)."
+}

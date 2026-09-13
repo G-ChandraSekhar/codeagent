@@ -1,0 +1,17 @@
+{
+  "check": "workspace_readonly_bind",
+  "primary": {
+    "result": "PASS",
+    "readonly_write_blocked": true,
+    "readonly_write_stdout": "",
+    "readonly_write_stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nOSError: [Errno 30] Read-only file system: 'canary.txt'\n",
+    "tmp_write_succeeded": true,
+    "host_canary_unchanged": true
+  },
+  "control": {
+    "result": "PASS",
+    "stdout": "WRITE_SUCCEEDED\n",
+    "host_canary_mutated": true
+  },
+  "classification": "PASS"
+}

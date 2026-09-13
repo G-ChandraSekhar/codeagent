@@ -1,0 +1,38 @@
+{
+  "check": "memory_limit",
+  "primary": {
+    "result": "INCONCLUSIVE",
+    "name": "codeagent-spike-s4-mem-600-eed25360",
+    "megabytes_allocated_target": 600,
+    "oom_killed": false,
+    "exit_code": 0,
+    "configured_memory_bytes": "536870912",
+    "configured_memswap_bytes": "1073741824",
+    "wait_exit_code_raw": "0",
+    "wait_timed_out": false,
+    "container_stdout": "ALLOCATION_SURVIVED 600\n"
+  },
+  "large_allocation_hand_controlled": {
+    "name": "codeagent-spike-s4-mem-1900-6e8ef998",
+    "megabytes_allocated_target": 1900,
+    "oom_killed": true,
+    "exit_code": 137,
+    "configured_memory_bytes": "536870912",
+    "configured_memswap_bytes": "1073741824",
+    "wait_exit_code_raw": "137",
+    "wait_timed_out": false,
+    "container_stdout": ""
+  },
+  "production_disposition_check": {
+    "verifier_outcome": "test_failure",
+    "verifier_exit_code": 137,
+    "twin_confirmed_oom_at_exit_137": true,
+    "verifier_run_matches_confirmed_oom_twin": true,
+    "disposition_gap_inferred": true
+  },
+  "notes": [
+    "the 600 MB allocation did not trigger an OOM kill (State.OOMKilled: false). --memory=512m limits this container's own memory usage to 512 MiB, but Docker Desktop's default MemorySwap=1073741824 bytes (Memory=536870912 bytes) permits additional swap on top of that, so the combined memory+swap allowance available to this container is larger than 512 MiB alone. --memory-swap=512m would prevent that additional swap and cap the combined allowance at 512 MiB. Not fixed here -- src/codeagent is not modified during this spike.",
+    "PRODUCTION DISPOSITION GAP (inferred, not directly proven for this exact container, not fixed): a separate, hand-controlled container using the identical image, flags, and 1900 MB allocation script was directly confirmed OOM-killed (State.OOMKilled=true, State.ExitCode=137). The real DockerVerifier, run separately against the same command and flags, also exited 137 and was classified TEST_FAILURE by DockerVerifier._attempt. Because DockerVerifier removes its own container before returning, State.OOMKilled could not be inspected for that specific instance -- this is a strongly supported inference that it was also OOM-killed, not a directly confirmed fact for that container. If the inference holds, DockerVerifier._attempt's exit-code-only disposition logic cannot distinguish an OOM kill (an operational/environment problem) from an ordinary failing test, and classifies both as TEST_FAILURE. src/codeagent was not modified to address this."
+  ],
+  "classification": "INCONCLUSIVE"
+}

@@ -1,0 +1,20 @@
+{
+  "check": "cap_sys_admin",
+  "primary": {
+    "result": "PASS",
+    "stdout": "MOUNT_FAILED 1 Operation not permitted\n",
+    "returncode": 1
+  },
+  "control": {
+    "result": "INCONCLUSIVE",
+    "stdout": "MOUNT_FAILED 13 Permission denied\n",
+    "returncode": 1
+  },
+  "supporting_evidence": {
+    "production_container_capeff": "CapEff:\t0000000000000000"
+  },
+  "notes": [
+    "control did not escalate even with --cap-add SYS_ADMIN -- likely a runtime restriction (seccomp/AppArmor) beyond capabilities alone; not weakened further to force a pass, classified INCONCLUSIVE instead"
+  ],
+  "classification": "INCONCLUSIVE"
+}
