@@ -1,0 +1,8 @@
+{
+  "purpose": "Proves every scenario/canary worktree registered against the temporary FIXTURE repository was actually removed -- captured before the scratch root (which contains this repo) is deleted. This is distinct from baseline_final_comparison.json's CodeAgent-checkout comparison, which only proves this run never registered/left a worktree in the real project checkout -- a host-integrity fact, not evidence that fixture-repo worktrees were cleaned up.",
+  "fixture_repo_path": "/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-zb85uqkf/fixture-repo",
+  "listing_ok": true,
+  "listing_raw": "worktree /private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-zb85uqkf/fixture-repo\nHEAD b45a132f1e40667529840f204b1d64e37855351b\nbranch refs/heads/main\n\n",
+  "worktree_entry_count": 1,
+  "has_only_main_worktree": true
+}

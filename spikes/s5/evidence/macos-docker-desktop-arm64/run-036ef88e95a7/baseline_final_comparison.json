@@ -1,0 +1,13 @@
+{
+  "baseline_ps_ok": true,
+  "baseline_ps_raw": "CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES\n",
+  "baseline_worktree_ok": true,
+  "baseline_worktree_raw": "worktree /Users/chandrasekhar/code/codeagent\nHEAD 1de3c019f3afeb50c3bea41536f83f7cc68803dd\nbranch refs/heads/main\n\n",
+  "final_ps_ok": true,
+  "final_ps_raw": "CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES\n",
+  "final_worktree_ok": true,
+  "final_worktree_raw": "worktree /Users/chandrasekhar/code/codeagent\nHEAD 1de3c019f3afeb50c3bea41536f83f7cc68803dd\nbranch refs/heads/main\n\n",
+  "listings_ok": true,
+  "exactly_equal": true,
+  "scratch_root_removed_confirmed": true
+}

@@ -1,0 +1,9 @@
+{
+  "session_id": "036ef88e95a7",
+  "repository_head": "1de3c019f3afeb50c3bea41536f83f7cc68803dd",
+  "repository_dirty": true,
+  "harness_file": "spikes/s5/spike_s5.py",
+  "harness_sha256": "8b0c07f664f3be6167d0f7a47399110e6141a67653238fcae04d0378885a5997",
+  "note": "repository_head does NOT represent the harness that produced this evidence unless repository_dirty is false and this exact harness_sha256 matches the tracked file at that commit -- the harness may be uncommitted/modified relative to HEAD; harness_sha256 is the authoritative pointer to the exact code that ran.",
+  "triggered_at": "2026-09-13T18:48:38.087399+00:00"
+}

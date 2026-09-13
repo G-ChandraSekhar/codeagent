@@ -1,0 +1,58 @@
+{
+  "results": [
+    {
+      "kind": "container",
+      "name": "codeagent-canary-a-unlabeled-0569ff36",
+      "action": "removed"
+    },
+    {
+      "kind": "container",
+      "name": "codeagent-verify-baseline-bfdafef25644",
+      "action": "removed"
+    },
+    {
+      "kind": "container",
+      "name": "codeagent-spike-s5-2453b195f1a5",
+      "action": "removed"
+    },
+    {
+      "kind": "child",
+      "run_token": "e8cef27a3f94",
+      "mode": "cooperative",
+      "action": "child_self_cleaned"
+    },
+    {
+      "kind": "child",
+      "run_token": "1a37e4dd764c",
+      "mode": "cooperative",
+      "action": "child_self_cleaned"
+    },
+    {
+      "kind": "child",
+      "run_token": "9877dd04bc85",
+      "mode": "cooperative",
+      "action": "child_self_cleaned"
+    },
+    {
+      "kind": "child",
+      "run_token": "20af59eca042",
+      "mode": "cooperative",
+      "action": "child_self_cleaned"
+    },
+    {
+      "kind": "child",
+      "run_token": "df2ce2e2bb77",
+      "mode": "cooperative",
+      "action": "child_self_cleaned"
+    },
+    {
+      "kind": "child",
+      "run_token": "72e4d9d82030",
+      "mode": "cooperative",
+      "action": "harness_direct_cleanup",
+      "container_result": "not_present",
+      "worktree_result": "not_present"
+    }
+  ],
+  "all_clean": true
+}

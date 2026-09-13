@@ -1,0 +1,37 @@
+{
+  "run_token": "4d4c87716cbc",
+  "pid": 34542,
+  "action_sent_at": "2026-09-13T18:31:01.926302+00:00",
+  "final_manifest": {
+    "cleaning_started_at": "2026-09-13T18:31:01.928727+00:00",
+    "complete_at": "2026-09-13T18:31:01.978388+00:00",
+    "container_created": true,
+    "container_id": "709bf19bbc63d35bfb22861b0c38956f3072657cd0bf85441ea1a0aa886156ec",
+    "container_name": "codeagent-spike-s5-4d4c87716cbc",
+    "created_at": "2026-09-13T18:31:01.705047+00:00",
+    "failure_history": [],
+    "labels": {
+      "codeagent.s5_run": "4d4c87716cbc",
+      "codeagent.s5_session": "14ddb5f761dd",
+      "codeagent.spike": "s5"
+    },
+    "lock_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/locks/4d4c87716cbc.lock",
+    "outcome": "sigint",
+    "pid": 34542,
+    "ready_barrier_ack_at": "2026-09-13T18:31:01.837162+00:00",
+    "reconciliation_attempts": 0,
+    "run_token": "4d4c87716cbc",
+    "scenario": "sigint",
+    "session_id": "14ddb5f761dd",
+    "sigint_received_at": "2026-09-13T18:31:01.928006+00:00",
+    "source_repo_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/fixture-repo",
+    "state": "COMPLETE",
+    "updated_at": "2026-09-13T18:31:01.978429+00:00",
+    "worktree_created": true,
+    "worktree_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/worktrees/4d4c87716cbc"
+  },
+  "worktree_absent": true,
+  "container_absent": true,
+  "ack_present": true,
+  "classification": "PASS"
+}

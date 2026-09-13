@@ -1,0 +1,170 @@
+{
+  "reconcile_result": {
+    "ok": true,
+    "results": [
+      {
+        "run_token": "20febda1c5b7",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      },
+      {
+        "run_token": "2dc09945e12f",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      },
+      {
+        "run_token": "3f07b6e6f841",
+        "action": "skipped_active"
+      },
+      {
+        "run_token": "4d4c87716cbc",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      },
+      {
+        "run_token": "567158b47f3c",
+        "action": "reconciled",
+        "snapshot": {
+          "container_created": true,
+          "container_id": "fc5d5a7ff74813f72cab655220a70afcc80332ecdfbce4442d6ae3eced392de5",
+          "container_name": "codeagent-spike-s5-567158b47f3c",
+          "created_at": "2026-09-13T18:31:02.380000+00:00",
+          "failure_history": [],
+          "labels": {
+            "codeagent.s5_run": "567158b47f3c",
+            "codeagent.s5_session": "14ddb5f761dd",
+            "codeagent.spike": "s5"
+          },
+          "lock_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/locks/567158b47f3c.lock",
+          "pid": 34570,
+          "ready_barrier_ack_at": "2026-09-13T18:31:02.488755+00:00",
+          "reconciliation_attempts": 0,
+          "run_token": "567158b47f3c",
+          "scenario": "sigkill",
+          "session_id": "14ddb5f761dd",
+          "source_repo_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/fixture-repo",
+          "state": "READY",
+          "updated_at": "2026-09-13T18:31:02.488763+00:00",
+          "worktree_created": true,
+          "worktree_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/worktrees/567158b47f3c"
+        },
+        "manifest": {
+          "container_created": true,
+          "container_id": "fc5d5a7ff74813f72cab655220a70afcc80332ecdfbce4442d6ae3eced392de5",
+          "container_name": "codeagent-spike-s5-567158b47f3c",
+          "created_at": "2026-09-13T18:31:02.380000+00:00",
+          "failure_history": [],
+          "labels": {
+            "codeagent.s5_run": "567158b47f3c",
+            "codeagent.s5_session": "14ddb5f761dd",
+            "codeagent.spike": "s5"
+          },
+          "lock_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/locks/567158b47f3c.lock",
+          "pid": 34570,
+          "ready_barrier_ack_at": "2026-09-13T18:31:02.488755+00:00",
+          "reconciliation_attempts": 0,
+          "run_token": "567158b47f3c",
+          "scenario": "sigkill",
+          "session_id": "14ddb5f761dd",
+          "source_repo_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/fixture-repo",
+          "state": "RECONCILED",
+          "updated_at": "2026-09-13T18:31:02.819679+00:00",
+          "worktree_created": true,
+          "worktree_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/worktrees/567158b47f3c"
+        }
+      },
+      {
+        "run_token": "78d92feeb5df",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      }
+    ]
+  },
+  "target_entry": {
+    "run_token": "567158b47f3c",
+    "action": "reconciled",
+    "snapshot": {
+      "container_created": true,
+      "container_id": "fc5d5a7ff74813f72cab655220a70afcc80332ecdfbce4442d6ae3eced392de5",
+      "container_name": "codeagent-spike-s5-567158b47f3c",
+      "created_at": "2026-09-13T18:31:02.380000+00:00",
+      "failure_history": [],
+      "labels": {
+        "codeagent.s5_run": "567158b47f3c",
+        "codeagent.s5_session": "14ddb5f761dd",
+        "codeagent.spike": "s5"
+      },
+      "lock_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/locks/567158b47f3c.lock",
+      "pid": 34570,
+      "ready_barrier_ack_at": "2026-09-13T18:31:02.488755+00:00",
+      "reconciliation_attempts": 0,
+      "run_token": "567158b47f3c",
+      "scenario": "sigkill",
+      "session_id": "14ddb5f761dd",
+      "source_repo_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/fixture-repo",
+      "state": "READY",
+      "updated_at": "2026-09-13T18:31:02.488763+00:00",
+      "worktree_created": true,
+      "worktree_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/worktrees/567158b47f3c"
+    },
+    "manifest": {
+      "container_created": true,
+      "container_id": "fc5d5a7ff74813f72cab655220a70afcc80332ecdfbce4442d6ae3eced392de5",
+      "container_name": "codeagent-spike-s5-567158b47f3c",
+      "created_at": "2026-09-13T18:31:02.380000+00:00",
+      "failure_history": [],
+      "labels": {
+        "codeagent.s5_run": "567158b47f3c",
+        "codeagent.s5_session": "14ddb5f761dd",
+        "codeagent.spike": "s5"
+      },
+      "lock_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/locks/567158b47f3c.lock",
+      "pid": 34570,
+      "ready_barrier_ack_at": "2026-09-13T18:31:02.488755+00:00",
+      "reconciliation_attempts": 0,
+      "run_token": "567158b47f3c",
+      "scenario": "sigkill",
+      "session_id": "14ddb5f761dd",
+      "source_repo_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/fixture-repo",
+      "state": "RECONCILED",
+      "updated_at": "2026-09-13T18:31:02.819679+00:00",
+      "worktree_created": true,
+      "worktree_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/worktrees/567158b47f3c"
+    }
+  },
+  "worktree_removed": true,
+  "container_removed": true,
+  "canaries_unchanged": true,
+  "canary_snapshot_after": {
+    "codeagent-canary-a-unlabeled-719645f0": {
+      "present": true,
+      "id": "6714efbd3380aab28e2548d88e9a79e2f964548db6748691e073710c37d5a830",
+      "labels": {}
+    },
+    "codeagent-verify-baseline-fe49f6c2ab30": {
+      "present": true,
+      "id": "3120a4a22d7460086795a3a4331b9f76cd182d75318ccbe00f72f4a63c90b57c",
+      "labels": {}
+    },
+    "codeagent-spike-s5-0eb3cfb267be": {
+      "present": true,
+      "id": "c21d854d9d6e0d832e3293c9023fb6394a4aed9da4eec7f76059fef53cf8f239",
+      "labels": {
+        "codeagent.s5_run": "0eb3cfb267be",
+        "codeagent.s5_session": "d31f07dbeabd",
+        "codeagent.spike": "s5"
+      }
+    },
+    "3f07b6e6f841": {
+      "worktree_registered": true,
+      "worktree_dir": true,
+      "container_present": true,
+      "container_labels": {
+        "codeagent.s5_run": "3f07b6e6f841",
+        "codeagent.s5_session": "14ddb5f761dd",
+        "codeagent.spike": "s5"
+      }
+    }
+  },
+  "classification": "PASS"
+}

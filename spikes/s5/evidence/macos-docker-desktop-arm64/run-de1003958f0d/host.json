@@ -1,0 +1,7 @@
+{
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python_version": "3.12.14",
+  "docker_version": "29.7.2"
+}

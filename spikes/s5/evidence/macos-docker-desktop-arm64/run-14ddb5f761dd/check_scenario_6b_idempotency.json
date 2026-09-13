@@ -1,0 +1,39 @@
+{
+  "reconcile_result": {
+    "ok": true,
+    "results": [
+      {
+        "run_token": "20febda1c5b7",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      },
+      {
+        "run_token": "2dc09945e12f",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      },
+      {
+        "run_token": "3f07b6e6f841",
+        "action": "skipped_active"
+      },
+      {
+        "run_token": "4d4c87716cbc",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      },
+      {
+        "run_token": "567158b47f3c",
+        "action": "skipped_terminal",
+        "state": "RECONCILED"
+      },
+      {
+        "run_token": "78d92feeb5df",
+        "action": "skipped_terminal",
+        "state": "COMPLETE"
+      }
+    ]
+  },
+  "target_entry_action": "skipped_terminal",
+  "canaries_unchanged": true,
+  "classification": "PASS"
+}

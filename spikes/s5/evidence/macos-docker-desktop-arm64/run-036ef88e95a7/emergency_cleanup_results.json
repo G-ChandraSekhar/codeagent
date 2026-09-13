@@ -1,0 +1,22 @@
+{
+  "results": [
+    {
+      "name": "codeagent-canary-a-unlabeled-073c3e77",
+      "action": "removed"
+    },
+    {
+      "name": "codeagent-verify-baseline-277a44f0854c",
+      "action": "removed"
+    },
+    {
+      "name": "codeagent-spike-s5-e0e4ff12e2af",
+      "action": "removed"
+    },
+    {
+      "run_token": "146fb2cb9304",
+      "mode": "cooperative",
+      "action": "child_self_cleaned"
+    }
+  ],
+  "all_clean": true
+}

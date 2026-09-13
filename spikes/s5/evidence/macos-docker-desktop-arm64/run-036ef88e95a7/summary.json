@@ -1,0 +1,24 @@
+{
+  "host": {
+    "system": "Darwin",
+    "release": "25.6.0",
+    "machine": "arm64",
+    "python_version": "3.12.14",
+    "docker_version": "29.7.2"
+  },
+  "session_id": "036ef88e95a7",
+  "scenario_classifications": {
+    "normal_completion": "PASS",
+    "cooperative_cancellation": "PASS",
+    "sigint": "PASS",
+    "sigterm": "PASS",
+    "sigkill": "PASS",
+    "reconciliation": "PASS",
+    "idempotency": "PASS"
+  },
+  "emergency_cleanup_all_clean": true,
+  "scratch_root_removed_confirmed": true,
+  "baseline_final_listings_ok": true,
+  "baseline_final_equal": true,
+  "overall_verdict": "PASS"
+}

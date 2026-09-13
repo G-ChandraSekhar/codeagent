@@ -1,0 +1,31 @@
+[
+  {
+    "kind": "container",
+    "name": "codeagent-canary-a-unlabeled-719645f0",
+    "id": "6714efbd3380aab28e2548d88e9a79e2f964548db6748691e073710c37d5a830",
+    "expected_labels": {}
+  },
+  {
+    "kind": "container",
+    "name": "codeagent-verify-baseline-fe49f6c2ab30",
+    "id": "3120a4a22d7460086795a3a4331b9f76cd182d75318ccbe00f72f4a63c90b57c",
+    "expected_labels": {}
+  },
+  {
+    "kind": "container",
+    "name": "codeagent-spike-s5-0eb3cfb267be",
+    "id": "c21d854d9d6e0d832e3293c9023fb6394a4aed9da4eec7f76059fef53cf8f239",
+    "expected_labels": {
+      "codeagent.spike": "s5",
+      "codeagent.s5_session": "d31f07dbeabd",
+      "codeagent.s5_run": "0eb3cfb267be"
+    }
+  },
+  {
+    "kind": "child",
+    "run_token": "3f07b6e6f841",
+    "container_name": "codeagent-spike-s5-3f07b6e6f841",
+    "worktree_path": "/private/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/codeagent-spike-s5-session-jlni0jg4/worktrees/3f07b6e6f841",
+    "pid": 34494
+  }
+]

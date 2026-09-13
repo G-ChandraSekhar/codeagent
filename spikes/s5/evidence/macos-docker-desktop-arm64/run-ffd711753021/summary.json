@@ -1,0 +1,27 @@
+{
+  "host": {
+    "system": "Darwin",
+    "release": "25.6.0",
+    "machine": "arm64",
+    "python_version": "3.12.14",
+    "docker_version": "29.7.2"
+  },
+  "session_id": "ffd711753021",
+  "scenario_classifications": {
+    "normal_completion": "PASS",
+    "cooperative_cancellation": "PASS",
+    "sigint": "PASS",
+    "sigterm": "PASS",
+    "sigkill": "PASS",
+    "reconciliation": "PASS",
+    "idempotency": "PASS"
+  },
+  "emergency_cleanup_all_clean": true,
+  "scratch_root_removed_confirmed": true,
+  "fixture_repo_has_only_main_worktree": true,
+  "baseline_final_listings_ok": true,
+  "baseline_final_equal": true,
+  "experiment_exception": null,
+  "secondary_cleanup_failures": [],
+  "overall_verdict": "PASS"
+}
