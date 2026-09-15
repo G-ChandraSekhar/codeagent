@@ -1,15 +1,18 @@
 # S5_RESULT.md — interruption, cancellation, orphan-resource reconciliation
 
-**Status: DRAFT / author review pending.** This document reports what
+**Status: evidence complete / final.** This document reports what
 was directly observed on both macOS/arm64 and Linux/x86_64. The macOS
 record contains one authoritative run plus seven preserved historical
 runs (one of which failed on a real bug and is retained deliberately);
 the Linux record contains one authoritative GitHub Actions run and its
-independent workflow diagnostics. It does not itself decide anything —
-no label schema, registry location, lock mechanism,
-startup-reconciliation policy, or signal-handling policy is accepted
-on the author's behalf by this document. See "Candidate decisions"
-below for what this evidence could inform, not what it settles.
+independent workflow diagnostics. Neither the evidence runs nor this
+document decided anything — no label schema, registry location, lock
+mechanism, startup-reconciliation policy, or signal-handling policy
+was accepted by them. The production decisions this evidence informed
+were subsequently made by the author in
+`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md` and
+`docs/adr/0005-cancellation-and-signal-ownership.md` (both Accepted,
+2026-09-15, neither implemented yet). See "Candidate decisions" below.
 
 ## Scope
 
@@ -24,7 +27,10 @@ reconciliation — is **spike-only scaffolding**. Current production
 GitWorktree` have **none** of this: no labels, no cancellation wiring,
 no durable manifest, no signal handling, no startup reconciler.
 `src/codeagent` was not modified; `codeagent.executor.DEFAULT_IMAGE`
-is imported read-only for the pinned verification image.
+is imported read-only for the pinned verification image. None of this
+spike code is imported into or reused by production code; any
+production implementation reimplements the demonstrated principles
+with its own tests.
 
 `GitWorktree` cannot itself implement this experiment's child-owned,
 precomputed-path worktree (its `__enter__` always allocates its own
@@ -348,7 +354,8 @@ every real process.
   location was prototyped.
 - The advisory-lock mechanism's cross-process exclusion and automatic
   release after the exact holder process dies were empirically
-  confirmed on macOS/arm64/APFS and Linux/x86_64/ext4. PID identity is
+  confirmed on macOS/arm64 (filesystem type not recorded in the macOS
+  evidence) and Linux/x86_64 (ext4 observed). PID identity is
   not the authority, but PID reuse itself was not induced or observed;
   host-reboot behavior and network filesystems remain untested.
 - Host-reboot recovery remains explicitly out of scope (consistent
@@ -378,7 +385,7 @@ every real process.
   independently re-verified, which is exactly how this defect, its own
   regression, and two further structural gaps were all found in turn.
 
-## Candidate decisions this evidence could inform (none accepted here)
+## Candidate decisions enabled by this evidence (subsequently decided in ADR 0004 and ADR 0005)
 
 - Docker ownership-label schema (the three-tier `spike`/`session`/`run`
   labels demonstrated here are a candidate, not a decision).
@@ -387,8 +394,8 @@ every real process.
   discipline demonstrated; no production-grade integrity mechanism
   proposed).
 - Stale-vs-active determination policy (advisory-lock approach
-  demonstrated as PID-reuse-safe locally; cross-reboot robustness not
-  addressed).
+  demonstrated not to rely on PID identity; PID reuse itself was not
+  induced or tested; cross-reboot robustness not addressed).
 - Startup-reconciliation trigger/scope in production.
 - SIGINT/SIGTERM ownership and whether production should install
   handlers at all.
@@ -397,7 +404,12 @@ every real process.
   `RECONCILIATION_FAILED`/retry discipline is evidence for, not a
   decision about, production retry/alert/refuse-to-start policy).
 
-None of the above is accepted by this document. All require an
-explicit author decision, to be recorded separately (and, if it meets
-the bar in `CLAUDE.md`'s documentation ladder, as an ADR) if and when
-made.
+None of the above was accepted by the evidence runs or by this
+document; the list is retained as the set of candidates the spike
+enabled. The author subsequently decided them in
+`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md` (label
+schema, registry, identity recomputation, stale-vs-active locking,
+startup reconciliation, reconciliation-failure behavior) and
+`docs/adr/0005-cancellation-and-signal-ownership.md` (signal ownership,
+cancellation API). Those ADRs, not this document, record the decisions;
+no mechanism from either is implemented in production yet.

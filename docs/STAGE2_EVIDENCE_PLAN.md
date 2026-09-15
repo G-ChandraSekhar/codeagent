@@ -11,9 +11,12 @@ Milestone 3 commit `00063d4` (`security: enforce Docker memory ceiling
 and classify OOM`) — a post-hardening follow-up then directly validated
 that resolution on both platforms (`spikes/s4/S4_RESULT.md`). S5
 (interrupt and lifecycle scenarios) has completed spike evidence on
-macOS/arm64 and Linux/x86_64 (`spikes/s5/S5_RESULT.md`, status DRAFT),
-including independent clean workflow diagnostics on Linux; no
-production decision or implementation has followed from it. The remaining spikes
+macOS/arm64 and Linux/x86_64 (`spikes/s5/S5_RESULT.md`, evidence
+complete), including independent clean workflow diagnostics on Linux;
+its production design is accepted in
+`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md` and
+`docs/adr/0005-cancellation-and-signal-ownership.md` but not yet
+implemented. The remaining spikes
 below (S2a, S2b, S7, S8, plus the non-spike S6) are still pending.
 Production code exists for Milestone 0, Milestone 1,
 and the Milestone 3 memory/OOM hardening (see `CLAUDE.md`'s current
@@ -419,12 +422,19 @@ retained as originally written and is not itself updated to describe
 current behavior)**: macOS/arm64 and Linux/x86_64 spike evidence for all six scenarios
 (five lifecycle outcomes plus fresh-process reconciliation), followed
 by a separate idempotency check, is complete
-(`spikes/s5/S5_RESULT.md`, status DRAFT). Linux workflow run
+(`spikes/s5/S5_RESULT.md`, evidence complete). Linux workflow run
 `34783737248` also retained independent clean baseline/final
-diagnostics. No production decision has been made from
-this evidence, and no S5 mechanism is implemented in
+diagnostics. The production design this evidence informed is accepted
+in `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md` and
+`docs/adr/0005-cancellation-and-signal-ownership.md`, but no S5
+mechanism is implemented in
 `src/codeagent/executor.py`, `src/codeagent/workspace.py`, or anywhere
-else in production code.
+else in production code. The original **Code disposition** line below
+("the reconciliation mechanism is directly reused in
+`execution/docker.py`") no longer describes the plan: the S5 spike
+code is spike-only and is not reused in production; any production
+implementation reimplements the demonstrated principles with its own
+tests.
 
 **Question**: Under each of six distinct lifecycle scenarios — normal
 completion, explicit cancellation, SIGINT, SIGTERM, an uncatchable

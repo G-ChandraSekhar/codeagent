@@ -1099,3 +1099,28 @@ reconciler removed them without changing the four canaries.
   cancellation, signal-ownership, or startup-reconciliation design is
   accepted; nothing is implemented in production. `S5_RESULT.md`
   remains DRAFT pending author review.
+
+---
+
+## Session (2026-09-15): S5 production decisions accepted (ADR 0004, ADR 0005)
+
+Documentation only. The author accepted the S5 lifecycle architecture as
+`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md` and
+`docs/adr/0005-cancellation-and-signal-ownership.md`; mechanics live there.
+
+- **Accepted decisions**: separate `lifecycle_id` (public `run_id`
+  unchanged); per-user state root with repository namespaces; four
+  required Docker labels and `baseline`/`verification` roles; bounded
+  lifecycle projection plus typed maintenance trace (run events stay
+  canonical); inode-verified, never-unlinked `flock` locks; fail-closed
+  current-repository reconciliation; `codeagent reconcile` with
+  resource-preserving abandonment (`ABANDONED_UNRESOLVED` never clean);
+  replaced-repository namespaces fail closed as an accepted v1
+  limitation; hidden checkpoint refs (ADR 0003 amendment pending);
+  `VerificationOutcome.CANCELLED` with entrypoint-owned SIGINT/SIGTERM.
+- **Guarantee**: recovery of owned resources plus interruption
+  detection — never crash consistency.
+- **Status**: nothing implemented; T-F1/T-F2 remain open until
+  implementation and production acceptance tests pass.
+- **Next step**: Milestone 2, starting with the ADR 0003 checkpoint-ref
+  amendment.

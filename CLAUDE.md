@@ -240,10 +240,18 @@ Stage 2 (of the four-stage planning process in
   all against real Docker and a real throwaway worktree; macOS evidence
   was committed at `d2a6f63`, and Linux workflow run `34783737248`
   passed with independently clean workflow diagnostics; see
-  `spikes/s5/S5_RESULT.md`, status DRAFT). No S5
-  mechanism (labeling, manifest/registry, locking, cancellation,
-  startup reconciliation) is implemented in production, and no
-  candidate architecture decision from this spike has been accepted.
+  `spikes/s5/S5_RESULT.md`, evidence complete). Author decisions are
+  **Accepted** in `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`
+  (lifecycle IDs, state root and repository namespaces, ownership
+  labels, locks, attribution, container → worktree → checkpoint-ref
+  cleanup, fail-closed pre-run reconciliation, explicit reconcile and
+  abandonment) and `docs/adr/0005-cancellation-and-signal-ownership.md`
+  (cancellation token, entrypoint-owned SIGINT/SIGTERM handlers,
+  `VerificationOutcome.CANCELLED`). **None of it is implemented in
+  production yet.** Order: Milestone 2 first — its first documentation
+  task is ADR 0003's hidden checkpoint-ref amendment — then these
+  mechanisms as Milestone 3 lifecycle work. S5 spike code is not reused
+  in production.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
