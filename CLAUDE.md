@@ -223,7 +223,13 @@ Stage 2 (of the four-stage planning process in
   implementation exists yet; the ADR records required Milestone 2
   failure-path testing obligations (disposal/recreation failure,
   additions, deletions, renames, unexpected dirty/index states) that
-  S3's evidence does not cover.
+  S3's evidence does not cover. **Amendment 1 (Accepted 2026-09-15)**
+  makes checkpoints durably reachable through one hidden ref per
+  lifecycle, `refs/codeagent/runs/<lifecycle_id>/checkpoint`, changed
+  only by compare-and-swap `git update-ref --no-deref`; a commit is
+  accepted only once that ref advances. Not implemented; Milestone 2
+  owns the ref mechanics and tests, ADR 0004 (Milestone 3) owns
+  durable write-ahead and dead-run reconciliation of orphaned refs.
 - **S4 — executor/container isolation**: original isolation evidence
   exists on both macOS/Docker Desktop and Linux/x86_64. Commit
   `00063d4` resolved the two open questions it raised (`--memory-swap`
@@ -248,8 +254,8 @@ Stage 2 (of the four-stage planning process in
   abandonment) and `docs/adr/0005-cancellation-and-signal-ownership.md`
   (cancellation token, entrypoint-owned SIGINT/SIGTERM handlers,
   `VerificationOutcome.CANCELLED`). **None of it is implemented in
-  production yet.** Order: Milestone 2 first — its first documentation
-  task is ADR 0003's hidden checkpoint-ref amendment — then these
+  production yet.** Order: Milestone 2 first — ADR 0003's hidden
+  checkpoint-ref amendment is now Accepted — then these
   mechanisms as Milestone 3 lifecycle work. S5 spike code is not reused
   in production.
 - One Stage-2 spike is unstarted: Responses API strict function tools

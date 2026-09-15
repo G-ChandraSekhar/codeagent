@@ -9,8 +9,8 @@ exists in production code yet. See "Implementation order" below.
 
 Every CodeAgent run creates host resources that can outlive the process
 that created them: a disposable Git worktree, verification containers,
-and — once ADR 0003's pending amendment adopts it — a hidden checkpoint
-ref. An uncatchable SIGKILL or a crash prevents any in-process cleanup
+and a hidden checkpoint ref (ADR 0003 Amendment 1, Accepted). An
+uncatchable SIGKILL or a crash prevents any in-process cleanup
 (`docs/threat-model.md` T-F1, T-F2).
 
 Stage-2 spike S5 (`spikes/s5/S5_RESULT.md`) exercised interruption and
@@ -147,12 +147,23 @@ determines a deletion target.
 Created and validated only while holding the repository lock.
 
 - Contents: `schema_version`, `repo_key`, the canonical Git common
-  directory path, and the `st_dev`/`st_ino` of the **opened** Git
-  common directory.
+  directory path, the `st_dev`/`st_ino` of the **opened** Git common
+  directory, and the repository's Git `object_format`.
 - Creation: only when `repos/<repo-key>/` and `worktrees/<repo-key>/`
   contain no state; created with `O_EXCL`, `fsync`ed.
-- Validation on every use: the key, canonical path, `st_dev`, and
-  `st_ino` must all match the freshly opened common directory. Any
+- **Object format (no SHA-1 assumption):** the object format is
+  determined from the trusted repository through Git itself (for
+  example `git rev-parse --show-object-format`) and must be `sha1`
+  (object IDs match `^[0-9a-f]{40}$`) or `sha256` (`^[0-9a-f]{64}$`).
+  An undeterminable or unsupported format is `SUBSTRATE_UNAVAILABLE`.
+  The zero OID used for compare-and-swap creation is the all-zero
+  object ID of that format's length. Every object ID CodeAgent records
+  or compares — checkpoint-ref SHAs in projections, abandonment
+  markers, and maintenance events — is validated against this format;
+  a malformed or wrong-length value is `REFUSED`.
+- Validation on every use: the key, canonical path, `st_dev`,
+  `st_ino`, and object format must all match the freshly opened
+  repository. Any
   mismatch — including a canonical-path match whose `st_dev` or
   `st_ino` changed because the repository was replaced, re-cloned,
   restored from backup, or its device number changed — is
@@ -188,9 +199,58 @@ used to explain what a run did.
   `state-root.json`); diagnostic `run_id` and source path; `state`;
   `containers.baseline` and `containers.verification`, each
   `{intent, id}`; `worktree {intent, expected_head}`;
-  `checkpoint_ref {intent, sha}`; `failure {phase, detail}` or null
-  (fixed, sanitized strings); `reconciliation {attempts_total,
-  recent_failures}`.
+  `checkpoint_ref {intent, accepted_sha, expected_old_sha,
+  proposed_new_sha}` (a write-ahead transition record — see below);
+  `failure {phase, detail}` or null (fixed, sanitized strings);
+  `reconciliation {attempts_total, recent_failures}`.
+- **`checkpoint_ref` transition record** (ADR 0003 Amendment 1). In the
+  record, `null` means "no ref"; the zero OID appears only in Git argv.
+  Every non-null SHA must match the repository's object format (§4).
+  Valid combinations:
+
+  | `intent` | `accepted_sha` | `expected_old_sha` | `proposed_new_sha` |
+  |---|---|---|---|
+  | `absent` | null | null | null |
+  | `creating` | null | null (no ref expected) | initial SHA |
+  | `present` | current accepted SHA | null | null |
+  | `advancing` | current accepted SHA A | A | new SHA B, with B ≠ A |
+  | `removing` | final accepted SHA F | F | null (absence expected) |
+
+  Any other combination is an inconsistent projection (`REFUSED`).
+  Write-ahead:
+  - **Create:** write `creating`; then the compare-and-swap create
+    against the zero OID; confirm the ref is non-symbolic and equals
+    the initial SHA; collapse to `present` with that SHA.
+  - **Advance:** write `advancing`; then the compare-and-swap advance;
+    confirm the ref equals B; collapse to `present` with B.
+  - **Delete:** write `removing`; then the compare-and-swap delete;
+    confirm the ref is absent; collapse to `absent`.
+  - **Live-owner handling after a failed or unconfirmed ref operation**
+    is operation-specific. It is always based on a fresh exact
+    observation of the ref:
+    - **Create failed:** if the ref is confirmed absent, collapse to
+      `absent`.
+    - **Advance failed:**
+      - Live ref confirmed still equal to `accepted_sha`: collapse to
+        `present` at `accepted_sha`. The new commit is unaccepted, and
+        ADR 0003 discard-and-recreate handles the contaminated worktree.
+      - Live ref equal to `proposed_new_sha`: the advance succeeded
+        despite the reported failure. Follow the normal
+        acceptance/confirmation path to `present` at `proposed_new_sha`;
+        never treat it as a rollback.
+    - **Terminal delete failed with the ref still present:** remain
+      `removing`, with the lifecycle in `CLEANING`, for later
+      reconciliation. Never collapse back to `present` to hide an
+      unconfirmed cleanup. The run cannot end cleanly (§13).
+    - **Delete where absence is confirmed:** collapse to `absent`.
+    - **Any other or ambiguous observation** (symbolic ref, unexpected
+      value, or failed observation): leave the transitional record
+      unchanged and terminate fail-closed. Dead-run reconciliation (§8)
+      re-inspects it: a valid recorded candidate may be reconciled, but a
+      symbolic or unexpected value is `REFUSED` and an inspection failure
+      remains `SUBSTRATE_UNAVAILABLE`.
+  - Within Milestone 2, before this projection exists, the owning
+    process holds the same transition record in memory only.
 - `recent_failures` is capped at 10 entries (oldest dropped);
   `attempts_total` is never reset. Complete history lives only in
   maintenance events (§12).
@@ -291,15 +351,29 @@ Worktree, at the recomputed path `<root>/worktrees/<repo-key>/<lifecycle-id>`:
   <path>`, confirmed by exact registration absence and directory
   absence. No recursive filesystem deletion fallback.
 
-Checkpoint ref `refs/codeagent/runs/<lifecycle-id>/checkpoint` (the
-reachability semantics belong to ADR 0003's pending amendment; the
-attribution and reconciliation rules below apply once it is adopted):
+Checkpoint ref `refs/codeagent/runs/<lifecycle_id>/checkpoint`
+(reachability semantics: ADR 0003 Amendment 1, Accepted). Dead-run
+reconciliation observes the exact recomputed ref through structured
+argv against the trusted repository, then acts on the persisted
+transition record (§5):
 
-- Ref missing: confirmed absent.
-- Ref value equals the recorded SHA: delete with compare-and-swap
-  (`git update-ref --no-deref -d <ref> <expected>`) and confirm missing.
-- Any other value, or a symbolic ref: `REFUSED`.
-- Intent `absent` while the ref exists: `REFUSED`.
+| Persisted `intent` | Deletion candidates | Live ref missing | Live value is a candidate | Any other value, or symbolic |
+|---|---|---|---|---|
+| `absent` | none | Confirmed absent | — | `REFUSED` (any existing ref) |
+| `creating` | `proposed_new_sha` | Confirmed absent | Delete | `REFUSED` |
+| `present` | `accepted_sha` | Confirmed absent | Delete | `REFUSED` |
+| `advancing` | `accepted_sha` (= `expected_old_sha`) or `proposed_new_sha` | Confirmed absent | Delete | `REFUSED` |
+| `removing` | `accepted_sha` (= `expected_old_sha`) | Confirmed absent | Delete | `REFUSED` |
+
+- **Delete** means `git update-ref --no-deref -d <ref> <observed
+  candidate SHA>`, then confirming the ref is absent, then recording
+  `absent`. The expected value is always the observed live value, and
+  only when that value is a valid candidate for the persisted intent.
+- An inconsistent or malformed transition record, or a SHA that does
+  not match the repository's object format, is `REFUSED`.
+- A failed observation is `SUBSTRATE_UNAVAILABLE`.
+- Intermediate discard-and-recreate never deletes or moves the ref
+  (§9). Terminal teardown and dead-run reconciliation delete it last.
 - `refs/codeagent/` is never swept; discovery is report-only.
 - While a ref exists it is visible to `git for-each-ref` and would be
   pushed by `git push --mirror`; this is documented, accepted
@@ -477,8 +551,11 @@ cancellation-specific application of this rule is in ADR 0005.
   ownership, and every container for that lifecycle is confirmed
   absent.
 - **I5** A checkpoint ref is removed only in terminal teardown or
-  dead-run reconciliation, with both locks held, the worktree
-  confirmed absent, and a compare-and-swap on the recorded SHA.
+  dead-run reconciliation (never during intermediate
+  discard-and-recreate), with both locks held, the worktree confirmed
+  absent, and a compare-and-swap whose expected value is a valid
+  candidate for the persisted transition intent (§5, §8), validated
+  against the repository's object format.
 - **I6** Any inspection error or timeout causes zero mutation for that
   entry and blocks the current repository.
 - **I7** Conflicts, ambiguities, inconsistent projections, and
@@ -584,7 +661,13 @@ replacement and case-alias detection; projection crash between temp
 write and replace, corruption refusal, bounded history; lock contention
 across real subprocesses, release after SIGKILL with a `docker`/`git`
 child running, inode-mismatch refusal, never-unlink; every row of the
-container, worktree, and ref tables; a canary suite (unlabeled and
+container, worktree, and ref tables; every valid and invalid
+`checkpoint_ref` transition combination, including a crash at each
+write-ahead step of create, advance, and delete; object-format
+detection and SHA validation in SHA-1 repositories and — where the
+installed Git supports `--object-format=sha256` — SHA-256
+repositories (an unsupported environment is reported as a skipped
+test with its reason, never a silent pass); a canary suite (unlabeled and
 same-prefix containers, foreign state root and lifecycle IDs, renamed
 owned containers, images carrying `codeagent.*` labels, operator
 worktrees present/missing/locked, locked CodeAgent worktrees, symlinked
@@ -647,7 +730,7 @@ reading `src/codeagent/workspace.py`, `src/codeagent/executor.py`, and
 
 ## Implementation order
 
-Nothing here is implemented. Milestone 2 comes first (its first
-documentation task is ADR 0003's checkpoint-ref amendment); the
+Nothing here is implemented. Milestone 2 comes first, including the
+checkpoint-ref mechanics of ADR 0003 Amendment 1 (Accepted); the
 mechanisms in this ADR are implemented afterwards as Milestone 3
 lifecycle work. See `CLAUDE.md` and `ENGINEERING_LOG.md`.

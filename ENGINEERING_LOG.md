@@ -1124,3 +1124,38 @@ Documentation only. The author accepted the S5 lifecycle architecture as
   implementation and production acceptance tests pass.
 - **Next step**: Milestone 2, starting with the ADR 0003 checkpoint-ref
   amendment.
+
+---
+
+## Session (2026-09-15): ADR 0003 Amendment 1 — hidden checkpoint refs
+
+Documentation only; first Milestone 2 task. Accepted Amendment 1 to
+`docs/adr/0003-recover-partial-patches-by-replacing-worktree.md`; the
+original decision text is unchanged.
+
+- **Why**: checkpoints are detached-`HEAD` commits with no ref, so after
+  discard they survive only until `git gc` — recreation "from the last
+  accepted checkpoint" was not structurally guaranteed (code reading;
+  no spike evidence).
+- **Decision**: one hidden ref per lifecycle,
+  `refs/codeagent/runs/<lifecycle_id>/checkpoint`, created at the
+  starting commit and changed only by compare-and-swap
+  `git update-ref --no-deref`; a commit is accepted only after all
+  checks pass and the ref advances; discard-and-recreate keeps the ref,
+  terminal teardown deletes it last; `refs/codeagent/` is never swept;
+  `git push --mirror` visibility is documented.
+- **Cross-ADR alignment**: ADR 0004 now uses a write-ahead
+  `checkpoint_ref` transition record (`absent`/`creating`/`present`/
+  `advancing`/`removing`) instead of one recorded SHA, and validates
+  object IDs against the repository's own object format (SHA-1 or
+  SHA-256), with operation-specific live-owner rollback: a failed
+  terminal delete stays `removing`, never `present`.
+  `ToolCompleted(success=True)` is delayed until the whole `apply_patch`
+  transaction is accepted, and one failure occurrence has exactly one
+  `OperationalError` (same `error_id` and code on every event).
+  `ToolCompleted` legality is extended rather than translated. T-M1 now separates today's
+  `GitWorktree` controls (including its `prune`/`rmtree` fallback,
+  which Milestone 2 removes) from the accepted ones.
+- **Status**: all mechanisms remain unimplemented. Milestone 2 owns ref
+  mechanics and tests; ADR 0004 (Milestone 3) owns durable write-ahead
+  and dead-run reconciliation.

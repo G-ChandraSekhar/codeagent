@@ -1324,21 +1324,51 @@ this detailed entry states.
   design — that is how Git worktrees work, not a bug to eliminate
 - Impact: if mishandled, could corrupt the original checkout's Git metadata
   (distinct from its working-copy *files*, which CodeAgent does not touch)
-- Implemented control: none yet (workspace module unbuilt)
-- Planned control: use only well-defined `git worktree` porcelain operations
-  (add/remove/prune) rather than hand-editing `.git` internals; verify
-  pre/post state of the original repository's metadata (branch list, HEAD,
-  refs) as part of the "original checkout unmodified" verification already
-  required by `PROJECT_BRIEF.md`'s completion criterion 7 — extended here to
-  cover metadata, not only working-copy file hashes
-- Evidence/future test: the Stage-2 worktree spike (S1) already exercises
-  create/remove; a future test should additionally snapshot and diff the
-  original repo's `.git` metadata (refs, worktree list) before and after,
-  not only working-copy file hashes
+- Implemented control (Milestone 1): `GitWorktree`
+  (`src/codeagent/workspace.py`) creates and removes disposable worktrees
+  with structured-argv porcelain `git worktree add --detach` and
+  `git worktree remove --force`, and parses exact
+  `git worktree list --porcelain` registrations rather than hand-editing
+  `.git` internals. Its cleanup fallback still calls `shutil.rmtree` and a
+  repository-wide `git worktree prune`, which can affect unrelated
+  registrations; Milestone 2 must remove that fallback (ADR 0004 I2). No
+  checkpoint ref exists today.
+- Planned control (accepted, not implemented):
+  - Per ADR 0003 Amendment 1 (Accepted 2026-09-15): exactly one
+    intentionally owned hidden ref per lifecycle,
+    `refs/codeagent/runs/<lifecycle_id>/checkpoint`, changed only by
+    compare-and-swap `git update-ref --no-deref` using the repository's
+    own object format, never swept, and refused if pre-existing,
+    symbolic, or unexpectedly changed.
+  - Per ADR 0004: worktree removal only by exact
+    `git worktree remove --force` with no `prune` or `rmtree` fallback,
+    and dead-run reconciliation of orphaned registrations and refs.
+  - Shared-metadata invariant, verified as part of `PROJECT_BRIEF.md`
+    completion criterion 7:
+    - the original checkout's working-copy files, branch `HEAD`, index,
+      and ordinary refs stay unchanged, with refs compared by value;
+    - while a lifecycle is active, only its exact owned worktree
+      registration and exact hidden checkpoint ref are permitted
+      administrative entries;
+    - Git's shared object database necessarily gains commit, tree, and
+      blob objects and is not expected to stay byte-identical;
+    - after teardown, both owned entries are absent;
+    - unrelated worktree registrations and refs stay unchanged.
+- Evidence/future test: the Stage-2 worktree spike (S1) and the Milestone 1
+  integration tests exercise create/remove; the invariant above still
+  needs dedicated tests that snapshot the original repository's refs (by
+  value), worktree list, branch `HEAD`, index, and working-copy file
+  hashes before, during, and after a run
 - Residual risk: low but nonzero — `git worktree` is mature, well-tested
   tooling, but CodeAgent's *usage* of it hasn't been adversarially tested for
-  metadata-corruption edge cases (e.g. concurrent access, see T-E1)
-- Owning milestone/spike: Stage-2 worktree spike, Milestone 1
+  metadata-corruption edge cases (e.g. concurrent access, see T-E1). The
+  owned hidden checkpoint ref is intentional shared metadata: ordinary
+  branch pushes exclude it, but `git push --mirror` and other all-refs
+  copies can publish it and its checkpoint commits, and an orphaned ref
+  retains objects until ADR 0004 reconciliation (Milestone 3) removes it
+- Owning milestone/spike: Milestone 1 (current `GitWorktree`); Milestone 2
+  (fallback removal and ADR 0003 Amendment 1 checkpoint-ref mechanics);
+  Milestone 3 (ADR 0004 reconciliation of orphaned registrations and refs)
 
   **Correction to prior language:** earlier reports in this project described
   the guarantee as "the original repository is never touched." That is
