@@ -392,7 +392,11 @@ def test_advance_when_absent_is_refused(repo: Path, ref: CheckpointRef) -> None:
 
 
 def test_observe_refuses_a_symbolic_ref(repo: Path, ref: CheckpointRef) -> None:
-    _git(repo, "symbolic-ref", ref.ref_name, "refs/heads/main")
+    # An explicitly created ref, never the repository's default branch
+    # name (which is an environment-dependent assumption — e.g. "main"
+    # vs. "master" — not something these tests should rely on).
+    _git(repo, "update-ref", "refs/heads/pin", _head(repo))
+    _git(repo, "symbolic-ref", ref.ref_name, "refs/heads/pin")
     with pytest.raises(CheckpointRefError) as excinfo:
         ref.observe()
     assert excinfo.value.reason is CheckpointRefFailure.SYMBOLIC_REF
@@ -404,8 +408,9 @@ def test_mutations_refuse_a_symbolic_ref_and_leave_it_symbolic(
     """Load-bearing: `git update-ref --no-deref` against a symbolic ref
     succeeds and silently rewrites it into a regular ref, so
     compare-and-swap alone would not protect the owned name."""
-    _git(repo, "symbolic-ref", ref.ref_name, "refs/heads/main")
     head = _head(repo)
+    _git(repo, "update-ref", "refs/heads/pin", head)
+    _git(repo, "symbolic-ref", ref.ref_name, "refs/heads/pin")
     second = _commit(repo, "two\n")
 
     for call in (
@@ -417,7 +422,7 @@ def test_mutations_refuse_a_symbolic_ref_and_leave_it_symbolic(
             call()
         assert excinfo.value.reason is CheckpointRefFailure.SYMBOLIC_REF
         assert (
-            _git(repo, "symbolic-ref", ref.ref_name).stdout.strip() == "refs/heads/main"
+            _git(repo, "symbolic-ref", ref.ref_name).stdout.strip() == "refs/heads/pin"
         ), "the owned ref must still be symbolic — no mutation may have happened"
 
 
