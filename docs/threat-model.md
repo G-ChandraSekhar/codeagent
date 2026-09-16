@@ -1419,17 +1419,42 @@ this detailed entry states.
   module does not make the system safe. Required follow-up: apply and
   test this policy in `workspace.py` and `patch.py` **before** the
   checkpoint-ref primitive is integrated with patch application, so the
-  integrated path never runs repository-configured hooks. Decide at
-  that point whether the policy belongs in one shared Git-invocation
-  helper rather than being repeated per module
+  integrated path never runs repository-configured hooks.
+  **`docs/adr/0006-git-safety-policy-for-filters-hooks-and-content-fidelity.md`
+  is now Accepted** and covers this in full, including the decision
+  that the policy lives in one shared Git-invocation module
+  (`_git_safety.py`) rather than being repeated per module — the
+  shared-module design, `filter.*`/`core.fsmonitor`/`core.pager`/
+  `core.editor`/`diff` textconv-and-ext-diff coverage (`patch.py`
+  already runs `git diff --cached`, so this is an active command, not a
+  hypothetical), the exact-byte content-fidelity invariant, and
+  partial-clone/lazy-fetch safety (which establishes Git >= 2.45 as
+  CodeAgent v1's minimum supported Git version, required for the global
+  `--no-lazy-fetch` option this control depends on). **No mechanism in
+  ADR 0006 is implemented yet**; this entry's "open for the rest of the codebase"
+  status below is unchanged until implementation lands and its
+  acceptance tests pass on both macOS and Linux. **Merge drivers are
+  currently non-applicable, not covered**: production code invokes no
+  `git merge` command anywhere today (confirmed by inspection of
+  `src/codeagent/`), so there is no active command for a merge driver
+  to attach to; any future code path that invokes `git merge` or an
+  external merge tool must extend ADR 0006 before use, not assume it is
+  already covered
 - Evidence/future test: the checkpoint-ref regression test described
   above; equivalent tests are still owed for `patch.py` (`pre-commit`,
-  `commit-msg`, `post-commit`) and `workspace.py` (`post-checkout`)
-- Residual risk: **open for the rest of the codebase.** Also unaddressed
-  here: other configuration-driven execution channels (for example
-  `core.fsmonitor`, `core.pager`, `core.editor`, `diff`/`merge` drivers,
-  or `filter.*` clean/smudge commands), which this entry does not claim
-  to have surveyed
+  `commit-msg`, `post-commit`) and `workspace.py` (`post-checkout`), plus
+  ADR 0006's full required-acceptance-test list (attribute-based
+  filter/content-fidelity refusal, partial-clone/lazy-fetch preflight
+  and controls on both platforms)
+- Residual risk: **open for the rest of the codebase — design accepted,
+  nothing implemented.** Also unaddressed here: other configuration-driven
+  execution channels (for example `core.fsmonitor`, `core.pager`,
+  `core.editor`, or `filter.*` clean/smudge commands) are now designed
+  for in ADR 0006 but not yet built or tested, so they remain open
+  exactly as before this ADR's acceptance. Merge drivers remain
+  genuinely unaddressed (not merely "not yet built") since ADR 0006
+  does not design for them at all, pending any future command that
+  would need them
 - Owning milestone/spike: Milestone 2 (before patch integration), then
   reviewed again when ADR 0004's lifecycle work adds Git invocations
 

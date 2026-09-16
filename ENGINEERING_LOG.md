@@ -1194,3 +1194,37 @@ lifecycle-store, reconciliation, cancellation, or CLI wiring. API:
 - **Next step**: T-M3 remediation in `workspace.py`/`patch.py`, then the
   lifecycle store that writes ADR 0004's `creating`/`advancing`/
   `removing` intent around these calls.
+
+---
+
+## Session (2026-09-16): ADR 0006 accepted — Git safety policy for T-M3
+
+**Outcome**:
+`docs/adr/0006-git-safety-policy-for-filters-hooks-and-content-fidelity.md`
+is **Accepted**. **No production code changed — design only.**
+
+- Real fixtures (hostile filters/hooks, a local fake `ext::`
+  remote-helper) proved `worktree add --no-checkout` + `read-tree` +
+  `check-attr --cached -z --stdin` inspects every tracked path's
+  attributes with zero filter/hook execution before materialization;
+  `filter` `set`/valued is unsafe, `unspecified`/`unset` safe;
+  `ident`/`working-tree-encoding` silently alter committed bytes
+  (both reproduced) and are refused per destination, not repo-wide;
+  `commit` can rerun clean/process filters, so it needs the same
+  backstop as `add`; `required=false` proven unnecessary once
+  overrides only touch subkeys that exist.
+- The same fake-helper fixture proved `read-tree`/`ls-files`/
+  `check-attr --cached` never need blob content and never fetch, while
+  `checkout`/`cat-file` do by default and are fully blocked by
+  `GIT_NO_LAZY_FETCH=1`. Verified macOS/Git 2.54.0 only. `--no-lazy-fetch`
+  requires Git 2.45+, so ADR 0006 sets that as CodeAgent v1's minimum
+  supported Git version — older installs are refused, not degraded.
+- Key decisions: whole-run refusal for any active `filter` anywhere;
+  per-destination refusal for byte-transforming attributes; fixed
+  enumeration bounds (128/256/65,536); three-way lazy-fetch runtime
+  classification (unsupported-substrate / objects-unavailable /
+  ordinary failure), `ErrorCode`s deferred to implementation.
+- **Status**: Accepted, **zero implementation**. T-M3 remains open.
+  Next: implement `_git_safety.py`, harden `workspace.py`/`patch.py`,
+  pass acceptance tests on macOS and Linux — only then does
+  `checkpoint_ref.py` integrate with patch application.

@@ -240,12 +240,24 @@ Stage 2 (of the four-stage planning process in
   run host code, object format is detected with no SHA-1 assumption,
   linked worktrees are refused, and every mutation outcome is
   classified by observation while preserving its precise cause — with
-  84 focused tests. **The hooks exposure is project-wide (threat model
+  90 focused tests. **The hooks exposure is project-wide (threat model
   T-M3): `patch.py` and `workspace.py` are still unprotected and must
   be fixed before patch integration.** This module is
   deliberately **not integrated**: no controller, worktree, patch,
   lifecycle-store, reconciliation, cancellation, or CLI wiring yet, and
   ADR 0004's durable transition record is the next slice.
+  **`docs/adr/0006-git-safety-policy-for-filters-hooks-and-content-fidelity.md`
+  is now Accepted**, designing T-M3's full remediation for
+  `workspace.py`/`patch.py`: inspect-then-refuse-or-checkout for
+  `worktree add` (no-checkout + `read-tree` + attribute inspection),
+  an exact-byte content-fidelity invariant, a bounded filter-enumeration
+  backstop for `status`/`add`/`commit`, and `GIT_NO_LAZY_FETCH=1`
+  partial-clone safety. **Nothing in ADR 0006 is implemented**; T-M3
+  remains open, and checkpoint-ref integration with patch application
+  must wait until this ADR's acceptance tests pass on macOS and Linux.
+  ADR 0006 also establishes **Git >= 2.45 as CodeAgent v1's minimum
+  supported Git version** (required for the global `--no-lazy-fetch`
+  option); nothing is implemented yet.
 - **S4 — executor/container isolation**: original isolation evidence
   exists on both macOS/Docker Desktop and Linux/x86_64. Commit
   `00063d4` resolved the two open questions it raised (`--memory-swap`
