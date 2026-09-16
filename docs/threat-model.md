@@ -1387,6 +1387,52 @@ this detailed entry states.
   rather than the "two runs" angle. Control and residual risk are as
   described in T-E1 (run-level lock); not duplicated here.
 
+**T-M3 — Repository-configured Git hooks execute host code during CodeAgent's own Git operations.**
+- Asset/objective: O1, O7, and the host itself
+- Source: `core.hooksPath` (or a populated hooks directory) in the
+  repository, global, or system Git configuration of the repository
+  CodeAgent operates on
+- Attack path: Git runs hooks for ordinary operations, outside any
+  container and with the operator's privileges. Reproduced directly
+  against real repositories: a `reference-transaction` hook ran during a
+  checkpoint-ref mutation; a `pre-commit` hook ran during
+  `patch.py`'s `git commit`; a `post-checkout` hook ran during
+  `workspace.py`'s `git worktree add`. Clearing `GIT_*` environment
+  variables does **not** disable hooks — configuration files are a
+  separate channel. Hooks are not copied by `git clone`, so this needs
+  either the operator's own configuration (trusted but fallible, A3) or
+  a `.git` directory obtained from an untrusted source; note that a
+  `core.hooksPath` pointing *inside* the working tree turns untrusted
+  repository content (A2) into host code execution
+- Impact: arbitrary host code execution outside the container boundary,
+  during operations the design treats as safe metadata manipulation
+- Implemented control: **`src/codeagent/checkpoint_ref.py` only.** Every
+  Git invocation there passes `-c core.hooksPath=/dev/null`, which is
+  command-line configuration and therefore outranks every configuration
+  file; a regression test installs a hostile `reference-transaction`
+  hook, exercises create/advance/delete, proves no hook ran, and uses a
+  positive control to prove the hook was armed
+- Planned control: the same policy on **every** Git invocation in
+  production code. `src/codeagent/patch.py` and
+  `src/codeagent/workspace.py` are **not** protected today, and the
+  project as a whole is therefore **not** protected — one hardened
+  module does not make the system safe. Required follow-up: apply and
+  test this policy in `workspace.py` and `patch.py` **before** the
+  checkpoint-ref primitive is integrated with patch application, so the
+  integrated path never runs repository-configured hooks. Decide at
+  that point whether the policy belongs in one shared Git-invocation
+  helper rather than being repeated per module
+- Evidence/future test: the checkpoint-ref regression test described
+  above; equivalent tests are still owed for `patch.py` (`pre-commit`,
+  `commit-msg`, `post-commit`) and `workspace.py` (`post-checkout`)
+- Residual risk: **open for the rest of the codebase.** Also unaddressed
+  here: other configuration-driven execution channels (for example
+  `core.fsmonitor`, `core.pager`, `core.editor`, `diff`/`merge` drivers,
+  or `filter.*` clean/smudge commands), which this entry does not claim
+  to have surveyed
+- Owning milestone/spike: Milestone 2 (before patch integration), then
+  reviewed again when ADR 0004's lifecycle work adds Git invocations
+
 ### 5.14 Platform-specific evidence (A9)
 
 **T-N1 — Sandbox/network/resource-limit claims validated only on Linux.**

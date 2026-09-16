@@ -227,9 +227,25 @@ Stage 2 (of the four-stage planning process in
   makes checkpoints durably reachable through one hidden ref per
   lifecycle, `refs/codeagent/runs/<lifecycle_id>/checkpoint`, changed
   only by compare-and-swap `git update-ref --no-deref`; a commit is
-  accepted only once that ref advances. Not implemented; Milestone 2
-  owns the ref mechanics and tests, ADR 0004 (Milestone 3) owns
-  durable write-ahead and dead-run reconciliation of orphaned refs.
+  accepted only once that ref advances. Milestone 2 owns the ref
+  mechanics and tests; ADR 0004 (Milestone 3) owns durable write-ahead
+  and dead-run reconciliation of orphaned refs.
+  **Milestone 2 slice A is implemented**: `src/codeagent/checkpoint_ref.py`
+  is the trusted ref primitive — compare-and-swap create/advance/delete
+  run inside a `git update-ref --stdin` transaction that re-observes the
+  ref while `prepare` holds its lock (closing the symbolic-substitution
+  race), every invocation strips all `GIT_*` variables and passes
+  `-c core.hooksPath=/dev/null` so neither a hostile `GIT_DIR`/
+  `GIT_NAMESPACE` nor a repository-configured hook can redirect it or
+  run host code, object format is detected with no SHA-1 assumption,
+  linked worktrees are refused, and every mutation outcome is
+  classified by observation while preserving its precise cause — with
+  84 focused tests. **The hooks exposure is project-wide (threat model
+  T-M3): `patch.py` and `workspace.py` are still unprotected and must
+  be fixed before patch integration.** This module is
+  deliberately **not integrated**: no controller, worktree, patch,
+  lifecycle-store, reconciliation, cancellation, or CLI wiring yet, and
+  ADR 0004's durable transition record is the next slice.
 - **S4 — executor/container isolation**: original isolation evidence
   exists on both macOS/Docker Desktop and Linux/x86_64. Commit
   `00063d4` resolved the two open questions it raised (`--memory-swap`

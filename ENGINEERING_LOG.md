@@ -1159,3 +1159,38 @@ original decision text is unchanged.
 - **Status**: all mechanisms remain unimplemented. Milestone 2 owns ref
   mechanics and tests; ADR 0004 (Milestone 3) owns durable write-ahead
   and dead-run reconciliation.
+
+---
+
+## Session (2026-09-16): Milestone 2 slice A — checkpoint-ref primitive
+
+**Outcome**: `src/codeagent/checkpoint_ref.py` implements ADR 0003
+Amendment 1's ref mechanics only — no controller, worktree, patch,
+lifecycle-store, reconciliation, cancellation, or CLI wiring. API:
+`CheckpointRef(source_repo, lifecycle_id)` with `observe`, `create`,
+`advance`, `delete`.
+
+- Mutations run inside a `git update-ref --stdin` transaction: probing
+  showed plain compare-and-swap does not stop a symbolic-ref
+  substitution race, so `prepare` locks the ref and it is re-observed
+  *while locked* before `commit`. Verified on `files` and `reftable`.
+- Every invocation strips all `GIT_*` env vars (a hostile `GIT_DIR` had
+  redirected `git -C <repo>` into another repository) and passes
+  `-c core.hooksPath=/dev/null`, since clearing env vars does not stop
+  a repository's own hooks from running host code — recorded as
+  threat-model **T-M3**: `patch.py`/`workspace.py` are still exposed and
+  must be fixed before patch integration; this module protects only
+  itself.
+- Mutation outcomes are decided by re-observing the ref, never assumed:
+  the precise original cause (launch/timeout/protocol failure) survives
+  when the ref turns out unchanged, and a still-unconfirmed transaction
+  process fails closed with `TRANSACTION_CLEANUP_UNCONFIRMED` (chained
+  from any abort failure) instead of silently returning.
+- No new `ErrorCode`: a module-local `CheckpointRefError`, same split as
+  `workspace.GitWorktreeError`, so the integrating slice still produces
+  exactly one `OperationalError` per occurrence.
+- **Verification**: 90 focused tests (real repositories), full suite
+  1018 passed / 3 skipped (pre-existing Docker tests, no local daemon).
+- **Next step**: T-M3 remediation in `workspace.py`/`patch.py`, then the
+  lifecycle store that writes ADR 0004's `creating`/`advancing`/
+  `removing` intent around these calls.
