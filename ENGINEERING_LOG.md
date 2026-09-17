@@ -1339,3 +1339,42 @@ Amendments 1-3; this is the concise final state.
   patch application not wired up; no trusted `.gitattributes`
   independent-layer inspection; `GitWorktree.__exit__`'s legacy
   `rmtree`/`prune` fallback unchanged (ADR 0004 gap).
+
+## Milestone 2 slice 2B-1: checkpoint session state machine (unwired)
+
+**Nothing here is integrated; it makes no production lifecycle
+guarantee.** Reviewed alone, before any controller wiring.
+
+- **Defect found while planning:** `_classify_outcome` computed the
+  mutation outcome then discarded it, re-raising the original failure
+  bare — so a timeout with the ref *confirmed unchanged* looked
+  identical to one never observed, though the two demand opposite
+  write-ahead handling. Fixed by publishing a `MutationOutcome` on
+  every `CheckpointRefError`, defaulting to `UNKNOWN` so unclassified
+  raise sites fail closed.
+- Outcomes are annotated **in place** on the same exception rather than
+  copied onto a replacement, keeping identity, traceback and the
+  `__cause__`/`__context__`/`__suppress_context__` state existing tests
+  assert on.
+- `TRANSACTION_CLEANUP_UNCONFIRMED` **dominates every classification**,
+  handled before any observation: an unconfirmed child may still hold
+  Git's ref lock, so nothing observed around it is authoritative. The
+  intended-value case previously returned success. Proven load-bearing
+  — removing the short-circuit fails four dedicated tests.
+- `checkpoint_session.py` holds ADR 0004 section 5's record **in memory
+  only**, under ADR 0004's field names so Milestone 3 serializes rather
+  than redesigns it. Collapses run off `(operation, outcome)`, never a
+  second observation. Every transitional state refuses every further
+  operation — `removing` included, since the record cannot distinguish
+  a confirmed-unchanged failure from an unknown lock outcome; only
+  reconciliation's fresh inspection can (Milestone 3). The 2B-2 error
+  mapping is recorded in that module's docstring.
+- `new_lifecycle_id()` accepts no seed — binding this function only, so
+  2B-2 must make the trusted composition root mint exclusively via it.
+
+**Verified**: 1438 full-suite, 125 checkpoint-ref (from 93), 106 new
+checkpoint-session, 3 real-Docker; py_compile and `git diff --check`
+clean; no leftover containers, worktrees, refs or Git processes.
+macOS/Git 2.54.0; Linux CI pending. **Next**: 2B-2 — entry gate,
+create/advance ordering, workspace ownership, worktree-before-ref
+teardown, event ordering, error identity.

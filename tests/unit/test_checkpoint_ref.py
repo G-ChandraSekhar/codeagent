@@ -10,6 +10,7 @@ single `_run_git` seam. No network and no Docker.
 
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 from pathlib import Path
@@ -20,8 +21,10 @@ from codeagent.checkpoint_ref import (
     CheckpointRef,
     CheckpointRefError,
     CheckpointRefFailure,
+    MutationOutcome,
     ObjectFormat,
     RefObservation,
+    new_lifecycle_id,
 )
 from codeagent import checkpoint_ref as checkpoint_ref_module
 
@@ -1624,3 +1627,586 @@ def test_create_and_advance_reject_replaced_oid_as_expected_old_value(
         ref.advance(expected_old_oid=decoy, new_oid=next_commit)
     assert excinfo.value.reason is CheckpointRefFailure.UNEXPECTED_VALUE
     assert ref.observe().oid == real
+
+
+# --------------------------------------------------------------------
+# Slice 2B-1: MutationOutcome is published alongside the reason
+#
+# The categorical reason alone cannot drive a write-ahead transition
+# record: the same reason accompanies both a ref confirmed still in its
+# pre-state and a ref whose state is unknown. These tests pin the
+# outcome for every path a session will branch on.
+# --------------------------------------------------------------------
+
+
+def test_successful_create_advance_delete_signal_applied_by_returning(
+    repo: Path, ref: CheckpointRef
+) -> None:
+    """APPLIED is signalled by a normal return and by nothing else —
+    there is no success-carrying error object to inspect."""
+    first = _head(repo)
+    assert ref.create(first) is None
+    second = _commit(repo, "two\n")
+    assert ref.advance(expected_old_oid=first, new_oid=second) is None
+    assert ref.delete(expected_oid=second) is None
+    assert ref.observe() == RefObservation(present=False, oid=None)
+
+
+def test_precheck_unexpected_value_reports_unexpected(repo: Path, ref: CheckpointRef) -> None:
+    first = _head(repo)
+    ref.create(first)
+    second = _commit(repo, "two\n")
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(second)  # already exists
+
+    assert excinfo.value.reason is CheckpointRefFailure.UNEXPECTED_VALUE
+    assert excinfo.value.outcome is MutationOutcome.UNEXPECTED
+
+
+def test_precheck_symbolic_ref_reports_symbolic(repo: Path, ref: CheckpointRef) -> None:
+    first = _head(repo)
+    _git(repo, "symbolic-ref", ref.ref_name, "refs/heads/pin")
+    _git(repo, "update-ref", "refs/heads/pin", first)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.advance(expected_old_oid=first, new_oid=_commit(repo, "two\n"))
+
+    assert excinfo.value.reason is CheckpointRefFailure.SYMBOLIC_REF
+    assert excinfo.value.outcome is MutationOutcome.SYMBOLIC
+
+
+def test_observation_failure_reports_unknown(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_run = checkpoint_ref_module._run_git
+
+    def fake_run(repo_path, *args):
+        if args[0] == "for-each-ref":
+            return subprocess.CompletedProcess(args, 128, stdout="", stderr="boom")
+        return real_run(repo_path, *args)
+
+    monkeypatch.setattr(checkpoint_ref_module, "_run_git", fake_run)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(_head(repo))
+
+    assert excinfo.value.reason is CheckpointRefFailure.OBSERVATION_FAILED
+    assert excinfo.value.outcome is MutationOutcome.UNKNOWN
+
+
+def test_ambiguous_observation_reports_unknown(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_run = checkpoint_ref_module._run_git
+    head = _head(repo)
+
+    def fake_run(repo_path, *args):
+        if args[0] == "for-each-ref":
+            two_records = f"{head}\t\t{ref.ref_name}\n{head}\t\t{ref.ref_name}\n"
+            return subprocess.CompletedProcess(args, 0, stdout=two_records, stderr="")
+        return real_run(repo_path, *args)
+
+    monkeypatch.setattr(checkpoint_ref_module, "_run_git", fake_run)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(head)
+
+    assert excinfo.value.reason is CheckpointRefFailure.AMBIGUOUS_OBSERVATION
+    assert excinfo.value.outcome is MutationOutcome.UNKNOWN
+
+
+def test_mutation_outcome_unknown_reports_unknown(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post-update observation itself fails: the outcome is
+    explicitly unknown, never reported as unchanged."""
+    launch_failure = CheckpointRefError(
+        CheckpointRefFailure.GIT_EXECUTABLE_UNAVAILABLE, "the git executable could not be launched"
+    )
+    _fail_transaction(monkeypatch, "begin", launch_failure)
+    real_run = checkpoint_ref_module._run_git
+
+    def fake_run(repo_path, *args):
+        if args[0] == "for-each-ref":
+            return subprocess.CompletedProcess(args, 128, stdout="", stderr="boom")
+        return real_run(repo_path, *args)
+
+    monkeypatch.setattr(CheckpointRef, "_require_state", lambda self, expected, when: None)
+    monkeypatch.setattr(checkpoint_ref_module, "_run_git", fake_run)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(_head(repo))
+
+    assert excinfo.value.reason is CheckpointRefFailure.MUTATION_OUTCOME_UNKNOWN
+    assert excinfo.value.outcome is MutationOutcome.UNKNOWN
+
+
+def test_timeout_with_confirmed_unchanged_ref_keeps_its_reason_and_reports_unchanged(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression this slice exists for: a timeout whose ref was
+    afterwards confirmed still in its pre-state must report BOTH its
+    original categorical reason AND `UNCHANGED`. Before the outcome
+    existed, this was indistinguishable from a never-observed failure,
+    so no caller could tell a safe collapse from an unsafe one."""
+    first = _head(repo)
+    ref.create(first)
+    second = _commit(repo, "two\n")
+
+    injected = CheckpointRefError(
+        CheckpointRefFailure.GIT_COMMAND_TIMEOUT,
+        "the git ref transaction did not finish within its time limit",
+    )
+    _fail_transaction(monkeypatch, "commit", injected)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.advance(expected_old_oid=first, new_oid=second)
+
+    # Same object, annotated in place — not a reconstructed replacement.
+    assert excinfo.value is injected
+    assert excinfo.value.reason is CheckpointRefFailure.GIT_COMMAND_TIMEOUT
+    assert excinfo.value.outcome is MutationOutcome.UNCHANGED
+    assert _ref_value(repo, ref.ref_name) == first
+
+
+def test_launch_failure_with_confirmed_unchanged_ref_reports_unchanged(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    injected = CheckpointRefError(
+        CheckpointRefFailure.GIT_EXECUTABLE_UNAVAILABLE,
+        "the git executable could not be launched",
+    )
+    _fail_transaction(monkeypatch, "__enter__", injected)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(_head(repo))
+
+    assert excinfo.value is injected
+    assert excinfo.value.reason is CheckpointRefFailure.GIT_EXECUTABLE_UNAVAILABLE
+    assert excinfo.value.outcome is MutationOutcome.UNCHANGED
+    assert _ref_value(repo, ref.ref_name) == ""
+
+
+def test_protocol_failure_with_confirmed_unchanged_ref_reports_unchanged(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    injected = CheckpointRefError(
+        CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED,
+        "git did not acknowledge the ref transaction stage",
+    )
+    _fail_transaction(monkeypatch, "begin", injected)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(_head(repo))
+
+    assert excinfo.value is injected
+    assert excinfo.value.reason is CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED
+    assert excinfo.value.outcome is MutationOutcome.UNCHANGED
+
+
+def test_self_constructed_compare_and_swap_rejection_reports_unchanged(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defensive branch: the transaction reported no failure at all,
+    yet the ref did not move. `commit` is neutralized so the
+    transaction aborts cleanly on exit and nothing is applied."""
+    monkeypatch.setattr(checkpoint_ref_module._RefTransaction, "commit", lambda self: None)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(_head(repo))
+
+    assert excinfo.value.reason is CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED
+    assert excinfo.value.outcome is MutationOutcome.UNCHANGED
+    assert _ref_value(repo, ref.ref_name) == ""
+
+
+def test_post_update_unexpected_value_reports_unexpected(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ref ended at a third value — neither the pre-state nor the
+    intended state."""
+    first = _head(repo)
+    second = _commit(repo, "two\n")
+    third = _commit(repo, "three\n")
+    ref.create(first)
+
+    injected = CheckpointRefError(
+        CheckpointRefFailure.GIT_COMMAND_TIMEOUT, "simulated transaction timeout"
+    )
+    _fail_transaction(monkeypatch, "commit", injected)
+    real_exit = checkpoint_ref_module._RefTransaction.__exit__
+
+    def exit_then_lose_the_race(self, exc_type, exc, tb):
+        # A competing writer wins the race in the window after this
+        # transaction released the ref lock and before the outcome is
+        # classified. (It has to be after `__exit__`: while the
+        # transaction holds the prepared lock, no other writer can move
+        # the ref at all — which is exactly the guarantee
+        # test_prepared_transaction_blocks_competing_writers asserts.)
+        result = real_exit(self, exc_type, exc, tb)
+        _git(repo, "update-ref", "--no-deref", ref.ref_name, third, first)
+        return result
+
+    monkeypatch.setattr(
+        checkpoint_ref_module._RefTransaction, "__exit__", exit_then_lose_the_race
+    )
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.advance(expected_old_oid=first, new_oid=second)
+
+    assert excinfo.value.reason is CheckpointRefFailure.UNEXPECTED_VALUE
+    assert excinfo.value.outcome is MutationOutcome.UNEXPECTED
+    assert excinfo.value.__cause__ is injected
+
+
+def test_cleanup_unconfirmed_reports_unknown_even_when_ref_looks_unchanged(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unconfirmed child may still hold the ref lock, so even a
+    clean "still at the pre-state" observation must not be collapsible."""
+    first = _head(repo)
+    ref.create(first)
+    second = _commit(repo, "two\n")
+
+    injected = CheckpointRefError(
+        CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED,
+        "the git ref transaction process could not be confirmed terminated",
+    )
+    _fail_transaction(monkeypatch, "commit", injected)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.advance(expected_old_oid=first, new_oid=second)
+
+    assert excinfo.value is injected
+    assert excinfo.value.reason is CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED
+    # NOT UNCHANGED, even though the ref was observed still at `first`.
+    assert excinfo.value.outcome is MutationOutcome.UNKNOWN
+    assert _ref_value(repo, ref.ref_name) == first
+
+
+def test_cleanup_unconfirmed_reports_unknown_even_when_the_ref_was_applied(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stricter half of the same rule: the mutation demonstrably
+    took effect, but cleanup could not be confirmed — this must raise
+    rather than return success, because the lock holder could still
+    change the ref after the observation."""
+    first = _head(repo)
+    ref.create(first)
+    second = _commit(repo, "two\n")
+
+    injected = CheckpointRefError(
+        CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED,
+        "the git ref transaction process could not be confirmed terminated",
+    )
+    real_commit = checkpoint_ref_module._RefTransaction.commit
+
+    def commit_then_fail_cleanup(self):
+        real_commit(self)  # the ref really does move
+        raise injected
+
+    monkeypatch.setattr(
+        checkpoint_ref_module._RefTransaction, "commit", commit_then_fail_cleanup
+    )
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.advance(expected_old_oid=first, new_oid=second)
+
+    assert excinfo.value is injected
+    assert excinfo.value.outcome is MutationOutcome.UNKNOWN
+    # The ref genuinely advanced; the refusal is about the unconfirmed
+    # process, not about the value.
+    assert _ref_value(repo, ref.ref_name) == second
+
+
+def _cleanup_unconfirmed_error() -> CheckpointRefError:
+    return CheckpointRefError(
+        CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED,
+        "the git ref transaction process could not be confirmed terminated",
+    )
+
+
+def _fault_observation_from_call(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    from_call: int,
+    returncode: int = 0,
+    stdout: str = "",
+) -> None:
+    """Make the `from_call`-th (1-based) `for-each-ref` invocation, and
+    every one after it, return a crafted result.
+
+    A mutation observes the ref twice before the outcome is
+    classified — once in the pre-check and once inside the locked
+    window — and both must keep working, or the failure being injected
+    never gets reached. Faulting only from the *third* call therefore
+    targets the post-operation observation specifically.
+    """
+    real_run = checkpoint_ref_module._run_git
+    seen = {"count": 0}
+
+    def fake_run(repo_path, *args):
+        if args[0] == "for-each-ref":
+            seen["count"] += 1
+            if seen["count"] >= from_call:
+                return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
+        return real_run(repo_path, *args)
+
+    monkeypatch.setattr(checkpoint_ref_module, "_run_git", fake_run)
+
+
+def test_cleanup_unconfirmed_dominates_a_symbolic_ref_observation(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cleanup-unconfirmed occurrence must not be replaced by
+    SYMBOLIC_REF: the unconfirmed process is the cause the caller has
+    to act on, and it dominates whatever the ref looks like now."""
+    head = _head(repo)
+    injected = _cleanup_unconfirmed_error()
+    _fail_transaction(monkeypatch, "commit", injected)
+    # A populated %(symref) field is exactly what makes observe() report
+    # a symbolic ref.
+    _fault_observation_from_call(
+        monkeypatch, from_call=3, stdout=f"{head}\trefs/heads/pin\t{ref.ref_name}\n"
+    )
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(head)
+
+    assert excinfo.value is injected
+    assert excinfo.value.reason is CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED
+    assert excinfo.value.outcome is MutationOutcome.UNKNOWN
+
+
+def test_cleanup_unconfirmed_dominates_a_failed_observation(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not replaced by MUTATION_OUTCOME_UNKNOWN either — same outcome,
+    but that would misattribute the cause to the observation."""
+    injected = _cleanup_unconfirmed_error()
+    _fail_transaction(monkeypatch, "commit", injected)
+    _fault_observation_from_call(monkeypatch, from_call=3, returncode=128)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(_head(repo))
+
+    assert excinfo.value is injected
+    assert excinfo.value.reason is CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED
+    assert excinfo.value.outcome is MutationOutcome.UNKNOWN
+
+
+def test_cleanup_unconfirmed_dominates_an_ambiguous_observation(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head = _head(repo)
+    injected = _cleanup_unconfirmed_error()
+    _fail_transaction(monkeypatch, "commit", injected)
+    _fault_observation_from_call(
+        monkeypatch,
+        from_call=3,
+        stdout=f"{head}\t\t{ref.ref_name}\n{head}\t\t{ref.ref_name}\n",
+    )
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(head)
+
+    assert excinfo.value is injected
+    assert excinfo.value.reason is CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED
+    assert excinfo.value.outcome is MutationOutcome.UNKNOWN
+
+
+def test_cleanup_unconfirmed_dominates_an_unexpected_direct_value(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Completes the matrix: not replaced by UNEXPECTED_VALUE either."""
+    first = _head(repo)
+    second = _commit(repo, "two\n")
+    third = _commit(repo, "three\n")
+    ref.create(first)
+
+    injected = _cleanup_unconfirmed_error()
+    _fail_transaction(monkeypatch, "commit", injected)
+    real_exit = checkpoint_ref_module._RefTransaction.__exit__
+
+    def exit_then_lose_the_race(self, exc_type, exc, tb):
+        result = real_exit(self, exc_type, exc, tb)
+        _git(repo, "update-ref", "--no-deref", ref.ref_name, third, first)
+        return result
+
+    monkeypatch.setattr(
+        checkpoint_ref_module._RefTransaction, "__exit__", exit_then_lose_the_race
+    )
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.advance(expected_old_oid=first, new_oid=second)
+
+    assert excinfo.value is injected
+    assert excinfo.value.reason is CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED
+    assert excinfo.value.outcome is MutationOutcome.UNKNOWN
+
+
+def test_cleanup_unconfirmed_preserves_message_traceback_and_chaining(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root_cause = RuntimeError("underlying abort failure")
+    injected = _cleanup_unconfirmed_error()
+    injected.__cause__ = root_cause
+    injected.__suppress_context__ = True
+    _fail_transaction(monkeypatch, "commit", injected)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(_head(repo))
+
+    raised = excinfo.value
+    assert raised is injected
+    assert raised.__cause__ is root_cause
+    assert raised.__suppress_context__ is True
+    assert raised.__traceback__ is not None
+    assert raised.message == (
+        "the git ref transaction process could not be confirmed terminated"
+    )
+    assert str(repo) not in str(raised)
+
+
+def test_annotation_preserves_identity_traceback_and_chaining(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Annotating in place must not cost this occurrence its identity,
+    traceback, or chaining state — the reason a replacement exception
+    was rejected."""
+    root_cause = RuntimeError("underlying cause")
+    injected = CheckpointRefError(
+        CheckpointRefFailure.GIT_COMMAND_TIMEOUT, "simulated transaction timeout"
+    )
+    injected.__cause__ = root_cause
+    injected.__suppress_context__ = True
+
+    def raising_commit(self):
+        raise injected
+
+    monkeypatch.setattr(checkpoint_ref_module._RefTransaction, "commit", raising_commit)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.create(_head(repo))
+
+    raised = excinfo.value
+    assert raised is injected                      # same object
+    assert raised.__cause__ is root_cause          # explicit chaining kept
+    assert raised.__suppress_context__ is True     # suppression kept
+    assert raised.__traceback__ is not None        # traceback kept
+    assert raised.outcome is MutationOutcome.UNCHANGED
+
+
+def test_annotation_preserves_the_sanitized_message_and_oids(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _head(repo)
+    ref.create(first)
+    second = _commit(repo, "two\n")
+
+    injected = CheckpointRefError(
+        CheckpointRefFailure.GIT_COMMAND_TIMEOUT,
+        "the git ref transaction did not finish within its time limit",
+        observed_oid=first,
+        expected_oid=second,
+    )
+    _fail_transaction(monkeypatch, "commit", injected)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.advance(expected_old_oid=first, new_oid=second)
+
+    assert excinfo.value.message == (
+        "the git ref transaction did not finish within its time limit"
+    )
+    assert str(excinfo.value) == excinfo.value.message
+    assert excinfo.value.observed_oid == first
+    assert excinfo.value.expected_oid == second
+    assert str(repo) not in str(excinfo.value)
+
+
+def test_default_outcome_is_unknown_for_an_unannotated_error() -> None:
+    """Fail closed: any raise site that forgets to classify reports
+    UNKNOWN, which no caller may collapse a transition record on."""
+    error = CheckpointRefError(CheckpointRefFailure.OBSERVATION_FAILED, "unclassified")
+    assert error.outcome is MutationOutcome.UNKNOWN
+
+
+def test_mutation_outcome_values_are_pinned() -> None:
+    assert {o.value for o in MutationOutcome} == {
+        "applied",
+        "unchanged",
+        "unexpected",
+        "symbolic",
+        "unknown",
+    }
+
+
+# --------------------------------------------------------------------
+# Slice 2B-1: lifecycle-id generation at the narrow internal boundary
+# --------------------------------------------------------------------
+
+
+def test_new_lifecycle_id_matches_the_required_format() -> None:
+    value = new_lifecycle_id()
+    assert checkpoint_ref_module.LIFECYCLE_ID_RE.fullmatch(value)
+    assert len(value) == 32
+
+
+def test_new_lifecycle_id_accepts_no_seed_or_input() -> None:
+    """`new_lifecycle_id` offers no parameter through which a `run_id`,
+    repository path, or model/operator text could be threaded.
+
+    This is a property of this function only — it is NOT yet a
+    system-wide guarantee: `CheckpointRef` still accepts any correctly
+    shaped lifecycle id from any source. Slice 2B-2 must ensure the
+    trusted composition root mints ids exclusively through here.
+    """
+    assert inspect.signature(new_lifecycle_id).parameters == {}
+
+
+def test_new_lifecycle_id_requests_128_bits_and_returns_each_generated_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deterministic, not statistical: the generator is scripted, so
+    this pins the byte count requested and that each validated value is
+    returned verbatim — no caching, no rewriting, no derivation."""
+    scripted = ["0" * 32, "1" * 32, "abcdef01" * 4]
+    calls: list[int] = []
+
+    def fake_token_hex(nbytes: int) -> str:
+        calls.append(nbytes)
+        return scripted[len(calls) - 1]
+
+    monkeypatch.setattr(checkpoint_ref_module.secrets, "token_hex", fake_token_hex)
+
+    produced = [new_lifecycle_id() for _ in scripted]
+
+    assert produced == scripted
+    # 16 bytes == 128 bits == the 32 hex characters LIFECYCLE_ID_RE requires.
+    assert calls == [16, 16, 16]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ["", "short", "A" * 32, "g" * 32, "0" * 31, "0" * 33],
+)
+def test_new_lifecycle_id_refuses_malformed_generator_output(
+    malformed: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The validation step is load-bearing, not decorative: a generator
+    that ever produced an id `CheckpointRef` would refuse must fail
+    here instead of leaking that value onward."""
+    monkeypatch.setattr(
+        checkpoint_ref_module.secrets, "token_hex", lambda nbytes: malformed
+    )
+
+    with pytest.raises(RuntimeError, match="did not match the required format"):
+        new_lifecycle_id()
+
+
+def test_a_generated_lifecycle_id_is_accepted_by_checkpoint_ref(repo: Path) -> None:
+    generated = new_lifecycle_id()
+    constructed = CheckpointRef(repo, generated)
+    assert constructed.lifecycle_id == generated
+    assert constructed.ref_name == f"refs/codeagent/runs/{generated}/checkpoint"

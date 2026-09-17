@@ -83,6 +83,23 @@ Safety properties this module enforces:
   else, or a symbolic ref, fails closed; and a failed observation stays
   explicitly unknown (`MUTATION_OUTCOME_UNKNOWN`) rather than being
   reported as unchanged.
+- **The observed outcome is reported alongside the reason.** Every
+  `CheckpointRefError` carries a `MutationOutcome`, because the reason
+  alone is not sufficient to drive a write-ahead transition record: a
+  timeout, launch failure, or protocol failure can accompany either a
+  ref confirmed still in its pre-state (`UNCHANGED`, safe to collapse)
+  or a ref whose state is unknown (`UNKNOWN`, never collapsible), and
+  the reason is identical in both cases. The classification this module
+  already performs is therefore published rather than discarded, so no
+  caller needs a second observation to act on it.
+  `TRANSACTION_CLEANUP_UNCONFIRMED` dominates every other
+  classification and is always `UNKNOWN`: a child process that could
+  not be confirmed dead may still hold the ref lock, so no observation
+  taken around it is authoritative — whether it sees the intended
+  value, the pre-state, an unexpected value, a symbolic ref, or fails
+  outright. That original error is raised as the same object rather
+  than being replaced by a `SYMBOLIC_REF` or `MUTATION_OUTCOME_UNKNOWN`
+  that would misattribute the cause.
 - **Sanitized errors.** Messages are fixed, categorical text plus the
   owned ref name and validated hex object IDs. Raw Git stderr, host
   paths, environment contents, and repository contents never appear.
@@ -100,6 +117,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import selectors
 import subprocess
 import time
@@ -146,6 +164,42 @@ class ObjectFormat(str, Enum):
 
 
 @unique
+class MutationOutcome(str, Enum):
+    """What actually happened to the ref during a mutation attempt, as
+    distinct from *why* the attempt failed (`CheckpointRefFailure`).
+
+    A categorical failure reason alone cannot drive a write-ahead
+    transition record: the same reason (a timeout, a launch failure, a
+    protocol failure) can accompany either a ref that was confirmed
+    still in its pre-state or a ref whose state could not be determined
+    at all, and those two demand opposite handling. This enum carries
+    the observed outcome alongside the reason so a caller never has to
+    perform a second observation to find out — see
+    `codeagent.checkpoint_session.CheckpointSession`, which branches on
+    `(operation, outcome)` and never re-observes.
+
+    - `APPLIED`: the ref was confirmed at the intended value. Signalled
+      by a mutation returning normally, never by an error.
+    - `UNCHANGED`: the ref was confirmed still in its pre-state, so the
+      mutation demonstrably did not take effect.
+    - `UNEXPECTED`: the ref was confirmed at some third direct value —
+      neither the pre-state nor the intended state.
+    - `SYMBOLIC`: the ref was confirmed to be a symbolic ref, which this
+      module never accepts.
+    - `UNKNOWN`: the outcome could not be confirmed. The conservative
+      default: any path that has not positively established one of the
+      above reports this, so an un-annotated failure fails closed
+      rather than inviting a collapse it cannot justify.
+    """
+
+    APPLIED = "applied"
+    UNCHANGED = "unchanged"
+    UNEXPECTED = "unexpected"
+    SYMBOLIC = "symbolic"
+    UNKNOWN = "unknown"
+
+
+@unique
 class CheckpointRefFailure(str, Enum):
     """Categorical reason a checkpoint-ref operation failed. These are
     for callers to branch on; `CheckpointRefError.message` is for humans
@@ -183,6 +237,17 @@ class CheckpointRefError(Exception):
     this once, at the boundary that records the occurrence — this module
     deliberately does not know the error taxonomy (same split as
     `codeagent.workspace.GitWorktreeError`).
+
+    `outcome` reports what happened to the ref itself (see
+    `MutationOutcome`). It is deliberately a mutable attribute rather
+    than a constructor-only value: a failure raised before the ref has
+    been observed is annotated *in place* once the outcome becomes
+    known, and re-raised as the very same object. Constructing a
+    replacement exception instead would silently drop this occurrence's
+    traceback and would require hand-copying `__cause__`,
+    `__context__`, and `__suppress_context__` — the exact chaining
+    state several existing tests assert on. Annotating preserves all of
+    it for free.
     """
 
     def __init__(
@@ -192,6 +257,7 @@ class CheckpointRefError(Exception):
         *,
         observed_oid: str | None = None,
         expected_oid: str | None = None,
+        outcome: MutationOutcome = MutationOutcome.UNKNOWN,
     ) -> None:
         super().__init__(message)
         self.reason = reason
@@ -199,6 +265,10 @@ class CheckpointRefError(Exception):
         # Structured detail so a caller never has to parse `message`.
         self.observed_oid = observed_oid
         self.expected_oid = expected_oid
+        # Conservative default: anything that has not positively
+        # established an outcome reports UNKNOWN, which no caller may
+        # collapse a transition record on.
+        self.outcome = outcome
 
 
 @dataclass(frozen=True)
@@ -208,6 +278,34 @@ class RefObservation:
 
     present: bool
     oid: str | None = None
+
+
+def new_lifecycle_id() -> str:
+    """Mint a fresh lifecycle id: 128 bits of `secrets` randomness as 32
+    lowercase hex characters (ADR 0004 section 1).
+
+    **Accepts no seed or input of any kind.** A lifecycle id must never
+    be derived from `run_id`, a repository path, a task statement, or
+    any other model- or operator-supplied text — those are public,
+    attacker-influenced, or unsafe as a path/ref component, and ADR
+    0004 rejects reusing them. This function offers no parameter
+    through which such a value could be threaded.
+
+    That is a property of *this function only*, not yet a
+    system-wide guarantee: `CheckpointRef` still accepts any correctly
+    shaped lifecycle id from any source. Slice 2B-2 must ensure the
+    trusted composition root mints ids exclusively through here; until
+    then the broader claim is not structurally enforced.
+
+    The freshly generated value is validated against the same
+    `LIFECYCLE_ID_RE` every consumer enforces, so this function can
+    never become a way to introduce an id that `CheckpointRef` would
+    later refuse.
+    """
+    lifecycle_id = secrets.token_hex(16)
+    if not LIFECYCLE_ID_RE.fullmatch(lifecycle_id):
+        raise RuntimeError("generated lifecycle id did not match the required format")
+    return lifecycle_id
 
 
 def git_environment() -> dict[str, str]:
@@ -359,6 +457,7 @@ class CheckpointRef:
             raise CheckpointRefError(
                 CheckpointRefFailure.OBSERVATION_FAILED,
                 f"the checkpoint ref {self._ref_name} could not be inspected",
+                outcome=MutationOutcome.UNKNOWN,
             )
 
         records = [line for line in result.stdout.splitlines() if line.strip()]
@@ -368,6 +467,7 @@ class CheckpointRef:
             raise CheckpointRefError(
                 CheckpointRefFailure.AMBIGUOUS_OBSERVATION,
                 f"git reported more than one record for the checkpoint ref {self._ref_name}",
+                outcome=MutationOutcome.UNKNOWN,
             )
 
         fields = records[0].split("\t")
@@ -375,6 +475,7 @@ class CheckpointRef:
             raise CheckpointRefError(
                 CheckpointRefFailure.OBSERVATION_FAILED,
                 f"git reported an unreadable record for the checkpoint ref {self._ref_name}",
+                outcome=MutationOutcome.UNKNOWN,
             )
         object_name, symref_target, refname = fields
 
@@ -382,11 +483,13 @@ class CheckpointRef:
             raise CheckpointRefError(
                 CheckpointRefFailure.AMBIGUOUS_OBSERVATION,
                 f"git reported a different ref than the owned {self._ref_name}",
+                outcome=MutationOutcome.UNKNOWN,
             )
         if symref_target:
             raise CheckpointRefError(
                 CheckpointRefFailure.SYMBOLIC_REF,
                 f"the checkpoint ref {self._ref_name} is a symbolic ref and is refused",
+                outcome=MutationOutcome.SYMBOLIC,
             )
         if len(object_name) != self._object_format.hex_length or not re.fullmatch(
             r"[0-9a-f]+", object_name
@@ -394,6 +497,7 @@ class CheckpointRef:
             raise CheckpointRefError(
                 CheckpointRefFailure.OBSERVATION_FAILED,
                 f"git reported a malformed object id for the checkpoint ref {self._ref_name}",
+                outcome=MutationOutcome.UNKNOWN,
             )
         return RefObservation(present=True, oid=object_name)
 
@@ -498,6 +602,9 @@ class CheckpointRef:
             f"the checkpoint ref {self._ref_name} {detail} ({when})",
             observed_oid=observed.oid,
             expected_oid=expected.oid,
+            # The ref was successfully observed at a direct value that is
+            # neither the pre-state nor the intended state.
+            outcome=MutationOutcome.UNEXPECTED,
         )
 
     def _classify_outcome(
@@ -513,8 +620,30 @@ class CheckpointRef:
         `original` is the categorical failure already reported by the
         transaction, if any. When the ref turns out unchanged, that
         cause is preserved rather than being flattened into a generic
-        compare-and-swap rejection.
+        compare-and-swap rejection — and is annotated *in place* with
+        `MutationOutcome.UNCHANGED` so the caller learns both the real
+        cause and the confirmed outcome from one object, without a
+        second observation.
+
+        `TRANSACTION_CLEANUP_UNCONFIRMED` dominates every other
+        classification and is handled first, before any observation is
+        attempted. An unconfirmed child process may still hold Git's ref
+        lock, so *no* observation taken here is authoritative — not one
+        that sees the intended value, the pre-state, an unexpected
+        value, a symbolic ref, or one that fails outright. Observing
+        anyway would only invite the misreading that the observed value
+        changed the answer. The original error is therefore raised as
+        the same object with `UNKNOWN`, never replaced by a
+        `SYMBOLIC_REF` or `MUTATION_OUTCOME_UNKNOWN` that would
+        misattribute the cause.
         """
+        if (
+            original is not None
+            and original.reason is CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED
+        ):
+            original.outcome = MutationOutcome.UNKNOWN
+            raise original
+
         try:
             observed = self.observe()
         except CheckpointRefError as exc:
@@ -532,6 +661,7 @@ class CheckpointRef:
                 f"the outcome of the update to the checkpoint ref {self._ref_name} could "
                 "not be determined, because the ref could not be observed afterwards",
                 expected_oid=intended_after.oid,
+                outcome=MutationOutcome.UNKNOWN,
             ) from (original or exc)
 
         if observed == intended_after:
@@ -539,7 +669,12 @@ class CheckpointRef:
         if observed == expected_before:
             if original is not None:
                 # The real cause — launch failure, timeout, protocol
-                # failure — is what the caller must see.
+                # failure — is what the caller must see, now carrying
+                # the confirmed outcome. Annotated in place and
+                # re-raised as the same object, so this occurrence's
+                # traceback, __cause__, __context__ and
+                # __suppress_context__ all survive untouched.
+                original.outcome = MutationOutcome.UNCHANGED
                 raise original
             raise CheckpointRefError(
                 CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED,
@@ -548,6 +683,7 @@ class CheckpointRef:
                 + (f"at {expected_before.oid}" if expected_before.present else "absent"),
                 observed_oid=observed.oid,
                 expected_oid=intended_after.oid,
+                outcome=MutationOutcome.UNCHANGED,
             )
         try:
             self._raise_unexpected(observed, intended_after, when="after the update")

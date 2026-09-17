@@ -240,10 +240,37 @@ Stage 2 (of the four-stage planning process in
   run host code, object format is detected with no SHA-1 assumption,
   linked worktrees are refused, and every mutation outcome is
   classified by observation while preserving its precise cause — with
-  90 focused tests. This module is deliberately **not integrated**: no
+  125 focused tests. This module is deliberately **not integrated**: no
   controller, patch, lifecycle-store, reconciliation, cancellation, or
-  CLI wiring yet, and ADR 0004's durable transition record is the next
-  slice.
+  CLI wiring yet.
+  **Milestone 2 slice 2B-1 is implemented and is also deliberately
+  unwired**: `checkpoint_ref.py` now publishes a `MutationOutcome`
+  (`APPLIED`/`UNCHANGED`/`UNEXPECTED`/`SYMBOLIC`/`UNKNOWN`) on every
+  `CheckpointRefError` — the categorical reason alone could not
+  distinguish "ref confirmed still in its pre-state" from "ref state
+  unknown", which are opposite decisions for a write-ahead record —
+  and `src/codeagent/checkpoint_session.py` holds ADR 0004 section 5's
+  `checkpoint_ref` transition record **in memory only** (ADR 0003
+  Amendment 1's Milestone 2 boundary), collapsing it strictly by
+  `(operation, outcome)` with no second observation.
+  `TRANSACTION_CLEANUP_UNCONFIRMED` dominates every classification and
+  never permits a collapse — an unconfirmed child may still hold the
+  ref lock, so no observation around it is authoritative. Every
+  transitional state refuses every further operation, `removing`
+  included: the in-memory record cannot distinguish a
+  confirmed-unchanged failure from an unknown lock outcome, so a
+  deletion retry would be guessing, and ADR 0004 section 8
+  reconciliation (Milestone 3) owns the fresh inspection that could.
+  `new_lifecycle_id()` accepts no seed or input, which binds that
+  function only — `CheckpointRef` still accepts any correctly shaped
+  id, so 2B-2 must make the trusted composition root mint exclusively
+  through it. 106 focused tests.
+  **This makes no production lifecycle guarantee**: nothing imports
+  `checkpoint_session`, it writes no file, takes no lock, emits no
+  event, and performs no Git call of its own. The entry gate,
+  create/advance ordering, workspace ownership, worktree-before-ref
+  teardown, event ordering and error identity are all slice 2B-2, and
+  ADR 0004's durable store remains Milestone 3.
   **`docs/adr/0006-git-safety-policy-for-filters-hooks-and-content-fidelity.md`
   (Accepted) is now implemented for `src/codeagent/_git_safety.py` and
   `src/codeagent/workspace.py`**: the shared foundation module
