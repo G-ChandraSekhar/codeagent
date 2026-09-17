@@ -1228,3 +1228,36 @@ is **Accepted**. **No production code changed — design only.**
   Next: implement `_git_safety.py`, harden `workspace.py`/`patch.py`,
   pass acceptance tests on macOS and Linux — only then does
   `checkpoint_ref.py` integrate with patch application.
+
+---
+
+## Session (2026-09-16): check-attr cannot classify `filter` alone
+
+**Correction to accepted ADR 0006**, found while reviewing the
+unintegrated `_git_safety.py` foundation slice.
+
+- `git check-attr` prints the literal string `unset` both for a
+  genuinely negated attribute (`a.txt -filter`) and for an explicit
+  assignment naming a driver *called* `unset` (`b.txt filter=unset`);
+  same collision for `unspecified`. Proven with positive controls in
+  one fixture: identical reported strings for all four paths, while
+  the `unset`/`unspecified`-named drivers really executed on `git add`
+  and the genuine cases did not.
+- Impact: the context-free rule would have classified those paths safe.
+  `worktree add` relies on attribute inspection as its *sole* control
+  (no enumerate-and-neutralize backstop), so this was a real bypass
+  permitting host code execution during checkout.
+- Correction: `filter` classification now takes the enumerated
+  driver-name set and treats `unset`/`unspecified` as safe only when
+  that exact string is not a configured driver name, refusing
+  conservatively on collision — accepting refusal of some genuinely
+  safe paths over guessing. Non-filter attributes are unaffected: Git
+  does not resolve their values as driver names.
+- Same pass: NUL framing now requires a terminal NUL (truncated output
+  whose field count still divides by three was accepted before), empty
+  paths/attribute names are refused, version parsing is fully anchored
+  (`2.45evil` no longer parses), and argv construction became private
+  so `run_git` is the only public execution API.
+- **Status**: ADR 0006 amended in place (findings 5/13 qualified,
+  finding 16 added, §1/§2 rules corrected, two magic-driver acceptance
+  tests added); status unchanged. Still zero integration — T-M3 open.

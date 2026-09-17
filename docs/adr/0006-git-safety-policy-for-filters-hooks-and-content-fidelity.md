@@ -48,10 +48,13 @@ this session, not by documentation review alone. Key findings:
    byte is written to disk and with zero code execution.
 5. **The four canonical `check-attr` states** are `unspecified` (no
    rule), `unset` (explicit negation), `set` (bare boolean-true), and
-   an explicit `value`. For `filter`, `unspecified` and `unset` are
-   both safe; `set` and any named value are unsafe (consistent with
-   finding 13's isolated proof and Decision section 2). For `text`/`eol`/`ident`/
-   `working-tree-encoding`, only `unspecified`/`unset` are safe.
+   an explicit `value`. For `text`/`eol`/`ident`/
+   `working-tree-encoding`, only `unspecified`/`unset` are safe. For
+   `filter`, `unspecified`/`unset` are safe **only conditionally** —
+   see finding 16, which corrects the unconditional reading this
+   finding originally carried: the reported string alone is not
+   sufficient, because a configured driver may be *named* `unset` or
+   `unspecified`.
 6. **This inspection is not an absolute guarantee.** It fixes the
    `.gitattributes` state recorded in the *inspected index* only.
    `.git/info/attributes`, `core.attributesFile`/global attributes, and
@@ -140,7 +143,8 @@ this session, not by documentation review alone. Key findings:
     no marker output, while the driver was independently confirmed live
     (it does fire for non-exempted paths in the same repo). This
     confirms `unset`, not only `unspecified`, is a safe state for
-    `filter`.
+    `filter` **in that fixture** — where no driver was named `unset`.
+    Finding 16 shows why that qualifier is load-bearing.
 14. **Attribute inheritance from three external sources was confirmed**,
     all without any local `.gitattributes` in the affected directory:
     a parent-directory `.gitattributes` (`sub/*.txt filter=hostile`
@@ -204,6 +208,35 @@ this session, not by documentation review alone. Key findings:
       fetch-decision logic, not of which transport would have been
       used, so the `ext::` fixture exercises the same enforcement point
       a real remote would.
+16. **`check-attr` output alone cannot classify `filter` safety: the
+    reported state strings collide with legal driver names.** Found
+    during implementation review of the foundation module, and
+    reproduced with real positive controls in one fixture repository
+    containing `a.txt -filter`, `b.txt filter=unset`, `c.txt` (no
+    filter rule), `d.txt filter=unspecified`, plus two live drivers
+    deliberately *named* `unset` and `unspecified`, each writing a
+    marker:
+
+    | Path | `.gitattributes` | `check-attr --cached -z` reports | Driver executed on `git add`? |
+    |---|---|---|---|
+    | `a.txt` | `-filter` | `unset` | No (marker absent) |
+    | `b.txt` | `filter=unset` | `unset` (**identical**) | **Yes** — `DRIVER-RAN:unset-driver` |
+    | `c.txt` | no filter rule | `unspecified` | No (marker absent) |
+    | `d.txt` | `filter=unspecified` | `unspecified` (**identical**) | **Yes** — `DRIVER-RAN:unspecified-driver` |
+
+    Git resolves the `filter` attribute's *value* as a configured
+    driver name, and `unset`/`unspecified` are legal driver names, so
+    the literal strings `check-attr` prints for "genuinely negated" and
+    "explicitly assigned to a driver of that name" are
+    indistinguishable. A context-free rule that treated those two
+    strings as safe would therefore permit host code execution during
+    exactly the real checkout that §1's primary control exists to
+    protect — and `worktree add` has no enumerate-and-neutralize
+    backstop (§5), so nothing else would catch it.
+
+    This does **not** affect `text`/`eol`/`ident`/
+    `working-tree-encoding`/`crlf`: Git does not resolve those values
+    as driver names, so their state classification is unchanged.
 
 ## Decision
 
@@ -217,8 +250,16 @@ this session, not by documentation review alone. Key findings:
   where no index step applies — see per-command table below) and
   refuse with a structured error, causing **whole-run refusal before
   materialization**, if any tracked path has an active external
-  `filter` attribute (state `set` or any named value; `unspecified` and
-  `unset` are both safe, per finding 13). This is the sole guarantee
+  `filter` attribute (state `set` or any named value). `unspecified`
+  and `unset` are safe **only when that exact string is not also a
+  configured filter driver name** — per finding 16, a driver may
+  legally be named `unset` or `unspecified`, and `check-attr` reports
+  the same literal string for it as for a genuine negation. The
+  inspection therefore requires the enumerated driver-name set (§1's
+  secondary control supplies it, read-only, even where its overrides
+  are not applied) and **refuses conservatively when the reported
+  string collides with a configured driver name**, accepting refusal
+  of some genuinely-safe paths rather than guessing. This is the sole guarantee
   for `git worktree add`, using `--no-checkout` +
   `git read-tree <commit>` + attribute inspection, then either
   refusing or performing the real checkout under the hardened policy
@@ -292,8 +333,10 @@ truncated.
   remove one variable and document intent).
 - Every affected path's `filter`, `text`, `eol`, `ident`,
   `working-tree-encoding`, and legacy `crlf` attributes are inspected.
-  For `filter`, `unspecified` and `unset` are safe, `set` and any named
-  value are unsafe (finding 13). For `text`/`eol`/`ident`/
+  For `filter`, `set` and any named value are unsafe; `unspecified` and
+  `unset` are safe only when that exact string is not also a configured
+  driver name, and are refused conservatively when it is (findings 13
+  and 16). For `text`/`eol`/`ident`/
   `working-tree-encoding`/`crlf`, only `unspecified`/`unset` are safe;
   `set` or any explicit value is unsafe (findings 7, 11, 12 — both
   `ident` and `working-tree-encoding` were independently forced and
@@ -639,6 +682,20 @@ cleanup behavior or its existing tests' observable outcomes.
 - `filter` state `unset` is proven safe/non-executing, distinct from
   `unspecified`, using an isolated fixture where the same driver is
   confirmed live for a non-exempted path (finding 13).
+- **A driver named `unset` is refused, with a positive control proving
+  it executes unprotected** (finding 16): a fixture with `a.txt
+  -filter`, `b.txt filter=unset` and a live `filter.unset.clean`
+  driver must show `check-attr` reporting the identical string `unset`
+  for both paths, the driver actually firing for `b.txt` and not for
+  `a.txt`, and the driver-set-dependent classification refusing both.
+- **A driver named `unspecified` is refused, with the same positive
+  control** (finding 16): `c.txt` (no filter rule) and `d.txt
+  filter=unspecified` against a live `filter.unspecified.clean` driver,
+  proving the identical-string collision, real execution for `d.txt`
+  only, and conservative refusal of both. Both tests must also confirm
+  the classification stays permissive for the same attribute states
+  once no driver claims those names, so the refusal is attributable to
+  the collision rather than to the states themselves.
 - Attributes inherited from a parent-directory `.gitattributes`,
   `.git/info/attributes`, and global `core.attributesFile` are all
   correctly detected by the inspection helper, including for a
