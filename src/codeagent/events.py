@@ -516,7 +516,12 @@ class ToolCompleted(Event):
         {ErrorCode.TOOL_INPUT_INVALID, ErrorCode.TOOL_EXECUTION_FAILED}
     )
     _PATCH_ERROR_CODES: ClassVar[frozenset[ErrorCode]] = frozenset(
-        {ErrorCode.PATCH_VALIDATION_FAILED, ErrorCode.PATCH_APPLICATION_FAILED}
+        {
+            ErrorCode.PATCH_VALIDATION_FAILED,
+            ErrorCode.PATCH_APPLICATION_FAILED,
+            ErrorCode.PATCH_UNSUPPORTED_GIT_SUBSTRATE,
+            ErrorCode.PATCH_REPOSITORY_OBJECTS_UNAVAILABLE,
+        }
     )
 
     def __post_init__(self) -> None:

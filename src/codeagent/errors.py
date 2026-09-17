@@ -109,6 +109,18 @@ class ErrorCode(str, Enum):
     # proposal validation or during application to the worktree.
     PATCH_VALIDATION_FAILED = "patch_validation_failed"
     PATCH_APPLICATION_FAILED = "patch_application_failed"
+    # ADR 0006's three-way Git-safety taxonomy, distinct from both codes
+    # above: the repository's Git substrate itself is not one patch.py's
+    # hardened policy can safely operate on (e.g. an unsupported/
+    # undetectable object format), independent of anything about this
+    # particular patch proposal.
+    PATCH_UNSUPPORTED_GIT_SUBSTRATE = "patch_unsupported_git_substrate"
+    # A required repository object (a staged blob, a commit's tree/
+    # parent) could not be confirmed present or retrieved intact —
+    # distinct from an ordinary application failure because the cause is
+    # the repository's object store, not the patch content or the
+    # worktree mutation itself.
+    PATCH_REPOSITORY_OBJECTS_UNAVAILABLE = "patch_repository_objects_unavailable"
 
     # ErrorDomain.EXECUTOR — the baseline/verification command executor
     # failed independently of whether the command under test passed.
@@ -161,6 +173,8 @@ ERROR_DOMAIN_BY_CODE: dict[ErrorCode, ErrorDomain] = {
     ErrorCode.TOOL_EXECUTION_FAILED: ErrorDomain.TOOL_EXECUTION,
     ErrorCode.PATCH_VALIDATION_FAILED: ErrorDomain.PATCH,
     ErrorCode.PATCH_APPLICATION_FAILED: ErrorDomain.PATCH,
+    ErrorCode.PATCH_UNSUPPORTED_GIT_SUBSTRATE: ErrorDomain.PATCH,
+    ErrorCode.PATCH_REPOSITORY_OBJECTS_UNAVAILABLE: ErrorDomain.PATCH,
     ErrorCode.EXECUTOR_COMMAND_START_FAILED: ErrorDomain.EXECUTOR,
     ErrorCode.EXECUTOR_TIMEOUT: ErrorDomain.EXECUTOR,
     ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE: ErrorDomain.EXECUTOR,

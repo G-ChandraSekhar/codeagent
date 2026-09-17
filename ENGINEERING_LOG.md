@@ -1298,3 +1298,44 @@ inspection **only** — `patch.py` remains unprotected.
 - **Remaining gaps**: `patch.py` unintegrated; `__exit__`'s legacy
   `rmtree`/`prune` fallback unchanged (ADR 0004 gap); Linux CI
   unconfirmed until this commit runs there.
+
+## ADR 0006 patch.py-hardening slice: implemented; Linux CI validation pending
+
+Extended `_git_safety.py` and rewrote `patch.py` to close T-M3 for the
+patch-application path. Full investigation history is in ADR 0006
+Amendments 1-3; this is the concise final state.
+
+- **Replace-ref / literal-pathspec defenses**: `refs/replace/*`
+  subverts `rev-parse`/`cat-file -p`/`ls-tree`, neutralized by
+  `--no-replace-objects` + `GIT_NO_REPLACE_OBJECTS=1`. Pathspec magic
+  survives `--`, neutralized by `--literal-pathspecs` +
+  `GIT_LITERAL_PATHSPECS=1`. `write-tree`/`checkpoint_ref.py` confirmed
+  unaffected by replace refs.
+- **Full six-attribute checking**: `filter`/`text`/`eol`/`ident`/
+  `working-tree-encoding`/`crlf`, cached and working-tree views, before
+  write and `add` — live transformations reproduced and refused.
+- **Bounded subprocess/object handling**: a deadline-controlled binary
+  seam (concurrent stdin writer for `cat-file --batch-check`) backs
+  object-availability/blob/commit-header retrieval and a genuinely
+  bounded `list_tracked_paths`; a real deadlock and a join-before-start
+  bug were found and fixed in its cleanup path.
+- **Structured GitSafetyError mapping**: every `_git_safety` call in
+  `patch.py` is wrapped so nothing escapes `apply()` unhandled, mapped
+  to the precise `ErrorCode` per pre-/post-mutation position. Two new
+  `ErrorCode`s share one `OperationalError` identity across
+  `ToolCompleted`/`RunFinished` (controller-tested).
+- **Strict commit acceptance**: expected parent/tree/blob captured
+  before `commit` runs once; HEAD observed once after and structurally
+  verified — unchanged/mismatched HEAD is never accepted.
+- **`.gitattributes` targets refused** (`PATCH_UNSUPPORTED_GIT_SUBSTRATE`):
+  a real probe showed a nested `.gitattributes` file's classification
+  can be masked by its own staged content, so no trusted independent
+  validation exists yet. A repository-wide helper is preserved, unused.
+- **Final local totals**: full suite 1300 passed; `_git_safety.py` 184
+  and `patch.py` 43 focused tests; 3 real Docker tests passed with
+  `CODEAGENT_REQUIRE_DOCKER=1`; clean diff-check and resource checks —
+  all on macOS/Git 2.54.0.
+- **Remaining gaps**: Linux CI pending; checkpoint-ref integration with
+  patch application not wired up; no trusted `.gitattributes`
+  independent-layer inspection; `GitWorktree.__exit__`'s legacy
+  `rmtree`/`prune` fallback unchanged (ADR 0004 gap).

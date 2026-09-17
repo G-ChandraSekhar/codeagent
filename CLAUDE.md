@@ -274,10 +274,34 @@ Stage 2 (of the four-stage planning process in
   lazy-fetch refusal, and hostile `GIT_*` environment variables — on
   macOS only; **Linux CI validation is still pending** as of this
   commit.
-  **`patch.py` remains unprotected and unintegrated** — T-M3 and
-  ADR 0006 are therefore **not complete project-wide**, and
-  checkpoint-ref integration with patch application still waits on
-  that work. `GitWorktree.__exit__`'s legacy `shutil.rmtree` +
+  **`patch.py`'s ADR 0006 hardening slice is implemented and passing
+  its own tests locally (macOS, Git 2.54.0) — see ADR 0006
+  Amendments 1–3 — with Linux CI validation pending.** Two correction
+  passes found and fixed real gaps before this slice was considered
+  final: attribute checks initially covering only `filter` (now the
+  full six ADR 0006 attributes); several call sites that could let a
+  raw `GitSafetyError` escape `apply()` as an unhandled exception (now
+  all wrapped and mapped); a silent-nonzero-exit `run_git_bounded`
+  contract (now fails categorically); `list_tracked_paths` claiming
+  "bounded" while using unbounded `capture_output` (now genuinely
+  bounded); a real deadlock in the bounded subprocess cleanup path from
+  closing a child's stdin concurrently with an in-flight writer-thread
+  `write()` call, and a second bug joining a writer thread that never
+  started (both fixed); and unsanitized
+  `Path.resolve`/`is_symlink`/`is_file`/`UnicodeEncodeError` failures
+  (now sanitized). Most significantly (Amendment 3): a nested
+  `.gitattributes` file's own attribute classification can be masked by
+  that file's own staged content — a real, reproduced probe — so there
+  is currently no trusted way to validate a `.gitattributes` target's
+  safety independently of its own content. **`.gitattributes` patch
+  targets (top-level or nested) are therefore refused categorically**
+  (`PATCH_UNSUPPORTED_GIT_SUBSTRATE`) before any mutation, not claimed
+  as supported. Verified with 184 focused `_git_safety` tests and 43
+  focused `patch` tests (1300 in the full suite) on macOS. Until Linux
+  CI passes, T-M3 and ADR 0006 remain **not complete project-wide**,
+  and checkpoint-ref integration with patch application still waits on
+  that work.
+  `GitWorktree.__exit__`'s legacy `shutil.rmtree` +
   repository-wide `git worktree prune` fallback (used only when the
   ordinary `git worktree remove` itself fails) is unchanged and remains
   an open ADR 0004 gap, separate from the new, stricter enter-time

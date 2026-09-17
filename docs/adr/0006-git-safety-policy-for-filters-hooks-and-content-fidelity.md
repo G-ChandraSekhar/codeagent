@@ -2,10 +2,23 @@
 
 Status: Accepted (2026-09-16)
 
-Implementation status: **not implemented.** No mechanism in this ADR
-exists in production code yet. Acceptance of this design is
-independent of implementation and of Linux validation — see
-Consequences.
+Implementation status: **partially implemented.** The shared
+foundation (`src/codeagent/_git_safety.py`) and `workspace.py`'s
+`worktree add` inspect-then-refuse-or-checkout mechanism are
+implemented, committed, and CI-validated on Linux (see
+`ENGINEERING_LOG.md` and CLAUDE.md's "Current status"). **Amendments
+1–3** below record the `patch.py`-hardening slice, including two
+correction passes that found and fixed real gaps — most notably that
+`.gitattributes` patch targets (top-level or nested) are **refused**,
+not safely supported: a nested `.gitattributes` file's own attribute
+classification can be masked by that file's own staged content, and
+there is currently no trusted way to validate parent/
+`.git/info/attributes`/global attribute layers independently of the
+target's own content (Amendment 3). The slice is implemented and
+passing its own tests locally (macOS, Git 2.54.0); Linux CI validation
+is pending — see Amendment 3 for exactly what evidence that implies
+and what it does not. Acceptance of this ADR's design is independent
+of implementation and of Linux validation — see Consequences.
 
 ## Context
 
@@ -766,3 +779,379 @@ cleanup behavior or its existing tests' observable outcomes.
 - `checkpoint_ref.py`'s existing 90 tests, including its transaction
   and cleanup behavior, show no regression after any shared-module
   adoption.
+
+## Amendment 1: patch.py-hardening slice (implemented; Linux CI validation pending)
+
+Recorded at implementation time, on macOS, Git 2.54.0
+(Apple Git-157), arm64. Every finding and control below is what was
+actually reproduced and verified by this session's tests
+(`tests/unit/test_git_safety.py`, `tests/unit/test_patch.py`,
+`tests/unit/test_checkpoint_ref.py`, `tests/unit/test_errors.py`,
+`tests/unit/test_events.py`, `tests/integration/test_controller.py`,
+`tests/integration/test_slice_c.py`) — not a general or cross-platform
+claim, and not yet exercised by CI.
+
+### New findings, with real reproduced evidence
+
+- **Replacement refs (`refs/replace/*`) silently subvert object-content
+  resolution.** `git rev-parse <oid>^{tree}`, `<oid>:path`, `<oid>^`,
+  `git ls-tree <oid>`, and `git cat-file -p <oid>` all resolve through
+  an active replace ref instead of the literal named object.
+  `GIT_REPLACE_REF_BASE` stripping alone does **not** help (verified
+  by a real negative-control probe still exhibiting the substitution).
+  `git write-tree` and `checkpoint_ref.py`'s `for-each-ref`/
+  `update-ref` are **unaffected** (verified by direct real-repository
+  probes in both `test_git_safety.py` and permanent regression tests
+  added to `test_checkpoint_ref.py`). The accepted defense is the
+  redundant pair `--no-replace-objects` (global flag) +
+  `GIT_NO_REPLACE_OBJECTS=1` (env var) on every governed invocation —
+  never either alone. `core.useReplaceRefs` is the real Git config key
+  for this behavior (an earlier draft of this amendment incorrectly
+  named a nonexistent `core.replaceRefs`); it is not relied on.
+
+- **Pathspec magic survives `--`.** `--` separates paths from
+  revisions but does not disable glob (`*`), single-character (`?`),
+  bracket-class, or magic-keyword-prefix (`:(glob)`, leading `:`)
+  pathspec interpretation. A literal filename containing these
+  characters can match unrelated files during `git add` even with
+  `--`. Verified with real decoy-file probes for all four forms.
+  Defense: the redundant pair `--literal-pathspecs` (global flag) +
+  `GIT_LITERAL_PATHSPECS=1` (env var). With this pair active, a
+  glob-shaped literal path that matches nothing is correctly reported
+  as missing (not ambiguously multi-matched) — see
+  `test_lookup_staged_entry_rejects_multi_match_from_pathspec_magic`'s
+  corrected expectation.
+
+- **`Path.read_text()`/`Path.write_text()` perform universal-newline
+  translation independent of any Git attribute**, on this session's
+  Python (3.12, no `newline=` parameter on `read_text`). Fixed by using
+  binary-safe `open(..., "rb"/"wb")` throughout `patch.py`'s I/O.
+
+- A real submodule (gitlink, mode `160000`) does **not** need its
+  referenced commit to exist locally for `git write-tree` to succeed
+  (verified via a fresh clone that never fetched the submodule's own
+  commit). This is the sole justification for excluding gitlinks from
+  `check_index_blob_availability`.
+
+- `git write-tree` (and therefore `git commit`, which calls it
+  internally) re-invokes a `clean` filter even on already-staged
+  content with no further working-tree change — confirmed via an
+  isolated `write-tree` call, not only `commit`. This is why filter
+  enumeration and the cached-attribute recheck are re-run immediately
+  before each of `add`, `write-tree`, and `commit` independently in
+  `patch.py`, never as one shared snapshot.
+
+- `git cat-file --batch-check` requires stdin, which risks a pipe-buffer
+  deadlock if written in full before its output is read (both ends can
+  fill their OS pipe buffers simultaneously). `_git_safety._read_bounded`
+  was extended to write via a concurrent daemon thread rather than a
+  blocking pre-read write; `test_read_bounded_with_stdin_survives_pipe_buffer_pressure`
+  reproduces real pipe-buffer pressure (300 objects) against this path.
+
+### What is implemented
+
+- `src/codeagent/_git_safety.py`: `--no-replace-objects` +
+  `GIT_NO_REPLACE_OBJECTS=1` and `--literal-pathspecs` +
+  `GIT_LITERAL_PATHSPECS=1` added to the shared hardened baseline (so
+  `workspace.py` inherits both automatically); `ObjectFormat`/
+  `detect_object_format`/`validate_oid`; a bounded, deadline-controlled
+  binary subprocess seam (`run_git_bounded`/`_read_bounded`) with
+  selector-based non-blocking reads, `limit+1` oversize detection,
+  confirmed kill/reap with a `PROCESS_CLEANUP_UNCONFIRMED` outcome, and
+  an optional concurrent stdin writer thread; path-safe
+  `lookup_staged_entry`/`lookup_tree_entry` (never `:<path>` revision
+  syntax); `check_index_blob_availability` (streamed `ls-files --stage
+  -z`, deduplicated, gitlink-excluded, chunked `cat-file --batch-check`);
+  `read_blob_bytes`/`read_commit_header` (structured pre-check, bounded
+  retrieval, header-only parsing); a `cached` parameter on
+  `check_filter_attribute_for_paths` for the working-tree attribute
+  view.
+- `src/codeagent/patch.py`: binary-safe bounded I/O
+  (`MAX_PATCH_BLOB_BYTES = 65536`); a clean-staged-index precondition
+  (`git diff --cached --quiet HEAD --`, three-way exit interpretation);
+  object-format detection and OID validation on every reused OID;
+  cached-and-working-tree filter/attribute safety checks before write
+  and again before `add`; independent filter re-enumeration before
+  each of `add`/`write-tree`/`commit`; a pre-mutation
+  `check_index_blob_availability` gate; strict commit acceptance
+  (capture expected parent/tree/staged-entry before `commit`, execute
+  once, observe HEAD exactly once, structurally verify single parent,
+  matching tree, matching target mode/OID, and exact-byte + SHA-256
+  blob match before accepting — an unchanged HEAD or a
+  structurally-mismatched HEAD is never accepted as success, and a
+  reported `commit` failure with an exact structural match is accepted
+  as success).
+- `src/codeagent/errors.py` / `src/codeagent/events.py`: two new
+  `ErrorCode`s, `PATCH_UNSUPPORTED_GIT_SUBSTRATE` and
+  `PATCH_REPOSITORY_OBJECTS_UNAVAILABLE`, both `ErrorDomain.PATCH`,
+  added to `ToolCompleted`'s enforced patch-error-code allowlist.
+- `tests/integration/test_controller.py`: a test proving
+  `_dispatch_apply_patch`'s returned `OperationalError` is the exact
+  same object (`is`, not just equal `error_id`) forwarded into both
+  `ToolCompleted.error` and `RunFinished.error`, for both new codes.
+- `tests/unit/test_checkpoint_ref.py`: three permanent regression tests
+  proving `observe()`/`advance()` are unaffected by a real replacement
+  ref on the checkpointed commit — `checkpoint_ref.py` itself required
+  no code change; no test failed against the existing implementation.
+
+### Explicitly not covered by this amendment
+
+- Linux validation. Everything above is macOS/Git 2.54.0 evidence only,
+  consistent with this ADR's existing "acceptance is independent of ...
+  Linux validation" framing.
+- **Superseded by Amendment 2** (below): the `patch.py` apply path is
+  now exercised end-to-end against a real `--object-format=sha256`
+  repository, and `.gitattributes` targets now trigger a real
+  repository-wide re-validation of every other tracked path's
+  attribute safety.
+- A live interrupted-commit (SIGKILL mid-`commit`) reproduction — as
+  before, this remains explicitly inferred from S3's evidence and the
+  worktree-replacement recovery model (ADR 0003), not independently
+  reproduced for the hardened `patch.py` path.
+- CI/Linux validation of any of the above; this amendment's changes are
+  implemented and locally tested only — Linux CI validation pending.
+
+## Amendment 2: correction pass on the patch.py-hardening slice
+
+Recorded at implementation time, same environment as Amendment 1
+(macOS, Git 2.54.0, arm64). This corrects several real gaps a review
+pass found in Amendment 1's implementation before anything was
+committed.
+
+### Real defects found and fixed
+
+1. **Only the `filter` attribute was ever checked.** `patch.py`'s
+   attribute-safety check called `check_filter_attribute_for_paths`
+   (filter only), never the other five ADR 0006 attributes
+   (`text`/`eol`/`ident`/`working-tree-encoding`/legacy `crlf`) — a
+   live `eol=crlf` or `ident` transformation on a patch target was not
+   refused. Fixed by generalizing `_git_safety.check_filter_attribute_for_paths`
+   into `check_attributes_for_paths` (queries all six attributes in one
+   `check-attr` invocation, positionally verified path-major, per-path
+   duplicate detection preserved) and wiring `patch.py`'s attribute
+   check to use it. Real positive-control tests (`test_git_safety.py`
+   and `test_patch.py`) reproduce live `eol`/`ident`/
+   `working-tree-encoding` transformations and confirm refusal.
+2. **The `.gitattributes` flow was documented as an accepted
+   limitation instead of implemented.** A patch to `.gitattributes`
+   itself never re-validated its effect on *other* tracked paths.
+   Fixed (at the time): after staging a `.gitattributes` change
+   (top-level or nested), `patch.py` enumerated every tracked path
+   under `list_tracked_paths`'s existing fixed bounds and re-checked
+   all six attributes for all of them against the current staged
+   index, repeated again immediately before `write-tree` and before
+   `commit`.
+   **Superseded by Amendment 3 below**: a further probe found this
+   repository-wide re-check itself relies on an untrustworthy premise
+   — a `.gitattributes` target's own attribute classification can be
+   masked by that same file's own staged content — so `.gitattributes`
+   patch targets are now refused categorically before any mutation,
+   and the repository-wide helper described here is preserved but not
+   invoked. This paragraph is kept for the historical record of what
+   was believed and tested at the time; it is not the current behavior.
+3. **Several real Git-invocation call sites in `patch.py` could let a
+   raw `_git_safety.GitSafetyError` escape `apply()` entirely**,
+   becoming an unhandled exception instead of a structured
+   `PatchResult` — found by systematically auditing every call into
+   `_git_safety` from `patch.py`. Confirmed gaps: the attribute-safety
+   helper's `enumerate_filter_neutralization`/`check_attributes_for_paths`
+   calls, `lookup_staged_entry`, and essentially every `run_git` call
+   in the write/stage/commit sequence (`add`, the staged-scope diff,
+   the diff-bytes computation, `write-tree`, `commit` itself, and both
+   `rev-parse HEAD` observations) — `run_git` itself raises
+   `GitSafetyError` for a timeout or launch failure, not just a
+   nonzero exit, and none of these were wrapped. All are now wrapped
+   and mapped to the most precise available `ErrorCode`/failure type
+   for their pre- vs. post-mutation position (an injected timeout at
+   the pre-write clean-baseline check maps to
+   `PATCH_UNSUPPORTED_GIT_SUBSTRATE`; everywhere else, post-write,
+   maps to `PATCH_APPLICATION_FAILED`; a raised error during the
+   `commit` invocation itself is deliberately swallowed and not
+   branched on, matching the existing documented policy that the
+   commit's own reported exit code is not dispositive — HEAD
+   observation and structural verification decide the outcome either
+   way). Six real injected-failure tests (timeout, a second timeout at
+   a pre-write site, malformed attribute output, filter-enumeration
+   failure, a staged-entry lookup failure, and a commit-verification
+   `read_commit_header` failure) prove no `GitSafetyError` escapes
+   `apply()` for any of these paths.
+4. **`_git_safety.run_git_bounded` returned a nonzero-exit
+   `BoundedProcessResult` silently** rather than failing categorically,
+   which every current call site (`check_index_blob_availability`,
+   `read_blob_bytes`, `read_commit_header`) treated as a footgun-prone
+   pattern requiring its own returncode check. Fixed: the public
+   `run_git_bounded` wrapper now raises
+   `GitSafetyFailure.BOUNDED_COMMAND_FAILED` on a nonzero exit; the
+   private `_read_bounded` primitive keeps its original neutral
+   contract (never raises on nonzero exit) since only the public
+   wrapper's callers uniformly wanted the stricter behavior. Each call
+   site now catches `BOUNDED_COMMAND_FAILED` and re-raises its own more
+   specific reason (`INDEX_STAGE_LISTING_UNAVAILABLE`,
+   `BLOB_UNAVAILABLE`, `COMMIT_OBJECT_UNAVAILABLE`).
+5. **`_read_bounded`'s cleanup path was not unified**, and its
+   EOF-then-hang case was not classified as a timeout. Rewritten around
+   a single `_terminate_and_confirm` abort path used for every failure
+   after `Popen` succeeds (a read/oversize/timeout failure, an EOF
+   followed by a `wait` timeout — now explicitly classified as
+   `GIT_COMMAND_TIMEOUT` rather than silently accepted as success, a
+   monitoring/selector setup failure — a new
+   `GitSafetyFailure.PROCESS_SETUP_FAILED` — or any other unexpected
+   exception). **A real deadlock was found and fixed while doing this**:
+   the initial correction attempt closed the child's stdin from the
+   main thread as part of abort, but a concurrent writer thread could
+   already be blocked inside a `write()` call on that same file object,
+   and Python's buffered-IO `close()` contends for the same internal
+   lock as an in-flight `write()` — closing it concurrently deadlocked
+   the abort path against the writer instead of unblocking it. Fixed by
+   never closing stdin from the abort path; killing the child (which
+   makes its read end disappear, delivering `BrokenPipeError` to the
+   blocked writer) is what actually unblocks it, and the writer's own
+   `finally` clause closes stdin once its write call returns. This is
+   real, reproduced evidence for a documented deviation from this
+   session's own correction instruction to "close stdin when
+   aborting" — doing so unconditionally is unsafe. Five new tests cover
+   a selector-setup failure, EOF-then-hang classified as timeout, a
+   writer blocked on a full stdin pipe recovering cleanly once the
+   child is killed, a writer that genuinely cannot be confirmed
+   stopped (`PROCESS_CLEANUP_UNCONFIRMED`), and the pre-existing
+   hung-child/launch-failure/cleanup-unconfirmed tests continuing to
+   pass unchanged.
+6. **`Path.resolve()`/`is_symlink()`/`is_file()` failures and a
+   `UnicodeEncodeError` from caller-provided replacement text were
+   unhandled** in `patch.py`'s path validation and content-preparation
+   logic. Both are real, plausible inputs (a permission failure or
+   symlink cycle; a model-proposed replacement containing an unpaired
+   UTF-16 surrogate) neither previously caught. Fixed: both are now
+   caught and converted to sanitized `_ValidationFailure`s via
+   `from None` (so the original exception — which can embed an
+   absolute path — is suppressed from the exception chain, verified via
+   `__suppress_context__` and a full `traceback.format_exception` render
+   in a white-box test, not just the persisted message string).
+
+### Corrected documentation
+
+- The docstring claim that `check_index_blob_availability` "streams"
+  `git ls-files --stage -z` was imprecise: `_read_bounded` performs a
+  bounded whole-output capture (`limit + 1` oversize detection), not
+  incremental record-by-record parsing. The docstring now says this
+  explicitly.
+
+### What is additionally implemented (beyond Amendment 1)
+
+- `_git_safety.check_attributes_for_paths` (all six ADR 0006
+  attributes, generalizing the former filter-only function, which is
+  now a thin backward-compatible wrapper `workspace.py` still uses
+  unchanged), `GitSafetyFailure.PROCESS_SETUP_FAILED` and
+  `BOUNDED_COMMAND_FAILED`, and a concurrent-writer-safe unified
+  cleanup path in `_read_bounded`.
+- `patch.py`'s `_check_repository_wide_attribute_safety` and
+  `_is_gitattributes_path`.
+- 6 new tests in `test_git_safety.py` (full-attribute defaults, three
+  live-transformation positive controls, duplicate-path rejection,
+  empty-attribute-names rejection) plus 2 new tests replacing a
+  previously-inverted `run_git_bounded` nonzero-exit expectation, plus
+  4 new bounded-reader cleanup tests — 181 total in that file (up from
+  170).
+- 22 new tests in `test_patch.py` (2 real full-attribute live-control
+  end-to-end refusals, 3 `.gitattributes` repository-wide-revalidation
+  tests, 6 injected-`GitSafetyError` mapping tests, 2 sanitization
+  tests, 5 negative-commit-acceptance tests including the SHA-256
+  end-to-end run, and a literal-pathspec end-to-end effectiveness
+  test) — 42 total in that file (up from 29).
+- Full suite: 1296 passed (up from 1267); the 3 real Docker
+  `test_slice_c.py` tests passed with `CODEAGENT_REQUIRE_DOCKER=1` set.
+
+### Explicitly not covered by this amendment
+
+- Linux validation — unchanged from Amendment 1: macOS/Git 2.54.0 only.
+- Linux CI validation of this amendment's changes.
+
+## Amendment 3: nested `.gitattributes` self-masking — narrowed scope, not a new design decision
+
+Recorded at implementation time, same environment as Amendments 1–2
+(macOS, Git 2.54.0, arm64). This is a new empirical finding from a
+further probe, not a reversal of ADR 0006's accepted decision (section
+1's inspect-then-refuse-or-checkout control for `worktree add`, and the
+shared attribute/filter-safety machinery in `_git_safety.py`, remain as
+accepted). It narrows what `patch.py` claims to support for one
+specific target shape.
+
+### The finding
+
+Amendment 2's `.gitattributes` repository-wide re-validation assumed
+that querying `check-attr --cached` for the `.gitattributes` file's own
+path, using the attribute state that file's own staged content
+produces, was a valid way to classify that target's safety. A direct
+probe disproves this:
+
+```
+# top-level .gitattributes:
+sub/.gitattributes filter=parent
+
+# sub/.gitattributes (the nested file's own content):
+.gitattributes -filter
+```
+
+Querying `git check-attr --cached filter` for the path
+`sub/.gitattributes` reports **`unset`** (a safe state) — the parent
+directory's `filter=parent` assignment for that exact path is silently
+shadowed by the nested file's own self-referential rule, because Git's
+`.gitattributes` precedence gives the deeper directory's rules priority
+for paths within it, and `sub/.gitattributes` is itself a path "within"
+`sub/`. The unsafe parent assignment never surfaces in the query.
+
+This means: **a `.gitattributes` target's own attribute classification
+is not trustworthy when it is derived, even in part, from that same
+file's own staged content** — which is exactly what both the
+single-target check (existing since Amendment 1) and the
+repository-wide re-check (Amendment 2) depend on for the
+`.gitattributes` file's own path specifically. Neither check is sound
+for this one target shape; both remain sound and unaffected for every
+*other* tracked path (this masking is specific to a file governing its
+own attributes, not a general flaw in `check-attr` or in
+`check_attributes_for_paths`).
+
+There is currently no trusted mechanism in this codebase to query a
+path's governing parent-directory, `.git/info/attributes`, or global/
+system attribute layers independently of the target file's own staged
+content. Building one (e.g., synthesizing a `.gitattributes`-file-free
+view of the same commit, or parsing the attribute file precedence
+chain directly) is future work, not attempted here.
+
+### The decision (scoped, not a reversal)
+
+`GitPatchApplier.apply()` now refuses **any** `.gitattributes` patch
+target — top-level or nested — categorically, before any read, write,
+stage, or commit, via `PATCH_UNSUPPORTED_GIT_SUBSTRATE`. This is
+narrower than Amendment 2's claim, not a new capability: Amendment 2's
+repository-wide helper (`_check_repository_wide_attribute_safety`) is
+preserved in `patch.py` for potential future reuse once a trusted
+independent-layer inspection mechanism exists, but it is **not called**
+from `apply()` and must not be described as a complete
+`.gitattributes` safety control until that gap is closed. Every other
+ADR 0006 control (the six-attribute check for non-`.gitattributes`
+targets, replace-ref/literal-pathspec defenses, object-format
+validation, bounded I/O, commit-acceptance verification) is unaffected.
+
+### Evidence
+
+- `test_nested_gitattributes_can_really_mask_a_parent_rule_for_its_own_path`
+  (`test_patch.py`) reproduces the probe above directly against a real
+  repository, independent of `patch.py`, confirming `check-attr`
+  reports `unset` despite the parent's `filter=parent`.
+- `test_apply_refuses_a_top_level_gitattributes_patch_target_before_any_mutation`
+  and `test_apply_refuses_a_nested_gitattributes_patch_target`
+  (`test_patch.py`) confirm `apply()`'s categorical refusal for both
+  shapes, before any mutation (HEAD never moves, nothing is staged).
+- Full suite: 1296 passed (unchanged count — 3 `.gitattributes` tests
+  were replaced/removed, 3 added, net even); `test_patch.py` at 43
+  tests (net even for the same reason).
+
+### Explicitly not covered by this amendment
+
+- A trusted, independent-of-target-content mechanism for inspecting
+  parent/`.git/info/attributes`/global attribute layers — this remains
+  unbuilt; `.gitattributes` patch support stays refused until it
+  exists.
+- Linux validation — unchanged: macOS/Git 2.54.0 only.
+- Linux CI validation of this amendment's changes.

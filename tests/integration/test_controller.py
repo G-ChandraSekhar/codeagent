@@ -49,6 +49,7 @@ def _build(
     max_repair_iterations: int = 3,
     max_plan_revisions: int = 2,
     patch_should_fail: bool = False,
+    patch_failure_code: ErrorCode = ErrorCode.PATCH_VALIDATION_FAILED,
     approval_mode: domain.ApprovalMode = domain.ApprovalMode.INTERACTIVE,
     model: ModelClient | None = None,
     reader: object | None = None,
@@ -65,7 +66,7 @@ def _build(
         model if model is not None else FakeModel(PLAN),
         FakeApprovalProvider(approval_decisions),
         FakeVerifier(verification_outcomes, baseline_outcome=baseline_outcome),
-        FakePatchApplier(patch_should_fail),
+        FakePatchApplier(patch_should_fail, failure_code=patch_failure_code),
         reader if reader is not None else FakeRepositoryReader(),
         clock=SteppingClock(),
     )
@@ -402,6 +403,46 @@ def test_patch_failure_reuses_the_same_error_id_across_events() -> None:
     assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
     assert not any(isinstance(e, events.CheckpointCreated) for e in controller.log.events)
     assert not any(isinstance(e, events.VerificationCompleted) for e in controller.log.events)
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    [
+        ErrorCode.PATCH_UNSUPPORTED_GIT_SUBSTRATE,
+        ErrorCode.PATCH_REPOSITORY_OBJECTS_UNAVAILABLE,
+    ],
+)
+def test_patch_failure_propagates_the_identical_error_object_for_new_adr0006_codes(
+    failure_code: ErrorCode,
+) -> None:
+    """ADR 0006's patch.py-hardening slice adds two new ErrorCodes. This
+    proves the same object-identity/error_id-reuse guarantee already
+    established for PATCH_VALIDATION_FAILED above also holds for both
+    new codes: _dispatch_apply_patch's returned OperationalError is the
+    exact same object forwarded into both ToolCompleted.error and (via
+    _finish) RunFinished.error -- not merely an equal-by-value copy."""
+    controller = _build(
+        "r-patch-fail-adr0006", patch_should_fail=True, patch_failure_code=failure_code
+    )
+    finished = controller.run()
+
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is failure_code
+
+    failed_tool_completions = [
+        e for e in controller.log.events if isinstance(e, events.ToolCompleted) and not e.success
+    ]
+    assert len(failed_tool_completions) == 1
+    tool_error = failed_tool_completions[0].error
+    assert tool_error is not None
+    assert tool_error.code is failure_code
+
+    # Object identity, not just equal error_id: the controller must
+    # forward the exact OperationalError PatchApplier.apply returned,
+    # never reconstruct or copy it along the way.
+    assert tool_error is finished.error
+    assert tool_error.error_id == finished.error.error_id
 
 
 # --------------------------------------------------------------------

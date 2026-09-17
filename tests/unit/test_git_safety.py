@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -157,7 +159,8 @@ def test_git_environment_strips_all_git_prefixed_variables(monkeypatch):
 
     env = git_environment()
 
-    assert not any(key.startswith("GIT_") and key != "GIT_NO_LAZY_FETCH" for key in env)
+    deliberately_set = {"GIT_NO_LAZY_FETCH", "GIT_NO_REPLACE_OBJECTS", "GIT_LITERAL_PATHSPECS"}
+    assert not any(key.startswith("GIT_") and key not in deliberately_set for key in env)
 
 
 def test_git_environment_preserves_non_git_variables(monkeypatch):
@@ -182,6 +185,18 @@ def test_git_environment_overrides_a_hostile_no_lazy_fetch_value(monkeypatch):
     env = git_environment()
 
     assert env["GIT_NO_LAZY_FETCH"] == "1"
+
+
+def test_git_environment_sets_no_replace_objects():
+    env = git_environment()
+
+    assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
+def test_git_environment_sets_literal_pathspecs():
+    env = git_environment()
+
+    assert env["GIT_LITERAL_PATHSPECS"] == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +228,14 @@ def test_baseline_args_contains_no_pager_flag():
 
 def test_baseline_args_contains_no_lazy_fetch_flag():
     assert "--no-lazy-fetch" in BASELINE_ARGS
+
+
+def test_baseline_args_contains_no_replace_objects_flag():
+    assert "--no-replace-objects" in BASELINE_ARGS
+
+
+def test_baseline_args_contains_literal_pathspecs_flag():
+    assert "--literal-pathspecs" in BASELINE_ARGS
 
 
 def test_build_git_argv_without_repo_has_no_dash_c_repo_flag():
@@ -1189,14 +1212,33 @@ def test_list_tracked_paths_ignores_untracked_files(tmp_path):
     assert paths == ("tracked.txt",)
 
 
+def _intercept_ls_files_popen(monkeypatch, tmp_path, *, stdout_bytes: bytes, returncode: int):
+    """`list_tracked_paths` now runs through the bounded binary seam
+    (real `subprocess.Popen`, not the text `_run` seam) -- these
+    fixtures intercept `git ls-files` specifically and substitute a
+    real short-lived process emitting exactly `stdout_bytes` then
+    exiting with `returncode`, while every other git invocation (the
+    fixture repo's own setup) is untouched."""
+    real_popen = subprocess.Popen
+    payload_file = tmp_path / "fake_ls_files_payload.bin"
+    payload_file.write_bytes(stdout_bytes)
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"] and "ls-files" in argv:
+            return real_popen(
+                ["sh", "-c", f"cat {payload_file}; exit {returncode}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+
 def test_list_tracked_paths_rejects_excessive_count(monkeypatch, tmp_path):
     repo = _make_repo(tmp_path / "r")
-
-    def fake_run(args, **kwargs):
-        payload = "".join(f"path{i}\0" for i in range(MAX_TRACKED_PATHS + 1))
-        return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
-
-    monkeypatch.setattr(_git_safety, "_run", fake_run)
+    payload = "".join(f"path{i}\0" for i in range(MAX_TRACKED_PATHS + 1)).encode()
+    _intercept_ls_files_popen(monkeypatch, tmp_path, stdout_bytes=payload, returncode=0)
 
     with pytest.raises(GitSafetyError) as excinfo:
         list_tracked_paths(repo)
@@ -1206,13 +1248,8 @@ def test_list_tracked_paths_rejects_excessive_count(monkeypatch, tmp_path):
 
 def test_list_tracked_paths_rejects_a_too_long_path(monkeypatch, tmp_path):
     repo = _make_repo(tmp_path / "r")
-
-    def fake_run(args, **kwargs):
-        return subprocess.CompletedProcess(
-            args, 0, stdout=("x" * (MAX_TRACKED_PATH_BYTES + 1)) + "\0", stderr=""
-        )
-
-    monkeypatch.setattr(_git_safety, "_run", fake_run)
+    payload = (("x" * (MAX_TRACKED_PATH_BYTES + 1)) + "\0").encode()
+    _intercept_ls_files_popen(monkeypatch, tmp_path, stdout_bytes=payload, returncode=0)
 
     with pytest.raises(GitSafetyError) as excinfo:
         list_tracked_paths(repo)
@@ -1222,11 +1259,7 @@ def test_list_tracked_paths_rejects_a_too_long_path(monkeypatch, tmp_path):
 
 def test_list_tracked_paths_rejects_empty_path(monkeypatch, tmp_path):
     repo = _make_repo(tmp_path / "r")
-
-    def fake_run(args, **kwargs):
-        return subprocess.CompletedProcess(args, 0, stdout="a.txt\0\0", stderr="")
-
-    monkeypatch.setattr(_git_safety, "_run", fake_run)
+    _intercept_ls_files_popen(monkeypatch, tmp_path, stdout_bytes=b"a.txt\0\0", returncode=0)
 
     with pytest.raises(GitSafetyError) as excinfo:
         list_tracked_paths(repo)
@@ -1236,11 +1269,7 @@ def test_list_tracked_paths_rejects_empty_path(monkeypatch, tmp_path):
 
 def test_list_tracked_paths_rejects_duplicate_path(monkeypatch, tmp_path):
     repo = _make_repo(tmp_path / "r")
-
-    def fake_run(args, **kwargs):
-        return subprocess.CompletedProcess(args, 0, stdout="a.txt\0a.txt\0", stderr="")
-
-    monkeypatch.setattr(_git_safety, "_run", fake_run)
+    _intercept_ls_files_popen(monkeypatch, tmp_path, stdout_bytes=b"a.txt\0a.txt\0", returncode=0)
 
     with pytest.raises(GitSafetyError) as excinfo:
         list_tracked_paths(repo)
@@ -1250,11 +1279,7 @@ def test_list_tracked_paths_rejects_duplicate_path(monkeypatch, tmp_path):
 
 def test_list_tracked_paths_rejects_truncated_output(monkeypatch, tmp_path):
     repo = _make_repo(tmp_path / "r")
-
-    def fake_run(args, **kwargs):
-        return subprocess.CompletedProcess(args, 0, stdout="a.txt\0b.txt", stderr="")
-
-    monkeypatch.setattr(_git_safety, "_run", fake_run)
+    _intercept_ls_files_popen(monkeypatch, tmp_path, stdout_bytes=b"a.txt\0b.txt", returncode=0)
 
     with pytest.raises(GitSafetyError) as excinfo:
         list_tracked_paths(repo)
@@ -1264,17 +1289,30 @@ def test_list_tracked_paths_rejects_truncated_output(monkeypatch, tmp_path):
 
 def test_list_tracked_paths_fails_closed_when_command_fails(monkeypatch, tmp_path):
     repo = _make_repo(tmp_path / "r")
-
-    def fake_run(args, **kwargs):
-        return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: not a repo")
-
-    monkeypatch.setattr(_git_safety, "_run", fake_run)
+    _intercept_ls_files_popen(monkeypatch, tmp_path, stdout_bytes=b"", returncode=128)
 
     with pytest.raises(GitSafetyError) as excinfo:
         list_tracked_paths(repo)
 
     assert excinfo.value.reason is GitSafetyFailure.TRACKED_PATH_LISTING_UNAVAILABLE
     assert "fatal" not in excinfo.value.message
+
+
+def test_list_tracked_paths_rejects_output_exceeding_the_bounded_limit(monkeypatch, tmp_path):
+    """New evidence for this pass: `list_tracked_paths` now goes
+    through the bounded binary seam, so an oversized listing is
+    detected via `limit + 1` semantics without ever materializing it
+    in full -- this is the real "genuinely bounded" behavior the
+    docstring now claims."""
+    repo = _make_repo(tmp_path / "r")
+    monkeypatch.setattr(_git_safety, "MAX_STAGE_LISTING_BYTES", 16)
+    oversized_payload = b"x" * 17 + b"\0"
+    _intercept_ls_files_popen(monkeypatch, tmp_path, stdout_bytes=oversized_payload, returncode=0)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        list_tracked_paths(repo)
+
+    assert excinfo.value.reason is GitSafetyFailure.BINARY_OUTPUT_TOO_LARGE
 
 
 def test_check_filter_attribute_for_paths_empty(tmp_path):
@@ -1425,3 +1463,1188 @@ def test_evaluate_tracked_filter_safety_true_once_magic_driver_is_removed(tmp_pa
     _git(repo, "add", ".gitattributes", "a.txt", "c.txt")
 
     assert evaluate_tracked_filter_safety(repo) is True
+
+
+# ---------------------------------------------------------------------------
+# Replacement refs (refs/replace/*) can silently substitute object content
+# for rev-parse/cat-file/ls-tree. --no-replace-objects + GIT_NO_REPLACE_OBJECTS=1
+# (both, redundantly) must neutralize this; GIT_REPLACE_REF_BASE stripping
+# alone does not (it only changes which replace namespace is consulted).
+# ---------------------------------------------------------------------------
+
+
+def _commit_with_content(repo, content: str) -> str:
+    (repo / "a.txt").write_text(content)
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", content)
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_replace_ref_subverts_rev_parse_tree_without_protection(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _commit_with_content(repo, "one")
+    second = _commit_with_content(repo, "two")
+    third = _commit_with_content(repo, "three")
+    real_tree = _git(repo, "rev-parse", f"{second}^{{tree}}").stdout.strip()
+    _git(repo, "replace", second, third)
+
+    # Bare, unprotected call (bypasses run_git/BASELINE_ARGS deliberately,
+    # to prove the vulnerability the baseline is meant to close).
+    subverted = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", f"{second}^{{tree}}"],
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+    ).stdout.strip()
+
+    assert subverted != real_tree
+
+
+def test_no_replace_objects_baseline_prevents_replace_ref_subversion(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _commit_with_content(repo, "one")
+    second = _commit_with_content(repo, "two")
+    real_tree = _git(repo, "rev-parse", f"{second}^{{tree}}").stdout.strip()
+    third = _commit_with_content(repo, "three")
+    _git(repo, "replace", second, third)
+
+    result = run_git(repo, "rev-parse", f"{second}^{{tree}}")
+
+    assert result.stdout.strip() == real_tree
+
+
+def test_stripping_git_replace_ref_base_alone_does_not_help(tmp_path):
+    """Explicit negative control per ADR 0006: GIT_REPLACE_REF_BASE
+    stripping (already covered by GIT_* removal) is not the mechanism
+    that neutralizes replace refs -- they live in refs/replace/*, a
+    separate channel."""
+    repo = _make_repo(tmp_path / "r")
+    _commit_with_content(repo, "one")
+    second = _commit_with_content(repo, "two")
+    real_tree = _git(repo, "rev-parse", f"{second}^{{tree}}").stdout.strip()
+    third = _commit_with_content(repo, "three")
+    _git(repo, "replace", second, third)
+
+    env = _clean_env()
+    env.pop("GIT_REPLACE_REF_BASE", None)
+    subverted = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", f"{second}^{{tree}}"],
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+
+    assert subverted != real_tree
+
+
+def test_write_tree_unaffected_by_replace_ref_either_way(tmp_path):
+    """write-tree only serializes the index -- no ref/commit resolution
+    -- so it is structurally immune, with or without the flags."""
+    repo = _make_repo(tmp_path / "r")
+    first = _commit_with_content(repo, "one")
+    second = _commit_with_content(repo, "two")
+    _git(repo, "replace", first, second)
+
+    (repo / "a.txt").write_text("x\n")
+    _git(repo, "add", "a.txt")
+    protected = run_git(repo, "write-tree").stdout.strip()
+    unprotected = subprocess.run(
+        ["git", "-C", str(repo), "write-tree"], capture_output=True, text=True, env=_clean_env()
+    ).stdout.strip()
+
+    assert protected == unprotected
+
+
+# ---------------------------------------------------------------------------
+# Pathspec magic: `--` alone does not disable glob/bracket/`?`/`:(...)`
+# interpretation. --literal-pathspecs + GIT_LITERAL_PATHSPECS=1 (both,
+# redundantly) must make an approved literal filename immune to matching
+# an unrelated decoy path.
+# ---------------------------------------------------------------------------
+
+
+def _make_pathspec_fixture(repo: Path) -> None:
+    (repo / "decoyA.txt").write_text("decoy1\n")
+    (repo / "decoyB.txt").write_text("decoy2\n")
+    (repo / "fileX.py").write_text("decoy3\n")
+    _git(repo, "add", "decoyA.txt", "decoyB.txt", "fileX.py")
+    _git(repo, "commit", "-q", "-m", "decoys")
+
+
+def test_unprotected_glob_pathspec_matches_a_decoy_file(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _make_pathspec_fixture(repo)
+    (repo / "*.txt").write_text("literal star content\n")
+    (repo / "decoyA.txt").write_text("modified\n")
+
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "--", "*.txt"], check=True, capture_output=True, env=_clean_env()
+    )
+    status = _git(repo, "status", "--porcelain=v1").stdout
+
+    assert "A  *.txt" in status
+    assert "M  decoyA.txt" in status  # the decoy was swept in too
+
+
+def test_literal_pathspecs_baseline_prevents_glob_matching_a_decoy(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _make_pathspec_fixture(repo)
+    (repo / "*.txt").write_text("literal star content\n")
+    (repo / "decoyA.txt").write_text("modified\n")
+
+    run_git(repo, "add", "--", "*.txt")
+    status = _git(repo, "status", "--porcelain=v1").stdout
+
+    assert "A  *.txt" in status
+    assert "M  decoyA.txt" not in status
+    assert " M decoyA.txt" in status  # unstaged, untouched
+
+
+def test_unprotected_question_mark_pathspec_matches_a_decoy_file(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _make_pathspec_fixture(repo)
+    (repo / "file?.py").write_text("literal question content\n")
+    (repo / "fileX.py").write_text("modified\n")
+
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "--", "file?.py"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    status = _git(repo, "status", "--porcelain=v1").stdout
+
+    assert "M  fileX.py" in status  # matched via ? wildcard
+
+
+def test_literal_pathspecs_baseline_prevents_question_mark_matching(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _make_pathspec_fixture(repo)
+    (repo / "file?.py").write_text("literal question content\n")
+    (repo / "fileX.py").write_text("modified\n")
+
+    run_git(repo, "add", "--", "file?.py")
+    status = _git(repo, "status", "--porcelain=v1").stdout
+
+    assert "M  fileX.py" not in status
+    assert " M fileX.py" in status
+
+
+def test_unprotected_magic_prefix_pathspec_matches_multiple_files(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _make_pathspec_fixture(repo)
+    (repo / "decoyA.txt").write_text("modified\n")
+
+    result = subprocess.run(
+        ["git", "-C", str(repo), "add", "--", ":(glob)*.txt"],
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+    )
+    status = _git(repo, "status", "--porcelain=v1").stdout
+
+    assert result.returncode == 0
+    assert "M  decoyA.txt" in status
+
+
+def test_literal_pathspecs_baseline_fails_closed_for_magic_prefix(tmp_path):
+    """Under --literal-pathspecs, ":(glob)*.txt" is treated as a literal
+    (nonexistent) filename and the add fails closed, rather than
+    matching anything."""
+    repo = _make_repo(tmp_path / "r")
+    _make_pathspec_fixture(repo)
+
+    result = run_git(repo, "add", "--", ":(glob)*.txt")
+
+    assert result.returncode != 0
+
+
+def test_literal_leading_colon_filename_requires_literal_pathspecs(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _make_pathspec_fixture(repo)
+    (repo / ":weird.txt").write_text("literal leading colon\n")
+
+    unprotected = subprocess.run(
+        ["git", "-C", str(repo), "add", "--", ":weird.txt"],
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+    )
+    assert unprotected.returncode != 0  # unrecognized magic keyword -> hard error, not literal
+
+    run_git(repo, "add", "--", ":weird.txt")
+    status = _git(repo, "status", "--porcelain=v1").stdout
+    assert "A  :weird.txt" in status
+
+
+def test_lookup_style_defense_in_depth_reveals_a_bypassed_magic_match(tmp_path):
+    """Even if a future call site forgot the hardened baseline, the
+    exact-one-record discipline in the path-safe lookup helpers would
+    still detect a multi-file magic match after the fact -- proven here
+    against the raw `ls-files --stage -z` shape those helpers parse."""
+    repo = _make_repo(tmp_path / "r")
+    _make_pathspec_fixture(repo)
+    (repo / "*.txt").write_text("literal\n")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "--", "*.txt"], check=True, capture_output=True, env=_clean_env()
+    )
+
+    result = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--stage", "-z", "--", "*.txt"],
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+    )
+    records = [r for r in result.stdout.split("\0") if r]
+
+    assert len(records) > 1
+
+
+# ---------------------------------------------------------------------------
+# Object-format detection and OID validation (ADR 0003/0004: sha1 and
+# sha256 are the only accepted formats; every Git-produced OID this
+# module reuses is validated against the repository's actual format
+# before being trusted).
+# ---------------------------------------------------------------------------
+
+
+def test_detect_object_format_sha1(tmp_path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "--object-format=sha1", str(repo)],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+
+    assert _git_safety.detect_object_format(repo) == _git_safety.ObjectFormat.SHA1
+
+
+def test_detect_object_format_sha256(tmp_path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    result = subprocess.run(
+        ["git", "init", "-q", "--object-format=sha256", str(repo)],
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+    )
+    if result.returncode != 0:
+        pytest.skip("this git build does not support --object-format=sha256")
+
+    assert _git_safety.detect_object_format(repo) == _git_safety.ObjectFormat.SHA256
+
+
+def test_object_format_hex_lengths():
+    assert _git_safety.ObjectFormat.SHA1.hex_length == 40
+    assert _git_safety.ObjectFormat.SHA256.hex_length == 64
+
+
+def test_validate_oid_accepts_correct_length_and_charset():
+    oid = "a" * 40
+    assert _git_safety.validate_oid(_git_safety.ObjectFormat.SHA1, oid) == oid
+
+
+def test_validate_oid_rejects_wrong_length():
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.validate_oid(_git_safety.ObjectFormat.SHA1, "a" * 39)
+    assert excinfo.value.reason is GitSafetyFailure.MALFORMED_OID
+
+
+def test_validate_oid_rejects_non_hex_characters():
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.validate_oid(_git_safety.ObjectFormat.SHA1, "g" * 40)
+    assert excinfo.value.reason is GitSafetyFailure.MALFORMED_OID
+
+
+def test_validate_oid_rejects_uppercase():
+    with pytest.raises(GitSafetyError):
+        _git_safety.validate_oid(_git_safety.ObjectFormat.SHA1, "A" * 40)
+
+
+def test_validate_oid_sha256_requires_64_chars():
+    oid = "b" * 64
+    assert _git_safety.validate_oid(_git_safety.ObjectFormat.SHA256, oid) == oid
+    with pytest.raises(GitSafetyError):
+        _git_safety.validate_oid(_git_safety.ObjectFormat.SHA256, "b" * 40)
+
+
+# ---------------------------------------------------------------------------
+# Bounded binary subprocess runner: one monotonic deadline across read,
+# termination, and reap; limit+1 semantics; confirmed process exit;
+# never exposes argv/paths/stderr/raw exceptions.
+# ---------------------------------------------------------------------------
+
+
+def test_run_git_bounded_returns_small_output(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("hello\n")
+    _git(repo, "add", "a.txt")
+    sha = _git(repo, "rev-parse", ":a.txt").stdout.strip()
+
+    result = _git_safety.run_git_bounded(repo, "cat-file", "-p", sha, limit=1024)
+
+    assert result.stdout == b"hello\n"
+    assert result.returncode == 0
+
+
+def test_run_git_bounded_detects_oversized_output_without_reading_it_all(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "big.txt").write_bytes(b"x" * 500_000)
+    _git(repo, "add", "big.txt")
+    sha = _git(repo, "rev-parse", ":big.txt").stdout.strip()
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.run_git_bounded(repo, "cat-file", "-p", sha, limit=4096)
+
+    assert excinfo.value.reason is GitSafetyFailure.BINARY_OUTPUT_TOO_LARGE
+
+
+def test_run_git_bounded_exact_boundary_succeeds(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "exact.txt").write_bytes(b"y" * 100)
+    _git(repo, "add", "exact.txt")
+    sha = _git(repo, "rev-parse", ":exact.txt").stdout.strip()
+
+    result = _git_safety.run_git_bounded(repo, "cat-file", "-p", sha, limit=100)
+
+    assert len(result.stdout) == 100
+
+
+def test_run_git_bounded_fails_categorically_on_nonzero_returncode(tmp_path):
+    """`run_git_bounded` (the public wrapper) fails categorically on a
+    nonzero exit rather than returning a `BoundedProcessResult` the
+    caller must remember to check — every current call site treated a
+    nonzero exit as a failure anyway."""
+    repo = _make_repo(tmp_path / "r")
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.run_git_bounded(repo, "cat-file", "-p", "0" * 40, limit=1024)
+
+    assert excinfo.value.reason is _git_safety.GitSafetyFailure.BOUNDED_COMMAND_FAILED
+
+
+def test_read_bounded_still_returns_a_neutral_nonzero_result(tmp_path):
+    """The private `_read_bounded` primitive keeps its own neutral
+    contract (never raises for a nonzero exit) — only the public
+    `run_git_bounded` wrapper is stricter."""
+    repo = _make_repo(tmp_path / "r")
+    argv = _git_safety._build_git_argv(repo, "cat-file", "-p", "0" * 40)
+
+    result = _git_safety._read_bounded(argv[1:], env=_git_safety.git_environment(), timeout=5.0, limit=1024)
+
+    assert result.returncode != 0
+
+
+def test_run_git_bounded_times_out_on_a_hung_child(monkeypatch):
+    """Reproduces the exact hung-child scenario probed this session:
+    a process that writes partial output then never finishes. Must
+    time out via the deadline, not block forever waiting for EOF."""
+
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            return real_popen(
+                ["sh", "-c", "printf partial; sleep 300"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety._read_bounded(["--version"], env=_git_safety.git_environment(), timeout=0.5, limit=4096)
+
+    assert excinfo.value.reason is GitSafetyFailure.GIT_COMMAND_TIMEOUT
+
+
+def test_run_git_bounded_launch_failure_is_sanitized(monkeypatch):
+    def fake_popen(argv, **kwargs):
+        raise FileNotFoundError("no such file: git")
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety._read_bounded(["--version"], env=_git_safety.git_environment(), timeout=1.0, limit=4096)
+
+    assert excinfo.value.reason is GitSafetyFailure.GIT_EXECUTABLE_UNAVAILABLE
+
+
+def test_run_git_bounded_cleanup_unconfirmed_when_process_will_not_die(monkeypatch, tmp_path):
+    """If the child cannot be confirmed terminated even after kill +
+    bounded wait, a distinct categorical failure is raised rather than
+    silently treating an unconfirmed process as handled."""
+    repo = _make_repo(tmp_path / "r")
+
+    real_popen = subprocess.Popen
+
+    class StubbornProcess:
+        def __init__(self, *args, **kwargs):
+            self._real = real_popen(
+                ["sh", "-c", "sleep 300"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            self.stdout = self._real.stdout
+
+        def kill(self):
+            pass  # simulate a kill that never actually terminates the process
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=timeout or 0)
+
+        @property
+        def returncode(self):
+            return self._real.returncode
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            return StubbornProcess()
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+    try:
+        with pytest.raises(GitSafetyError) as excinfo:
+            _git_safety._read_bounded(
+                ["--version"], env=_git_safety.git_environment(), timeout=0.2, limit=4096
+            )
+        assert excinfo.value.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 300"], capture_output=True)
+
+
+def test_run_git_bounded_error_messages_do_not_leak_argv_or_paths(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "big.txt").write_bytes(b"x" * 500_000)
+    _git(repo, "add", "big.txt")
+    sha = _git(repo, "rev-parse", ":big.txt").stdout.strip()
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.run_git_bounded(repo, "cat-file", "-p", sha, limit=4096)
+
+    assert str(repo) not in str(excinfo.value)
+    assert sha not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+
+
+# ---------------------------------------------------------------------------
+# Path-safe index/tree lookup: never `:<path>` or `<commit>:<path>`
+# revision syntax; exactly-one-record discipline; mode/type validation.
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_staged_entry_returns_regular_file(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("hello\n")
+    _git(repo, "add", "a.txt")
+    expected_oid = _git(repo, "rev-parse", ":a.txt").stdout.strip()
+
+    entry = _git_safety.lookup_staged_entry(repo, "a.txt", object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert entry.path == "a.txt"
+    assert entry.oid == expected_oid
+    assert entry.mode == "100644"
+
+
+def test_lookup_staged_entry_missing_path(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.lookup_staged_entry(
+            repo, "does-not-exist.txt", object_format=_git_safety.ObjectFormat.SHA1
+        )
+
+    assert excinfo.value.reason is GitSafetyFailure.INDEX_ENTRY_MISSING
+
+
+def test_lookup_staged_entry_rejects_unmerged_path(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "c.txt").write_text("base\n")
+    _git(repo, "add", "c.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    initial_branch = _git(repo, "branch", "--show-current").stdout.strip()
+    _git(repo, "checkout", "-qb", "branch1")
+    (repo / "c.txt").write_text("branch1\n")
+    _git(repo, "commit", "-qam", "b1")
+    _git(repo, "checkout", "-q", initial_branch)
+    (repo / "c.txt").write_text("master\n")
+    _git(repo, "commit", "-qam", "m")
+    subprocess.run(
+        ["git", "-C", str(repo), "merge", "branch1", "-q"], capture_output=True, env=_clean_env()
+    )
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.lookup_staged_entry(repo, "c.txt", object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert excinfo.value.reason is GitSafetyFailure.INDEX_ENTRY_AMBIGUOUS
+
+
+def test_lookup_staged_entry_rejects_symlink_mode(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "target.txt").write_text("x\n")
+    _git(repo, "add", "target.txt")
+    subprocess.run(
+        ["ln", "-s", "target.txt", str(repo / "link.txt")], check=True, capture_output=True
+    )
+    _git(repo, "add", "link.txt")
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.lookup_staged_entry(repo, "link.txt", object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert excinfo.value.reason is GitSafetyFailure.INDEX_ENTRY_UNEXPECTED_MODE
+
+
+def test_lookup_staged_entry_rejects_multi_match_from_pathspec_magic(tmp_path):
+    """The hardened baseline's `--literal-pathspecs` means a glob-looking
+    string like `*.txt` is never reinterpreted as magic here — it is
+    looked up as the literal filename `*.txt`, which does not exist, so
+    the safe, correct outcome is MISSING rather than a multi-match. This
+    is defense-in-depth evidence: the lookup never widens a literal path
+    into a sweep across `a.txt`/`b.txt`, even though it could ambiguously
+    match if the baseline's literal-pathspecs protection were absent."""
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("a\n")
+    (repo / "b.txt").write_text("b\n")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "a.txt", "b.txt"], check=True, capture_output=True, env=_clean_env()
+    )
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.lookup_staged_entry(repo, "*.txt", object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert excinfo.value.reason is GitSafetyFailure.INDEX_ENTRY_MISSING
+
+
+def test_lookup_tree_entry_returns_blob(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("hello\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "init")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    expected_oid = _git(repo, "rev-parse", f"{head}:a.txt").stdout.strip()
+
+    entry = _git_safety.lookup_tree_entry(
+        repo, head, "a.txt", object_format=_git_safety.ObjectFormat.SHA1
+    )
+
+    assert entry is not None
+    assert entry.path == "a.txt"
+    assert entry.oid == expected_oid
+    assert entry.mode == "100644"
+    assert entry.type == "blob"
+
+
+def test_lookup_tree_entry_missing_path_returns_none(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    entry = _git_safety.lookup_tree_entry(
+        repo, head, "does-not-exist.txt", object_format=_git_safety.ObjectFormat.SHA1
+    )
+
+    assert entry is None
+
+
+def test_lookup_tree_entry_rejects_gitlink(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True, capture_output=True, env=_clean_env())
+    subprocess.run(
+        ["git", "-C", str(sub)] + _GIT_IDENTITY + ["commit", "-q", "--allow-empty", "-m", "sub"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    repo = _make_repo(tmp_path / "r")
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "protocol.file.allow=always"] + _GIT_IDENTITY
+        + ["submodule", "add", "-q", f"file://{sub}", "sub"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    _git(repo, "commit", "-q", "-m", "add submodule")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.lookup_tree_entry(repo, head, "sub", object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert excinfo.value.reason is GitSafetyFailure.TREE_ENTRY_UNEXPECTED_MODE
+
+
+def test_check_index_blob_availability_passes_for_complete_repo(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("hello\n")
+    _git(repo, "add", "a.txt")
+
+    _git_safety.check_index_blob_availability(repo, object_format=_git_safety.ObjectFormat.SHA1)
+
+
+def test_check_index_blob_availability_skips_gitlinks(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True, capture_output=True, env=_clean_env())
+    subprocess.run(
+        ["git", "-C", str(sub)] + _GIT_IDENTITY + ["commit", "-q", "--allow-empty", "-m", "sub"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    repo = _make_repo(tmp_path / "r")
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "protocol.file.allow=always"] + _GIT_IDENTITY
+        + ["submodule", "add", "-q", f"file://{sub}", "sub"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+
+    # A staged gitlink whose target commit is not (and never needs to be)
+    # present locally must not fail the check.
+    _git_safety.check_index_blob_availability(repo, object_format=_git_safety.ObjectFormat.SHA1)
+
+
+def test_check_index_blob_availability_detects_a_missing_blob(tmp_path):
+    src = tmp_path / "src"
+    _make_repo(src)
+    subprocess.run(
+        ["git", "-C", str(src), "config", "uploadpack.allowFilter", "true"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    (src / "a.txt").write_text("hello\n")
+    _git(src, "add", "a.txt")
+    _git(src, "commit", "-q", "-m", "init")
+    blob_oid = _git(src, "rev-parse", "HEAD:a.txt").stdout.strip()
+
+    # `--no-local` is required: Git's local-clone fast path ignores
+    # `--filter` entirely ("filtering not recognized by server"), which
+    # would silently fetch every blob and defeat this test's premise.
+    clone = tmp_path / "clone"
+    subprocess.run(
+        [
+            "git", "-c", "protocol.file.allow=always", "clone", "-q", "--no-local",
+            "--filter=blob:none", "--no-checkout", f"file://{src}", str(clone),
+        ],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    subprocess.run(
+        ["git", "-C", str(clone), "config", "extensions.partialClone", "origin"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    # Stage the tree without ever fetching the blob content: read-tree
+    # populates the index from HEAD's tree without materializing files.
+    _git(clone, "read-tree", "HEAD")
+    # Confirm the blob is genuinely absent locally before asserting on it.
+    local_check = subprocess.run(
+        ["git", "-C", str(clone), "-c", "core.useReplaceRefs=false", "cat-file", "-e", blob_oid],
+        env={**_clean_env(), "GIT_NO_LAZY_FETCH": "1"},
+        capture_output=True,
+    )
+    if local_check.returncode == 0:
+        pytest.skip("partial clone unexpectedly has the blob locally; cannot exercise this path")
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.check_index_blob_availability(clone, object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert excinfo.value.reason is _git_safety.GitSafetyFailure.OBJECT_MISSING
+
+
+def test_check_index_blob_availability_chunks_large_staged_sets(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path / "r")
+    for i in range(5):
+        (repo / f"f{i}.txt").write_text(f"content {i}\n")
+    _git(repo, "add", *[f"f{i}.txt" for i in range(5)])
+
+    calls: list[int] = []
+    real_check = _git_safety._check_objects_present
+
+    def _counting_check(repo_path, oids, *, object_format):
+        calls.append(len(oids))
+        return real_check(repo_path, oids, object_format=object_format)
+
+    monkeypatch.setattr(_git_safety, "_check_objects_present", _counting_check)
+    monkeypatch.setattr(_git_safety, "MAX_BATCH_CHECK_CHUNK", 2)
+
+    _git_safety.check_index_blob_availability(repo, object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert calls == [2, 2, 1]
+
+
+def test_read_blob_bytes_returns_exact_content(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    content = b"line one\r\nline two\x00binary\n"
+    (repo / "a.bin").write_bytes(content)
+    _git(repo, "add", "a.bin")
+    oid = _git(repo, "rev-parse", ":a.bin").stdout.strip()
+
+    result = _git_safety.read_blob_bytes(repo, oid, object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert result == content
+
+
+def test_read_blob_bytes_rejects_oversized_blob(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("x" * 100)
+    _git(repo, "add", "a.txt")
+    oid = _git(repo, "rev-parse", ":a.txt").stdout.strip()
+    monkeypatch.setattr(_git_safety, "MAX_PATCH_BLOB_BYTES", 10)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.read_blob_bytes(repo, oid, object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert excinfo.value.reason is GitSafetyFailure.BLOB_TOO_LARGE
+
+
+def test_read_blob_bytes_rejects_non_blob_type(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.read_blob_bytes(repo, head, object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert excinfo.value.reason is GitSafetyFailure.BLOB_UNEXPECTED_TYPE
+
+
+def test_read_blob_bytes_rejects_missing_oid(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    fake_oid = "a" * 40
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.read_blob_bytes(repo, fake_oid, object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert excinfo.value.reason is GitSafetyFailure.BLOB_UNAVAILABLE
+
+
+def test_read_commit_header_returns_tree_and_parents(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("one\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "first")
+    first = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "a.txt").write_text("two\n")
+    _git(repo, "commit", "-qam", "second")
+    second = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    expected_tree = _git(repo, "rev-parse", f"{second}^{{tree}}").stdout.strip()
+
+    header = _git_safety.read_commit_header(repo, second, object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert header.tree == expected_tree
+    assert header.parents == (first,)
+
+
+def test_read_commit_header_root_commit_has_no_parents(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "root")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    header = _git_safety.read_commit_header(repo, head, object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert header.parents == ()
+
+
+def test_read_commit_header_rejects_non_commit_type(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("hello\n")
+    _git(repo, "add", "a.txt")
+    blob_oid = _git(repo, "rev-parse", ":a.txt").stdout.strip()
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.read_commit_header(repo, blob_oid, object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert excinfo.value.reason is GitSafetyFailure.COMMIT_OBJECT_UNEXPECTED_TYPE
+
+
+def test_read_commit_header_ignores_message_body(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("hello\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "tree \nparent \nnot a real header line")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    expected_tree = _git(repo, "rev-parse", f"{head}^{{tree}}").stdout.strip()
+
+    header = _git_safety.read_commit_header(repo, head, object_format=_git_safety.ObjectFormat.SHA1)
+
+    assert header.tree == expected_tree
+    assert header.parents == ()
+
+
+def test_read_bounded_with_stdin_survives_pipe_buffer_pressure(tmp_path):
+    """Real evidence for the concurrent-writer design: a batch-check
+    payload larger than a typical OS pipe buffer must not deadlock."""
+    repo = _make_repo(tmp_path / "r")
+    oids: list[str] = []
+    for i in range(300):
+        path = repo / f"f{i}.txt"
+        path.write_text(f"content number {i}\n" * 5)
+        _git(repo, "add", f"f{i}.txt")
+        oids.append(_git(repo, "rev-parse", f":f{i}.txt").stdout.strip())
+
+    _git_safety._check_objects_present(repo, oids, object_format=_git_safety.ObjectFormat.SHA1)
+
+
+def test_check_filter_attribute_for_paths_uncached_reflects_unstaged_gitattributes(tmp_path):
+    """An unstaged `.gitattributes` edit still governs `git add` itself
+    -- this is why patch.py's hardening needs a working-tree
+    (`cached=False`) attribute view in addition to the staged one."""
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.bin").write_text("hello\n")
+    _git(repo, "add", "a.bin")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    # Add a *staged* .gitattributes that marks a.bin filterless, but then
+    # further edit it in the working tree (unstaged) to apply a filter.
+    (repo / ".gitattributes").write_text("*.bin -filter\n")
+    _git(repo, "add", ".gitattributes")
+    (repo / ".gitattributes").write_text("*.bin filter=lfs\n")
+
+    cached = _git_safety.check_filter_attribute_for_paths(repo, ["a.bin"], cached=True)
+    uncached = _git_safety.check_filter_attribute_for_paths(repo, ["a.bin"], cached=False)
+
+    assert cached[0].value == "unset"
+    assert uncached[0].value == "lfs"
+
+
+# --------------------------------------------------------------------
+# check_attributes_for_paths: full ADR 0006 attribute set
+# --------------------------------------------------------------------
+
+
+def test_check_attributes_for_paths_reports_all_six_attributes_unspecified_by_default(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("hello\n")
+    _git(repo, "add", "a.txt")
+
+    records = _git_safety.check_attributes_for_paths(repo, ["a.txt"], cached=True)
+
+    assert [r.attribute for r in records] == list(_git_safety.ALL_SAFETY_ATTRIBUTE_NAMES)
+    assert all(r.value == "unspecified" for r in records)
+    assert all(r.path == "a.txt" for r in records)
+
+
+def test_check_attributes_for_paths_detects_a_live_text_eol_transformation(tmp_path):
+    """Positive control: `text eol=crlf` is a live, active
+    transformation (finding 7's `core.autocrlf=false` does not
+    override it), and both `text` and `eol` must report as unsafe."""
+    repo = _make_repo(tmp_path / "r")
+    (repo / ".gitattributes").write_text("crlf.txt text eol=crlf\n")
+    (repo / "crlf.txt").write_bytes(b"line one\r\nline two\r\n")
+    _git(repo, "add", ".gitattributes", "crlf.txt")
+
+    records = {
+        r.attribute: r
+        for r in _git_safety.check_attributes_for_paths(repo, ["crlf.txt"], cached=True)
+    }
+    neutralization = _git_safety.enumerate_filter_neutralization(repo)
+
+    assert records["text"].value == "set"
+    assert records["eol"].value == "crlf"
+    assert not records["text"].is_safe(configured_driver_names=neutralization.driver_names)
+    assert not records["eol"].is_safe(configured_driver_names=neutralization.driver_names)
+
+    # Live evidence the transformation actually mutates content: the
+    # committed blob is LF-normalized regardless of the CRLF working-
+    # tree bytes above.
+    blob_oid = _git(repo, "rev-parse", ":crlf.txt").stdout.strip()
+    committed = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-p", blob_oid], capture_output=True, env=_clean_env()
+    ).stdout
+    assert committed == b"line one\nline two\n"
+
+
+def test_check_attributes_for_paths_detects_a_live_ident_transformation(tmp_path):
+    """Positive control: `ident` performs live `$Id$` keyword
+    expansion at staging time."""
+    repo = _make_repo(tmp_path / "r")
+    (repo / ".gitattributes").write_text("ident.txt ident\n")
+    # A previously-expanded $Id$ line (as `ident`'s own smudge would
+    # produce on checkout) -- staging must collapse it back via clean,
+    # a real, observable, non-identity transformation.
+    (repo / "ident.txt").write_text(
+        "$Id: 0123456789abcdef0123456789abcdef01234567 $\nbody\n"
+    )
+    _git(repo, "add", ".gitattributes", "ident.txt")
+
+    records = {
+        r.attribute: r
+        for r in _git_safety.check_attributes_for_paths(repo, ["ident.txt"], cached=True)
+    }
+    neutralization = _git_safety.enumerate_filter_neutralization(repo)
+
+    assert records["ident"].value == "set"
+    assert not records["ident"].is_safe(configured_driver_names=neutralization.driver_names)
+
+    blob_oid = _git(repo, "rev-parse", ":ident.txt").stdout.strip()
+    committed = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-p", blob_oid], capture_output=True, env=_clean_env()
+    ).stdout
+    working_tree_bytes = (repo / "ident.txt").read_bytes()
+    assert committed != working_tree_bytes
+    assert committed == b"$Id$\nbody\n"
+
+
+def test_check_attributes_for_paths_detects_a_live_working_tree_encoding_transformation(tmp_path):
+    """Positive control: `working-tree-encoding=UTF-16` performs a
+    live re-encoding of the blob relative to the working-tree bytes."""
+    repo = _make_repo(tmp_path / "r")
+    (repo / ".gitattributes").write_text("wte.txt working-tree-encoding=UTF-16\n")
+    (repo / "wte.txt").write_text("hello\n", encoding="utf-16")
+    _git(repo, "add", ".gitattributes", "wte.txt")
+
+    records = {
+        r.attribute: r
+        for r in _git_safety.check_attributes_for_paths(repo, ["wte.txt"], cached=True)
+    }
+    neutralization = _git_safety.enumerate_filter_neutralization(repo)
+
+    assert records["working-tree-encoding"].value == "UTF-16"
+    assert not records["working-tree-encoding"].is_safe(
+        configured_driver_names=neutralization.driver_names
+    )
+
+    blob_oid = _git(repo, "rev-parse", ":wte.txt").stdout.strip()
+    committed = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-p", blob_oid], capture_output=True, env=_clean_env()
+    ).stdout
+    working_tree_bytes = (repo / "wte.txt").read_bytes()
+    assert committed != working_tree_bytes
+    assert committed == "hello\n".encode("utf-8")
+
+
+def test_check_attributes_for_paths_rejects_duplicate_requested_path(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("x\n")
+    _git(repo, "add", "a.txt")
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.check_attributes_for_paths(repo, ["a.txt", "a.txt"], cached=True)
+
+    assert excinfo.value.reason is GitSafetyFailure.ATTRIBUTE_RECORD_DUPLICATE_PATH
+
+
+def test_check_attributes_for_paths_rejects_empty_attribute_names(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    with pytest.raises(ValueError):
+        _git_safety.check_attributes_for_paths(repo, ["a.txt"], attribute_names=())
+
+
+def test_run_git_bounded_selector_setup_failure_is_categorical_and_cleans_up(monkeypatch):
+    """A monitoring-setup failure (selector construction itself failing)
+    must still go through the single cleanup path and kill the real
+    child, not leak a process or raise an unsanitized exception."""
+    real_popen = subprocess.Popen
+    real_selector_cls = _git_safety.selectors.DefaultSelector
+
+    def failing_selector():
+        raise OSError("simulated selector construction failure")
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            return real_popen(
+                ["sh", "-c", "sleep 300"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(_git_safety.selectors, "DefaultSelector", failing_selector)
+
+    try:
+        with pytest.raises(GitSafetyError) as excinfo:
+            _git_safety._read_bounded(
+                ["--version"], env=_git_safety.git_environment(), timeout=1.0, limit=4096
+            )
+        assert excinfo.value.reason is GitSafetyFailure.PROCESS_SETUP_FAILED
+    finally:
+        monkeypatch.setattr(_git_safety.selectors, "DefaultSelector", real_selector_cls)
+        subprocess.run(["pkill", "-f", "sleep 300"], capture_output=True)
+
+
+def test_run_git_bounded_classifies_eof_then_hang_as_timeout(monkeypatch):
+    """A child that closes stdout (a real EOF) but does not promptly
+    exit must be classified as GIT_COMMAND_TIMEOUT, not silently
+    accepted as a successful bounded read."""
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            return real_popen(
+                ["sh", "-c", "printf done; exec 1>&-; sleep 300"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+    try:
+        with pytest.raises(GitSafetyError) as excinfo:
+            _git_safety._read_bounded(
+                ["--version"], env=_git_safety.git_environment(), timeout=0.3, limit=4096
+            )
+        assert excinfo.value.reason is GitSafetyFailure.GIT_COMMAND_TIMEOUT
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 300"], capture_output=True)
+
+
+def test_run_git_bounded_cleans_up_a_writer_blocked_on_a_full_stdin_pipe(monkeypatch):
+    """A writer thread blocked on a full stdin pipe (because the child
+    never reads it) must be unblocked and confirmed once the child is
+    killed as part of the drain-timeout cleanup path -- the original
+    GIT_COMMAND_TIMEOUT is what's raised, not a spurious cleanup
+    failure caused by the writer."""
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            return real_popen(
+                ["sh", "-c", "sleep 300"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+    # Larger than a typical OS pipe buffer, so the writer thread
+    # genuinely blocks rather than completing immediately.
+    oversized_payload = b"x" * (4 * 1024 * 1024)
+
+    try:
+        with pytest.raises(GitSafetyError) as excinfo:
+            _git_safety._read_bounded(
+                ["--version"],
+                env=_git_safety.git_environment(),
+                timeout=0.3,
+                limit=4096,
+                input_bytes=oversized_payload,
+            )
+        assert excinfo.value.reason is GitSafetyFailure.GIT_COMMAND_TIMEOUT
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 300"], capture_output=True)
+
+
+def test_run_git_bounded_raises_cleanup_unconfirmed_when_writer_will_not_stop(monkeypatch):
+    """If the writer thread cannot be confirmed stopped even after the
+    process is killed and a bounded grace join, a distinct categorical
+    failure is raised -- the writer, not just the process, must be
+    confirmed."""
+    real_popen = subprocess.Popen
+
+    class _HangingStdin:
+        def write(self, data: bytes) -> None:
+            time.sleep(5.0)  # never unblocked by closing/killing the process
+
+        def close(self) -> None:
+            pass
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            process = real_popen(["true"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            process.stdin = _HangingStdin()
+            return process
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety._read_bounded(
+            ["--version"],
+            env=_git_safety.git_environment(),
+            timeout=0.2,
+            limit=4096,
+            input_bytes=b"hello",
+        )
+    assert excinfo.value.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+
+
+def test_read_bounded_thread_start_failure_reaps_the_child(monkeypatch):
+    """A writer-thread start failure (e.g. `RuntimeError: can't start
+    new thread`) is now inside the same protected region as the
+    drain/confirm sequence -- it must invoke _terminate_and_confirm
+    before propagating, never leak the already-spawned process."""
+    real_popen = subprocess.Popen
+    spawned: dict[str, subprocess.Popen] = {}
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            process = real_popen(
+                ["sh", "-c", "sleep 300"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            spawned["proc"] = process
+            return process
+        return real_popen(argv, **kwargs)
+
+    def raising_start(self):
+        raise RuntimeError("simulated thread-start failure")
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(threading.Thread, "start", raising_start)
+
+    try:
+        with pytest.raises(GitSafetyError) as excinfo:
+            _git_safety._read_bounded(
+                ["--version"],
+                env=_git_safety.git_environment(),
+                timeout=1.0,
+                limit=4096,
+                input_bytes=b"hello",
+            )
+        assert excinfo.value.reason is GitSafetyFailure.PROCESS_SETUP_FAILED
+        assert "proc" in spawned
+        assert spawned["proc"].poll() is not None  # confirmed reaped, not leaked
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 300"], capture_output=True)
+
+
+def test_read_bounded_injected_git_safety_error_after_popen_cleans_up_and_propagates(
+    monkeypatch,
+):
+    """A raw GitSafetyError raised from inside the protected region
+    (not just a `_BoundedFailure`) must still invoke
+    _terminate_and_confirm before propagating, and its identity/reason
+    must be preserved exactly -- not converted to a generic
+    PROCESS_SETUP_FAILED."""
+    real_popen = subprocess.Popen
+    spawned: dict[str, subprocess.Popen] = {}
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            process = real_popen(
+                ["sh", "-c", "sleep 300"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            spawned["proc"] = process
+            return process
+        return real_popen(argv, **kwargs)
+
+    injected = GitSafetyError(GitSafetyFailure.MALFORMED_OID, "simulated injected failure")
+
+    def raising_drain(process, *, deadline, limit):
+        raise injected
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(_git_safety, "_drain_stdout", raising_drain)
+
+    try:
+        with pytest.raises(GitSafetyError) as excinfo:
+            _git_safety._read_bounded(
+                ["--version"], env=_git_safety.git_environment(), timeout=1.0, limit=4096
+            )
+        assert excinfo.value is injected
+        assert spawned["proc"].poll() is not None  # confirmed reaped, not leaked
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 300"], capture_output=True)

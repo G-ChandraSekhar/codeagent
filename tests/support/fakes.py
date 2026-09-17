@@ -174,9 +174,11 @@ class FakePatchApplier:
         self,
         should_fail: bool = False,
         changed_paths: tuple[str, ...] = ("jobs/worker.py",),
+        failure_code: ErrorCode = ErrorCode.PATCH_VALIDATION_FAILED,
     ) -> None:
         self._should_fail = should_fail
         self._changed_paths = changed_paths
+        self._failure_code = failure_code
         self._n = 0
 
     def apply(
@@ -195,7 +197,7 @@ class FakePatchApplier:
                 changed_paths=(),
                 diff_bytes=0,
                 error=OperationalError(
-                    code=ErrorCode.PATCH_VALIDATION_FAILED,
+                    code=self._failure_code,
                     error_id=f"{run_id}-fake-patch-err-{self._n}",
                     message="fixture-forced patch validation failure",
                 ),

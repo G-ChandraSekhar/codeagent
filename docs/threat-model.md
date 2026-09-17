@@ -1406,8 +1406,9 @@ this detailed entry states.
   repository content (A2) into host code execution
 - Impact: arbitrary host code execution outside the container boundary,
   during operations the design treats as safe metadata manipulation
-- Implemented control: **`src/codeagent/checkpoint_ref.py` and
-  `src/codeagent/workspace.py`.** `checkpoint_ref.py`: every Git
+- Implemented control: **`src/codeagent/checkpoint_ref.py`,
+  `src/codeagent/workspace.py`, and `src/codeagent/patch.py`.**
+  `checkpoint_ref.py`: every Git
   invocation passes `-c core.hooksPath=/dev/null`, which is
   command-line configuration and therefore outranks every configuration
   file; a regression test installs a hostile `reference-transaction`
@@ -1437,13 +1438,33 @@ this detailed entry states.
   configuration, and a real `git://` daemon partial-clone lazy-fetch
   refusal; **Linux CI validation is still pending.**
 - Planned control: the same policy on every remaining Git invocation in
-  production code. **`src/codeagent/patch.py` is still not
-  protected**, and the project as a whole is therefore **still not
-  protected** — hardening `workspace.py` does not by itself make the
-  system safe. Required follow-up: apply and test this policy in
-  `patch.py` **before** the checkpoint-ref primitive is integrated with
-  patch application, so the integrated path never runs
-  repository-configured hooks.
+  production code. **`src/codeagent/patch.py` is hardened**
+  (ADR 0006 Amendments 1–3): every Git invocation goes through
+  `_git_safety.run_git`/`run_git_bounded`, carrying the full baseline
+  (hooks/fsmonitor/autocrlf/submodule-recursion neutralization,
+  replace-object and literal-pathspec defenses), plus a clean-baseline
+  precondition, the full six-attribute (`filter`/`text`/`eol`/`ident`/
+  `working-tree-encoding`/`crlf`) cached-and-working-tree check before
+  write and before `add`, a pre-mutation object-availability check
+  (`check_index_blob_availability`), and strict structural commit
+  acceptance (expected parent/tree/blob captured before `commit` runs
+  once, HEAD observed exactly once afterward and verified — an
+  unchanged or structurally-mismatched HEAD is never accepted).
+  **`.gitattributes` patch targets (top-level or nested) are refused**
+  with `PATCH_UNSUPPORTED_GIT_SUBSTRATE` before any mutation, not
+  safely supported: a real, reproduced probe (Amendment 3) showed a
+  nested `.gitattributes` file's own attribute classification can be
+  masked by that file's own staged content (a parent directory's rule
+  for the nested file's path silently shadowed by a self-referential
+  rule inside it), so there is currently no trusted way to validate a
+  `.gitattributes` target's safety independently of the content being
+  validated. This is implemented and passing its own tests **locally
+  on macOS (Git 2.54.0) only** — Linux CI validation is pending, so the
+  project as a whole is **not yet validated as protected** until that
+  lands. The checkpoint-ref primitive is still not integrated with
+  patch application (that remains separate Milestone 2 wiring work), so
+  this hardening exists in `patch.py` itself but is not yet exercised
+  through the full checkpoint-ref-backed path.
   `GitWorktree.__exit__`'s legacy `shutil.rmtree` + repository-wide
   `git worktree prune` fallback (used only when the ordinary
   `git worktree remove` itself fails) is unchanged by this work and
@@ -1457,34 +1478,57 @@ this detailed entry states.
   external merge tool must extend ADR 0006 before use, not assume it is
   already covered
 - Evidence/future test: the checkpoint-ref regression test described
-  above; `workspace.py` now has 49 focused tests covering real hostile
-  `post-checkout` hooks, clean/smudge/process filters, the
-  `unset`/`unspecified` driver-name collision, attribute assignment via
-  `.gitattributes`/`.git/info/attributes`/global scope, ambient
-  global/system-level filter configuration, hostile `GIT_*`
+  above, plus three permanent replace-ref-immunity regression tests
+  added for ADR 0006 Amendment 1; `workspace.py` has 49 focused tests
+  covering real hostile `post-checkout` hooks, clean/smudge/process
+  filters, the `unset`/`unspecified` driver-name collision, attribute
+  assignment via `.gitattributes`/`.git/info/attributes`/global scope,
+  ambient global/system-level filter configuration, hostile `GIT_*`
   environment variables, a real `git://` daemon partial-clone
   lazy-fetch refusal, and enter-time cleanup after every class of
-  `worktree add` failure (ordinary, ambiguous, and combined
-  registration+tempdir cleanup failure) — 116 further focused tests
-  cover the shared `_git_safety.py` foundation itself (1170 in the full
-  suite). Equivalent tests are still owed for `patch.py`
-  (`pre-commit`, `commit-msg`, `post-commit`), plus ADR 0006's
-  remaining required-acceptance-test items not yet exercised at the
-  `workspace.py` level (the exact-byte content-fidelity invariant for
-  `text`/`eol`/`ident`/`working-tree-encoding`, and Linux-platform
-  runs of everything above)
-- Residual risk: **open for the rest of the codebase.** `workspace.py`
-  is implemented and locally (macOS) validated; `patch.py` is not, so
-  T-M3 remains open project-wide and no cross-platform claim is made
-  until Linux CI passes. `core.fsmonitor` and the pager are covered for
-  every command `workspace.py` issues (the shared baseline applies
-  `-c core.fsmonitor=false` and `--no-pager` unconditionally); channels
-  specific to commands `workspace.py` never runs (`commit.gpgSign`, an
-  editor, `diff` textconv/ext-diff) remain `patch.py`'s responsibility
-  when that module is hardened. Merge drivers remain
-  genuinely unaddressed (not merely "not yet built") since ADR 0006
-  does not design for them at all, pending any future command that
-  would need them
+  `worktree add` failure; the shared `_git_safety.py` foundation has
+  **184 focused tests** (object-format detection/validation, the
+  bounded binary subprocess seam including a real hung-child
+  reproduction, a pipe-buffer-pressure stdin writer, a genuinely
+  bounded `list_tracked_paths`, and two real deadlock/cleanup bugs
+  found and fixed in that seam plus their regression tests, path-safe
+  index/tree lookup, index-blob availability, blob/commit-header
+  retrieval, the full six-attribute `check_attributes_for_paths` with
+  live-transformation positive controls, and replace-ref/
+  literal-pathspec positive/negative controls); `patch.py` has **43
+  focused tests**, including real end-to-end refusals for live
+  `eol`/`ident` transformations, real refusals of both a top-level and
+  a nested `.gitattributes` patch target (plus a direct, independent
+  reproduction of the nested-masking probe against real Git), six
+  injected-`GitSafetyError` mapping tests proving no such error escapes
+  `apply()`, sanitization tests (including a real symlink-loop
+  `RuntimeError`), and a real SHA-256 end-to-end run. ADR 0006's
+  remaining required-acceptance-test items not yet exercised
+  (Linux-platform runs of everything above, and a trusted
+  independent-of-target-content attribute-layer inspection mechanism
+  for `.gitattributes`) are the ones still open.
+- Residual risk: **narrowed, not closed.** `workspace.py` and
+  `patch.py` are both implemented and locally (macOS) validated; T-M3
+  remains open project-wide until `patch.py`'s slice passes Linux CI
+  and checkpoint-ref integration with patch application is completed,
+  and no cross-platform claim is made until then. `core.fsmonitor` and
+  the pager are covered for every command either module issues (the
+  shared baseline applies
+  `-c core.fsmonitor=false` and `--no-pager` unconditionally);
+  `commit.gpgSign=false` is applied explicitly at `patch.py`'s one
+  `commit` call site. Merge drivers remain genuinely unaddressed (not
+  merely "not yet built") since ADR 0006 does not design for them at
+  all, pending any future command that would need them. `.gitattributes`
+  patch targets are a genuinely unsupported shape, not merely
+  unvalidated: `patch.py` refuses them outright
+  (`PATCH_UNSUPPORTED_GIT_SUBSTRATE`) rather than attempting a
+  repository-wide re-validation whose own premise (classifying the
+  target using attribute state that target's own content can influence)
+  was shown unsound. A repository-wide re-validation helper exists in
+  `patch.py` (`_check_repository_wide_attribute_safety`) but is
+  deliberately unused, preserved only for potential future reuse once a
+  trusted, independent-of-target-content attribute-layer inspection
+  mechanism exists.
 - Owning milestone/spike: Milestone 2 (before patch integration), then
   reviewed again when ADR 0004's lifecycle work adds Git invocations
 

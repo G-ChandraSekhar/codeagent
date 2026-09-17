@@ -1555,3 +1555,72 @@ def test_symbolic_state_without_original_failure_is_not_falsely_chained(
         ref.observe()
     assert excinfo.value.reason is CheckpointRefFailure.SYMBOLIC_REF
     assert excinfo.value.__cause__ is None
+
+
+# --------------------------------------------------------------------
+# ADR 0006 finding: refs/replace/* subverts object-content resolution
+# for rev-parse/cat-file/ls-tree, but CheckpointRef never resolves
+# object *content* — observe() reads for-each-ref's own literal stored
+# OID, and advance()/create() compare-and-swap against that literal
+# OID via update-ref. These are permanent regression tests proving
+# that immunity with real replace refs, not merely asserting it.
+# --------------------------------------------------------------------
+
+
+def test_observe_ignores_a_replacement_ref_for_the_checkpointed_commit(
+    repo: Path, ref: CheckpointRef
+) -> None:
+    real = _head(repo)
+    decoy = _commit(repo, "decoy content, never checkpointed\n")
+    ref.create(real)
+
+    # A replace ref substituting the checkpointed commit's content with
+    # an unrelated commit's — this is exactly what silently subverts
+    # `git rev-parse <oid>^{tree}` / `cat-file -p <oid>` / `ls-tree
+    # <oid>` elsewhere in this codebase.
+    _git(repo, "replace", real, decoy)
+    assert _git(repo, "rev-parse", f"{real}^{{tree}}").stdout.strip() == _git(
+        repo, "rev-parse", f"{decoy}^{{tree}}"
+    ).stdout.strip(), "test setup did not actually create a subverting replace ref"
+
+    observation = ref.observe()
+
+    assert observation.present is True
+    assert observation.oid == real
+
+
+def test_advance_compare_and_swap_ignores_a_replacement_ref(
+    repo: Path, ref: CheckpointRef
+) -> None:
+    real = _head(repo)
+    decoy = _commit(repo, "decoy content, never checkpointed\n")
+    next_commit = _commit(repo, "the real next checkpoint\n")
+    ref.create(real)
+    _git(repo, "replace", real, decoy)
+
+    # The compare-and-swap must succeed against the ref's real literal
+    # stored value, not be confused by the replacement.
+    ref.advance(expected_old_oid=real, new_oid=next_commit)
+
+    assert ref.observe().oid == next_commit
+    assert _ref_value(repo, ref.ref_name) == next_commit
+
+
+def test_create_and_advance_reject_replaced_oid_as_expected_old_value(
+    repo: Path, ref: CheckpointRef
+) -> None:
+    """Defense-in-depth converse of the two tests above: passing the
+    *replacement's* OID as the expected old value must be rejected as a
+    real compare-and-swap mismatch (the ref's literal value is `real`,
+    not `decoy`), proving advance() never silently accepts a
+    replace-resolved identity either."""
+    real = _head(repo)
+    decoy = _commit(repo, "decoy content, never checkpointed\n")
+    next_commit = _commit(repo, "the real next checkpoint\n")
+    ref.create(real)
+    _git(repo, "replace", real, decoy)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.advance(expected_old_oid=decoy, new_oid=next_commit)
+    assert excinfo.value.reason is CheckpointRefFailure.UNEXPECTED_VALUE
+    assert ref.observe().oid == real
