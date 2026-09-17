@@ -2,27 +2,36 @@
 (`docs/adr/0006-git-safety-policy-for-filters-hooks-and-content-fidelity.md`,
 Accepted).
 
-Scope boundary, deliberately narrow (this is the foundation slice
-only):
+Scope boundary:
 
 - This module owns the building blocks ADR 0006 specifies: Git >= 2.45
   / `--no-lazy-fetch` preflight, sanitized environment construction,
   the fixed hardened baseline argv, bounded filter-driver
-  enumeration/neutralization, and NUL-safe `check-attr` output parsing
-  with the safe/unsafe attribute-state classification.
-- It is **not** wired into `workspace.py`, `patch.py`,
-  `checkpoint_ref.py`, the controller, or any lifecycle/CLI code yet.
-  No production behavior outside this module changes.
-- It does not implement the no-checkout/read-tree/inspect-then-refuse
-  orchestration for `worktree add` (ADR 0006 §1), the `.gitattributes`
-  patch-handling sequencing (§3), or the source-status sequencing (§4)
-  — those integrate this foundation into `workspace.py`/`patch.py` in a
-  later slice.
+  enumeration/neutralization, bounded/chunked/NUL-safe tracked-path
+  listing and filter-attribute inspection, and the safe/unsafe
+  attribute-state classification (including the driver-set-dependent
+  `filter` rule).
+- `src/codeagent/workspace.py` is wired into this module: every Git
+  invocation in `GitWorktree` (worktree creation, index population,
+  the pre-materialization filter-safety check, the hardened
+  materializing checkout, and `snapshot_source()`'s hardened `status`)
+  goes through `run_git`/`check_git_preflight`/
+  `evaluate_tracked_filter_safety` here. This closes threat-model T-M3
+  for workspace creation and source-repository inspection only.
+- `patch.py`, the controller, `checkpoint_ref.py` integration,
+  lifecycle storage, cancellation, reconciliation, and CLI/frontend
+  work are **not** wired into this module yet — those remain later
+  slices. `workspace.py`'s own module docstring records what its
+  integration does and does not cover, including the pre-existing
+  `__exit__` prune/rmtree fallback gap (ADR 0004 I2, not resolved by
+  either module).
 - It never decides run outcomes and never constructs an
   `OperationalError`. Failures raise `GitSafetyError` carrying a
-  categorical `reason`; an integrating slice translates one failure
-  occurrence into exactly one `OperationalError`, mirroring
-  `codeagent.checkpoint_ref.CheckpointRefError`'s existing split.
+  categorical `reason`; an integrating module translates one failure
+  occurrence into its own categorical error (`workspace.py`'s
+  `GitWorktreeError`) or, eventually, exactly one `OperationalError`,
+  mirroring `codeagent.checkpoint_ref.CheckpointRefError`'s existing
+  split.
 
 Safety properties this module enforces:
 
@@ -135,6 +144,22 @@ MAX_FILTER_DRIVERS = 128
 MAX_FILTER_DRIVER_NAME_BYTES = 256
 MAX_FILTER_ARGV_BYTES = 65_536
 
+# Bounds for the shared tracked-path listing / filter-attribute
+# inspection helpers (used by workspace.py's pre-materialization
+# refusal check, ADR 0006 section 1's primary control). A repository
+# with more tracked paths, or a single path longer, than these bounds
+# is refused rather than processed — the same "fail closed rather than
+# silently truncate" discipline as the filter-driver bounds above.
+MAX_TRACKED_PATHS = 200_000
+MAX_TRACKED_PATH_BYTES = 4_096
+# Paths are inspected in fixed-size chunks so no single `check-attr
+# --stdin` invocation's payload grows unboundedly with repository size.
+ATTR_CHECK_CHUNK_SIZE = 512
+# Defense in depth beyond chunk size × MAX_TRACKED_PATH_BYTES (which
+# already bounds a chunk to a few MB): an explicit hard ceiling on any
+# single check-attr stdin payload.
+MAX_ATTR_CHECK_STDIN_BYTES = 4 * 1024 * 1024
+
 # unspecified: no rule at all. unset: an explicit "-attr" negation.
 # "set" (bare boolean-true) and any named value are unsafe.
 #
@@ -198,6 +223,16 @@ class GitSafetyFailure(str, Enum):
     FILTER_ENUMERATION_LIMIT_EXCEEDED = "filter_enumeration_limit_exceeded"
     FILTER_PASSTHROUGH_UNAVAILABLE = "filter_passthrough_unavailable"
     ATTRIBUTE_OUTPUT_MALFORMED = "attribute_output_malformed"
+    TRACKED_PATH_LISTING_UNAVAILABLE = "tracked_path_listing_unavailable"
+    TRACKED_PATH_LISTING_MALFORMED = "tracked_path_listing_malformed"
+    TRACKED_PATH_COUNT_EXCEEDED = "tracked_path_count_exceeded"
+    TRACKED_PATH_TOO_LONG = "tracked_path_too_long"
+    ATTRIBUTE_INSPECTION_UNAVAILABLE = "attribute_inspection_unavailable"
+    ATTRIBUTE_INSPECTION_PAYLOAD_TOO_LARGE = "attribute_inspection_payload_too_large"
+    ATTRIBUTE_RECORD_COUNT_MISMATCH = "attribute_record_count_mismatch"
+    ATTRIBUTE_RECORD_PATH_MISMATCH = "attribute_record_path_mismatch"
+    ATTRIBUTE_RECORD_DUPLICATE_PATH = "attribute_record_duplicate_path"
+    ATTRIBUTE_RECORD_UNEXPECTED_ATTRIBUTE = "attribute_record_unexpected_attribute"
 
 
 class GitSafetyError(Exception):
@@ -627,3 +662,153 @@ def _verify_fixed_cat_path() -> None:
             GitSafetyFailure.FILTER_PASSTHROUGH_UNAVAILABLE,
             "the fixed filter passthrough executable is not available on this host",
         )
+
+
+def list_tracked_paths(repo_path: Path | str) -> tuple[str, ...]:
+    """List every path tracked in `repo_path`'s index (`git ls-files
+    -z`), NUL-safe and bounded.
+
+    Used as the input to `check_filter_attribute_for_paths` for ADR
+    0006 section 1's primary control: before any materializing
+    checkout, every tracked path's `filter` attribute must be
+    inspected, not just the paths a particular operation happens to
+    touch.
+
+    Raises `GitSafetyError` if the listing command fails, the output is
+    truncated or contains an empty or duplicate path, or the repository
+    has more tracked paths, or a single path longer, than the fixed
+    safety bounds (`MAX_TRACKED_PATHS`, `MAX_TRACKED_PATH_BYTES`) —
+    never a partial or silently truncated listing.
+    """
+    result = run_git(repo_path, "ls-files", "-z")
+    if result.returncode != 0:
+        raise GitSafetyError(
+            GitSafetyFailure.TRACKED_PATH_LISTING_UNAVAILABLE,
+            "the repository's tracked paths could not be listed",
+        )
+    paths = _split_nul_records(
+        result.stdout,
+        reason=GitSafetyFailure.TRACKED_PATH_LISTING_MALFORMED,
+        description="git ls-files output",
+    )
+    if len(paths) > MAX_TRACKED_PATHS:
+        raise GitSafetyError(
+            GitSafetyFailure.TRACKED_PATH_COUNT_EXCEEDED,
+            "the repository has more tracked paths than the fixed safety bound allows",
+        )
+    seen: set[str] = set()
+    for path in paths:
+        if path == "":
+            raise GitSafetyError(
+                GitSafetyFailure.TRACKED_PATH_LISTING_MALFORMED,
+                "git ls-files output contained an empty path",
+            )
+        if len(path.encode("utf-8", "surrogateescape")) > MAX_TRACKED_PATH_BYTES:
+            raise GitSafetyError(
+                GitSafetyFailure.TRACKED_PATH_TOO_LONG,
+                "a tracked path exceeds the fixed safety length bound",
+            )
+        if path in seen:
+            raise GitSafetyError(
+                GitSafetyFailure.TRACKED_PATH_LISTING_MALFORMED,
+                "git ls-files output contained a duplicate path",
+            )
+        seen.add(path)
+    return tuple(paths)
+
+
+def check_filter_attribute_for_paths(
+    repo_path: Path | str, paths: Collection[str]
+) -> tuple[AttributeRecord, ...]:
+    """Inspect the `filter` attribute for every path in `paths` against
+    `repo_path`'s staged index, in fixed-size chunks
+    (`ATTR_CHECK_CHUNK_SIZE`) so no single `check-attr --stdin`
+    invocation's payload grows unboundedly with the number of paths.
+
+    Each chunk's response is verified, not trusted: the record count
+    must match the chunk size, every record's path must match the
+    corresponding requested path in order, no path may repeat, and
+    every record's attribute must be `filter`. Any mismatch — a
+    Git version reordering output, a truncated response, an injected or
+    dropped record — is a categorical `GitSafetyError`, never silently
+    tolerated or partially applied.
+    """
+    paths = list(paths)
+    records: list[AttributeRecord] = []
+    for start in range(0, len(paths), ATTR_CHECK_CHUNK_SIZE):
+        chunk = paths[start : start + ATTR_CHECK_CHUNK_SIZE]
+        stdin_payload = "".join(path + "\0" for path in chunk)
+        payload_bytes = len(stdin_payload.encode("utf-8", "surrogateescape"))
+        if payload_bytes > MAX_ATTR_CHECK_STDIN_BYTES:
+            raise GitSafetyError(
+                GitSafetyFailure.ATTRIBUTE_INSPECTION_PAYLOAD_TOO_LARGE,
+                "a chunk of paths to inspect exceeds the fixed safety payload size bound",
+            )
+        result = run_git(
+            repo_path,
+            "check-attr",
+            "--cached",
+            "-z",
+            "--stdin",
+            FILTER_ATTRIBUTE_NAME,
+            input_text=stdin_payload,
+        )
+        if result.returncode != 0:
+            raise GitSafetyError(
+                GitSafetyFailure.ATTRIBUTE_INSPECTION_UNAVAILABLE,
+                "the filter attribute could not be inspected for a chunk of tracked paths",
+            )
+        chunk_records = parse_check_attr_output(result.stdout)
+        if len(chunk_records) != len(chunk):
+            raise GitSafetyError(
+                GitSafetyFailure.ATTRIBUTE_RECORD_COUNT_MISMATCH,
+                "git check-attr reported a different number of records than paths requested",
+            )
+        seen: set[str] = set()
+        for expected_path, record in zip(chunk, chunk_records):
+            if record.path != expected_path:
+                raise GitSafetyError(
+                    GitSafetyFailure.ATTRIBUTE_RECORD_PATH_MISMATCH,
+                    "git check-attr reported a record for a path that was not requested "
+                    "in that position",
+                )
+            if record.path in seen:
+                raise GitSafetyError(
+                    GitSafetyFailure.ATTRIBUTE_RECORD_DUPLICATE_PATH,
+                    "git check-attr reported more than one record for the same path",
+                )
+            seen.add(record.path)
+            if record.attribute != FILTER_ATTRIBUTE_NAME:
+                raise GitSafetyError(
+                    GitSafetyFailure.ATTRIBUTE_RECORD_UNEXPECTED_ATTRIBUTE,
+                    "git check-attr reported a record for an attribute that was not requested",
+                )
+            records.append(record)
+    return tuple(records)
+
+
+def evaluate_tracked_filter_safety(repo_path: Path | str) -> bool:
+    """`True` iff every path currently tracked in `repo_path`'s index
+    has a safe `filter` attribute, given the repository's actually
+    configured driver names (ADR 0006 finding 16's driver-set-dependent
+    rule — a bare `unspecified`/`unset` string is not, by itself,
+    sufficient).
+
+    This is the composed primary control for ADR 0006 section 1:
+    `worktree add`'s real checkout must never proceed while this
+    returns anything other than `True`. Any `GitSafetyError` raised by
+    the underlying enumeration/listing/inspection calls (a timeout,
+    malformed output, an exceeded bound, a missing object) propagates
+    to the caller rather than being treated as `True` — the caller must
+    treat an inability to complete this evaluation as unsafe, not as a
+    pass.
+    """
+    neutralization = enumerate_filter_neutralization(repo_path)
+    paths = list_tracked_paths(repo_path)
+    if not paths:
+        return True
+    records = check_filter_attribute_for_paths(repo_path, paths)
+    return all(
+        record.is_safe(configured_driver_names=neutralization.driver_names)
+        for record in records
+    )

@@ -1406,34 +1406,50 @@ this detailed entry states.
   repository content (A2) into host code execution
 - Impact: arbitrary host code execution outside the container boundary,
   during operations the design treats as safe metadata manipulation
-- Implemented control: **`src/codeagent/checkpoint_ref.py` only.** Every
-  Git invocation there passes `-c core.hooksPath=/dev/null`, which is
+- Implemented control: **`src/codeagent/checkpoint_ref.py` and
+  `src/codeagent/workspace.py`.** `checkpoint_ref.py`: every Git
+  invocation passes `-c core.hooksPath=/dev/null`, which is
   command-line configuration and therefore outranks every configuration
   file; a regression test installs a hostile `reference-transaction`
   hook, exercises create/advance/delete, proves no hook ran, and uses a
-  positive control to prove the hook was armed
-- Planned control: the same policy on **every** Git invocation in
-  production code. `src/codeagent/patch.py` and
-  `src/codeagent/workspace.py` are **not** protected today, and the
-  project as a whole is therefore **not** protected — one hardened
-  module does not make the system safe. Required follow-up: apply and
-  test this policy in `workspace.py` and `patch.py` **before** the
-  checkpoint-ref primitive is integrated with patch application, so the
-  integrated path never runs repository-configured hooks.
-  **`docs/adr/0006-git-safety-policy-for-filters-hooks-and-content-fidelity.md`
-  is now Accepted** and covers this in full, including the decision
-  that the policy lives in one shared Git-invocation module
-  (`_git_safety.py`) rather than being repeated per module — the
-  shared-module design, `filter.*`/`core.fsmonitor`/`core.pager`/
-  `core.editor`/`diff` textconv-and-ext-diff coverage (`patch.py`
-  already runs `git diff --cached`, so this is an active command, not a
-  hypothetical), the exact-byte content-fidelity invariant, and
-  partial-clone/lazy-fetch safety (which establishes Git >= 2.45 as
-  CodeAgent v1's minimum supported Git version, required for the global
-  `--no-lazy-fetch` option this control depends on). **No mechanism in
-  ADR 0006 is implemented yet**; this entry's "open for the rest of the codebase"
-  status below is unchanged until implementation lands and its
-  acceptance tests pass on both macOS and Linux. **Merge drivers are
+  positive control to prove the hook was armed. `workspace.py`: every
+  Git invocation now routes through the shared
+  `src/codeagent/_git_safety.py` module (ADR 0006, Accepted and
+  implemented for this module) — the Git >= 2.45 / `--no-lazy-fetch`
+  preflight, sanitized `GIT_*` environment, hardened baseline argv
+  (including `-c core.hooksPath=/dev/null`), and bounded timeout.
+  `GitWorktree` registers with `--no-checkout`, populates the index via
+  `read-tree`, inspects every tracked path's `filter` attribute
+  (bounded/chunked/NUL-safe, driver-set-dependent per finding 16), and
+  refuses the whole run before a single file is materialized if any
+  path is unsafe or ambiguous; only then does a real, hardened
+  `checkout` run. `snapshot_source()`'s `status` call carries the
+  enumerate-and-neutralize backstop. A `git worktree add` outcome is
+  treated as potentially mutating regardless of how it concludes
+  (nonzero, an infrastructure error, or an ambiguous report): any
+  failure after the attempt performs exact registration removal plus
+  tempdir cleanup, confirmed by observation, with no repository-wide
+  sweep and no `prune` on this path; an unconfirmed cleanup raises a
+  sanitized `GitWorktreeCleanupError` chaining the original failure as
+  its cause. Verified locally (macOS) with real hostile
+  hooks/clean/smudge/process filters, the `unset`/`unspecified`
+  driver-name collision, ambient global/system-level filter
+  configuration, and a real `git://` daemon partial-clone lazy-fetch
+  refusal; **Linux CI validation is still pending.**
+- Planned control: the same policy on every remaining Git invocation in
+  production code. **`src/codeagent/patch.py` is still not
+  protected**, and the project as a whole is therefore **still not
+  protected** — hardening `workspace.py` does not by itself make the
+  system safe. Required follow-up: apply and test this policy in
+  `patch.py` **before** the checkpoint-ref primitive is integrated with
+  patch application, so the integrated path never runs
+  repository-configured hooks.
+  `GitWorktree.__exit__`'s legacy `shutil.rmtree` + repository-wide
+  `git worktree prune` fallback (used only when the ordinary
+  `git worktree remove` itself fails) is unchanged by this work and
+  remains an open ADR 0004 gap — a narrower, stricter cleanup applies
+  only to the new enter-time failure path this session added, not to
+  `__exit__`'s pre-existing recovery path. **Merge drivers are
   currently non-applicable, not covered**: production code invokes no
   `git merge` command anywhere today (confirmed by inspection of
   `src/codeagent/`), so there is no active command for a merge driver
@@ -1441,17 +1457,31 @@ this detailed entry states.
   external merge tool must extend ADR 0006 before use, not assume it is
   already covered
 - Evidence/future test: the checkpoint-ref regression test described
-  above; equivalent tests are still owed for `patch.py` (`pre-commit`,
-  `commit-msg`, `post-commit`) and `workspace.py` (`post-checkout`), plus
-  ADR 0006's full required-acceptance-test list (attribute-based
-  filter/content-fidelity refusal, partial-clone/lazy-fetch preflight
-  and controls on both platforms)
-- Residual risk: **open for the rest of the codebase — design accepted,
-  nothing implemented.** Also unaddressed here: other configuration-driven
-  execution channels (for example `core.fsmonitor`, `core.pager`,
-  `core.editor`, or `filter.*` clean/smudge commands) are now designed
-  for in ADR 0006 but not yet built or tested, so they remain open
-  exactly as before this ADR's acceptance. Merge drivers remain
+  above; `workspace.py` now has 49 focused tests covering real hostile
+  `post-checkout` hooks, clean/smudge/process filters, the
+  `unset`/`unspecified` driver-name collision, attribute assignment via
+  `.gitattributes`/`.git/info/attributes`/global scope, ambient
+  global/system-level filter configuration, hostile `GIT_*`
+  environment variables, a real `git://` daemon partial-clone
+  lazy-fetch refusal, and enter-time cleanup after every class of
+  `worktree add` failure (ordinary, ambiguous, and combined
+  registration+tempdir cleanup failure) — 116 further focused tests
+  cover the shared `_git_safety.py` foundation itself (1170 in the full
+  suite). Equivalent tests are still owed for `patch.py`
+  (`pre-commit`, `commit-msg`, `post-commit`), plus ADR 0006's
+  remaining required-acceptance-test items not yet exercised at the
+  `workspace.py` level (the exact-byte content-fidelity invariant for
+  `text`/`eol`/`ident`/`working-tree-encoding`, and Linux-platform
+  runs of everything above)
+- Residual risk: **open for the rest of the codebase.** `workspace.py`
+  is implemented and locally (macOS) validated; `patch.py` is not, so
+  T-M3 remains open project-wide and no cross-platform claim is made
+  until Linux CI passes. `core.fsmonitor` and the pager are covered for
+  every command `workspace.py` issues (the shared baseline applies
+  `-c core.fsmonitor=false` and `--no-pager` unconditionally); channels
+  specific to commands `workspace.py` never runs (`commit.gpgSign`, an
+  editor, `diff` textconv/ext-diff) remain `patch.py`'s responsibility
+  when that module is hardened. Merge drivers remain
   genuinely unaddressed (not merely "not yet built") since ADR 0006
   does not design for them at all, pending any future command that
   would need them

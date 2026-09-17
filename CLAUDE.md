@@ -240,24 +240,48 @@ Stage 2 (of the four-stage planning process in
   run host code, object format is detected with no SHA-1 assumption,
   linked worktrees are refused, and every mutation outcome is
   classified by observation while preserving its precise cause — with
-  90 focused tests. **The hooks exposure is project-wide (threat model
-  T-M3): `patch.py` and `workspace.py` are still unprotected and must
-  be fixed before patch integration.** This module is
-  deliberately **not integrated**: no controller, worktree, patch,
-  lifecycle-store, reconciliation, cancellation, or CLI wiring yet, and
-  ADR 0004's durable transition record is the next slice.
+  90 focused tests. This module is deliberately **not integrated**: no
+  controller, patch, lifecycle-store, reconciliation, cancellation, or
+  CLI wiring yet, and ADR 0004's durable transition record is the next
+  slice.
   **`docs/adr/0006-git-safety-policy-for-filters-hooks-and-content-fidelity.md`
-  is now Accepted**, designing T-M3's full remediation for
-  `workspace.py`/`patch.py`: inspect-then-refuse-or-checkout for
-  `worktree add` (no-checkout + `read-tree` + attribute inspection),
-  an exact-byte content-fidelity invariant, a bounded filter-enumeration
-  backstop for `status`/`add`/`commit`, and `GIT_NO_LAZY_FETCH=1`
-  partial-clone safety. **Nothing in ADR 0006 is implemented**; T-M3
-  remains open, and checkpoint-ref integration with patch application
-  must wait until this ADR's acceptance tests pass on macOS and Linux.
-  ADR 0006 also establishes **Git >= 2.45 as CodeAgent v1's minimum
-  supported Git version** (required for the global `--no-lazy-fetch`
-  option); nothing is implemented yet.
+  (Accepted) is now implemented for `src/codeagent/_git_safety.py` and
+  `src/codeagent/workspace.py`**: the shared foundation module
+  (Git >= 2.45 / `--no-lazy-fetch` preflight, sanitized `GIT_*`
+  environment, the hardened baseline argv, bounded/chunked/NUL-safe
+  filter-driver enumeration and tracked-path attribute inspection, and
+  the driver-set-dependent `filter` safety rule) is wired into
+  `GitWorktree`. Worktree creation now registers with `--no-checkout`,
+  populates the index via `read-tree`, inspects every tracked path's
+  `filter` attribute, and refuses the whole run before a single file
+  is materialized if any path is unsafe or ambiguous — only then does a
+  real, hardened `checkout` run. `snapshot_source()`'s `status` call
+  carries the enumerate-and-neutralize backstop. `git worktree add`'s
+  outcome is treated as potentially mutating regardless of how it
+  concludes (nonzero, an infrastructure error, or an ambiguous
+  report): a failure at any point after the attempt performs exact
+  registration removal plus tempdir cleanup, confirmed by observation,
+  with **no repository-wide sweep and no `prune`** on this new
+  enter-time path; an unconfirmed cleanup raises a sanitized
+  `GitWorktreeCleanupError` chaining the original failure as its cause
+  rather than silently dropping it. Failure messages never contain raw
+  stderr, argv, repository/worktree paths, or environment values.
+  Verified with 116 focused `_git_safety` tests and 49 focused
+  `workspace` tests (1170 in the full suite), including real hostile
+  hooks/filters (clean/smudge/process), the `unset`/`unspecified`
+  driver-name collision (finding 16), ambient global/system-level
+  filter configuration, a real `git://` daemon partial-clone
+  lazy-fetch refusal, and hostile `GIT_*` environment variables — on
+  macOS only; **Linux CI validation is still pending** as of this
+  commit.
+  **`patch.py` remains unprotected and unintegrated** — T-M3 and
+  ADR 0006 are therefore **not complete project-wide**, and
+  checkpoint-ref integration with patch application still waits on
+  that work. `GitWorktree.__exit__`'s legacy `shutil.rmtree` +
+  repository-wide `git worktree prune` fallback (used only when the
+  ordinary `git worktree remove` itself fails) is unchanged and remains
+  an open ADR 0004 gap, separate from the new, stricter enter-time
+  cleanup path.
 - **S4 — executor/container isolation**: original isolation evidence
   exists on both macOS/Docker Desktop and Linux/x86_64. Commit
   `00063d4` resolved the two open questions it raised (`--memory-swap`

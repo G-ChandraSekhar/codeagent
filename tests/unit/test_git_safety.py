@@ -23,21 +23,27 @@ import pytest
 
 from codeagent import _git_safety
 from codeagent._git_safety import (
+    ATTR_CHECK_CHUNK_SIZE,
     BASELINE_ARGS,
     FIXED_CAT_PATH,
     MAX_FILTER_ARGV_BYTES,
     MAX_FILTER_DRIVER_NAME_BYTES,
     MAX_FILTER_DRIVERS,
+    MAX_TRACKED_PATH_BYTES,
+    MAX_TRACKED_PATHS,
     MIN_GIT_VERSION,
     AttributeRecord,
     FilterNeutralization,
     GitSafetyError,
     GitSafetyFailure,
+    check_filter_attribute_for_paths,
     check_git_preflight,
     enumerate_filter_neutralization,
+    evaluate_tracked_filter_safety,
     git_environment,
     is_safe_filter_state,
     is_safe_non_filter_state,
+    list_tracked_paths,
     parse_check_attr_output,
     run_git,
 )
@@ -1147,3 +1153,275 @@ def test_parse_check_attr_output_against_a_real_repository(tmp_path):
     assert by_path["a.txt"].is_safe(configured_driver_names=configured) is False
     assert by_path["b.txt"].value == "unset"
     assert by_path["b.txt"].is_safe(configured_driver_names=configured) is True
+
+
+# ---------------------------------------------------------------------------
+# Shared tracked-path listing + bounded/chunked filter-attribute inspection
+# (used by workspace.py's pre-materialization refusal check)
+# ---------------------------------------------------------------------------
+
+
+def test_list_tracked_paths_empty_repo(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    assert list_tracked_paths(repo) == ()
+
+
+def test_list_tracked_paths_returns_tracked_files(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("x\n")
+    (repo / "b.txt").write_text("y\n")
+    _git(repo, "add", "a.txt", "b.txt")
+
+    paths = list_tracked_paths(repo)
+
+    assert set(paths) == {"a.txt", "b.txt"}
+
+
+def test_list_tracked_paths_ignores_untracked_files(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "tracked.txt").write_text("x\n")
+    _git(repo, "add", "tracked.txt")
+    (repo / "untracked.txt").write_text("y\n")
+
+    paths = list_tracked_paths(repo)
+
+    assert paths == ("tracked.txt",)
+
+
+def test_list_tracked_paths_rejects_excessive_count(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        payload = "".join(f"path{i}\0" for i in range(MAX_TRACKED_PATHS + 1))
+        return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        list_tracked_paths(repo)
+
+    assert excinfo.value.reason is GitSafetyFailure.TRACKED_PATH_COUNT_EXCEEDED
+
+
+def test_list_tracked_paths_rejects_a_too_long_path(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args, 0, stdout=("x" * (MAX_TRACKED_PATH_BYTES + 1)) + "\0", stderr=""
+        )
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        list_tracked_paths(repo)
+
+    assert excinfo.value.reason is GitSafetyFailure.TRACKED_PATH_TOO_LONG
+
+
+def test_list_tracked_paths_rejects_empty_path(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout="a.txt\0\0", stderr="")
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        list_tracked_paths(repo)
+
+    assert excinfo.value.reason is GitSafetyFailure.TRACKED_PATH_LISTING_MALFORMED
+
+
+def test_list_tracked_paths_rejects_duplicate_path(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout="a.txt\0a.txt\0", stderr="")
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        list_tracked_paths(repo)
+
+    assert excinfo.value.reason is GitSafetyFailure.TRACKED_PATH_LISTING_MALFORMED
+
+
+def test_list_tracked_paths_rejects_truncated_output(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout="a.txt\0b.txt", stderr="")
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        list_tracked_paths(repo)
+
+    assert excinfo.value.reason is GitSafetyFailure.TRACKED_PATH_LISTING_MALFORMED
+
+
+def test_list_tracked_paths_fails_closed_when_command_fails(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: not a repo")
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        list_tracked_paths(repo)
+
+    assert excinfo.value.reason is GitSafetyFailure.TRACKED_PATH_LISTING_UNAVAILABLE
+    assert "fatal" not in excinfo.value.message
+
+
+def test_check_filter_attribute_for_paths_empty(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    assert check_filter_attribute_for_paths(repo, ()) == ()
+
+
+def test_check_filter_attribute_for_paths_chunks_large_input(tmp_path):
+    """Prove chunking actually happens: more paths than one chunk holds
+    must still all be inspected, via multiple bounded git invocations."""
+    repo = _make_repo(tmp_path / "r")
+    count = ATTR_CHECK_CHUNK_SIZE + 5
+    names = [f"f{i}.txt" for i in range(count)]
+    for name in names:
+        (repo / name).write_text("x\n")
+    _git(repo, "add", *names)
+
+    records = check_filter_attribute_for_paths(repo, tuple(names))
+
+    assert len(records) == count
+    assert {r.path for r in records} == set(names)
+    assert all(r.attribute == "filter" for r in records)
+
+
+def test_check_filter_attribute_for_paths_rejects_record_count_mismatch(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        # Only one record for two requested paths.
+        return subprocess.CompletedProcess(args, 0, stdout="a.txt\0filter\0unspecified\0", stderr="")
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        check_filter_attribute_for_paths(repo, ("a.txt", "b.txt"))
+
+    assert excinfo.value.reason is GitSafetyFailure.ATTRIBUTE_RECORD_COUNT_MISMATCH
+
+
+def test_check_filter_attribute_for_paths_rejects_path_mismatch(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        # Reports "wrong.txt" instead of the requested "a.txt".
+        return subprocess.CompletedProcess(args, 0, stdout="wrong.txt\0filter\0unspecified\0", stderr="")
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        check_filter_attribute_for_paths(repo, ("a.txt",))
+
+    assert excinfo.value.reason is GitSafetyFailure.ATTRIBUTE_RECORD_PATH_MISMATCH
+
+
+def test_check_filter_attribute_for_paths_rejects_duplicate_record(monkeypatch, tmp_path):
+    """Both requested slots are for the same path, and both records
+    correctly match their position -- so the path-mismatch check alone
+    would not catch this; the independent duplicate check must."""
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="a.txt\0filter\0unspecified\0a.txt\0filter\0unspecified\0",
+            stderr="",
+        )
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        check_filter_attribute_for_paths(repo, ("a.txt", "a.txt"))
+
+    assert excinfo.value.reason is GitSafetyFailure.ATTRIBUTE_RECORD_DUPLICATE_PATH
+
+
+def test_check_filter_attribute_for_paths_rejects_unexpected_attribute(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout="a.txt\0text\0unspecified\0", stderr="")
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        check_filter_attribute_for_paths(repo, ("a.txt",))
+
+    assert excinfo.value.reason is GitSafetyFailure.ATTRIBUTE_RECORD_UNEXPECTED_ATTRIBUTE
+
+
+def test_check_filter_attribute_for_paths_fails_closed_on_command_failure(monkeypatch, tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: boom")
+
+    monkeypatch.setattr(_git_safety, "_run", fake_run)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        check_filter_attribute_for_paths(repo, ("a.txt",))
+
+    assert excinfo.value.reason is GitSafetyFailure.ATTRIBUTE_INSPECTION_UNAVAILABLE
+    assert "fatal" not in excinfo.value.message
+
+
+def test_evaluate_tracked_filter_safety_true_for_plain_repo(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("x\n")
+    _git(repo, "add", "a.txt")
+
+    assert evaluate_tracked_filter_safety(repo) is True
+
+
+def test_evaluate_tracked_filter_safety_true_for_no_tracked_files(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    assert evaluate_tracked_filter_safety(repo) is True
+
+
+def test_evaluate_tracked_filter_safety_false_for_active_filter(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    _git(repo, "config", "filter.hostile.clean", "cmd")
+    (repo / ".gitattributes").write_text("a.txt filter=hostile\n")
+    (repo / "a.txt").write_text("x\n")
+    _git(repo, "add", ".gitattributes", "a.txt")
+
+    assert evaluate_tracked_filter_safety(repo) is False
+
+
+def test_evaluate_tracked_filter_safety_refuses_driver_named_unset(tmp_path):
+    """Positive control, end to end through the composed function: a
+    live driver named `unset` collides with check-attr's own reported
+    string for a genuinely negated path, so the whole evaluation must
+    refuse per ADR 0006 finding 16."""
+    repo, _marker = _make_magic_driver_repo(tmp_path)
+
+    assert evaluate_tracked_filter_safety(repo) is False
+
+
+def test_evaluate_tracked_filter_safety_true_once_magic_driver_is_removed(tmp_path):
+    """Negative control proving the refusal above is caused by the
+    driver-name collision, not the attribute states themselves."""
+    repo = _make_repo(tmp_path / "r")
+    (repo / ".gitattributes").write_text("a.txt -filter\nc.txt text\n")
+    (repo / "a.txt").write_text("x\n")
+    (repo / "c.txt").write_text("y\n")
+    _git(repo, "add", ".gitattributes", "a.txt", "c.txt")
+
+    assert evaluate_tracked_filter_safety(repo) is True

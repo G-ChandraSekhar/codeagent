@@ -1261,3 +1261,40 @@ unintegrated `_git_safety.py` foundation slice.
 - **Status**: ADR 0006 amended in place (findings 5/13 qualified,
   finding 16 added, §1/§2 rules corrected, two magic-driver acceptance
   tests added); status unchanged. Still zero integration — T-M3 open.
+
+---
+
+## Session (2026-09-17): ADR 0006 implemented for workspace.py
+
+**Outcome**: `src/codeagent/_git_safety.py` gained bounded/chunked
+tracked-path listing and filter-attribute inspection helpers; every
+Git invocation in `src/codeagent/workspace.py` now routes through that
+shared module. T-M3 closed for workspace creation and source
+inspection **only** — `patch.py` remains unprotected.
+
+- `GitWorktree` registers with `--no-checkout`, populates the index via
+  `read-tree`, inspects every tracked path's `filter` attribute
+  (driver-set-dependent per finding 16), and refuses the whole run
+  before materializing anything if any path is unsafe or ambiguous.
+  `snapshot_source()`'s `status` carries the enumerate-and-neutralize
+  backstop.
+- `git worktree add`'s outcome is treated as potentially mutating
+  regardless of how it concludes (nonzero, an infra error, or an
+  ambiguous report): any failure after the attempt performs exact
+  registration removal plus tempdir cleanup, confirmed by observation
+  — never `prune`, never a repository-wide sweep on this path. An
+  unconfirmed cleanup raises `GitWorktreeCleanupError` chaining the
+  original failure as its cause; simultaneous registration+tempdir
+  failures are both represented in one message.
+- Path-bearing exceptions (`Path.resolve()`, `TemporaryDirectory`
+  construction/cleanup) are sanitized via `from None`, verified against
+  the complete rendered traceback, not just the top-level message.
+- **Verification**: 116 focused `_git_safety` tests, 49 focused
+  `workspace` tests, 1170 in the full suite — real hostile
+  hooks/clean/smudge/process filters, the `unset`/`unspecified`
+  collision, ambient global/system-level filter config, hostile
+  `GIT_*` env vars, and a real `git://` daemon partial-clone
+  lazy-fetch refusal. macOS only; Linux CI still pending.
+- **Remaining gaps**: `patch.py` unintegrated; `__exit__`'s legacy
+  `rmtree`/`prune` fallback unchanged (ADR 0004 gap); Linux CI
+  unconfirmed until this commit runs there.
