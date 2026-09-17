@@ -1971,9 +1971,26 @@ def test_lookup_staged_entry_rejects_unmerged_path(tmp_path):
     _git(repo, "checkout", "-q", initial_branch)
     (repo / "c.txt").write_text("master\n")
     _git(repo, "commit", "-qam", "m")
-    subprocess.run(
-        ["git", "-C", str(repo), "merge", "branch1", "-q"], capture_output=True, env=_clean_env()
+    # Explicit identity, same as every other git invocation via _git()
+    # -- omitting it here (as this test previously did) relies on
+    # ambient global git config, which does not exist on a clean CI
+    # runner: the merge then fails outright with "unable to
+    # auto-detect email address" instead of producing the intended
+    # conflict, and the fixture passes vacuously.
+    merge_result = subprocess.run(
+        ["git", "-C", str(repo), *_GIT_IDENTITY, "merge", "branch1", "-q"],
+        capture_output=True,
+        env=_clean_env(),
     )
+    assert merge_result.returncode == 1, (
+        "expected a real merge conflict (exit 1); got "
+        f"{merge_result.returncode}: {merge_result.stderr!r}"
+    )
+    # Independent confirmation the fixture actually reached the
+    # unmerged state this test means to exercise -- never trust the
+    # merge's own exit code alone to imply an unmerged index.
+    unmerged = _git(repo, "ls-files", "-u").stdout
+    assert unmerged.strip() != "", "fixture did not produce an unmerged path to test against"
 
     with pytest.raises(GitSafetyError) as excinfo:
         _git_safety.lookup_staged_entry(repo, "c.txt", object_format=_git_safety.ObjectFormat.SHA1)
@@ -2502,13 +2519,28 @@ def test_run_git_bounded_cleans_up_a_writer_blocked_on_a_full_stdin_pipe(monkeyp
     never reads it) must be unblocked and confirmed once the child is
     killed as part of the drain-timeout cleanup path -- the original
     GIT_COMMAND_TIMEOUT is what's raised, not a spurious cleanup
-    failure caused by the writer."""
+    failure caused by the writer.
+
+    Uses `exec sleep 300`, not bare `sleep 300`, so the process this
+    test kills is the *same* process holding the pipe open. A plain
+    `sh -c "sleep 300"` can leave `sh` forking `sleep` as a child
+    instead of exec-replacing itself (confirmed to differ by shell/
+    platform); killing only the parent then leaves the pipe's read end
+    held open by an orphaned `sleep`, and the blocked write never
+    unblocks -- which is not a bug in `_terminate_and_confirm`, it is
+    that function correctly reporting `PROCESS_CLEANUP_UNCONFIRMED`
+    (failing closed) rather than falsely claiming cleanup succeeded.
+    That failure mode is exercised deliberately, separately, by
+    `test_run_git_bounded_raises_cleanup_unconfirmed_when_writer_will_not_stop`
+    below. This test's own intent is the *ordinary* case: a single
+    killed process whose death promptly unblocks its writer.
+    """
     real_popen = subprocess.Popen
 
     def fake_popen(argv, **kwargs):
         if argv[:1] == ["git"]:
             return real_popen(
-                ["sh", "-c", "sleep 300"],
+                ["sh", "-c", "exec sleep 300"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
