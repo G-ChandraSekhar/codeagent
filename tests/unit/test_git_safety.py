@@ -81,6 +81,40 @@ def _make_repo(path: Path) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def isolated_git_user_config(tmp_path_factory, monkeypatch):
+    """Isolate every test's Git invocations — both the test oracle's
+    `_git()`/`_make_repo()` and the production `run_git`/`_run` seam —
+    from this machine's or CI runner's real user-level Git
+    configuration.
+
+    This is a real, previously-hit failure mode: GitHub's
+    `ubuntu-24.04` runner image registers a global
+    `filter.lfs.{clean,smudge,process}` driver (Git LFS ships
+    pre-installed and globally configured), which silently joined every
+    test repository's enumerated `filter.*` config and broke
+    driver-count assertions in CI while this suite passed locally,
+    where no such global config exists.
+
+    Each test gets a fresh `HOME` and `XDG_CONFIG_HOME`, covering both
+    locations Git may read global config from (`$HOME/.gitconfig` and
+    `$XDG_CONFIG_HOME/git/config`).
+
+    `GIT_CONFIG_NOSYSTEM` is deliberately **not** set: production
+    intentionally reads system-level Git configuration (ADR 0006 does
+    not exempt it, and `_git_safety.git_environment()` only strips
+    `GIT_*` variables), so a test-only `NOSYSTEM` override would
+    exercise behavior no production invocation ever runs under. Only
+    the *user*-level configuration locations are isolated here.
+    """
+    home = tmp_path_factory.mktemp("isolated-home")
+    xdg_config_home = tmp_path_factory.mktemp("isolated-xdg-config")
+    home.mkdir(parents=True, exist_ok=True)
+    xdg_config_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config_home))
+
+
 # ---------------------------------------------------------------------------
 # Environment sanitization
 # ---------------------------------------------------------------------------
@@ -345,6 +379,41 @@ def test_run_uses_sanitized_environment(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # Filter-driver enumeration and neutralization
 # ---------------------------------------------------------------------------
+
+
+def test_isolated_global_git_config_starts_empty(tmp_path):
+    """Characterization test for the autouse isolation fixture itself:
+    a fresh repository under the isolated HOME must see zero configured
+    filter drivers before any test writes anything. If this ever fails,
+    ambient runner configuration (like the real `filter.lfs.*` seen on
+    GitHub's ubuntu-24.04 image) could again contaminate every
+    driver-count assertion in this file."""
+    repo = _make_repo(tmp_path / "r")
+
+    result = enumerate_filter_neutralization(repo)
+
+    assert result == FilterNeutralization(args=(), driver_names=frozenset())
+
+
+def test_enumerate_filter_neutralization_discovers_a_global_driver(tmp_path):
+    """Positive control pinning that global Git configuration remains
+    part of production behavior: this module must not accidentally
+    become blind to `--global` filter configuration merely because the
+    tests isolate *which* global config file is read. The repository
+    itself has no local filter configuration at all."""
+    repo = _make_repo(tmp_path / "r")
+    subprocess.run(
+        ["git", "config", "--global", "filter.globaldriver.clean", "some-command"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+    )
+
+    result = enumerate_filter_neutralization(repo)
+
+    assert result.driver_names == frozenset({"globaldriver"})
+    assert f"filter.globaldriver.clean={FIXED_CAT_PATH}" in result.args
 
 
 def test_enumerate_filter_neutralization_empty_repo_has_no_overrides(tmp_path):
