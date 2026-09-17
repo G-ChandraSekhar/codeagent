@@ -115,6 +115,30 @@ def isolated_git_user_config(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config_home))
 
 
+@pytest.fixture
+def ambient_filter_baseline(tmp_path_factory) -> FilterNeutralization:
+    """Whatever `enumerate_filter_neutralization` discovers for a
+    completely unconfigured repository under this test's isolated
+    `HOME` — i.e., configuration this suite does not and must not
+    control, such as a real ambient **system-level** filter driver
+    (GitHub's `ubuntu-24.04` runner image ships Git LFS pre-installed
+    via `git lfs install --system`, which registers `filter.lfs.*` in
+    `/etc/gitconfig`).
+
+    `isolated_git_user_config` isolates `HOME`/`XDG_CONFIG_HOME` (the
+    *user*-level config locations) but deliberately leaves system-level
+    configuration untouched, since production reads it intentionally.
+    Tests that configure their own driver(s) must therefore diff
+    against this baseline instead of asserting an absolute empty/exact
+    driver set, which would be false whenever the environment running
+    this suite has any real ambient system-level filter — exactly the
+    condition that broke this file's first version of these tests in
+    CI (see ENGINEERING_LOG.md).
+    """
+    baseline_repo = _make_repo(tmp_path_factory.mktemp("ambient-baseline"))
+    return enumerate_filter_neutralization(baseline_repo)
+
+
 # ---------------------------------------------------------------------------
 # Environment sanitization
 # ---------------------------------------------------------------------------
@@ -381,21 +405,32 @@ def test_run_uses_sanitized_environment(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_isolated_global_git_config_starts_empty(tmp_path):
+def test_isolated_git_user_config_fixture_starts_with_no_global_filter_config():
     """Characterization test for the autouse isolation fixture itself:
-    a fresh repository under the isolated HOME must see zero configured
-    filter drivers before any test writes anything. If this ever fails,
-    ambient runner configuration (like the real `filter.lfs.*` seen on
-    GitHub's ubuntu-24.04 image) could again contaminate every
-    driver-count assertion in this file."""
-    repo = _make_repo(tmp_path / "r")
+    the isolated `HOME`'s `--global` scope must have zero configured
+    filter drivers before any test writes anything.
 
-    result = enumerate_filter_neutralization(repo)
+    This deliberately tests **global** scope specifically, not the
+    merged view `enumerate_filter_neutralization` returns — the fixture
+    isolates `HOME`/`XDG_CONFIG_HOME` (user-level config) but leaves
+    system-level configuration untouched on purpose (production reads
+    it intentionally), so a real ambient system-level driver (e.g.
+    GitHub's runner-image `filter.lfs`) can still legitimately appear
+    in the merged view without this fixture having failed."""
+    result = subprocess.run(
+        ["git", "config", "--global", "--get-regexp", r"^filter\."],
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+    )
 
-    assert result == FilterNeutralization(args=(), driver_names=frozenset())
+    assert result.returncode == 1  # git's "no matching config" exit code
+    assert result.stdout == ""
 
 
-def test_enumerate_filter_neutralization_discovers_a_global_driver(tmp_path):
+def test_enumerate_filter_neutralization_discovers_a_global_driver(
+    tmp_path, ambient_filter_baseline
+):
     """Positive control pinning that global Git configuration remains
     part of production behavior: this module must not accidentally
     become blind to `--global` filter configuration merely because the
@@ -412,27 +447,34 @@ def test_enumerate_filter_neutralization_discovers_a_global_driver(tmp_path):
 
     result = enumerate_filter_neutralization(repo)
 
-    assert result.driver_names == frozenset({"globaldriver"})
+    assert result.driver_names - ambient_filter_baseline.driver_names == {"globaldriver"}
     assert f"filter.globaldriver.clean={FIXED_CAT_PATH}" in result.args
 
 
-def test_enumerate_filter_neutralization_empty_repo_has_no_overrides(tmp_path):
+def test_enumerate_filter_neutralization_empty_repo_has_no_overrides(
+    tmp_path, ambient_filter_baseline
+):
+    """A repository with no filter configuration of its own introduces
+    no driver beyond whatever this environment's real ambient
+    (system-level, not isolated by design) configuration already
+    contributes."""
     repo = _make_repo(tmp_path / "r")
 
     result = enumerate_filter_neutralization(repo)
 
-    assert result == FilterNeutralization(args=(), driver_names=frozenset())
-    assert result.driver_count == 0
+    assert result == ambient_filter_baseline
 
 
-def test_enumerate_filter_neutralization_overrides_clean_and_smudge(tmp_path):
+def test_enumerate_filter_neutralization_overrides_clean_and_smudge(
+    tmp_path, ambient_filter_baseline
+):
     repo = _make_repo(tmp_path / "r")
     _git(repo, "config", "filter.hostile.clean", "some-hostile-command")
     _git(repo, "config", "filter.hostile.smudge", "another-hostile-command")
 
     result = enumerate_filter_neutralization(repo)
 
-    assert result.driver_count == 1
+    assert result.driver_names - ambient_filter_baseline.driver_names == {"hostile"}
     assert "-c" in result.args
     assert f"filter.hostile.clean={FIXED_CAT_PATH}" in result.args
     assert f"filter.hostile.smudge={FIXED_CAT_PATH}" in result.args
@@ -467,24 +509,28 @@ def test_enumerate_filter_neutralization_never_sets_required_false(tmp_path):
     assert not any("required" in arg for arg in result.args)
 
 
-def test_enumerate_filter_neutralization_handles_dotted_driver_names(tmp_path):
+def test_enumerate_filter_neutralization_handles_dotted_driver_names(
+    tmp_path, ambient_filter_baseline
+):
     repo = _make_repo(tmp_path / "r")
     _git(repo, "config", "filter.weird.name.clean", "cmd")
 
     result = enumerate_filter_neutralization(repo)
 
-    assert result.driver_count == 1
+    assert result.driver_names - ambient_filter_baseline.driver_names == {"weird.name"}
     assert f"filter.weird.name.clean={FIXED_CAT_PATH}" in result.args
 
 
-def test_enumerate_filter_neutralization_deduplicates_exact_driver_names(tmp_path):
+def test_enumerate_filter_neutralization_deduplicates_exact_driver_names(
+    tmp_path, ambient_filter_baseline
+):
     repo = _make_repo(tmp_path / "r")
     _git(repo, "config", "filter.hostile.clean", "cmd1")
     _git(repo, "config", "filter.hostile.smudge", "cmd2")
 
     result = enumerate_filter_neutralization(repo)
 
-    assert result.driver_count == 1
+    assert result.driver_names - ambient_filter_baseline.driver_names == {"hostile"}
 
 
 def test_enumerate_filter_neutralization_rejects_too_many_drivers(tmp_path):
@@ -545,7 +591,9 @@ def test_enumerate_filter_neutralization_malformed_output_is_categorical(monkeyp
     assert excinfo.value.reason is GitSafetyFailure.FILTER_ENUMERATION_MALFORMED
 
 
-def test_enumerate_filter_neutralization_handles_multi_valued_subkey(tmp_path):
+def test_enumerate_filter_neutralization_handles_multi_valued_subkey(
+    tmp_path, ambient_filter_baseline
+):
     """`git config --add` can give one subkey multiple values; --get-
     regexp reports each as a separate record for the same key. Only
     presence matters here (the original value is never reused), so
@@ -556,7 +604,7 @@ def test_enumerate_filter_neutralization_handles_multi_valued_subkey(tmp_path):
 
     result = enumerate_filter_neutralization(repo)
 
-    assert result.driver_count == 1
+    assert result.driver_names - ambient_filter_baseline.driver_names == {"hostile"}
     assert result.args.count(f"filter.hostile.clean={FIXED_CAT_PATH}") == 1
 
 
@@ -750,7 +798,9 @@ def test_attribute_record_non_filter_attribute_ignores_the_driver_set():
     assert record.is_safe(configured_driver_names=frozenset({"unset"})) is True
 
 
-def test_enumerate_filter_neutralization_handles_bare_boolean_subkey(tmp_path):
+def test_enumerate_filter_neutralization_handles_bare_boolean_subkey(
+    tmp_path, ambient_filter_baseline
+):
     """`git config -z --get-regexp` emits a bare-boolean entry (e.g.
     `[filter "x"]\\n\\tclean` with no `=value`) as `key\\0` with no
     embedded newline at all -- a real, valid git config shape, not
@@ -763,11 +813,13 @@ def test_enumerate_filter_neutralization_handles_bare_boolean_subkey(tmp_path):
 
     result = enumerate_filter_neutralization(repo)
 
-    assert result.driver_count == 1
+    assert result.driver_names - ambient_filter_baseline.driver_names == {"boolonly"}
     assert f"filter.boolonly.clean={FIXED_CAT_PATH}" in result.args
 
 
-def test_enumerate_filter_neutralization_survives_non_utf8_driver_name(tmp_path):
+def test_enumerate_filter_neutralization_survives_non_utf8_driver_name(
+    tmp_path, ambient_filter_baseline
+):
     """A filter driver name is an arbitrary quoted string in Git's
     config file grammar and can contain bytes that are not valid UTF-8.
     Enumeration must not crash with an uncaught UnicodeDecodeError; it
@@ -783,7 +835,7 @@ def test_enumerate_filter_neutralization_survives_non_utf8_driver_name(tmp_path)
         result = enumerate_filter_neutralization(repo)
     except GitSafetyError:
         return
-    assert result.driver_count == 1
+    assert len(result.driver_names - ambient_filter_baseline.driver_names) == 1
 
 
 def test_run_timeout_does_not_chain_the_full_argv_into_cause(monkeypatch):
@@ -814,7 +866,9 @@ def test_enumerate_filter_neutralization_fails_closed_when_cat_missing(monkeypat
     assert excinfo.value.reason is GitSafetyFailure.FILTER_PASSTHROUGH_UNAVAILABLE
 
 
-def test_enumerate_filter_neutralization_skips_cat_check_when_nothing_to_neutralize(tmp_path):
+def test_enumerate_filter_neutralization_skips_cat_check_when_nothing_to_neutralize(
+    tmp_path, ambient_filter_baseline
+):
     """No driver needs clean/smudge overridden (e.g. only `required` is
     set) -- the passthrough executable must not be required to exist."""
     repo = _make_repo(tmp_path / "r")
@@ -822,8 +876,8 @@ def test_enumerate_filter_neutralization_skips_cat_check_when_nothing_to_neutral
 
     result = enumerate_filter_neutralization(repo)
 
-    assert result.driver_count == 1
-    assert result.args == ()
+    assert result.driver_names - ambient_filter_baseline.driver_names == {"hostile"}
+    assert not any(arg.startswith("filter.hostile.") for arg in result.args)
 
 
 def test_check_git_preflight_distinguishes_command_failure_from_malformed_output(monkeypatch):
@@ -960,7 +1014,7 @@ def test_driver_set_dependent_classification_refuses_the_magic_names(tmp_path):
             states[path], configured_driver_names=neutralization.driver_names
         )
 
-    assert neutralization.driver_names == frozenset({"unset", "unspecified"})
+    assert {"unset", "unspecified"} <= neutralization.driver_names
     # Conservative refusal: a.txt and c.txt are genuinely safe, but
     # indistinguishable from b.txt/d.txt, so all four are refused.
     assert classify("a.txt") is False
@@ -986,7 +1040,7 @@ def test_classification_stays_permissive_without_the_magic_driver_names(tmp_path
     )
     states = {r.path: r.value for r in parse_check_attr_output(result.stdout)}
 
-    assert neutralization.driver_names == frozenset({"ordinary"})
+    assert {"ordinary"} <= neutralization.driver_names
     assert is_safe_filter_state(states["a.txt"], configured_driver_names=neutralization.driver_names)
     assert is_safe_filter_state(states["c.txt"], configured_driver_names=neutralization.driver_names)
 
