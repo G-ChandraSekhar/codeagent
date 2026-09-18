@@ -1,9 +1,22 @@
 # ADR 0004: Owned-resource lifecycle, registry, attribution, cleanup, and reconciliation
 
-Status: Accepted (2026-09-15)
+Status: Accepted (2026-09-15). Amended 2026-09-18 by Amendment 1
+(Accepted): Milestone 3 Slice 3A-1's state-root, trusted-repository-
+identity, and repository/generic-lock substrate design — see the end
+of this document. Everything above "Amendment 1" is the original
+decision, unchanged.
 
-Implementation status: **not implemented.** No mechanism in this ADR
-exists in production code yet. See "Implementation order" below.
+Implementation status: **partially implemented.** This ADR's
+Milestone 2 prerequisites exist in production code: generated
+lifecycle IDs, `CheckpointSession`'s in-memory transition record,
+`RunController` integration, gated worktree/checkpoint-ref teardown,
+and evidence capture (all Milestone 2 Slice 2B-1/2B-2, per
+`CLAUDE.md`). The durable Milestone 3 lifecycle substrate this ADR
+itself describes remains unimplemented: `state-root.json`, `repo.json`,
+the repository/lifecycle locks, `lifecycle.json`, durable attribution,
+reconciliation, abandonment, and the maintenance trace. Slice 3A-1's
+state-root/identity/lock design is Accepted (Amendment 1) but not
+implemented. See "Implementation order" below.
 
 ## Context
 
@@ -734,3 +747,396 @@ Nothing here is implemented. Milestone 2 comes first, including the
 checkpoint-ref mechanics of ADR 0003 Amendment 1 (Accepted); the
 mechanisms in this ADR are implemented afterwards as Milestone 3
 lifecycle work. See `CLAUDE.md` and `ENGINEERING_LOG.md`.
+
+---
+
+## Amendment 1 (Accepted 2026-09-18): Milestone 3 Slice 3A-1 — state root, trusted repository identity, and the repository/generic lock substrate
+
+Implementation status: **design accepted; not implemented.** This
+amendment records the persistent-format and filesystem-safety decisions
+reached through a multi-round planning-only architecture review for
+Milestone 3 Slice 3A-1 — the substrate this ADR's §2 (state root), §1's
+`repo_key` identity, and the repository-lock half of §6 depend on.
+Nothing in this amendment exists in production code yet; no
+`src/codeagent/_lifecycle_fs.py`, `state_locks.py`, `state_root.py`, or
+`repo_identity.py` module exists. This amendment does not revise any
+decision made above — it fills in exact mechanisms this ADR's original
+text left unspecified, and narrows one detail (the ambient-symlink
+policy has no analogue here at all; see below) the way ADR 0003
+Amendment 2 and ADR 0006 Amendment 4 previously narrowed their own
+ADRs' text without reversing it.
+
+### 1. `repo_key` derivation
+
+`canonical_common_dir_bytes = os.fsencode(canonical_common_dir)` — a
+**same-host identity only**, deliberately: `os.fsencode` uses the
+interpreter's filesystem encoding with `surrogateescape`, so a
+canonical path containing non-UTF-8 bytes (legal on Linux, where a
+pathname is an opaque byte string) produces a stable, deterministic
+`repo_key` on a given host without any cross-host portability claim,
+none being needed. Pinned by an exact test vector:
+`sha256(b"codeagent.repo-key.v1\0" + os.fsencode("/tmp/codeagent-fixed-repo-key-vector")).hexdigest()[:32]
+== "126b3309737aaf2addc754b014f19c79"` — a hardcoded literal, not a
+value recomputed from the function under test, so an accidental
+domain-prefix or truncation-length regression cannot be silently
+"fixed" by updating the test to match new behavior.
+
+### 2. Canonical directory identity (macOS case bug)
+
+**`Path.resolve()` does not canonicalize case on a case-insensitive-
+but-preserving macOS (APFS/HFS+) volume** — reproduced directly this
+session: `/Users/chandrasekhar/code/codeagent` and
+`/users/chandrasekhar/code/codeagent` both resolve while preserving
+their distinct spelling, meaning two spellings of the same directory
+would otherwise compute two different `repo_key`s or be missed by a
+containment check. One shared primitive closes this:
+
+- Open the directory safely (`O_NOFOLLOW | O_DIRECTORY`), `fstat` it.
+- On Darwin, canonicalize via `fcntl.fcntl(fd, fcntl.F_GETPATH,
+  bytes(1024))` — **exactly this call shape**: passing `array.array`
+  or `bytearray` instead of an immutable `bytes` buffer raises
+  `TypeError` on the current macOS/CPython runtime. The returned value
+  must contain a NUL terminator; the bytes before it must be nonempty
+  and start with `/`. Decode with `os.fsdecode` only — never a
+  UTF-8-then-fallback branch, since `os.fsdecode`/`os.fsencode` are the
+  one paired filesystem conversion this design relies on everywhere
+  else. Any failure of this step (missing `F_GETPATH`, a `TypeError`,
+  a malformed buffer, or an `OSError`) is `SUBSTRATE_UNAVAILABLE`,
+  **with no fallback to the non-canonical path** — silently falling
+  back would defeat the entire point of the mechanism.
+- On Linux, the already-resolved absolute path used to open the
+  directory is the canonical value (Linux filesystems are normally
+  case-sensitive, and `st_dev`/`st_ino` are already the authoritative,
+  case-independent identity there).
+
+Applied to exactly three starting points before any containment check
+runs: the resolved state root, the trusted working-tree root, and the
+trusted Git common directory. **Containment checks operate only on
+these canonical values** — never on a bare `Path.resolve()` output.
+`StateRoot.path` stores the case-canonical path, never the
+pre-`F_GETPATH` spelling.
+
+### 3. Canonical JSON: strict UTF-8, `ensure_ascii=True`
+
+Persisted JSON (`state-root.json`, `repo.json`, and — when 3A-2 defines
+it — `lifecycle.json`) is serialized with `json.dumps(payload,
+sort_keys=True, separators=(",", ":"), ensure_ascii=True)` followed by
+**strict** `.encode("utf-8")`, and deserialized with **strict**
+`.decode("utf-8")` before `json.loads`. `ensure_ascii=True` is
+required, not optional: escaping every non-ASCII code point — including
+a lone surrogate in `os.fsdecode`'s surrogateescape range — as a
+`\uXXXX` sequence of plain ASCII characters means the serialized string
+is pure ASCII, so strict UTF-8 encoding always succeeds and the file on
+disk is always genuinely valid UTF-8 JSON text. (A prior design using
+`ensure_ascii=False` plus a `surrogateescape`-mode encode was rejected
+during review: it could write raw invalid-UTF-8 bytes into a file
+claiming to be JSON.)
+
+A `\udcXX` escape (U+DC80–U+DCFF, exactly `os.fsdecode`'s
+surrogateescape range for raw bytes 0x80–0xFF) is a **legitimate
+filesystem surrogate** and round-trips through `os.fsencode()` to
+recover the original path bytes exactly. Any other lone surrogate
+(U+D800–U+DC7F or U+DD00–U+DFFF) is refused — CodeAgent's own encoder
+never produces one, so its presence is either corruption or hostile
+input.
+
+### 4. Fixed persisted bounds
+
+| Item | Bound | Measured as |
+|---|---|---|
+| `state-root.json` | 4096 bytes | encoded JSON file size |
+| `repo.json` | **32768 bytes (32 KiB)** | encoded JSON file size — sized for a 4096-filesystem-byte path where every byte needs a worst-case 6-character `\udcXX` escape (24,576 bytes) plus fixed-field/JSON-punctuation overhead (≈150 bytes), leaving ≈8,042 bytes (≈24%) of headroom above that worst case |
+| `lifecycle.json` (3A-2's own schema) | 64 KiB | encoded JSON file size — the budget accommodates one maximally-escaped diagnostic path plus the capped `recent_failures` history; 3A-2 must re-verify this arithmetic once its exact schema is fixed |
+| `run_id` | 256 bytes | encoded JSON file size — a diagnostic field of `lifecycle.json` only, **never stored in `repo.json`** (whose §4 schema has no such field) |
+| Stored paths (canonical common dir, any diagnostic source path) | 4096 bytes | filesystem bytes (`len(os.fsencode(path))`) — a deliberate, fixed **v1 product limit** applied uniformly on both platforms, not a claim that 4096 is either OS's actual `PATH_MAX` |
+| Sanitized failure `detail` | 512 bytes | encoded JSON file size |
+
+Duplicate-key, unknown-field, invalid-UTF-8, oversized, and
+schema-invalid content are all refused (never partially trusted); the
+precise state-machine treatment of a syntactically incomplete document
+is §7 below.
+
+### 5. State-root location
+
+`resolve_state_root_path()` returns a typed `StateRootLocation` (`path`,
+`origin` ∈ {`EXPLICIT`, `MACOS_DEFAULT`, `XDG_DEFAULT`,
+`LINUX_HOME_DEFAULT`}, `conventional_parent_creation_allowed`) rather
+than a bare path:
+
+- `CODEAGENT_STATE_DIR` (`EXPLICIT`) must be absolute; a missing parent
+  is refused, never auto-created — an operator-supplied explicit path
+  with an absent ancestor is a typo or an intentional refusal signal,
+  not a convenience gap to paper over.
+- `XDG_STATE_HOME` is used only when set **and absolute**; a relative
+  value falls back to `~/.local/state/codeagent`, per this ADR's
+  original §2 text.
+- For the three default origins only, **precisely bounded** ancestor
+  creation is permitted: macOS may create at most the two named
+  components `Library/Application Support` beneath `$HOME`; the Linux
+  home default may create at most `.local/state` beneath `$HOME`; the
+  XDG default may create at most `$XDG_STATE_HOME` itself. None of
+  these ever recurses into an unconstrained `os.makedirs` over an
+  arbitrary ancestor chain, and a missing `$HOME` itself is refused,
+  never worked around.
+
+### 6. Canonicalization before directional containment
+
+Containment is a **directional** primitive (`is_within_or_equal`,
+component-aware via resolved `Path.parts` comparison, never a string
+prefix), applied to the **canonical** (§2) values of the state root,
+the trusted working-tree root, and the trusted Git common directory —
+never to raw `Path.resolve()` output, which is what the reproduced
+macOS case bug would otherwise slip past. Exactly the four checks this
+ADR's original §2 text already implies, made explicit: the state root
+must not be within-or-equal-to the trusted working-tree root; the state
+root must not be within-or-equal-to the trusted Git common directory;
+the trusted working-tree root must not be within-or-equal-to
+`<state-root>/worktrees`; the trusted Git common directory must not be
+within-or-equal-to `<state-root>/worktrees`. A bare repository has no
+working-tree root (`working_tree_root=None`); the working-tree-side
+checks are skipped, never defaulted to some other path. Production
+discovery itself refuses a bare repository outright
+(`BARE_REPOSITORY_UNSUPPORTED`, matching `workspace.py`'s existing
+requirement that the trusted source repository have a working tree) —
+`working_tree_root=None` is exercised only by isolated unit tests of
+the generic containment primitive, never by any production code path.
+
+### 7. `dir_fd`-relative authority below the state root; no ambient-symlink exception
+
+The operator-chosen state-root location may itself be reached through
+an ordinary, pre-existing symlink (an ambient OS convention, or an
+operator's own `~`/environment-variable resolution) — resolved **once**
+via `Path.resolve()` plus the case-canonicalization of §2. **Everything
+CodeAgent itself creates below that resolved root — `repo-locks/`,
+`repos/<repo-key>/`, and everything nested under them — is reached only
+through `dir_fd`-relative `os.mkdir`/`os.open` calls anchored to an
+already-open, already-validated parent descriptor, never a fresh
+full-pathname lookup of an intermediate component.** This is a
+**stricter** policy than `evidence.py`'s Darwin-gated, target-verified
+`/tmp`/`/var`/`/etc` exception (ADR 0003 Amendment 2's own correction):
+nothing below the state root has any legitimate reason to be a
+symlink, so no allowlist of any kind exists here, and none of
+`evidence.py`'s allowlist logic is reused. `state-root.json`, `repo.json`,
+and repository-lock operations all use the `dir_fd`-relative primitives
+(`open_private_create_exclusive_at`, `acquire_lock_nonblocking_at`,
+`fsync_directory_fd`, `os.lstat(basename, dir_fd=...)`); a `Path` value
+constructed for a managed location below the root (e.g. a `LockHandle`'s
+diagnostic path) is **diagnostic only** and is never re-resolved or
+used as filesystem authority after the fact.
+
+`StateRoot` itself owns a long-lived, open file descriptor for the
+resolved root for as long as the object is alive — a structural
+consequence of the "never reopen by pathname" rule, since every later
+dir_fd-relative operation beneath it needs that descriptor to anchor
+to.
+
+### 8. Private-file creation, independent of umask
+
+`state-root.json` and `repo.json` creation both go through the **same**
+one primitive: `O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC` (dir_fd-
+relative), followed by an explicit `fchmod(0o600)` and an `fstat`-
+verified exact-mode/regular-file/current-uid check — never a bare
+`os.open(..., 0o600)`, since umask can silently narrow the requested
+mode below what the caller asked for.
+
+### 9. Non-inheritable descriptors, checked at operation time
+
+Every descriptor this substrate opens — the state-root directory, the
+trusted working-tree root, the trusted Git common directory and Git
+directory (during discovery), every intermediate managed directory,
+the `repo-locks/` directory, the `repos/<repo-key>/` directory, lock
+files, and private JSON files — uses `O_CLOEXEC` where the platform
+supports it, with `FD_CLOEXEC` **reasserted and verified** via
+`fcntl.fcntl(fd, F_SETFD, ...)` / `fcntl.fcntl(fd, F_GETFD)` rather than
+trusted from the open flag alone. Missing `fcntl`, `flock`,
+`O_NOFOLLOW`, `O_CLOEXEC`, or (Darwin) `F_GETPATH` support is
+`SUBSTRATE_UNAVAILABLE`, raised **at the operation that actually needs
+it**, never at module import time — so a platform lacking one of these
+capabilities fails closed with a categorical, testable error rather
+than an uncaught `ImportError`/`AttributeError`.
+
+### 10. Complete descriptor cleanup, never swallowed, never short-circuited
+
+Every primitive that owns a descriptor's lifetime — directory
+canonicalization, managed-directory-chain traversal, `StateRoot`'s own
+close, repository-context/identity discovery, private-JSON-file
+creation, and lock acquisition/release — follows one uniform rule:
+**every close in a batch is attempted, even after an earlier one in the
+same batch fails** (an aggregation implemented as an explicit loop that
+accumulates a failure flag across every element, never a short-
+circuiting `any()` over a generator, which would stop attempting
+further closes as soon as the first one failed); and **a cleanup
+failure dominates** — it becomes the primary raised error, explicitly
+chained from whatever sanitized exception was already active (`raise
+cleanup_error from original_error`), never silently discarded and
+never left to compound as an unraised, already-forgotten failure. This
+applies uniformly, with no per-module exception:
+
+- **Directory canonicalization** (§2): a close failure after a
+  canonicalization failure is not silently discarded — it is chained
+  from that failure the same as everywhere else.
+- **Managed-directory-chain traversal**: on a traversal failure, every
+  opened intermediate descriptor is closed (all of them, not stopping
+  at the first close failure); a resulting cleanup failure is chained
+  from the traversal failure. On a *successful* traversal, every
+  intermediate descriptor except the final one returned to the caller
+  is closed the same way; a cleanup failure here has no prior failure
+  to chain from and is itself the primary error (the final descriptor
+  is also closed at that point, rather than compounding the leak
+  further).
+- **Repository-context/identity discovery**: every descriptor opened
+  during Git-directory canonicalization, common-directory
+  canonicalization, and working-tree-root canonicalization is tracked
+  on an explicit owned-descriptor stack as it is acquired — never
+  assumed closeable only via straight-line code that only reaches a
+  cleanup step on the successful path. A failure at any acquisition
+  point closes every descriptor acquired so far (in the same
+  all-attempted, no-short-circuit, cleanup-dominates-and-chains
+  manner) before propagating.
+- **Lock acquisition, partial success**: if the lock file itself has
+  been successfully opened and `flock`ed, but cleanup of the short-lived
+  parent-directory descriptor used to reach it then fails, the acquired
+  lock is never left unreachable — release of the just-acquired lock is
+  attempted *before* raising. If both the parent-fd cleanup and the
+  lock release fail, both failures are reported categorically together
+  in one sanitized cleanup error (never only one, silently dropping the
+  other), still chained from any earlier sanitized failure that was
+  already active. A dedicated test proves a second process can acquire
+  the same lock afterward whenever release was independently confirmed,
+  regardless of what happened to the unrelated parent-fd descriptor.
+- **Lock release** (unchanged from the accepted design of the prior
+  planning rounds): a release failure is the primary raised error,
+  explicitly chained from any already-propagating body exception rather
+  than merely recorded as a side-channel attribute — deliberately
+  stricter than `GitWorktree.__exit__`'s "never mask an in-flight
+  exception" convention, since a stuck lock can block every future run
+  against the repository, not just this one's own cleanup.
+
+### 11. `LockScope`
+
+```
+LockScope(kind: LockKind, repo_key: str, lifecycle_id: str | None = None)
+```
+
+`repo_key` (and, when present, `lifecycle_id`) are validated as
+**exactly 32 lowercase hexadecimal characters** in `LockScope`'s own
+construction — before any path component is derived from them, not
+after. `LockKind.LIFECYCLE` requires a `lifecycle_id`; `LockKind.
+REPOSITORY` forbids one. `load_or_create_repo_json` requires the
+presented lock handle to be currently held and its `scope` to equal
+exactly `LockScope(kind=REPOSITORY, repo_key=<this repository's key>)`
+— a lifecycle-scoped or wrong-repository handle is rejected. `LockKind.
+LIFECYCLE` is fully defined now specifically so 3A-2 does not require a
+breaking change to this capability model later; **nothing in Slice
+3A-1 ever constructs a `LockScope` of kind `LIFECYCLE`.**
+
+### 12. Repository/lifecycle lock ordering boundary (3A-1 vs. 3A-2)
+
+Slice 3A-1 implements **only** the generic, verified, nonblocking lock
+primitive and the one named repository-lock wrapper. It does **not**
+create `runs/<lifecycle-id>/` and does **not** expose a lifecycle-lock
+wrapper. Slice 3A-2 is responsible for atomically ordering: acquire the
+repository lock (reusing 3A-1's primitive unchanged) → create
+`runs/<lifecycle-id>/` → acquire the lifecycle lock (reusing 3A-1's
+generic primitive with `LockKind.LIFECYCLE`) → write the initial
+`PREPARING` `lifecycle.json` projection — all strictly before any
+Docker container, worktree, or checkpoint ref exists, per this ADR's
+§6/§10. This ordering is a documented contract for 3A-2's own
+composition, not something 3A-1 itself provides as a combined
+function.
+
+### 13. `repo.json` identity-mismatch classification
+
+A module-local `RepoIdentityFailure.IDENTITY_MISMATCH` reason is
+retained as the precise diagnostic label, carrying a **bounded,
+immutable set of mismatched field names only** — drawn exclusively from
+`{repo_key, canonical_common_dir, st_dev, st_ino, object_format}`,
+**never the recorded or observed values themselves** (no path, no
+inode number, appears in the exception). Its **ADR-level classification
+remains exactly `SUBSTRATE_UNAVAILABLE`**, per this ADR's original §4
+text, and the namespace is refused (fail closed) — `IDENTITY_MISMATCH`
+is not, and must never be described as, a distinct `REFUSED` outcome
+category of its own.
+
+### 14. `repo.json` crash behavior
+
+| Point | Behavior |
+|---|---|
+| Before `O_EXCL` | No file exists; a later attempt (by any correctly-locked process) creates normally. |
+| After creation, before the write completes | File exists with 0 or partial bytes; a later locked reader's ordinary validation path fails schema/JSON validation and reports `SUBSTRATE_UNAVAILABLE` — never regenerated or overwritten automatically, identical to `state-root.json`'s crash-handling philosophy. |
+| After the write, before file `fsync` | Process-crash atomicity only (this ADR's §15, unchanged) — no additional guarantee for a power-loss event. |
+| After file `fsync`, before directory `fsync` | The file's content is durable; the directory entry's durability is unconfirmed, with no observable difference for a live (non-power-loss) process. |
+| Directory-`fsync` failure | The **creating process's own call** reports failure (§10's cleanup-dominates rule); the file itself is left exactly as written, never deleted or reverted. A **later, fresh invocation** finds a genuinely complete and correct `repo.json`, validates it successfully, and proceeds — even though the original writer's own call failed. No claim beyond this ADR's existing power-loss-durability boundary is made. |
+
+### 15. Precise state-root initialization / race classification
+
+A four-state probe — `VALID`, `ABSENT`, `RETRYABLE_PARTIAL`,
+`PERMANENTLY_INVALID` — replaces any ad hoc two-attempt substitute.
+**The bounded retry window (2.0 s, polled every 50 ms, `time.monotonic`)
+applies only when this process itself first observed `state-root.json`
+absent, attempted `O_CREAT | O_EXCL`, and received `EEXIST`** — never
+during ordinary startup, where any of the same content shapes is
+immediately `SUBSTRATE_UNAVAILABLE`. Inside that one legitimate window,
+only two content shapes are retried: an exactly-empty file, and content
+that fails to parse as syntactically complete JSON (categorized
+precisely as `JSON_SYNTAX_INVALID`, not a generic "malformed" bucket —
+Python's JSON parser cannot always distinguish genuine truncation from
+arbitrary invalid syntax, so this category is deliberately named for
+what it actually is: syntactically incomplete-or-invalid JSON,
+retryable **only** inside the post-`EEXIST` window, because our own
+writer's single-shot complete write means a live writer can only ever
+be observed as "nothing yet" or "some invalid-JSON-shaped prefix" —
+never as a fully-parseable, wrong-schema document). Every other content
+shape — invalid UTF-8, a duplicate JSON key, oversized content, a
+symlink, a schema-invalid-but-syntactically-complete document, or any
+other I/O failure — is `PERMANENTLY_INVALID` immediately, **even inside
+the retry window**: none of these is a shape a live, still-writing
+process could ever legitimately produce, so waiting out the window for
+any of them would only delay an already-certain failure. `clock`/
+`sleeper` are injectable seams (defaulting to `time.monotonic`/
+`time.sleep`) so the state machine itself is tested deterministically
+without a real wait; exactly one real cross-process test uses genuine
+wall-clock timing.
+
+### 16. Exact production ordering (documented contract, not a new function)
+
+```
+1. discover_repository_identity_and_context(repo_path)
+      -> (RepositoryIdentity, TrustedRepositoryContext)
+2. resolve_state_root_path() -> StateRootLocation
+3. open_or_create_canonical_root(location) -> (root_fd, canonical_root_path)
+4. directional containment validation (§6), on canonical paths only
+5. probe/initialize state-root.json via root_fd -> StateRoot (owns root_fd thereafter)
+6. acquire_repository_lock(state_root, identity.repo_key) -> LockHandle
+7. load_or_create_repo_json(state_root, identity, repo_lock) -> RepositoryIdentity
+```
+
+### Milestone boundary
+
+**Slice 3A-1** (this amendment's scope): `state-root.json` init/
+validation; trusted repository identity and context discovery; the
+repository-lock primitive; the generic lock primitive `LockScope`
+already anticipates for lifecycle locks; `repo.json` creation/
+validation while the correct repository lock is held. **Not** in
+3A-1: `runs/<lifecycle-id>/` creation, any lifecycle-lock wrapper,
+`lifecycle.json` of any kind, container/worktree/checkpoint-ref
+attribution or reconciliation, `codeagent reconcile`/`--abandon`, the
+maintenance trace, any `errors.ErrorCode`/`ErrorDomain` addition, or
+any controller/CLI wiring. **Slice 3A-2** owns `runs/<lifecycle-id>/`
+creation, the lifecycle-lock wrapper, and the initial `PREPARING`
+`lifecycle.json` projection, ordered per §12 above. The remainder of
+this ADR (attribution, reconciliation, abandonment, the maintenance
+trace) remains later Milestone 3 work, unchanged in scope by this
+amendment.
+
+### Evidence
+
+A multi-round, planning-only architecture review, including a real,
+reproduced probe of the macOS case-canonicalization gap
+(`/Users/chandrasekhar/code/codeagent` vs.
+`/users/chandrasekhar/code/codeagent` both resolving via
+`Path.resolve()` while preserving their distinct spelling) and a real
+computation of the pinned `repo_key` test vector in §1. No
+implementation exists yet; the test matrix recorded in
+`ENGINEERING_LOG.md`'s Slice 3A-1 planning entry is the implementation
+obligation this amendment creates.

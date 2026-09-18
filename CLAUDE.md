@@ -265,18 +265,24 @@ Stage 2 (of the four-stage planning process in
   function only — `CheckpointRef` still accepts any correctly shaped
   id, so 2B-2 must make the trusted composition root mint exclusively
   through it. 106 focused tests.
-  **This makes no production lifecycle guarantee**: nothing imports
-  `checkpoint_session`, it writes no file, takes no lock, emits no
-  event, and performs no Git call of its own. The entry gate,
-  create/advance ordering, workspace ownership, worktree-before-ref
-  teardown, event ordering and error identity are all slice 2B-2, and
-  ADR 0004's durable store remains Milestone 3.
+  **At the time slice 2B-1 was committed, this made no production
+  lifecycle guarantee**: nothing imported `checkpoint_session`, it
+  wrote no file, took no lock, emitted no event, and performed no Git
+  call of its own. **`checkpoint_session` is now integrated by slice
+  2B-2 below** — `RunController` constructs and drives it as a required
+  collaborator. The entry gate, create/advance ordering, workspace
+  ownership, worktree-before-ref teardown, event ordering and error
+  identity described here remain slice 2B-1's own contribution; ADR
+  0004's durable store remains Milestone 3.
   **Milestone 2 Slice 2B-2 is implemented (2026-09-17) per
   `docs/adr/0003-recover-partial-patches-by-replacing-worktree.md`
   Amendment 2 and `docs/adr/0006-git-safety-policy-for-filters-hooks-
   and-content-fidelity.md` Amendment 4 — verified locally on macOS with
-  a real Docker daemon; Linux CI validation and SHA-256 object-format
-  coverage are still pending.**
+  a real Docker daemon, and confirmed on Linux CI (commit `fafefbe`,
+  run [35306212472](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35306212472),
+  success: 1863 passed, 1 intentional Darwin-only skip, all 3
+  real-Docker tests passed, no leftover verification containers).
+  SHA-256 object-format coverage is still pending.**
   - `src/codeagent/evidence.py` (new): `FilesystemEvidenceSink`
     implements the accepted durable-evidence-artifact design in full —
     strictly observational `status`+`diff` capture sharing one
@@ -353,8 +359,9 @@ Stage 2 (of the four-stage planning process in
     `src/codeagent/evidence.py`'s ambient-symlink exception
     (`/tmp`/`/var`/`/etc`) is now gated to a verified macOS/Darwin
     target match, never trusted by name alone or on another platform;
-    `tests/unit/test_evidence.py` is now 37 tests. **Not yet done**:
-    Linux CI validation; SHA-256 object-format exercise (ADR 0003's own
+    `tests/unit/test_evidence.py` is now 37 tests. Linux CI validation
+    passed (see the run cited above). **Not yet done**: SHA-256
+    object-format exercise (ADR 0003's own
     required-test list); a dedicated test for every scenario in the
     original 2B-2 task's exhaustive list (several are exercised only
     incidentally via the real end-to-end tests, not each via its own
@@ -451,6 +458,13 @@ Stage 2 (of the four-stage planning process in
   checkpoint-ref amendment is now Accepted — then these
   mechanisms as Milestone 3 lifecycle work. S5 spike code is not reused
   in production.
+- **Milestone 3 Slice 3A-1** (trusted lifecycle state-root, repository
+  identity, and repository/generic lock primitives) is **accepted and
+  design-complete but not implemented**: see
+  `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  "Amendment 1 (Accepted 2026-09-18)". No `state_root.py`,
+  `repo_identity.py`, `state_locks.py`, or `_lifecycle_fs.py` module
+  exists yet; nothing from this slice is wired into production code.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

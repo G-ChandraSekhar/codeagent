@@ -17,11 +17,12 @@ there is currently no trusted way to validate parent/
 target's own content (Amendment 3). The slice is implemented and
 passing its own tests locally (macOS, Git 2.54.0); Linux CI validation
 is pending — see Amendment 3 for exactly what evidence that implies
-and what it does not. **Amendment 4** (2026-09-17, implemented and
-locally macOS-verified, Linux CI pending) extends this policy to `git
-diff` against working-tree content, found during Milestone 2 Slice
-2B-2's evidence-capture design review; see the end of this document.
-Acceptance of this ADR's design
+and what it does not. **Amendment 4** (2026-09-17, implemented,
+locally macOS-verified, and confirmed on Linux CI — see Amendment 4's
+own implementation-status note for the run) extends this policy to
+`git diff` against working-tree content, found during Milestone 2
+Slice 2B-2's evidence-capture design review; see the end of this
+document. Acceptance of this ADR's design
 is independent of implementation and of Linux validation — see
 Consequences.
 
@@ -1163,8 +1164,11 @@ validation, bounded I/O, commit-acceptance verification) is unaffected.
 
 ## Amendment 4 (Accepted 2026-09-17): `git diff` is a filter/external-diff/textconv execution point
 
-Implementation status: **implemented (2026-09-17) and locally verified
-on macOS; Linux CI validation is pending.** `src/codeagent/
+Implementation status: **implemented (2026-09-17), locally verified
+on macOS, and confirmed on Linux CI (commit `fafefbe`, run
+[35306212472](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35306212472),
+success: 1863 passed, 1 intentional Darwin-only skip, all 3 real-Docker
+tests passed, no leftover verification containers).** `src/codeagent/
 _git_safety.py` gained the planned `run_git_bounded_preview` primitive
 (a bounded-preview counterpart to `run_git_bounded`: on overflow it
 stops draining, terminates and confirms reaping of the child, and

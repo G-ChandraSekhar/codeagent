@@ -1571,3 +1571,24 @@ and would accept a hostile symlink placed at one of those exact names.
 passed including 3 real-Docker tests with `CODEAGENT_REQUIRE_DOCKER=1`;
 `git diff --check`/`py_compile` clean; no leftover containers,
 worktrees, or temp files. macOS/Git 2.54.0; Linux CI still pending.
+
+## 2026-09-18: Linux CI confirmation for Slice 2B-2; Slice 3A-1 design accepted
+
+Linux CI run [35306212472](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35306212472)
+(commit `fafefbe`) concluded `success`: full suite 1863 passed plus 1
+intentional Darwin-only skip, all 3 real-Docker tests passed, no
+leftover `codeagent-verify` containers. This closes the "Linux CI
+validation is pending" caveat carried by Slice 2B-2's status notes in
+`CLAUDE.md`, ADR 0003 Amendment 2, and ADR 0006 Amendment 4 — all three
+corrected to cite this run. SHA-256 object-format coverage (ADR 0003's
+own required-test list) remains genuinely outstanding, unchanged by
+this run. Also corrected a stale claim in `CLAUDE.md`'s Slice 2B-1
+bullet that "nothing imports `checkpoint_session`" — true when 2B-1 was
+committed, no longer true since `RunController` began driving it as a
+required collaborator in 2B-2.
+
+Milestone 3 Slice 3A-1 (trusted lifecycle state-root, repository
+identity, repository/generic lock primitives) completed a five-round,
+planning-only architecture review and is now **Accepted** as ADR 0004
+Amendment 1 — design-complete, not implemented. No production module
+exists yet; implementation is the next Milestone 3 step.

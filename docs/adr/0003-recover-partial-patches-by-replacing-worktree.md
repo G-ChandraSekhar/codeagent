@@ -502,8 +502,11 @@ obligation.
 
 ## Amendment 2 (Accepted 2026-09-17): lazy checkpoint establishment, durable evidence capture, gated teardown, and terminal precedence
 
-Implementation status: **implemented (2026-09-17) and locally verified
-on macOS with a real Docker daemon; Linux CI validation is pending.**
+Implementation status: **implemented (2026-09-17), locally verified
+on macOS with a real Docker daemon, and confirmed on Linux CI (commit
+`fafefbe`, run [35306212472](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35306212472),
+success: 1863 passed, 1 intentional Darwin-only skip, all 3 real-Docker
+tests passed, no leftover verification containers).**
 `src/codeagent/evidence.py` (`FilesystemEvidenceSink`), the
 `Workspace`/`CheckpointSessionLike` integration in
 `src/codeagent/controller.py` (`RunController._terminate`,
@@ -524,7 +527,7 @@ checkpoint ref and worktree are both genuinely absent, the evidence
 artifact is genuinely published with correct framing/hash, and no
 container is left behind. See `ENGINEERING_LOG.md`'s 2B-2
 implementation entry for the exact file list, defect list, and what
-remains unverified (Linux, SHA-256 object format, and the broader
+remains unverified (SHA-256 object format, and the broader
 G-list of exhaustive scenarios this pass did not each get a dedicated
 test for).
 
