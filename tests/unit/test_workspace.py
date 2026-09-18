@@ -230,11 +230,14 @@ class _FakeCompletedProcess:
         self.stderr = stderr
 
 
-def _patch_run_git_to_fail_remove_and_noop_prune(monkeypatch) -> None:
-    """Simulate `git worktree remove` failing and `git worktree prune`
-    silently not fixing it, so the stale registration genuinely
-    persists — everything else (add, rev-parse, status, list) still
-    calls the real git binary via the real, hardened `_run` seam."""
+def _patch_run_git_to_fail_remove(monkeypatch) -> None:
+    """Simulate `git worktree remove` failing so the stale registration
+    genuinely persists — everything else (add, rev-parse, status, list)
+    still calls the real git binary via the real, hardened `_run` seam.
+    `dispose()` no longer has a `prune`/`rmtree` fallback to simulate
+    around (ADR 0003 Amendment 2): once `remove` fails, disposal simply
+    raises `GitWorktreeCleanupError`, so there is nothing left to
+    recover from."""
     import codeagent.workspace as workspace_module
 
     real_run = workspace_module._run
@@ -242,15 +245,13 @@ def _patch_run_git_to_fail_remove_and_noop_prune(monkeypatch) -> None:
     def fake_run(repo_path, *args: str, input_text: str | None = None):
         if "remove" in args:
             return _FakeCompletedProcess(returncode=1, stderr="simulated remove failure")
-        if "prune" in args:
-            return _FakeCompletedProcess(returncode=0)  # "succeeds" but does nothing
         return real_run(repo_path, *args, input_text=input_text)
 
     monkeypatch.setattr(workspace_module, "_run", fake_run)
 
 
-def test_cleanup_surfaces_a_failure_when_remove_and_prune_cannot_recover(monkeypatch) -> None:
-    _patch_run_git_to_fail_remove_and_noop_prune(monkeypatch)
+def test_cleanup_surfaces_a_failure_when_remove_cannot_be_confirmed(monkeypatch) -> None:
+    _patch_run_git_to_fail_remove(monkeypatch)
 
     with real_fixture_repo() as repo:
         wt = GitWorktree(repo, run_id="r-cleanup-fail")
@@ -259,15 +260,18 @@ def test_cleanup_surfaces_a_failure_when_remove_and_prune_cannot_recover(monkeyp
             with wt as path:
                 captured_path = path
 
-        # The temporary directory is still removed (finally path) even
-        # though the git-level registration could not be cleaned up.
-        assert not captured_path.exists()
+        # No rmtree/prune fallback exists any more (ADR 0003 Amendment
+        # 2): an unconfirmed `git worktree remove` is surfaced loudly,
+        # and the worktree's own content is deliberately left exactly
+        # as it was — force-deleting it here would be indistinguishable
+        # from the forbidden rmtree fallback.
+        assert captured_path.exists()
         assert wt.cleanup_error is not None
-        assert wt.path is None
+        assert wt.path is not None
 
 
 def test_cleanup_failure_does_not_mask_an_exception_already_propagating(monkeypatch) -> None:
-    _patch_run_git_to_fail_remove_and_noop_prune(monkeypatch)
+    _patch_run_git_to_fail_remove(monkeypatch)
 
     with real_fixture_repo() as repo:
         wt = GitWorktree(repo, run_id="r-cleanup-fail-mask")
@@ -278,7 +282,7 @@ def test_cleanup_failure_does_not_mask_an_exception_already_propagating(monkeypa
         # The original exception won, not GitWorktreeCleanupError — but
         # the cleanup problem is still recorded, not silently dropped.
         assert wt.cleanup_error is not None
-        assert not path.exists()
+        assert path.exists()
 
 
 def test_registration_status_treats_a_failed_listing_as_unknown_not_absent(monkeypatch) -> None:
@@ -1390,3 +1394,351 @@ def test_registration_status_path_resolution_failure_during_cleanup(monkeypatch)
             text=True,
         ).stdout
         assert str(exact_path) not in real_status
+
+
+# ---------------------------------------------------------------------------
+# Milestone 2 slice 2B-2 (ADR 0003 Amendment 2): initial_commit,
+# entry_gate, dispose/preserve, and the tri-state __exit__ dispatch.
+# ---------------------------------------------------------------------------
+
+
+def test_initial_commit_unavailable_before_enter() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-initial-commit-early")
+        with pytest.raises(GitWorktreeError):
+            _ = wt.initial_commit
+
+
+def test_initial_commit_is_the_pinned_starting_sha() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-initial-commit")
+        with wt as path:
+            expected = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            assert wt.initial_commit == expected
+            # rev-parse inside the worktree itself agrees.
+            observed = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            assert wt.initial_commit == observed
+
+
+def test_entry_gate_accepts_a_clean_worktree_at_the_expected_commit() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-gate-ok")
+        with wt as path:
+            wt.entry_gate(wt.initial_commit)  # must not raise
+
+
+def test_entry_gate_rejects_wrong_expected_commit() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-gate-wrong-head")
+        with wt as path:
+            with pytest.raises(GitWorktreeError):
+                wt.entry_gate("0" * 40)
+
+
+def test_entry_gate_rejects_dirty_working_tree() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-gate-dirty-tree")
+        with wt as path:
+            tracked = next(path.rglob("*.py"))
+            tracked.write_text(tracked.read_text() + "\n# dirty\n")
+            with pytest.raises(GitWorktreeError):
+                wt.entry_gate(wt.initial_commit)
+
+
+def test_entry_gate_rejects_dirty_staged_index() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-gate-dirty-index")
+        with wt as path:
+            tracked = next(path.rglob("*.py"))
+            tracked.write_text(tracked.read_text() + "\n# staged\n")
+            subprocess.run(
+                ["git", "-C", str(path), "add", "-A"], check=True, capture_output=True
+            )
+            with pytest.raises(GitWorktreeError):
+                wt.entry_gate(wt.initial_commit)
+
+
+def test_entry_gate_rejects_untracked_paths() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-gate-untracked")
+        with wt as path:
+            (path / "untracked_new_file.txt").write_text("surprise\n")
+            with pytest.raises(GitWorktreeError):
+                wt.entry_gate(wt.initial_commit)
+
+
+def test_entry_gate_requires_an_active_worktree() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-gate-inactive")
+        with pytest.raises(GitWorktreeError):
+            wt.entry_gate("0" * 40)
+
+
+def test_dispose_removes_registration_and_directory() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-dispose-ok")
+        with wt as path:
+            wt.dispose()
+            assert not path.exists()
+            listing = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert str(path) not in listing
+            assert wt.path is None
+
+
+def test_dispose_is_idempotent() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-dispose-twice")
+        with wt as path:
+            wt.dispose()
+            wt.dispose()  # must not raise, must not attempt another git call
+
+
+def test_dispose_accepts_confirmed_absence_despite_reported_remove_failure(monkeypatch) -> None:
+    """Correction pass (defect 5): `git worktree remove`'s own reported
+    status must not decide success — only the independent final
+    observation does. The real removal is allowed to actually happen;
+    only the *reported* result is fabricated as a failure."""
+    import codeagent.workspace as workspace_module
+
+    real_run = workspace_module._run
+
+    def fake_run(repo_path, *args: str, input_text: str | None = None):
+        result = real_run(repo_path, *args, input_text=input_text)
+        if "remove" in args:
+            return _FakeCompletedProcess(returncode=1, stderr="simulated remove failure")
+        return result
+
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-dispose-despite-reported-failure")
+        with wt as path:
+            monkeypatch.setattr(workspace_module, "_run", fake_run)
+            wt.dispose()  # must NOT raise: final observation confirms exact absence
+            assert not path.exists()
+            assert wt.path is None
+            listing = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert str(path) not in listing
+
+
+def test_dispose_raises_when_absence_is_genuinely_unconfirmed_despite_reported_success(
+    monkeypatch,
+) -> None:
+    """The converse of the fix above: a command that reports *success*
+    is equally untrusted — if the final observation cannot confirm
+    absence, dispose() still raises."""
+    import codeagent.workspace as workspace_module
+
+    real_run = workspace_module._run
+
+    def fake_run(repo_path, *args: str, input_text: str | None = None):
+        if "remove" in args:
+            return _FakeCompletedProcess(returncode=0)  # claims success, does nothing real
+        return real_run(repo_path, *args, input_text=input_text)
+
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-dispose-false-success")
+        with wt as path:
+            monkeypatch.setattr(workspace_module, "_run", fake_run)
+            with pytest.raises(GitWorktreeCleanupError):
+                wt.dispose()
+            assert wt.path is not None
+            assert wt._disposition == "active"
+            # Undo the fabricated-success patch and dispose for real
+            # before the `with` block's own __exit__ runs, so __exit__
+            # sees an already-disposed instance and no-ops cleanly
+            # rather than repeating the same fabricated failure
+            # uncaught.
+            monkeypatch.undo()
+            wt.dispose()
+            assert wt.path is None
+            assert wt._disposition == "disposed"
+
+
+def test_dispose_retry_recovers_after_tempdir_cleanup_failure(monkeypatch) -> None:
+    """Correction pass (defect 5): a tempdir-cleanup failure must not
+    permanently strand the instance — self._tempdir is left intact so a
+    later retry can succeed once the transient problem clears, and the
+    already-confirmed-gone worktree portion is not redone destructively."""
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-dispose-tempdir-retry")
+        with wt as path:
+            call_count = {"n": 0}
+            real_cleanup = wt._tempdir.cleanup
+
+            def flaky_cleanup():
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    raise PermissionError("simulated transient failure")
+                return real_cleanup()
+
+            monkeypatch.setattr(wt._tempdir, "cleanup", flaky_cleanup)
+
+            with pytest.raises(GitWorktreeCleanupError):
+                wt.dispose()
+            # The worktree itself is already confirmed gone; only the
+            # tempdir wrapper cleanup failed, and disposition/path stay
+            # "active" so a retry is possible rather than stuck forever.
+            assert not path.exists()
+            assert wt.path is not None
+            assert wt._disposition == "active"
+
+            wt.dispose()  # retry, now that the transient failure clears
+            assert wt.path is None
+            assert wt._disposition == "disposed"
+            assert call_count["n"] == 2
+
+
+def test_exit_after_dispose_is_a_noop(monkeypatch) -> None:
+    """A direct dispose() followed by the with-block's own __exit__
+    must not attempt a second removal (which would fail against an
+    already-gone registration and incorrectly surface as a cleanup
+    error)."""
+    called_remove = False
+
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-dispose-then-exit")
+        with wt as path:
+            wt.dispose()
+
+            import codeagent.workspace as workspace_module
+
+            real_run = workspace_module._run
+
+            def fake_run(repo_path, *args: str, input_text: str | None = None):
+                nonlocal called_remove
+                if "remove" in args:
+                    called_remove = True
+                return real_run(repo_path, *args, input_text=input_text)
+
+            monkeypatch.setattr(workspace_module, "_run", fake_run)
+
+        assert called_remove is False
+
+
+def test_preserve_then_exit_leaves_worktree_intact() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-preserve")
+        with wt as path:
+            wt.preserve()
+        # __exit__ has now run and must have done nothing.
+        assert path.exists()
+        listing = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert str(path) in listing
+        assert wt.path is not None
+
+    # Clean up what the test itself intentionally preserved, so this
+    # test doesn't leak a real worktree registration/tempdir.
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "remove", "--force", str(path)],
+        capture_output=True,
+    )
+
+
+def test_preserve_requires_active_state() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-preserve-twice")
+        with wt as path:
+            wt.preserve()
+            with pytest.raises(GitWorktreeError):
+                wt.preserve()
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "remove", "--force", str(path)],
+            capture_output=True,
+        )
+
+
+def test_preserve_after_dispose_is_rejected() -> None:
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-preserve-after-dispose")
+        with wt as path:
+            wt.dispose()
+            with pytest.raises(GitWorktreeError):
+                wt.preserve()
+
+
+def test_direct_context_manager_use_disposes_exactly() -> None:
+    """A caller that never touches preserve()/dispose() at all (the
+    existing, pre-2B-2 usage pattern) still gets exact disposal via
+    __exit__ alone."""
+    with real_fixture_repo() as repo:
+        captured_path = None
+        with GitWorktree(repo, run_id="r-direct-use") as path:
+            captured_path = path
+        assert not captured_path.exists()
+        listing = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert str(captured_path) not in listing
+
+
+def test_exceptional_exit_before_teardown_still_disposes_exactly() -> None:
+    """An exception raised inside the with-block, before any explicit
+    dispose()/preserve() call, must still result in exact disposal via
+    __exit__'s active-state fallback — never a leaked worktree."""
+    captured_path = None
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-exceptional-exit")
+        with pytest.raises(RuntimeError, match="boom"):
+            with wt as path:
+                captured_path = path
+                raise RuntimeError("boom")
+        assert not captured_path.exists()
+        listing = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert str(captured_path) not in listing
+
+
+def test_no_rmtree_or_prune_reference_exists_in_workspace_module() -> None:
+    """Static AST-level proof that no `shutil` import, no `rmtree` call,
+    and no `"prune"` string literal remains anywhere in workspace.py's
+    actual code (docstrings are deliberately excluded — this module's
+    own docstrings now describe the *absence* of both, by name, which
+    would otherwise make a bare substring check false-positive) — a
+    regression guard against either fallback silently reappearing."""
+    import ast
+    import inspect
+
+    import codeagent.workspace as workspace_module
+
+    source = inspect.getsource(workspace_module)
+    tree = ast.parse(source)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert alias.name != "shutil", "workspace.py must not import shutil"
+        if isinstance(node, ast.Attribute) and node.attr == "rmtree":
+            raise AssertionError("workspace.py must not call any *.rmtree(...)")
+        if isinstance(node, ast.Constant) and node.value == "prune":
+            raise AssertionError("workspace.py must not pass a 'prune' argument to git")

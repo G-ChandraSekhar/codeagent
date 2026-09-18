@@ -23,13 +23,18 @@ from codeagent.controller import (
 from codeagent.errors import ErrorCode, OperationalError
 from tests.support.fakes import (
     FakeApprovalProvider,
+    FakeCheckpointSession,
+    FakeEvidenceSink,
     FakeModel,
     FakePatchApplier,
     FakeRepositoryReader,
     FakeVerifier,
+    FakeWorkspace,
     MarkerGatedFakeModel,
     SteppingClock,
 )
+
+_LIFECYCLE_ID = "a" * 32
 
 PLAN = PlanProposal(
     problem_hypothesis="idempotency key dropped on retry",
@@ -53,11 +58,15 @@ def _build(
     approval_mode: domain.ApprovalMode = domain.ApprovalMode.INTERACTIVE,
     model: ModelClient | None = None,
     reader: object | None = None,
+    workspace: object | None = None,
+    session: object | None = None,
+    evidence_sink: object | None = None,
 ) -> RunController:
     config = RunConfig(
         run_id=run_id,
         task_statement="fix retry bug",
         approval_mode=approval_mode,
+        lifecycle_id=_LIFECYCLE_ID,
         max_repair_iterations=max_repair_iterations,
         max_plan_revisions=max_plan_revisions,
     )
@@ -68,6 +77,9 @@ def _build(
         FakeVerifier(verification_outcomes, baseline_outcome=baseline_outcome),
         FakePatchApplier(patch_should_fail, failure_code=patch_failure_code),
         reader if reader is not None else FakeRepositoryReader(),
+        workspace if workspace is not None else FakeWorkspace(),
+        session if session is not None else FakeCheckpointSession(),
+        evidence_sink if evidence_sink is not None else FakeEvidenceSink(),
         clock=SteppingClock(),
     )
 
@@ -281,6 +293,7 @@ def test_run_config_rejects_negative_budget_limits(field: str) -> None:
         run_id="r",
         task_statement="x",
         approval_mode=domain.ApprovalMode.NONE,
+        lifecycle_id=_LIFECYCLE_ID,
         max_repair_iterations=1,
         max_plan_revisions=1,
     )
@@ -354,7 +367,10 @@ def test_every_patch_applied_has_a_preceding_checkpoint_created() -> None:
     ]
     assert len(checkpoint_created_events) == len(patch_applied_events) == 2
     # Checkpoints chain: the second's parent is the first's id.
-    assert checkpoint_created_events[0].parent_checkpoint_id is None
+    # The first checkpoint's parent is always the workspace's pinned
+    # initial commit now (ADR 0003 Amendment 2) — never None, since
+    # every run has a workspace with a real initial_commit.
+    assert checkpoint_created_events[0].parent_checkpoint_id == "a" * 40
     assert checkpoint_created_events[1].parent_checkpoint_id == checkpoint_created_events[0].checkpoint_id
 
 
@@ -482,6 +498,7 @@ class _OomVerifier:
             duration_seconds=0.01,
             stdout="",
             stderr="",
+            cleanup_status=events.ContainerCleanupStatus.CONFIRMED_ABSENT,
         )
 
     def run(self, attempt_index: int) -> VerificationResult:
@@ -491,6 +508,7 @@ class _OomVerifier:
             duration_seconds=0.01,
             stdout="",
             stderr="",
+            cleanup_status=events.ContainerCleanupStatus.CONFIRMED_ABSENT,
             error=self.oom_error,
         )
 
@@ -500,6 +518,7 @@ def test_confirmed_oom_kill_during_verification_aborts_the_run_without_repair_or
         run_id="r-oom",
         task_statement="fix retry bug",
         approval_mode=domain.ApprovalMode.INTERACTIVE,
+        lifecycle_id=_LIFECYCLE_ID,
         max_repair_iterations=3,
         max_plan_revisions=2,
     )
@@ -511,6 +530,9 @@ def test_confirmed_oom_kill_during_verification_aborts_the_run_without_repair_or
         verifier,
         FakePatchApplier(),
         FakeRepositoryReader(),
+        FakeWorkspace(),
+        FakeCheckpointSession(),
+        FakeEvidenceSink(),
         clock=SteppingClock(),
     )
 
@@ -565,6 +587,7 @@ def test_patch_reporting_files_outside_the_approved_plan_aborts_the_run() -> Non
         run_id="r-scope-violation",
         task_statement="fix retry bug",
         approval_mode=domain.ApprovalMode.INTERACTIVE,
+        lifecycle_id=_LIFECYCLE_ID,
     )
     # PLAN approves only "jobs/worker.py"; the patch applier (mis)reports
     # having changed a different file entirely.
@@ -575,6 +598,9 @@ def test_patch_reporting_files_outside_the_approved_plan_aborts_the_run() -> Non
         FakeVerifier((events.VerificationOutcome.PASSED,)),
         FakePatchApplier(changed_paths=("unrelated_file.py",)),
         FakeRepositoryReader(),
+        FakeWorkspace(),
+        FakeCheckpointSession(),
+        FakeEvidenceSink(),
         clock=SteppingClock(),
     )
 
@@ -584,12 +610,18 @@ def test_patch_reporting_files_outside_the_approved_plan_aborts_the_run() -> Non
     assert finished.error is not None
     assert finished.error.code is ErrorCode.INTERNAL_INVARIANT_VIOLATION
 
-    # The real (fake, but truthful) PatchApplied/CheckpointCreated
-    # events still appear — they genuinely happened — but verification
-    # is never reached: the run is stopped before spending further
-    # budget on an out-of-scope change.
-    assert any(isinstance(e, events.PatchApplied) for e in controller.log.events)
+    # ADR 0003 Amendment 1 point 4: the approved-path postcondition now
+    # runs *before* ToolCompleted(success=True)/CheckpointCreated/
+    # PatchApplied are ever emitted, so none of them appear for a scope
+    # violation — the transaction was never accepted.
+    assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
+    assert not any(isinstance(e, events.CheckpointCreated) for e in controller.log.events)
     assert not any(isinstance(e, events.VerificationCompleted) for e in controller.log.events)
+    failed_tool_completions = [
+        e for e in controller.log.events if isinstance(e, events.ToolCompleted) and not e.success
+    ]
+    assert len(failed_tool_completions) == 1
+    assert failed_tool_completions[0].error is finished.error
 
 
 def test_patch_reporting_a_subset_of_approved_files_is_accepted() -> None:
@@ -599,6 +631,7 @@ def test_patch_reporting_a_subset_of_approved_files_is_accepted() -> None:
         run_id="r-scope-subset",
         task_statement="fix retry bug",
         approval_mode=domain.ApprovalMode.INTERACTIVE,
+        lifecycle_id=_LIFECYCLE_ID,
     )
     plan_with_two_files = PlanProposal(
         problem_hypothesis=PLAN.problem_hypothesis,
@@ -612,6 +645,9 @@ def test_patch_reporting_a_subset_of_approved_files_is_accepted() -> None:
         FakeVerifier((events.VerificationOutcome.PASSED,)),
         FakePatchApplier(changed_paths=("jobs/worker.py",)),
         FakeRepositoryReader(),
+        FakeWorkspace(),
+        FakeCheckpointSession(),
+        FakeEvidenceSink(),
         clock=SteppingClock(),
     )
 
@@ -743,3 +779,72 @@ def test_illegal_read_path_aborts_the_run_without_reading_host_content() -> None
     )
     assert not read_completed.success
     assert read_completed.error is not None
+
+
+# --------------------------------------------------------------------
+# Correction pass: an EvidenceSink that raises unexpectedly must never
+# block workspace/ref cleanup or RunFinished (defect 2).
+# --------------------------------------------------------------------
+
+
+def test_raising_evidence_sink_does_not_block_later_teardown() -> None:
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink(raise_error=RuntimeError("sink exploded"))
+
+    controller = _build(
+        "r-evidence-raises", workspace=workspace, session=session, evidence_sink=evidence_sink
+    )
+    finished = controller.run()
+
+    # The sink really was called (proving this is the path under test),
+    # and RunFinished was still reached with a sanitized, categorized
+    # failure rather than an uncaught RuntimeError propagating out of
+    # controller.run() and never producing a terminal event at all.
+    assert evidence_sink.capture_calls == 1
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+    assert "sink exploded" not in finished.error.message
+
+    # Later teardown genuinely executed: the workspace was disposed and
+    # the (ABSENT, so no-op) session delete was still invoked.
+    assert workspace.disposed is True
+    assert workspace.preserved is False
+    assert session.delete_calls == 1
+
+    evidence_captured = next(
+        e for e in controller.log.events if isinstance(e, events.EvidenceCaptured)
+    )
+    assert evidence_captured.success is False
+    assert evidence_captured.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+
+
+def test_raising_evidence_sink_with_unconfirmed_verifier_still_preserves_workspace() -> None:
+    """Both failure classes at once: the evidence sink raises AND the
+    verifier's cleanup is unconfirmed. Teardown must still reach
+    preserve() and RunFinished."""
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink(raise_error=RuntimeError("sink exploded again"))
+
+    controller = _build(
+        "r-evidence-raises-preserve",
+        verification_outcomes=(events.VerificationOutcome.PASSED,),
+        workspace=workspace,
+        session=session,
+        evidence_sink=evidence_sink,
+    )
+    # Force the verifier-cleanup-unconfirmed flag the same way the real
+    # controller sets it, without needing a real Docker-shaped fake.
+    controller._any_verifier_cleanup_unconfirmed = True
+
+    finished = controller.run()
+
+    assert evidence_sink.capture_calls == 1
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+    assert workspace.preserved is True
+    assert workspace.disposed is False
+    assert session.delete_calls == 0

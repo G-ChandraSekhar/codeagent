@@ -1930,6 +1930,259 @@ def test_run_git_bounded_error_messages_do_not_leak_argv_or_paths(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# run_git_bounded_preview: "capture up to `limit` bytes, and say so
+# clearly if there's more" — distinct from run_git_bounded's "fail if
+# there's more than `limit` bytes" contract, which is unaffected by any
+# of this.
+# ---------------------------------------------------------------------------
+
+
+def test_run_git_bounded_preview_normal_completion(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("hello\n")
+    _git(repo, "add", "a.txt")
+    sha = _git(repo, "rev-parse", ":a.txt").stdout.strip()
+
+    result = _git_safety.run_git_bounded_preview(repo, "cat-file", "-p", sha, limit=1024)
+
+    assert result.stdout == b"hello\n"
+    assert result.returncode == 0
+    assert result.complete is True
+
+
+def test_run_git_bounded_preview_exact_boundary_is_complete(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "exact.txt").write_bytes(b"y" * 100)
+    _git(repo, "add", "exact.txt")
+    sha = _git(repo, "rev-parse", ":exact.txt").stdout.strip()
+
+    result = _git_safety.run_git_bounded_preview(repo, "cat-file", "-p", sha, limit=100)
+
+    assert result.stdout == b"y" * 100
+    assert result.complete is True
+    assert result.returncode == 0
+
+
+def test_run_git_bounded_preview_overflow_returns_truncated_preview_not_raise(tmp_path):
+    """Overflow is a normal outcome for this function — unlike
+    run_git_bounded, which discards the buffer and raises."""
+    repo = _make_repo(tmp_path / "r")
+    (repo / "big.txt").write_bytes(b"x" * 500_000)
+    _git(repo, "add", "big.txt")
+    sha = _git(repo, "rev-parse", ":big.txt").stdout.strip()
+
+    result = _git_safety.run_git_bounded_preview(repo, "cat-file", "-p", sha, limit=4096)
+
+    assert result.complete is False
+    assert len(result.stdout) == 4096
+    assert result.stdout == b"x" * 4096
+    assert result.returncode is None
+
+
+def test_run_git_bounded_preview_retains_at_most_limit_bytes_never_more(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    (repo / "big.txt").write_bytes(b"z" * 200_000)
+    _git(repo, "add", "big.txt")
+    sha = _git(repo, "rev-parse", ":big.txt").stdout.strip()
+
+    result = _git_safety.run_git_bounded_preview(repo, "cat-file", "-p", sha, limit=1)
+
+    assert len(result.stdout) <= 1
+    assert result.complete is False
+
+
+def test_run_git_bounded_preview_overflow_confirms_child_terminated(tmp_path):
+    """Overflow must actually kill and reap the child, not merely stop
+    reading from it — verified independently via the OS process table."""
+    repo = _make_repo(tmp_path / "r")
+    (repo / "big.txt").write_bytes(b"w" * 500_000)
+    _git(repo, "add", "big.txt")
+    sha = _git(repo, "rev-parse", ":big.txt").stdout.strip()
+
+    real_popen = subprocess.Popen
+    spawned: list[subprocess.Popen] = []
+
+    def tracking_popen(argv, **kwargs):
+        proc = real_popen(argv, **kwargs)
+        if argv[:1] == ["git"]:
+            spawned.append(proc)
+        return proc
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_git_safety.subprocess, "Popen", tracking_popen)
+        result = _git_safety.run_git_bounded_preview(repo, "cat-file", "-p", sha, limit=4096)
+
+    assert result.complete is False
+    assert len(spawned) == 1
+    # Confirmed reaped: poll() is non-None once a child has actually
+    # been waited on to completion (never None, which would mean it's
+    # still considered running by this process).
+    assert spawned[0].poll() is not None
+
+
+def test_run_git_bounded_preview_nonzero_exit_on_complete_capture_fails_categorically(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety.run_git_bounded_preview(repo, "cat-file", "-p", "0" * 40, limit=1024)
+
+    assert excinfo.value.reason is GitSafetyFailure.BOUNDED_COMMAND_FAILED
+
+
+def test_run_git_bounded_preview_times_out_on_a_hung_child(monkeypatch):
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            return real_popen(
+                ["sh", "-c", "printf partial; sleep 300"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety._read_bounded_preview(
+            ["--version"], env=_git_safety.git_environment(), timeout=0.5, limit=4096
+        )
+
+    assert excinfo.value.reason is GitSafetyFailure.GIT_COMMAND_TIMEOUT
+
+
+def test_run_git_bounded_preview_launch_failure_is_sanitized(monkeypatch):
+    def fake_popen(argv, **kwargs):
+        raise FileNotFoundError("no such file: git")
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(GitSafetyError) as excinfo:
+        _git_safety._read_bounded_preview(
+            ["--version"], env=_git_safety.git_environment(), timeout=1.0, limit=4096
+        )
+
+    assert excinfo.value.reason is GitSafetyFailure.GIT_EXECUTABLE_UNAVAILABLE
+
+
+def test_run_git_bounded_preview_selector_setup_failure_is_categorical(monkeypatch):
+    def fake_selector():
+        raise OSError("no selector available")
+
+    monkeypatch.setattr(_git_safety.selectors, "DefaultSelector", fake_selector)
+
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            return real_popen(
+                ["sh", "-c", "sleep 300"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+    try:
+        with pytest.raises(GitSafetyError) as excinfo:
+            _git_safety._read_bounded_preview(
+                ["--version"], env=_git_safety.git_environment(), timeout=1.0, limit=4096
+            )
+        assert excinfo.value.reason is GitSafetyFailure.PROCESS_SETUP_FAILED
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 300"], capture_output=True)
+
+
+def test_run_git_bounded_preview_cleanup_unconfirmed_when_process_will_not_die(monkeypatch):
+    """Cleanup-unconfirmed after overflow must raise categorically, not
+    be silently treated as a successful truncation."""
+    real_popen = subprocess.Popen
+
+    class StubbornProcess:
+        def __init__(self, *args, **kwargs):
+            self._real = real_popen(
+                ["sh", "-c", "printf xxxxxxxxxx; sleep 300"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            self.stdout = self._real.stdout
+
+        def kill(self):
+            pass  # simulate a kill that never actually terminates the process
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=timeout or 0)
+
+        @property
+        def returncode(self):
+            return self._real.returncode
+
+    def fake_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            return StubbornProcess()
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(_git_safety.subprocess, "Popen", fake_popen)
+
+    try:
+        with pytest.raises(GitSafetyError) as excinfo:
+            _git_safety._read_bounded_preview(
+                ["--version"], env=_git_safety.git_environment(), timeout=0.2, limit=4
+            )
+        assert excinfo.value.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 300"], capture_output=True)
+
+
+def test_run_git_bounded_preview_binary_bytes_are_never_decoded(tmp_path):
+    repo = _make_repo(tmp_path / "r")
+    raw = bytes(range(256)) * 4
+    (repo / "bin.dat").write_bytes(raw)
+    _git(repo, "add", "bin.dat")
+    sha = _git(repo, "rev-parse", ":bin.dat").stdout.strip()
+
+    result = _git_safety.run_git_bounded_preview(repo, "cat-file", "-p", sha, limit=len(raw) + 1)
+
+    assert result.stdout == raw
+    assert result.complete is True
+
+
+def test_run_git_bounded_preview_applies_baseline_and_accepts_extra_args_like_neutralization(
+    tmp_path,
+):
+    """Confirms the same hardened-baseline argv ordering discipline as
+    every other public function, and that ordinary extra `-c` arguments
+    (standing in for a caller's filter-neutralization overrides) pass
+    through untouched, ahead of the subcommand."""
+    repo = _make_repo(tmp_path / "r")
+    (repo / "a.txt").write_text("hi\n")
+    _git(repo, "add", "a.txt")
+    sha = _git(repo, "rev-parse", ":a.txt").stdout.strip()
+
+    real_popen = subprocess.Popen
+    seen_argv: list[list[str]] = []
+
+    def capturing_popen(argv, **kwargs):
+        if argv[:1] == ["git"]:
+            seen_argv.append(list(argv))
+        return real_popen(argv, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_git_safety.subprocess, "Popen", capturing_popen)
+        result = _git_safety.run_git_bounded_preview(
+            repo, "-c", "extra.override=1", "cat-file", "-p", sha, limit=1024
+        )
+
+    assert result.stdout == b"hi\n"
+    assert len(seen_argv) == 1
+    argv = seen_argv[0]
+    for baseline_arg in BASELINE_ARGS:
+        assert baseline_arg in argv
+    assert argv.index("--no-pager") < argv.index("cat-file")
+    assert "extra.override=1" in argv
+    assert argv.index("extra.override=1") < argv.index("cat-file")
+
+
+# ---------------------------------------------------------------------------
 # Path-safe index/tree lookup: never `:<path>` or `<commit>:<path>`
 # revision syntax; exactly-one-record discipline; mode/type validation.
 # ---------------------------------------------------------------------------

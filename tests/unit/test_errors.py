@@ -96,6 +96,16 @@ def test_domain_of_matches_the_fixed_mapping(code: ErrorCode) -> None:
         (ErrorCode.POLICY_VIOLATION_SEVERE, ErrorDomain.POLICY),
         (ErrorCode.INTERNAL_INVARIANT_VIOLATION, ErrorDomain.INTERNAL),
         (ErrorCode.UNCLASSIFIED_FAILURE, ErrorDomain.INTERNAL),
+        (ErrorCode.EVIDENCE_CAPTURE_FAILED, ErrorDomain.EVIDENCE),
+        (ErrorCode.EVIDENCE_INCOMPLETE, ErrorDomain.EVIDENCE),
+        (ErrorCode.EVIDENCE_ARTIFACT_COLLISION, ErrorDomain.EVIDENCE),
+        (ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED, ErrorDomain.EVIDENCE),
+        (ErrorCode.CHECKPOINT_REF_UPDATE_REJECTED, ErrorDomain.LIFECYCLE),
+        (ErrorCode.CHECKPOINT_REF_OPERATION_FAILED, ErrorDomain.LIFECYCLE),
+        (ErrorCode.CHECKPOINT_REF_UNEXPECTED_STATE, ErrorDomain.LIFECYCLE),
+        (ErrorCode.CHECKPOINT_REF_OUTCOME_UNKNOWN, ErrorDomain.LIFECYCLE),
+        (ErrorCode.WORKSPACE_ENTRY_GATE_FAILED, ErrorDomain.LIFECYCLE),
+        (ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED, ErrorDomain.LIFECYCLE),
     ],
 )
 def test_specific_code_to_domain_assignments(
@@ -120,6 +130,8 @@ def test_error_domain_values_are_pinned() -> None:
         "persistence",
         "policy",
         "internal",
+        "evidence",
+        "lifecycle",
     }
 
 
@@ -143,6 +155,16 @@ def test_error_code_values_are_pinned() -> None:
         "policy_violation_severe",
         "internal_invariant_violation",
         "unclassified_failure",
+        "evidence_capture_failed",
+        "evidence_incomplete",
+        "evidence_artifact_collision",
+        "evidence_durability_unconfirmed",
+        "checkpoint_ref_update_rejected",
+        "checkpoint_ref_operation_failed",
+        "checkpoint_ref_unexpected_state",
+        "checkpoint_ref_outcome_unknown",
+        "workspace_entry_gate_failed",
+        "lifecycle_cleanup_unconfirmed",
     }
 
 
@@ -203,9 +225,17 @@ def test_no_error_code_exists_for_plan_rejection() -> None:
 
 def test_no_error_code_exists_for_incomplete_model_response() -> None:
     """events.ModelResponseStatus.INCOMPLETE plus incomplete_reason
-    already cover this; it's a model-behavior outcome, not a system
-    failure, so no ErrorCode represents it."""
-    assert not any("incomplete" in c.value for c in ErrorCode)
+    already cover a model response finishing incomplete; it's a
+    model-behavior outcome, not a system failure, so no ErrorCode
+    represents *that*. ErrorCode.EVIDENCE_INCOMPLETE is a distinct,
+    later-introduced concept (a durable evidence capture truncated at
+    its fixed size bound, or an untracked path found at teardown — ADR
+    0003 Amendment 2) and does not represent model-response
+    incompleteness; this narrows the original blanket substring check
+    to what it actually meant to guard."""
+    model_response_codes = {ErrorCode.MODEL_RESPONSE_FAILED_STATUS, ErrorCode.MODEL_RESPONSE_MALFORMED}
+    assert not any("incomplete" in c.value for c in model_response_codes)
+    assert ErrorCode.EVIDENCE_INCOMPLETE not in model_response_codes
 
 
 def test_severe_policy_violation_is_the_only_policy_error_code() -> None:

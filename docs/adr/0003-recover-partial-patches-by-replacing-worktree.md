@@ -502,16 +502,93 @@ obligation.
 
 ## Amendment 2 (Accepted 2026-09-17): lazy checkpoint establishment, durable evidence capture, gated teardown, and terminal precedence
 
-Implementation status: **not implemented.** This amendment records
+Implementation status: **implemented (2026-09-17) and locally verified
+on macOS with a real Docker daemon; Linux CI validation is pending.**
+`src/codeagent/evidence.py` (`FilesystemEvidenceSink`), the
+`Workspace`/`CheckpointSessionLike` integration in
+`src/codeagent/controller.py` (`RunController._terminate`,
+`_dispatch_apply_patch`'s ADR 0003 Amendment 1/2 ordering,
+`_map_checkpoint_error`), `initial_commit`/`entry_gate`/`dispose`/
+`preserve` in `src/codeagent/workspace.py`, and the structured
+`ContainerCleanupStatus` threading in `src/codeagent/executor.py` now
+exist and are exercised by real, non-mocked tests: `tests/unit/
+test_evidence.py` (37 tests, current; including real hostile
+external-diff/textconv/clean/process filter positive controls),
+`tests/unit/test_workspace.py`'s 2B-2 additions, `tests/unit/
+test_executor.py`'s cleanup-status matrix, `tests/integration/
+test_controller.py`'s fake-collaborator integration, and
+`tests/integration/test_slice_b.py`/`test_slice_c.py`'s real
+worktree + real checkpoint-ref + real evidence-artifact + (for
+slice C) real Docker end-to-end runs — the latter confirming the
+checkpoint ref and worktree are both genuinely absent, the evidence
+artifact is genuinely published with correct framing/hash, and no
+container is left behind. See `ENGINEERING_LOG.md`'s 2B-2
+implementation entry for the exact file list, defect list, and what
+remains unverified (Linux, SHA-256 object format, and the broader
+G-list of exhaustive scenarios this pass did not each get a dedicated
+test for).
+
+**Correction pass (2026-09-17), narrowing this amendment's "every
+parent path component is validated symlink-free" wording below** — in
+two stages:
+
+1. A first implementation attempt used an "already exists on disk"
+   boundary to decide which components to check, exempting components
+   above the deepest pre-existing ancestor. This was found, by a real
+   fixture, to have two defects — it falsely rejected legitimate paths
+   under macOS's own ambient `/tmp`/`/var`/`/etc` symlinks, and, more
+   seriously, it silently stopped validating *any* intermediate
+   component once the full output path already existed on disk (e.g. a
+   shared output directory reused across runs), letting a hostile
+   symlink planted at an already-materialized intermediate component go
+   completely unchecked. Fixed by checking every component
+   unconditionally, existing or not, exempting only a small, fixed,
+   named allowlist (`/tmp`, `/var`, `/etc`).
+2. That named allowlist was itself found too permissive: it trusted
+   those three names on **every** platform by name alone, with no
+   verification of what they actually resolve to. The accepted,
+   final policy — **`_is_verified_ambient_symlink` in
+   `src/codeagent/evidence.py`** — narrows this twice further: the
+   exception is consulted only when the running platform is actually
+   verified macOS/Darwin (`_current_platform_is_darwin`, since Linux
+   does not make these three paths symlinks at all and trusting the
+   bare names there would accept a hostile symlink with no ambient
+   meaning), and even then a component is exempted only if its fully
+   resolved real target exactly matches the recorded expectation
+   (`_MACOS_AMBIENT_SYMLINK_TARGETS`: `/tmp` → `/private/tmp`, `/var` →
+   `/private/var`, `/etc` → `/private/etc`, confirmed against a real
+   macOS host via `os.readlink`). A symlink merely named `/tmp`, `/var`,
+   or `/etc` but redirected elsewhere, or any of the three on a
+   non-Darwin platform, is refused exactly like any other hostile
+   symlink component.
+
+The accepted policy is therefore: every component of the
+caller-specified output path is checked for being a symlink
+**unconditionally**, regardless of whether it or the full path already
+exists, except for this narrow, platform-gated, target-verified
+exception for the three named macOS paths. This is a narrowing of the
+literal "every parent path component" wording to "every component
+except this platform-gated, target-verified named exception," not a
+reversal of the containment or symlink-refusal requirement itself. See
+`tests/unit/test_evidence.py::test_intermediate_symlink_is_refused_even_when_the_final_directory_already_exists`
+for the first reproducing fixture, and
+`test_ambient_symlink_with_mismatched_target_is_refused_even_on_darwin`/
+`test_ambient_symlink_is_refused_on_a_non_darwin_platform` for the
+second. This status note does not otherwise revise anything in this
+amendment's decision text below, which remains the accepted design as
+written.
+
+Original planning-time status, preserved for the historical record (now
+superseded by the implementation status above): this amendment records
 author decisions reached through a multi-round planning-only
 architecture review for Milestone 2 Slice 2B-2 (integrating
 `checkpoint_ref.py`/`checkpoint_session.py` into `controller.py`/
 `workspace.py`/`patch.py`). Every empirical claim below was verified by
 real, positive-controlled Git probes in scratch directories during that
-review, not asserted from documentation. Nothing in this amendment
-exists in production code yet; Slice 2B-1 (`checkpoint_ref.py`'s
-`MutationOutcome`, `checkpoint_session.py`) remains implemented and
-unwired, exactly as recorded in `ENGINEERING_LOG.md`.
+review, not asserted from documentation. At the time this amendment was
+accepted, nothing in it existed in production code yet; Slice 2B-1
+(`checkpoint_ref.py`'s `MutationOutcome`, `checkpoint_session.py`) was
+implemented and unwired, exactly as recorded in `ENGINEERING_LOG.md`.
 
 ### 1. Lazy checkpoint establishment (narrows Amendment 1 point 4)
 

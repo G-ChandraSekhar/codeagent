@@ -136,6 +136,7 @@ def _make_baseline_recorded(**overrides: object) -> events.BaselineRecorded:
         command=("pytest",),
         exit_code=0,
         duration_seconds=1.0,
+        cleanup_status=events.ContainerCleanupStatus.CONFIRMED_ABSENT,
     )
     kwargs.update(overrides)
     return events.BaselineRecorded(**make_envelope(state=domain.RunState.BASELINE), **kwargs)
@@ -873,6 +874,12 @@ _TOOL_COMPLETED_PATCH_ERROR_CODES = [
     ErrorCode.PATCH_APPLICATION_FAILED,
     ErrorCode.PATCH_UNSUPPORTED_GIT_SUBSTRATE,
     ErrorCode.PATCH_REPOSITORY_OBJECTS_UNAVAILABLE,
+    ErrorCode.WORKSPACE_ENTRY_GATE_FAILED,
+    ErrorCode.CHECKPOINT_REF_UPDATE_REJECTED,
+    ErrorCode.CHECKPOINT_REF_OPERATION_FAILED,
+    ErrorCode.CHECKPOINT_REF_UNEXPECTED_STATE,
+    ErrorCode.CHECKPOINT_REF_OUTCOME_UNKNOWN,
+    ErrorCode.INTERNAL_INVARIANT_VIOLATION,
 ]
 _ALL_TOOL_NAMES = list(domain.ToolName)
 _NON_PATCH_TOOL_NAMES = [t for t in _ALL_TOOL_NAMES if t is not domain.ToolName.APPLY_PATCH]
@@ -1181,6 +1188,7 @@ def _make_verification_completed(**overrides: object) -> events.VerificationComp
         duration_seconds=2.0,
         fail_to_pass=("tests/test_retry.py::test_idempotent",),
         pass_to_pass_broken=(),
+        cleanup_status=events.ContainerCleanupStatus.CONFIRMED_ABSENT,
     )
     kwargs.update(overrides)
     return events.VerificationCompleted(**make_envelope(state=domain.RunState.VERIFY), **kwargs)
@@ -1597,6 +1605,7 @@ def test_event_type_values_are_pinned() -> None:
         "verification_completed",
         "budget_exceeded",
         "run_finished",
+        "evidence_captured",
     }
 
 
@@ -1619,3 +1628,311 @@ def test_model_response_status_values_are_pinned() -> None:
         "queued",
         "incomplete",
     }
+
+
+# --------------------------------------------------------------------
+# ContainerCleanupStatus (Milestone 2 slice 2B-2)
+# --------------------------------------------------------------------
+
+
+def test_container_cleanup_status_values_are_pinned() -> None:
+    assert {s.value for s in events.ContainerCleanupStatus} == {
+        "not_applicable",
+        "confirmed_absent",
+        "unconfirmed",
+    }
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        events.VerificationOutcome.PASSED,
+        events.VerificationOutcome.TEST_FAILURE,
+        events.VerificationOutcome.TIMEOUT,
+    ],
+)
+def test_unconfirmed_cleanup_status_is_rejected_for_non_environment_failure_outcomes(
+    outcome: events.VerificationOutcome,
+) -> None:
+    exit_code = 0 if outcome is events.VerificationOutcome.PASSED else 1
+    error = None
+    if outcome is events.VerificationOutcome.TIMEOUT:
+        error = OperationalError(code=ErrorCode.EXECUTOR_TIMEOUT, error_id="e-1", message="m")
+    with pytest.raises(ValueError):
+        events.validate_verification_outcome_shape(
+            outcome, exit_code, error, events.ContainerCleanupStatus.UNCONFIRMED
+        )
+
+
+def test_unconfirmed_cleanup_status_is_accepted_for_environment_failure() -> None:
+    error = OperationalError(
+        code=ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE, error_id="e-1", message="m"
+    )
+    events.validate_verification_outcome_shape(
+        events.VerificationOutcome.ENVIRONMENT_FAILURE,
+        None,
+        error,
+        events.ContainerCleanupStatus.UNCONFIRMED,
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        events.VerificationOutcome.PASSED,
+        events.VerificationOutcome.TEST_FAILURE,
+        events.VerificationOutcome.TIMEOUT,
+    ],
+)
+def test_not_applicable_cleanup_status_is_rejected_for_a_ran_container(
+    outcome: events.VerificationOutcome,
+) -> None:
+    exit_code = 0 if outcome is events.VerificationOutcome.PASSED else 1
+    error = None
+    if outcome is events.VerificationOutcome.TIMEOUT:
+        error = OperationalError(code=ErrorCode.EXECUTOR_TIMEOUT, error_id="e-1", message="m")
+    with pytest.raises(ValueError):
+        events.validate_verification_outcome_shape(
+            outcome, exit_code, error, events.ContainerCleanupStatus.NOT_APPLICABLE
+        )
+
+
+def test_not_applicable_cleanup_status_is_accepted_for_command_start_failure() -> None:
+    error = OperationalError(
+        code=ErrorCode.EXECUTOR_COMMAND_START_FAILED, error_id="e-1", message="m"
+    )
+    events.validate_verification_outcome_shape(
+        events.VerificationOutcome.COMMAND_START_FAILURE,
+        None,
+        error,
+        events.ContainerCleanupStatus.NOT_APPLICABLE,
+    )
+
+
+def test_confirmed_absent_cleanup_status_is_legal_for_every_outcome() -> None:
+    for outcome, exit_code, error in [
+        (events.VerificationOutcome.PASSED, 0, None),
+        (events.VerificationOutcome.TEST_FAILURE, 1, None),
+        (
+            events.VerificationOutcome.TIMEOUT,
+            None,
+            OperationalError(code=ErrorCode.EXECUTOR_TIMEOUT, error_id="e", message="m"),
+        ),
+        (
+            events.VerificationOutcome.ENVIRONMENT_FAILURE,
+            None,
+            OperationalError(code=ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE, error_id="e", message="m"),
+        ),
+        (
+            events.VerificationOutcome.COMMAND_START_FAILURE,
+            None,
+            OperationalError(code=ErrorCode.EXECUTOR_COMMAND_START_FAILED, error_id="e", message="m"),
+        ),
+    ]:
+        events.validate_verification_outcome_shape(
+            outcome, exit_code, error, events.ContainerCleanupStatus.CONFIRMED_ABSENT
+        )
+
+
+def test_baseline_recorded_rejects_unconfirmed_cleanup_with_passed_outcome() -> None:
+    with pytest.raises(ValueError):
+        _make_baseline_recorded(cleanup_status=events.ContainerCleanupStatus.UNCONFIRMED)
+
+
+def test_verification_completed_rejects_not_applicable_cleanup_with_passed_outcome() -> None:
+    with pytest.raises(ValueError):
+        _make_verification_completed(cleanup_status=events.ContainerCleanupStatus.NOT_APPLICABLE)
+
+
+# --------------------------------------------------------------------
+# EvidenceCaptured (Milestone 2 slice 2B-2)
+# --------------------------------------------------------------------
+
+
+def _receipt(**overrides: object) -> dict[str, object]:
+    kwargs: dict[str, object] = dict(
+        artifact_id="lifecycle-abc123",
+        sha256_payload="a" * 64,
+        bytes_written=42,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_evidence_captured_complete_shape() -> None:
+    e = events.EvidenceCaptured(
+        **make_envelope(state=domain.RunState.DONE),
+        success=True,
+        complete=True,
+        **_receipt(),
+    )
+    assert e.success is True
+    assert e.error is None
+
+
+def test_evidence_captured_complete_requires_receipt() -> None:
+    with pytest.raises(ValueError):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE), success=True, complete=True
+        )
+
+
+def test_evidence_captured_incomplete_shape() -> None:
+    e = events.EvidenceCaptured(
+        **make_envelope(state=domain.RunState.DONE),
+        success=False,
+        complete=False,
+        error=OperationalError(code=ErrorCode.EVIDENCE_INCOMPLETE, error_id="e-1", message="m"),
+        **_receipt(),
+    )
+    assert e.error.code is ErrorCode.EVIDENCE_INCOMPLETE
+
+
+def test_evidence_captured_incomplete_requires_receipt() -> None:
+    with pytest.raises(ValueError):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE),
+            success=False,
+            complete=False,
+            error=OperationalError(code=ErrorCode.EVIDENCE_INCOMPLETE, error_id="e-1", message="m"),
+        )
+
+
+def test_evidence_captured_incomplete_rejects_complete_true() -> None:
+    with pytest.raises(ValueError):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE),
+            success=False,
+            complete=True,
+            error=OperationalError(code=ErrorCode.EVIDENCE_INCOMPLETE, error_id="e-1", message="m"),
+            **_receipt(),
+        )
+
+
+def test_evidence_captured_durability_unconfirmed_shape() -> None:
+    e = events.EvidenceCaptured(
+        **make_envelope(state=domain.RunState.DONE),
+        success=False,
+        complete=True,
+        error=OperationalError(
+            code=ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED, error_id="e-1", message="m"
+        ),
+        **_receipt(),
+    )
+    assert e.error.code is ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED
+    assert e.complete is True
+
+
+def test_evidence_captured_durability_unconfirmed_requires_receipt() -> None:
+    with pytest.raises(ValueError):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE),
+            success=False,
+            complete=True,
+            error=OperationalError(
+                code=ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED, error_id="e-1", message="m"
+            ),
+        )
+
+
+def test_evidence_captured_durability_unconfirmed_rejects_complete_false() -> None:
+    """Correction pass (defect 4): ADR 0003 Amendment 2's terminal
+    precedence requires EVIDENCE_INCOMPLETE to win over
+    EVIDENCE_DURABILITY_UNCONFIRMED when both apply — this pairing must
+    be structurally impossible to construct, not merely avoided by
+    convention in evidence.py."""
+    with pytest.raises(ValueError, match="EVIDENCE_DURABILITY_UNCONFIRMED requires complete=True"):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE),
+            success=False,
+            complete=False,
+            error=OperationalError(
+                code=ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED, error_id="e-1", message="m"
+            ),
+            **_receipt(),
+        )
+
+
+@pytest.mark.parametrize(
+    "code", [ErrorCode.EVIDENCE_CAPTURE_FAILED, ErrorCode.EVIDENCE_ARTIFACT_COLLISION]
+)
+def test_evidence_captured_no_receipt_shapes(code: ErrorCode) -> None:
+    e = events.EvidenceCaptured(
+        **make_envelope(state=domain.RunState.DONE),
+        success=False,
+        complete=False,
+        error=OperationalError(code=code, error_id="e-1", message="m"),
+    )
+    assert e.artifact_id is None
+    assert e.sha256_payload is None
+    assert e.bytes_written is None
+
+
+@pytest.mark.parametrize(
+    "code", [ErrorCode.EVIDENCE_CAPTURE_FAILED, ErrorCode.EVIDENCE_ARTIFACT_COLLISION]
+)
+def test_evidence_captured_no_receipt_shapes_reject_a_receipt(code: ErrorCode) -> None:
+    with pytest.raises(ValueError):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE),
+            success=False,
+            complete=False,
+            error=OperationalError(code=code, error_id="e-1", message="m"),
+            **_receipt(),
+        )
+
+
+def test_evidence_captured_rejects_partial_receipt() -> None:
+    with pytest.raises(ValueError):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE),
+            success=True,
+            complete=True,
+            artifact_id="a",
+            sha256_payload=None,
+            bytes_written=1,
+        )
+
+
+def test_evidence_captured_rejects_error_when_success() -> None:
+    with pytest.raises(ValueError):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE),
+            success=True,
+            complete=True,
+            error=OperationalError(code=ErrorCode.EVIDENCE_INCOMPLETE, error_id="e-1", message="m"),
+            **_receipt(),
+        )
+
+
+def test_evidence_captured_requires_error_when_failed() -> None:
+    with pytest.raises(ValueError):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE), success=False, complete=False
+        )
+
+
+def test_evidence_captured_rejects_success_true_with_complete_false() -> None:
+    with pytest.raises(ValueError):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE),
+            success=True,
+            complete=False,
+            **_receipt(),
+        )
+
+
+def test_evidence_captured_rejects_wrong_error_code() -> None:
+    with pytest.raises(ValueError):
+        events.EvidenceCaptured(
+            **make_envelope(state=domain.RunState.DONE),
+            success=False,
+            complete=False,
+            error=OperationalError(
+                code=ErrorCode.EXECUTOR_TIMEOUT, error_id="e-1", message="m"
+            ),
+        )
+
+
+def test_evidence_captured_is_registered_in_event_type_registry() -> None:
+    assert events.EVENT_CLASSES_BY_TYPE[events.EventType.EVIDENCE_CAPTURED] is events.EvidenceCaptured

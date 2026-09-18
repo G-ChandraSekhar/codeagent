@@ -219,15 +219,38 @@ class DockerVerifier:
 
     def _attempt(
         self, name: str, label: str
-    ) -> tuple[bool, events.VerificationOutcome, int | None, str, str, OperationalError | None]:
+    ) -> tuple[
+        bool, bool, events.VerificationOutcome, int | None, str, str, OperationalError | None
+    ]:
         """Runs create -> start -> inspect for one container and returns
-        (created, outcome, exit_code, stdout, stderr, error) — a
-        provisional result. Never raises: every failure mode here is
-        turned into a returned outcome instead of propagating, so the
-        caller's cleanup step always runs regardless of what happened
-        here, and never has to guess whether a container might exist
-        from inside an exception handler."""
+        (create_attempted, created, outcome, exit_code, stdout, stderr,
+        error) — a provisional result. Never raises: every failure mode
+        here is turned into a returned outcome instead of propagating,
+        so the caller's cleanup step always runs regardless of what
+        happened here, and never has to guess whether a container might
+        exist from inside an exception handler.
+
+        `create_attempted` is set to `True` immediately before the
+        `docker create` invocation — including when that invocation
+        itself raises `_DockerLaunchError` (the docker executable could
+        not even be launched). This means a bare launch failure is
+        still treated as "attempted": cleanup must still be confirmed
+        for it (conservatively — nothing was actually created, so
+        confirmation always finds it genuinely absent), never reported
+        as `NOT_APPLICABLE`. `NOT_APPLICABLE` is reserved for a failure
+        that occurs strictly *before* this point — none exists in this
+        implementation today (nothing here validates anything between
+        entering `_attempt` and issuing the create call), so it remains
+        structurally reachable for a future pre-create check rather
+        than produced by any path today; see
+        `_cleanup_status_for`'s dedicated unit tests for how that case
+        is still verified directly, and `created` — distinct from
+        `create_attempted` — for whether a container object might
+        actually exist afterward.
+        """
+        create_attempted = False
         try:
+            create_attempted = True
             create_result = _run_docker(
                 "create",
                 "--name",
@@ -242,6 +265,7 @@ class DockerVerifier:
             )
         except _DockerLaunchError:
             return (
+                create_attempted,
                 False,
                 events.VerificationOutcome.COMMAND_START_FAILURE,
                 None,
@@ -255,6 +279,7 @@ class DockerVerifier:
             )
         if create_result.returncode != 0:
             return (
+                create_attempted,
                 False,
                 events.VerificationOutcome.ENVIRONMENT_FAILURE,
                 None,
@@ -273,6 +298,7 @@ class DockerVerifier:
             )
         except _DockerLaunchError:
             return (
+                create_attempted,
                 True,
                 events.VerificationOutcome.COMMAND_START_FAILURE,
                 None,
@@ -287,6 +313,7 @@ class DockerVerifier:
 
         if timed_out:
             return (
+                create_attempted,
                 True,
                 events.VerificationOutcome.TIMEOUT,
                 None,
@@ -300,6 +327,7 @@ class DockerVerifier:
             )
         if status != "exited" or exit_code is None or oom_killed is None:
             return (
+                create_attempted,
                 True,
                 events.VerificationOutcome.ENVIRONMENT_FAILURE,
                 None,
@@ -320,6 +348,7 @@ class DockerVerifier:
         # never raw Docker inspect payloads or daemon output.
         if oom_killed:
             return (
+                create_attempted,
                 True,
                 events.VerificationOutcome.ENVIRONMENT_FAILURE,
                 exit_code,
@@ -332,22 +361,63 @@ class DockerVerifier:
                 ),
             )
         if exit_code == 0:
-            return True, events.VerificationOutcome.PASSED, 0, stdout_text, stderr_text, None
-        return True, events.VerificationOutcome.TEST_FAILURE, exit_code, stdout_text, stderr_text, None
+            return (
+                create_attempted,
+                True,
+                events.VerificationOutcome.PASSED,
+                0,
+                stdout_text,
+                stderr_text,
+                None,
+            )
+        return (
+            create_attempted,
+            True,
+            events.VerificationOutcome.TEST_FAILURE,
+            exit_code,
+            stdout_text,
+            stderr_text,
+            None,
+        )
+
+    @staticmethod
+    def _cleanup_status_for(
+        *, create_attempted: bool, confirmed_absent: bool
+    ) -> events.ContainerCleanupStatus:
+        """The structural mapping from (create_attempted, cleanup
+        confirmation) to a `ContainerCleanupStatus` — factored out as a
+        pure function so `NOT_APPLICABLE` (a case `_attempt` cannot
+        currently produce, since nothing today fails before the create
+        call) can still be verified directly."""
+        if not create_attempted:
+            return events.ContainerCleanupStatus.NOT_APPLICABLE
+        return (
+            events.ContainerCleanupStatus.CONFIRMED_ABSENT
+            if confirmed_absent
+            else events.ContainerCleanupStatus.UNCONFIRMED
+        )
 
     def _execute(self, label: str) -> VerificationResult:
         start = self._clock.monotonic()
         name = f"{CONTAINER_NAME_PREFIX}{label}-{uuid4().hex[:12]}"
 
-        created, outcome, exit_code, stdout_text, stderr_text, error = self._attempt(name, label)
+        create_attempted, _created, outcome, exit_code, stdout_text, stderr_text, error = (
+            self._attempt(name, label)
+        )
 
-        # Cleanup and its confirmation run unconditionally — whatever
-        # _attempt returned above is provisional until this succeeds.
-        cleanup_confirmed = self._cleanup(name) if created else True
+        # Cleanup confirmation runs unconditionally whenever creation
+        # was attempted — regardless of whether create itself failed,
+        # a launch failure occurred, or the container ran to completion
+        # — since any of those can leave a real container object
+        # behind. Only a genuine "never attempted" case skips it.
+        confirmed_absent = self._cleanup(name) if create_attempted else True
+        cleanup_status = self._cleanup_status_for(
+            create_attempted=create_attempted, confirmed_absent=confirmed_absent
+        )
 
         duration = self._clock.monotonic() - start
 
-        if not cleanup_confirmed:
+        if cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED:
             # Overrides any provisional outcome, including a would-be
             # PASSED: a cleanup attempt is not a cleanup guarantee, and
             # this module never reports a successful run it can't also
@@ -358,6 +428,7 @@ class DockerVerifier:
                 duration_seconds=duration,
                 stdout=stdout_text,
                 stderr=stderr_text,
+                cleanup_status=cleanup_status,
                 error=self._error(
                     ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
                     label,
@@ -371,6 +442,7 @@ class DockerVerifier:
             duration_seconds=duration,
             stdout=stdout_text,
             stderr=stderr_text,
+            cleanup_status=cleanup_status,
             error=error,
         )
 

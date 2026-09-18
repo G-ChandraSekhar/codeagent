@@ -37,10 +37,19 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Protocol
 
 from codeagent import domain, events
+from codeagent.checkpoint_ref import (
+    LIFECYCLE_ID_RE,
+    CheckpointRefError,
+    CheckpointRefFailure,
+    MutationOutcome,
+)
+from codeagent.checkpoint_session import CheckpointIntent, CheckpointSessionError
 from codeagent.errors import ErrorCode, OperationalError
+from codeagent.evidence import EvidenceReceipt, EvidenceSink
 
 
 def _canonical_json(payload: dict[str, object]) -> str:
@@ -171,10 +180,13 @@ class VerificationResult:
     duration_seconds: float
     stdout: str
     stderr: str
+    cleanup_status: events.ContainerCleanupStatus
     error: OperationalError | None = None
 
     def __post_init__(self) -> None:
-        events.validate_verification_outcome_shape(self.outcome, self.exit_code, self.error)
+        events.validate_verification_outcome_shape(
+            self.outcome, self.exit_code, self.error, self.cleanup_status
+        )
         if not math.isfinite(self.duration_seconds) or self.duration_seconds < 0:
             raise ValueError(
                 f"duration_seconds must be finite and >= 0, got {self.duration_seconds!r}"
@@ -269,6 +281,46 @@ class Verifier(Protocol):
     def run(self, attempt_index: int) -> VerificationResult: ...
 
 
+class Workspace(Protocol):
+    """The narrow slice of `codeagent.workspace.GitWorktree` the
+    controller needs (Milestone 2 slice 2B-2): the two real paths
+    evidence capture needs, the sole trusted initial-checkpoint SHA, the
+    entry gate, and the dispose/preserve ownership-transfer pair. A
+    fake implementing this Protocol never touches a filesystem or Git
+    at all — see `tests.support.fakes.FakeWorkspace`.
+    """
+
+    @property
+    def path(self) -> Path: ...
+    @property
+    def source_repo_path(self) -> Path: ...
+    @property
+    def initial_commit(self) -> str: ...
+    def entry_gate(self, expected_commit: str) -> None: ...
+    def dispose(self) -> None: ...
+    def preserve(self) -> None: ...
+
+
+class CheckpointSessionLike(Protocol):
+    """The narrow slice of `codeagent.checkpoint_session.CheckpointSession`
+    the controller needs. Implementations — real or fake — must raise
+    `codeagent.checkpoint_ref.CheckpointRefError` for a Git-level
+    checkpoint-ref failure and `codeagent.checkpoint_session.
+    CheckpointSessionError` for a session-state misuse, exactly like
+    the real `CheckpointSession`, so the controller's exact
+    reason/outcome mapping (`_map_checkpoint_error`) works uniformly
+    for both — see `tests.support.fakes.FakeCheckpointSession`.
+    """
+
+    @property
+    def intent(self) -> CheckpointIntent: ...
+    @property
+    def accepted_sha(self) -> str | None: ...
+    def establish(self, initial_sha: str) -> None: ...
+    def advance(self, new_sha: str) -> None: ...
+    def delete(self) -> None: ...
+
+
 class PatchApplier(Protocol):
     """Applies whatever patch the implementation is configured with and
     reports what actually happened. Deliberately does not take the full
@@ -298,13 +350,16 @@ class RunConfig:
     run_id: str
     task_statement: str
     approval_mode: domain.ApprovalMode
+    # ADR 0004's internal, validated 128-bit lowercase-hex lifecycle
+    # identity — the sole owner of this run's checkpoint ref namespace
+    # (Milestone 2 slice 2B-2). Required: every run has exactly one
+    # lifecycle. Minted only via codeagent.checkpoint_ref.new_lifecycle_id()
+    # by the trusted composition root — never derived from run_id or any
+    # other caller-supplied text.
+    lifecycle_id: str = ""
     # Real worktree path when one exists (slice B); a placeholder URI
     # when the run has no real repository at all (slice A, fully faked).
     repository_path: str = "fixture://synthetic"
-    # The commit RunController should cite as the first patch's parent
-    # checkpoint — the real worktree's starting commit, when known.
-    # None when there's no real repository (slice A).
-    initial_checkpoint_id: str | None = None
     # Repairs allowed *after* the initial verification attempt: max=0
     # permits the initial attempt but no repair; max=2 permits the
     # initial attempt plus two repairs (3 verification attempts total).
@@ -322,6 +377,8 @@ class RunConfig:
             raise ValueError("task_statement must be a nonempty string")
         if not self.repository_path:
             raise ValueError("repository_path must be a nonempty string")
+        if not LIFECYCLE_ID_RE.fullmatch(self.lifecycle_id or ""):
+            raise ValueError("lifecycle_id must be exactly 32 lowercase hexadecimal characters")
         _require_nonnegative_int("max_repair_iterations", self.max_repair_iterations)
         _require_nonnegative_int("max_plan_revisions", self.max_plan_revisions)
 
@@ -380,6 +437,9 @@ class RunController:
         verifier: Verifier,
         patch_applier: PatchApplier,
         reader: RepositoryReader,
+        workspace: Workspace,
+        session: CheckpointSessionLike,
+        evidence_sink: EvidenceSink,
         clock: Clock | None = None,
         event_log: EventLog | None = None,
     ) -> None:
@@ -389,11 +449,23 @@ class RunController:
         self._verifier = verifier
         self._patch_applier = patch_applier
         self._reader = reader
+        self._workspace = workspace
+        self._session = session
+        self._evidence_sink = evidence_sink
         self._clock = clock or SystemClock()
         self.log = event_log or EventLog()
         self.state = domain.RunState.INIT
         self._total_duration = 0.0
-        self._last_checkpoint_id: str | None = config.initial_checkpoint_id
+        # The first checkpoint's parent is the workspace's pinned
+        # starting commit — the sole trusted initial-checkpoint
+        # authority (ADR 0003 Amendment 2), replacing the removed
+        # caller-controlled RunConfig.initial_checkpoint_id.
+        self._last_checkpoint_id: str | None = workspace.initial_commit
+        # Tracked across the whole run (Milestone 2 slice 2B-2): any
+        # single verifier cleanup-unconfirmed occurrence — baseline or
+        # any verification attempt — forces the workspace/ref to be
+        # preserved at terminal teardown, per ADR 0003 Amendment 2.
+        self._any_verifier_cleanup_unconfirmed = False
 
     def _now(self) -> datetime:
         return self._clock.now()
@@ -494,9 +566,12 @@ class RunController:
                 command=self._verifier.command,
                 exit_code=baseline_result.exit_code,
                 duration_seconds=baseline_result.duration_seconds,
+                cleanup_status=baseline_result.cleanup_status,
                 error=baseline_result.error,
             )
         )
+        if baseline_result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED:
+            self._any_verifier_cleanup_unconfirmed = True
         if baseline_result.outcome not in (
             events.VerificationOutcome.PASSED,
             events.VerificationOutcome.TEST_FAILURE,
@@ -505,8 +580,7 @@ class RunController:
             # executor couldn't even establish what "broken" looks
             # like) aborts the run outright — there's nothing to repair
             # towards yet.
-            result = self._transition(0, domain.Trigger.UNRECOVERABLE_ERROR)
-            return self._finish(0, result.terminal_reason, error=baseline_result.error)
+            return self._terminate(0, domain.Trigger.UNRECOVERABLE_ERROR, error=baseline_result.error)
         self._transition(0, domain.Trigger.BASELINE_RECORDED)
 
         pass_index = 0
@@ -524,8 +598,9 @@ class RunController:
                 # outcome, so it aborts the run the same way a baseline
                 # or verification operational failure does, without
                 # consuming any repair/revision budget.
-                result = self._transition(pass_index, domain.Trigger.UNRECOVERABLE_ERROR)
-                return self._finish(pass_index, result.terminal_reason, error=read_error)
+                return self._terminate(
+                    pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=read_error
+                )
             self._transition(pass_index, domain.Trigger.PLAN_PROPOSED)
             self._transition(pass_index, domain.Trigger.PLAN_RECORDED)
 
@@ -542,13 +617,12 @@ class RunController:
                 )
             )
             approval_visit += 1
-            trigger = domain.APPROVAL_DECISION_TO_TRIGGER[decision]
-            result = self._transition(pass_index, trigger)
 
             if decision is domain.ApprovalDecision.REJECTED:
-                return self._finish(pass_index, result.terminal_reason)
+                return self._terminate(pass_index, domain.Trigger.PLAN_REJECTED)
 
             if decision is domain.ApprovalDecision.REVISION_REQUESTED:
+                self._transition(pass_index, domain.Trigger.PLAN_REVISION_REQUESTED)
                 if plan_revisions_used >= c.max_plan_revisions:
                     self._emit(
                         events.BudgetExceeded(
@@ -562,23 +636,26 @@ class RunController:
                             observed_value=plan_revisions_used,
                         )
                     )
-                    result = self._transition(pass_index, domain.Trigger.BUDGET_EXCEEDED)
-                    return self._finish(pass_index, result.terminal_reason)
+                    return self._terminate(pass_index, domain.Trigger.BUDGET_EXCEEDED)
                 plan_revisions_used += 1
                 pass_index += 1
                 continue
 
             # APPROVED -> EXECUTE
+            self._transition(pass_index, domain.Trigger.PLAN_APPROVED)
             patch_ok, patch_error = self._dispatch_apply_patch(pass_index, plan)
             if not patch_ok:
-                result = self._transition(pass_index, domain.Trigger.UNRECOVERABLE_ERROR)
-                return self._finish(pass_index, result.terminal_reason, error=patch_error)
+                return self._terminate(
+                    pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error
+                )
 
-            result = self._transition(pass_index, domain.Trigger.PATCH_APPLIED)
+            self._transition(pass_index, domain.Trigger.PATCH_APPLIED)
 
             verification_result = self._verifier.run(verification_attempt)
             verification_attempt += 1
             self._total_duration += verification_result.duration_seconds
+            if verification_result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED:
+                self._any_verifier_cleanup_unconfirmed = True
             self._emit(
                 events.VerificationCompleted(
                     run_id=c.run_id,
@@ -592,18 +669,18 @@ class RunController:
                     duration_seconds=verification_result.duration_seconds,
                     fail_to_pass=(),
                     pass_to_pass_broken=(),
+                    cleanup_status=verification_result.cleanup_status,
                     error=verification_result.error,
                 )
             )
 
             if verification_result.outcome is events.VerificationOutcome.PASSED:
-                result = self._transition(pass_index, domain.Trigger.VERIFICATION_PASSED)
-                return self._finish(pass_index, result.terminal_reason)
+                return self._terminate(pass_index, domain.Trigger.VERIFICATION_PASSED)
 
             if verification_result.outcome is events.VerificationOutcome.TEST_FAILURE:
                 # An expected domain outcome, not an error: repair if
                 # budget allows.
-                result = self._transition(pass_index, domain.Trigger.VERIFICATION_FAILED)
+                self._transition(pass_index, domain.Trigger.VERIFICATION_FAILED)
                 if repair_iterations_used >= c.max_repair_iterations:
                     self._emit(
                         events.BudgetExceeded(
@@ -617,8 +694,7 @@ class RunController:
                             observed_value=repair_iterations_used,
                         )
                     )
-                    result = self._transition(pass_index, domain.Trigger.BUDGET_EXCEEDED)
-                    return self._finish(pass_index, result.terminal_reason)
+                    return self._terminate(pass_index, domain.Trigger.BUDGET_EXCEEDED)
                 repair_iterations_used += 1
                 pass_index += 1
                 continue  # loop back to EXPLORE for another attempt
@@ -628,8 +704,9 @@ class RunController:
             # repair budget — this isn't a normal repair-triggering
             # failure, it's the executor itself failing to produce a
             # trustworthy result at all.
-            result = self._transition(pass_index, domain.Trigger.UNRECOVERABLE_ERROR)
-            return self._finish(pass_index, result.terminal_reason, error=verification_result.error)
+            return self._terminate(
+                pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=verification_result.error
+            )
 
     def _explore_and_propose_plan(
         self, iteration: int
@@ -787,21 +864,59 @@ class RunController:
         )
         return result, None, tool_call_id
 
+    def _map_checkpoint_error(self, exc: Exception, iteration: int) -> OperationalError:
+        """ADR 0003 Amendment 2's exact reason+MutationOutcome mapping.
+
+        `CheckpointRefError` (a Git-level checkpoint-ref failure): the
+        code is chosen from the confirmed `MutationOutcome`, not the
+        categorical reason alone — the same outcome-first discipline
+        `checkpoint_session.py` itself uses:
+        - `UNCHANGED` with a plain compare-and-swap rejection (no
+          accompanying command/protocol failure) ->
+          `CHECKPOINT_REF_UPDATE_REJECTED`.
+        - `UNCHANGED` accompanying a known command/protocol failure
+          (a timeout, a launch failure, an unacknowledged transaction
+          stage) -> `CHECKPOINT_REF_OPERATION_FAILED`.
+        - `UNEXPECTED` or `SYMBOLIC` -> `CHECKPOINT_REF_UNEXPECTED_STATE`.
+        - `UNKNOWN` (including `TRANSACTION_CLEANUP_UNCONFIRMED`, which
+          always forces `UNKNOWN`) -> `CHECKPOINT_REF_OUTCOME_UNKNOWN`.
+
+        `CheckpointSessionError` (a session-state misuse, e.g. a
+        malformed commit hash, or calling establish/advance from the
+        wrong intent) is a controller-facing invariant violation, not a
+        Git-level failure with an outcome to classify.
+        """
+        if isinstance(exc, CheckpointRefError):
+            if exc.outcome is MutationOutcome.UNCHANGED:
+                code = (
+                    ErrorCode.CHECKPOINT_REF_UPDATE_REJECTED
+                    if exc.reason is CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED
+                    else ErrorCode.CHECKPOINT_REF_OPERATION_FAILED
+                )
+            elif exc.outcome in (MutationOutcome.UNEXPECTED, MutationOutcome.SYMBOLIC):
+                code = ErrorCode.CHECKPOINT_REF_UNEXPECTED_STATE
+            else:
+                code = ErrorCode.CHECKPOINT_REF_OUTCOME_UNKNOWN
+        else:
+            code = ErrorCode.INTERNAL_INVARIANT_VIOLATION
+        return OperationalError(
+            code=code,
+            error_id=f"{self._c.run_id}-checkpoint-{iteration}",
+            message="the checkpoint-ref operation for this patch could not be accepted",
+        )
+
     def _dispatch_apply_patch(
         self, iteration: int, plan: PlanProposal
     ) -> tuple[bool, OperationalError | None]:
-        """Dispatch the patch as a tool call and report exactly what the
-        PatchApplier says happened — never invented data. Returns
-        (ok, error).
-
-        No retry/disposition policy exists yet (deferred by design — see
-        errors.py's module docstring: that decision belongs to a future
-        controller with budget/attempt-count context this one doesn't
-        model). This controller's placeholder policy is the simplest
-        honest one: a failed patch aborts the run as
-        UNRECOVERABLE_ERROR. That is a placeholder, not a considered
-        disposition policy, and is expected to be replaced wholesale
-        once budgets.py exists.
+        """One `apply_patch` transaction, in ADR 0003 Amendment 1/
+        Amendment 2's exact accepted order: ToolRequested,
+        PolicyDecisionRecorded, the workspace entry gate, lazy
+        checkpoint establishment (only from ABSENT), the patch itself,
+        the approved-path postcondition, the checkpoint-ref advance,
+        and only then ToolCompleted(success=True), CheckpointCreated,
+        and PatchApplied — in that order. Every failure emits exactly
+        one `ToolCompleted(success=False)` carrying one `OperationalError`
+        and produces no success-shaped event at all. Returns (ok, error).
         """
         c = self._c
         tool_call_id = f"{c.run_id}-tc-patch-{iteration}"
@@ -812,17 +927,11 @@ class RunController:
             {"file_paths": list(plan.proposed_file_paths)},
         )
 
-        # Real elapsed time — applying a patch is real I/O from slice B
-        # onward (git add/diff/commit for GitPatchApplier), unlike the
-        # still-fake model/approval/verifier durations above.
         start = self._clock.monotonic()
-        result = self._patch_applier.apply(
-            c.run_id, iteration, frozenset(plan.proposed_file_paths)
-        )
-        duration = self._clock.monotonic() - start
-        self._total_duration += duration
 
-        if not result.success:
+        def _fail(error: OperationalError) -> tuple[bool, OperationalError]:
+            duration = self._clock.monotonic() - start
+            self._total_duration += duration
             self._emit(
                 events.ToolCompleted(
                     run_id=c.run_id,
@@ -835,11 +944,71 @@ class RunController:
                     success=False,
                     duration_seconds=duration,
                     result_summary="",
-                    error=result.error,
+                    error=error,
                 )
             )
-            return False, result.error
+            return False, error
 
+        # Step 3: the workspace entry gate. The expected commit is the
+        # sole trusted initial checkpoint SHA while no ref exists yet
+        # (ABSENT), or the ref's currently accepted checkpoint once one
+        # does — never a separately tracked value of this controller's
+        # own.
+        expected_commit = (
+            self._workspace.initial_commit
+            if self._session.intent is CheckpointIntent.ABSENT
+            else self._session.accepted_sha
+        )
+        try:
+            self._workspace.entry_gate(expected_commit)
+        except Exception as exc:  # noqa: BLE001 — any Workspace implementation's own exception type
+            return _fail(
+                OperationalError(
+                    code=ErrorCode.WORKSPACE_ENTRY_GATE_FAILED,
+                    error_id=f"{c.run_id}-gate-{iteration}",
+                    message="the workspace entry gate refused this patch attempt",
+                )
+            )
+
+        # Step 4: lazy establishment, only from ABSENT (ADR 0003
+        # Amendment 1 point 4 / Amendment 2 section 1).
+        if self._session.intent is CheckpointIntent.ABSENT:
+            try:
+                self._session.establish(self._workspace.initial_commit)
+            except (CheckpointRefError, CheckpointSessionError) as exc:
+                return _fail(self._map_checkpoint_error(exc, iteration))
+
+        # Step 5: the patch itself.
+        result = self._patch_applier.apply(
+            c.run_id, iteration, frozenset(plan.proposed_file_paths)
+        )
+        if not result.success:
+            return _fail(result.error)
+
+        # Step 6: the approved-path postcondition — defense-in-depth,
+        # not the primary enforcement (see PatchApplier's docstring and
+        # codeagent.patch.GitPatchApplier.apply, which must reject an
+        # unapproved target before any write or commit happens at all).
+        approved_paths = set(plan.proposed_file_paths)
+        actual_paths = set(result.changed_paths)
+        if not actual_paths.issubset(approved_paths):
+            return _fail(
+                OperationalError(
+                    code=ErrorCode.INTERNAL_INVARIANT_VIOLATION,
+                    error_id=f"{c.run_id}-scope-{iteration}",
+                    message="patch changed files outside the approved plan's proposed_file_paths",
+                )
+            )
+
+        # Step 7: advance the checkpoint ref to the newly accepted commit.
+        try:
+            self._session.advance(result.commit_hash)
+        except (CheckpointRefError, CheckpointSessionError) as exc:
+            return _fail(self._map_checkpoint_error(exc, iteration))
+
+        # Steps 8-10: only now, with the transaction fully accepted.
+        duration = self._clock.monotonic() - start
+        self._total_duration += duration
         self._emit(
             events.ToolCompleted(
                 run_id=c.run_id,
@@ -854,8 +1023,6 @@ class RunController:
                 result_summary=f"{result.operation_count} operation(s) applied",
             )
         )
-        # The checkpoint's identity is the real commit hash — no
-        # separately invented id.
         checkpoint_id = result.commit_hash
         self._emit(
             events.CheckpointCreated(
@@ -883,31 +1050,154 @@ class RunController:
                 diff_bytes=result.diff_bytes,
             )
         )
-
-        # Defense-in-depth postcondition, NOT the primary enforcement:
-        # the primary, preventive check is inside PatchApplier.apply
-        # itself (see PatchApplier's docstring and
-        # codeagent.patch.GitPatchApplier.apply) — it must reject an
-        # unapproved target before any write or commit happens at all.
-        # This check only catches a PatchApplier implementation that
-        # got that wrong (or a future implementation that doesn't
-        # enforce it as strictly) — by the time this runs, the mutation
-        # this checks for would already have happened. What it *does*
-        # still guarantee even then: an out-of-scope change is never
-        # treated as a legitimate step by the rest of the run — the run
-        # is aborted here, before any further budget (a verification
-        # attempt) is spent on it.
-        approved_paths = set(plan.proposed_file_paths)
-        actual_paths = set(result.changed_paths)
-        if not actual_paths.issubset(approved_paths):
-            scope_error = OperationalError(
-                code=ErrorCode.INTERNAL_INVARIANT_VIOLATION,
-                error_id=f"{c.run_id}-scope-{iteration}",
-                message="patch changed files outside the approved plan's proposed_file_paths",
-            )
-            return False, scope_error
-
         return True, None
+
+    def _fallback_evidence_receipt(self, pass_index: int, reason: str) -> EvidenceReceipt:
+        return EvidenceReceipt(
+            success=False,
+            complete=False,
+            artifact_id=None,
+            sha256_payload=None,
+            bytes_written=None,
+            error=OperationalError(
+                code=ErrorCode.EVIDENCE_CAPTURE_FAILED,
+                error_id=f"{self._c.run_id}-evidence-{reason}-{pass_index}",
+                message=f"the evidence capture step failed unexpectedly ({reason})",
+            ),
+        )
+
+    def _capture_evidence(self, pass_index: int) -> EvidenceReceipt:
+        """Always attempted, regardless of the run's underlying domain
+        outcome, and never blocking any subsequent cleanup step (ADR
+        0003 Amendment 2) — including when the `EvidenceSink` itself
+        misbehaves. An `EvidenceSink` is expected to report its own
+        failures as a well-formed `EvidenceReceipt` (see
+        `evidence.FilesystemEvidenceSink`), but this method does not
+        trust that contract blindly: an unexpected exception from
+        either the sink's `capture()` call or from constructing the
+        resulting `EvidenceCaptured` event (e.g. a malformed receipt)
+        is converted into a sanitized `EVIDENCE_CAPTURE_FAILED` result
+        instead of propagating and aborting the rest of `_terminate`.
+        Emitted in the run's current (pre-terminal) state, matching
+        Event's ordering convention for a causative event.
+        """
+        try:
+            receipt = self._evidence_sink.capture(
+                worktree_path=self._workspace.path,
+                source_repo_path=self._workspace.source_repo_path,
+                initial_commit=self._workspace.initial_commit,
+                lifecycle_id=self._c.lifecycle_id,
+            )
+        except Exception:  # noqa: BLE001 — a sink must never be able to block teardown
+            receipt = self._fallback_evidence_receipt(pass_index, "sink-raised")
+
+        try:
+            self._emit(
+                events.EvidenceCaptured(
+                    run_id=self._c.run_id,
+                    sequence=self.log.next_sequence(),
+                    timestamp=self._now(),
+                    state=self.state,
+                    iteration=pass_index,
+                    success=receipt.success,
+                    complete=receipt.complete,
+                    artifact_id=receipt.artifact_id,
+                    sha256_payload=receipt.sha256_payload,
+                    bytes_written=receipt.bytes_written,
+                    error=receipt.error,
+                )
+            )
+        except Exception:  # noqa: BLE001 — a malformed receipt must not block teardown either
+            receipt = self._fallback_evidence_receipt(pass_index, "receipt-malformed")
+            self._emit(
+                events.EvidenceCaptured(
+                    run_id=self._c.run_id,
+                    sequence=self.log.next_sequence(),
+                    timestamp=self._now(),
+                    state=self.state,
+                    iteration=pass_index,
+                    success=False,
+                    complete=False,
+                    error=receipt.error,
+                )
+            )
+        return receipt
+
+    def _terminate(
+        self,
+        pass_index: int,
+        trigger: domain.Trigger,
+        error: OperationalError | None = None,
+    ) -> events.RunFinished:
+        """The single terminal path, replacing every direct
+        `_transition` + `_finish` call (ADR 0003 Amendment 2).
+
+        1. Always attempt durable evidence capture.
+        2. If any verifier result this run was cleanup-UNCONFIRMED:
+           preserve the workspace and skip both worktree disposal and
+           checkpoint-ref deletion.
+        3. Otherwise dispose the workspace.
+        4. If disposal itself could not be confirmed: skip checkpoint-ref
+           deletion (an unconfirmed worktree may still reference it).
+        5. Otherwise delete the checkpoint session's ref (a no-op from
+           ABSENT — no `apply_patch` ever occurred).
+        6. Determine the final trigger/error per the terminal precedence
+           below, perform the (possibly overridden) domain transition,
+           and emit `RunFinished` last.
+
+        Precedence for `RunFinished.error`: any verifier/worktree/ref
+        cleanup unconfirmed > evidence incomplete > evidence durability
+        unconfirmed > evidence artifact collision > evidence capture
+        failure > the original result. A cleanup-unconfirmed or evidence
+        failure always overrides `trigger` to `UNRECOVERABLE_ERROR`,
+        since domain.py's `TerminalReason` has no separate slot for "the
+        original outcome succeeded but teardown did not" — the original
+        `error` (if any) stays exactly where it was already recorded
+        (e.g. on the `ToolCompleted` that reported it); only
+        `RunFinished.error` is replaced.
+        """
+        evidence_receipt = self._capture_evidence(pass_index)
+
+        worktree_cleanup_unconfirmed = False
+        ref_cleanup_unconfirmed = False
+        if self._any_verifier_cleanup_unconfirmed:
+            try:
+                self._workspace.preserve()
+            except Exception:  # noqa: BLE001 — a preserve() failure must not block RunFinished
+                worktree_cleanup_unconfirmed = True
+        else:
+            try:
+                self._workspace.dispose()
+            except Exception:  # noqa: BLE001 — any Workspace implementation's own exception type
+                worktree_cleanup_unconfirmed = True
+            if not worktree_cleanup_unconfirmed:
+                try:
+                    self._session.delete()
+                except Exception:  # noqa: BLE001 — CheckpointRefError or a fake's own type
+                    ref_cleanup_unconfirmed = True
+
+        cleanup_unconfirmed = (
+            self._any_verifier_cleanup_unconfirmed
+            or worktree_cleanup_unconfirmed
+            or ref_cleanup_unconfirmed
+        )
+
+        final_trigger = trigger
+        final_error = error
+        if cleanup_unconfirmed:
+            final_trigger = domain.Trigger.UNRECOVERABLE_ERROR
+            final_error = OperationalError(
+                code=ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED,
+                error_id=f"{self._c.run_id}-cleanup-{pass_index}",
+                message="a verifier container, worktree, or checkpoint-ref cleanup step "
+                "could not be confirmed",
+            )
+        elif not evidence_receipt.success:
+            final_trigger = domain.Trigger.UNRECOVERABLE_ERROR
+            final_error = evidence_receipt.error
+
+        result = self._transition(pass_index, final_trigger)
+        return self._finish(pass_index, result.terminal_reason, error=final_error)
 
     def _finish(
         self,

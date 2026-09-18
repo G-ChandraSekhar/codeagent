@@ -316,7 +316,48 @@ def test_cleanup_exact_name_match_not_fooled_by_similar_names(monkeypatch, tmp_p
 # --------------------------------------------------------------------
 
 
-def test_create_launch_failure_is_command_start_failure(monkeypatch, tmp_path) -> None:
+def test_create_launch_failure_with_confirmed_cleanup_is_command_start_failure(
+    monkeypatch, tmp_path
+) -> None:
+    """`create_attempted` is set immediately before the create call, so a
+    create-launch failure still requires cleanup confirmation (ADR 0003
+    Amendment 2's structured cleanup-status correction) — this test
+    confirms that when cleanup succeeds (nothing was ever created, and
+    the listing genuinely confirms it), the outcome is the original
+    COMMAND_START_FAILURE with cleanup_status=CONFIRMED_ABSENT, not
+    NOT_APPLICABLE (which is legal only for a failure strictly before
+    the create invocation, which this is not)."""
+    calls = [
+        _FakeCompleted(returncode=0),  # rm (cleanup, no-op — nothing exists)
+        _listing([]),  # confirmed absent
+    ]
+
+    def fake_run_docker(*args: str):
+        if args and args[0] == "create":
+            raise _DockerLaunchError("docker executable missing")
+        return calls.pop(0)
+
+    monkeypatch.setattr("codeagent.executor._run_docker", fake_run_docker)
+    verifier = DockerVerifier(tmp_path, clock=SteppingClock())
+
+    result = verifier.run_baseline()
+
+    assert result.outcome == events.VerificationOutcome.COMMAND_START_FAILURE
+    assert result.exit_code is None
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+    assert result.error is not None
+    assert result.error.code == ErrorCode.EXECUTOR_COMMAND_START_FAILED
+
+
+def test_create_launch_failure_with_unconfirmable_cleanup_is_environment_failure(
+    monkeypatch, tmp_path
+) -> None:
+    """When the docker executable is unavailable for every call
+    (create *and* the cleanup rm/ps-a calls), cleanup cannot be
+    confirmed — the outcome is overridden to ENVIRONMENT_FAILURE with
+    cleanup_status=UNCONFIRMED, never silently reported as a
+    COMMAND_START_FAILURE that would imply nothing needed checking."""
+
     def raise_launch_error(*args, **kwargs):
         raise _DockerLaunchError("docker executable missing")
 
@@ -325,23 +366,48 @@ def test_create_launch_failure_is_command_start_failure(monkeypatch, tmp_path) -
 
     result = verifier.run_baseline()
 
-    assert result.outcome == events.VerificationOutcome.COMMAND_START_FAILURE
-    assert result.exit_code is None
+    assert result.outcome == events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED
     assert result.error is not None
-    assert result.error.code == ErrorCode.EXECUTOR_COMMAND_START_FAILED
+    assert result.error.code == ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE
 
 
 def test_create_nonzero_exit_is_environment_failure(monkeypatch, tmp_path) -> None:
     verifier = _make_verifier(
         monkeypatch,
         tmp_path,
-        docker_calls=[_FakeCompleted(returncode=1, stderr="no such image")],
+        docker_calls=[
+            _FakeCompleted(returncode=1, stderr="no such image"),  # create
+            _FakeCompleted(returncode=0),  # rm (cleanup)
+            _listing([]),  # confirmed absent
+        ],
     )
 
     result = verifier.run_baseline()
 
     assert result.outcome == events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
     assert result.error.code == ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE
+
+
+def test_create_nonzero_exit_with_unconfirmed_cleanup_overrides_to_unconfirmed(
+    monkeypatch, tmp_path
+) -> None:
+    name = _container_name("baseline")
+    verifier = _make_verifier(
+        monkeypatch,
+        tmp_path,
+        docker_calls=[
+            _FakeCompleted(returncode=1, stderr="no such image"),  # create
+            _FakeCompleted(returncode=0),  # rm (cleanup)
+            _listing([name]),  # still present: cleanup cannot be confirmed
+        ],
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.outcome == events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED
 
 
 def test_timeout_while_running_is_timeout_outcome(monkeypatch, tmp_path) -> None:
@@ -361,6 +427,35 @@ def test_timeout_while_running_is_timeout_outcome(monkeypatch, tmp_path) -> None
 
     assert result.outcome == events.VerificationOutcome.TIMEOUT
     assert result.error.code == ErrorCode.EXECUTOR_TIMEOUT
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+
+
+# --------------------------------------------------------------------
+# ContainerCleanupStatus derivation (Milestone 2 slice 2B-2)
+# --------------------------------------------------------------------
+
+
+def test_cleanup_status_for_not_applicable_when_create_never_attempted() -> None:
+    """NOT_APPLICABLE is reserved for a failure strictly before the
+    create invocation begins — no path in `_attempt` produces this
+    today (nothing validates anything before issuing `docker create`),
+    so this maps the pure classification function directly rather than
+    trying to provoke it through `_attempt`/`_execute`."""
+    status = DockerVerifier._cleanup_status_for(create_attempted=False, confirmed_absent=True)
+    assert status is events.ContainerCleanupStatus.NOT_APPLICABLE
+    # confirmed_absent is irrelevant once create was never attempted.
+    status = DockerVerifier._cleanup_status_for(create_attempted=False, confirmed_absent=False)
+    assert status is events.ContainerCleanupStatus.NOT_APPLICABLE
+
+
+def test_cleanup_status_for_confirmed_absent() -> None:
+    status = DockerVerifier._cleanup_status_for(create_attempted=True, confirmed_absent=True)
+    assert status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+
+
+def test_cleanup_status_for_unconfirmed() -> None:
+    status = DockerVerifier._cleanup_status_for(create_attempted=True, confirmed_absent=False)
+    assert status is events.ContainerCleanupStatus.UNCONFIRMED
 
 
 def test_unparseable_inspect_output_is_environment_failure(monkeypatch, tmp_path) -> None:
@@ -457,6 +552,7 @@ def test_exited_zero_is_passed(monkeypatch, tmp_path) -> None:
     assert result.exit_code == 0
     assert result.error is None
     assert "ok" in result.stdout
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
 
 
 def test_exited_nonzero_is_test_failure(monkeypatch, tmp_path) -> None:
@@ -500,6 +596,7 @@ def test_confirmed_oom_kill_is_environment_failure_with_oom_error_code(
     assert result.exit_code == 137
     assert result.error is not None
     assert result.error.code == ErrorCode.EXECUTOR_OOM_KILLED
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
     # Only a fixed, sanitized message is persisted -- never raw Docker
     # inspect payloads or daemon output.
     assert "OOMKilled" not in result.error.message

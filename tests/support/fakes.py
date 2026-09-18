@@ -10,10 +10,13 @@ depending on concrete fake types directly.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from codeagent import domain, events
+from codeagent.checkpoint_session import CheckpointIntent
 from codeagent.controller import PatchResult, PlanProposal, ReadResult, VerificationResult
 from codeagent.errors import ErrorCode, OperationalError
+from codeagent.evidence import EvidenceReceipt
 
 # FakeVerifier's own choice, not a controller-level restriction: this
 # synthetic harness only fabricates PASSED/TEST_FAILURE, since it has
@@ -123,11 +126,22 @@ class FakeApprovalProvider:
 
 
 class FakeVerifier:
+    """`cleanup_status` defaults to `CONFIRMED_ABSENT` for every result —
+    the honest default for a fake that never creates a real container
+    and so has nothing genuinely ambiguous to report — and can be
+    overridden (e.g. to `UNCONFIRMED`) so controller tests can exercise
+    the verifier-cleanup-unconfirmed path without any real Docker
+    involvement. `NOT_APPLICABLE` is not offered here: it requires
+    `outcome` to be `COMMAND_START_FAILURE`/`ENVIRONMENT_FAILURE`, which
+    this fake's `_FAKE_SUPPORTED_OUTCOMES` never produces.
+    """
+
     def __init__(
         self,
         outcomes: tuple[events.VerificationOutcome, ...],
         baseline_outcome: events.VerificationOutcome = events.VerificationOutcome.TEST_FAILURE,
         command: tuple[str, ...] = FIXTURE_VERIFY_COMMAND,
+        cleanup_status: events.ContainerCleanupStatus = events.ContainerCleanupStatus.CONFIRMED_ABSENT,
     ) -> None:
         if not outcomes:
             raise ValueError("outcomes must be a nonempty tuple")
@@ -138,18 +152,40 @@ class FakeVerifier:
         self._outcomes = outcomes
         self._baseline_outcome = baseline_outcome
         self._command = command
+        self._cleanup_status = cleanup_status
 
     @property
     def command(self) -> tuple[str, ...]:
         return self._command
 
     def _result(self, outcome: events.VerificationOutcome) -> VerificationResult:
+        cleanup_status = self._cleanup_status
+        effective_outcome = outcome
+        if cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED:
+            # Mirrors DockerVerifier._execute's override: an unconfirmed
+            # cleanup always forces ENVIRONMENT_FAILURE, regardless of
+            # what the provisional outcome would otherwise have been.
+            effective_outcome = events.VerificationOutcome.ENVIRONMENT_FAILURE
+            return VerificationResult(
+                outcome=effective_outcome,
+                exit_code=None,
+                duration_seconds=0.01,
+                stdout="",
+                stderr="",
+                cleanup_status=cleanup_status,
+                error=OperationalError(
+                    code=ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                    error_id=f"fake-cleanup-unconfirmed-{outcome.value}",
+                    message="fake verifier: cleanup deliberately unconfirmed",
+                ),
+            )
         return VerificationResult(
-            outcome=outcome,
+            outcome=effective_outcome,
             exit_code=_FAKE_EXIT_CODE_BY_OUTCOME[outcome],
             duration_seconds=0.01,
             stdout="",
             stderr="",
+            cleanup_status=cleanup_status,
         )
 
     def run_baseline(self) -> VerificationResult:
@@ -269,3 +305,126 @@ class SteppingClock:
         current = self._next_monotonic
         self._next_monotonic += self._monotonic_step
         return current
+
+
+class FakeWorkspace:
+    """Deterministic `controller.Workspace` double (Milestone 2 slice
+    2B-2): no filesystem or Git involved. `initial_commit` defaults to
+    a fixed, valid-looking 40-hex SHA so it can be passed straight into
+    a real `CheckpointSession.establish()`/`advance()` if a test wires
+    one in; `FakeCheckpointSession` below doesn't require that shape at
+    all.
+    """
+
+    def __init__(
+        self,
+        *,
+        initial_commit: str = "a" * 40,
+        path: Path | None = None,
+        source_repo_path: Path | None = None,
+    ) -> None:
+        self._initial_commit = initial_commit
+        self.path = path if path is not None else Path("/fake/worktree")
+        self.source_repo_path = (
+            source_repo_path if source_repo_path is not None else Path("/fake/source")
+        )
+        self.disposed = False
+        self.preserved = False
+        self.dispose_error: Exception | None = None
+        self.entry_gate_calls: list[str] = []
+        self.entry_gate_error: Exception | None = None
+
+    @property
+    def initial_commit(self) -> str:
+        return self._initial_commit
+
+    def entry_gate(self, expected_commit: str) -> None:
+        self.entry_gate_calls.append(expected_commit)
+        if self.entry_gate_error is not None:
+            raise self.entry_gate_error
+
+    def dispose(self) -> None:
+        if self.dispose_error is not None:
+            raise self.dispose_error
+        self.disposed = True
+
+    def preserve(self) -> None:
+        self.preserved = True
+
+
+class FakeCheckpointSession:
+    """Deterministic `controller.CheckpointSessionLike` double: an
+    in-memory `intent`/`accepted_sha` pair with no wrapped
+    `CheckpointRef` and no Git call of its own. Failure injection uses
+    the *real* `codeagent.checkpoint_ref.CheckpointRefError`/
+    `codeagent.checkpoint_session.CheckpointSessionError` exception
+    types, so `RunController._map_checkpoint_error`'s exact
+    reason/outcome mapping is exercised identically to how it would be
+    against the real `CheckpointSession`.
+    """
+
+    def __init__(self) -> None:
+        self.intent: CheckpointIntent = CheckpointIntent.ABSENT
+        self.accepted_sha: str | None = None
+        self.establish_error: Exception | None = None
+        self.advance_error: Exception | None = None
+        self.delete_error: Exception | None = None
+        self.delete_calls = 0
+
+    def establish(self, initial_sha: str) -> None:
+        if self.establish_error is not None:
+            raise self.establish_error
+        self.intent = CheckpointIntent.PRESENT
+        self.accepted_sha = initial_sha
+
+    def advance(self, new_sha: str) -> None:
+        if self.advance_error is not None:
+            raise self.advance_error
+        self.accepted_sha = new_sha
+
+    def delete(self) -> None:
+        self.delete_calls += 1
+        if self.intent is CheckpointIntent.ABSENT:
+            return
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.intent = CheckpointIntent.ABSENT
+        self.accepted_sha = None
+
+
+class FakeEvidenceSink:
+    """Deterministic `EvidenceSink` double: no filesystem or Git
+    involved. Defaults to a trivial successful, complete, empty
+    capture; a test overrides `receipt` to exercise any of the other
+    three legal `EvidenceCaptured` shapes."""
+
+    def __init__(
+        self, receipt: EvidenceReceipt | None = None, *, raise_error: Exception | None = None
+    ) -> None:
+        self._receipt = receipt
+        self._raise_error = raise_error
+        self.capture_calls = 0
+        self.last_call_kwargs: dict[str, object] | None = None
+
+    def capture(
+        self, *, worktree_path, source_repo_path, initial_commit, lifecycle_id
+    ) -> EvidenceReceipt:
+        self.capture_calls += 1
+        if self._raise_error is not None:
+            raise self._raise_error
+        self.last_call_kwargs = {
+            "worktree_path": worktree_path,
+            "source_repo_path": source_repo_path,
+            "initial_commit": initial_commit,
+            "lifecycle_id": lifecycle_id,
+        }
+        if self._receipt is not None:
+            return self._receipt
+        return EvidenceReceipt(
+            success=True,
+            complete=True,
+            artifact_id=lifecycle_id,
+            sha256_payload="0" * 64,
+            bytes_written=0,
+            error=None,
+        )

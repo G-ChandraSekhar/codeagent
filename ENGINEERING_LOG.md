@@ -1414,3 +1414,160 @@ event schema changed; detail lives in the amendments.
   `UNCONFIRMED`), `NOT_APPLICABLE` legal only before `docker create`.
 - **Status**: Accepted designs, not implementations. **Next: implement
   2B-2.**
+
+## Milestone 2 slice 2B-2: checkpoint/evidence integration implemented
+
+Implements ADR 0003 Amendment 2 and ADR 0006 Amendment 4 in full.
+Verified locally on macOS with a real Docker daemon; Linux CI and
+SHA-256 object-format coverage are still pending.
+
+- **New**: `src/codeagent/evidence.py` — `FilesystemEvidenceSink`,
+  strictly observational (one filter enumeration reused for `status`+
+  `diff`), framed binary artifact (magic/header-length/JSON
+  header/payload), component-aware containment, `0700`/`0600`
+  permissions enforced independent of umask, atomic no-replace
+  hard-link publish, 1 MiB hard bound with immediate child termination
+  on overflow (no fabricated totals), and all four `EvidenceCaptured`
+  shapes. 24 tests, including real hostile external-diff/textconv/
+  clean/process filter positive controls against the production path.
+- **`_git_safety.py`**: new `run_git_bounded_preview` (overflow returns
+  a confirmed-terminated, truncated, `complete=False` result instead of
+  raising; `run_git_bounded` itself unchanged). 12 new tests.
+- **`workspace.py`**: `initial_commit`, `entry_gate()`, `dispose()`,
+  `preserve()`, tri-state `__exit__`. Every `rmtree`/`prune` fallback
+  removed — unconfirmed disposal now raises loudly. 18 new tests
+  including a static AST proof neither remains in the module.
+- **`executor.py`**: `ContainerCleanupStatus` threaded through
+  `_attempt`/`_execute`, no production default; `create_attempted` set
+  immediately before `docker create` so a bare launch failure still
+  requires confirmed cleanup rather than `NOT_APPLICABLE`.
+- **`controller.py`**: `RunConfig.lifecycle_id` required/validated,
+  `initial_checkpoint_id` removed; three new required collaborators
+  (`workspace`, `session`, `evidence_sink`); `_dispatch_apply_patch`
+  reordered to the full accepted sequence with `_map_checkpoint_error`
+  implementing the exact reason+`MutationOutcome` mapping; new
+  `_terminate` replaces every direct finish path with the accepted
+  gated-teardown/six-tier-precedence choreography.
+- **Real end-to-end**: `test_slice_b.py`/`test_slice_c.py` now wire
+  real `CheckpointRef`/`CheckpointSession`/`FilesystemEvidenceSink`
+  (slice C with real Docker) and confirm the ref, worktree, and
+  container are all genuinely gone after teardown, with a genuinely
+  published, correctly-framed evidence artifact.
+- **Real defect found and fixed during implementation**: the evidence
+  containment/symlink check initially rejected `output_root` paths
+  under macOS's `/var -> /private/var` (a standard OS symlink, not a
+  threat) — narrowed to only check components at or below the deepest
+  *already-existing* ancestor, so ambient OS structure above the
+  caller-specified portion of the path is trusted while a hostile
+  symlink introduced within it is still refused.
+- Discovered while wiring the controller: `RunFinished` cannot carry an
+  `error` for any `terminal_reason` other than `POLICY_VIOLATION`/
+  `UNRECOVERABLE_ERROR` (existing `events.py` contract), and
+  `domain.TerminalReason` has no slot for "the original outcome
+  succeeded but teardown didn't." Resolved by having `_terminate`
+  override the *trigger* to `UNRECOVERABLE_ERROR` whenever precedence
+  selects a cleanup/evidence failure — the original result's own error
+  (if any) stays exactly where it was already recorded; only
+  `RunFinished.error` changes.
+- **Full suite: 1845 passed** (up from 1804), including 3 real-Docker
+  tests with `CODEAGENT_REQUIRE_DOCKER=1`; `git diff --check` and
+  `py_compile` clean; no leftover containers, worktrees, or temp files
+  after a full run.
+- **Not done**: Linux CI; SHA-256 object format; a dedicated unit test
+  for every scenario in the original task's exhaustive list (several
+  are exercised only incidentally through the real end-to-end tests);
+  ADR 0004's durable lifecycle store, locks, reconciliation,
+  abandonment, and CLI/frontend work remain Milestone 3.
+
+## Slice 2B-2 correction pass: five independently verified defects fixed
+
+All five reproduced first, then fixed, in the unstaged 2B-2 implementation.
+
+1. **`evidence.py` used single `os.write` calls**, not robust against a
+   partial write, `EINTR`, or a zero-progress write. Added `_write_all`
+   (retries `EINTR`, raises categorically on zero progress) and used it
+   for every artifact segment/payload write. Real fault-injection tests
+   (a blocking pipe forcing genuine short writes, a forced
+   1-byte-short writer patched into every `os.write` call during a real
+   capture) prove the published artifact is always exactly correct —
+   never silently truncated.
+2. **`RunController._terminate`**: an unexpected exception from
+   `EvidenceSink.capture()` or from constructing `EvidenceCaptured`
+   itself aborted `_terminate` before workspace/ref cleanup or
+   `RunFinished` ever ran. `_capture_evidence` now guards both steps
+   independently, converting either into a sanitized
+   `EVIDENCE_CAPTURE_FAILED` result; `preserve()` is now guarded too.
+   Two new tests use a raising `FakeEvidenceSink` and confirm dispose/
+   session.delete/`RunFinished` (and, combined with an unconfirmed
+   verifier, `preserve()`) still run.
+3. **Evidence symlink validation missed an intermediate symlink when
+   the final output directory already existed** — the prior
+   "already-exists" boundary heuristic stopped validating entirely once
+   the whole path was pre-materialized (e.g. an output directory reused
+   across runs), a real, previously-undetected gap. Replaced with an
+   explicit, fixed allowlist (`_TRUSTED_AMBIENT_SYMLINK_ROOTS = {/tmp,
+   /var, /etc}`): every other path component is now checked
+   unconditionally, existing or not. A real fixture reproduces the
+   original blind spot; the ADR's "every parent path component"
+   wording is amended in place to record this narrowing.
+4. **Combined incomplete + durability-ambiguous capture** could report
+   `EVIDENCE_DURABILITY_UNCONFIRMED` with `complete=False`, violating
+   the accepted terminal precedence (`EVIDENCE_INCOMPLETE` must win).
+   Fixed in `evidence.py`'s publish-error handling and hardened
+   structurally in `events.EvidenceCaptured.__post_init__` (this
+   pairing is now impossible to construct, not merely avoided by
+   convention). New combined-failure test forces both conditions at
+   once.
+5. **`GitWorktree.dispose()` let the `git worktree remove` command's
+   own reported status (nonzero exit or a raised exception) override a
+   confirmed exact absence**, and a tempdir-cleanup failure discarded
+   `self._tempdir`, making retry impossible. Fixed: only the final
+   observation (registration status + directory presence) decides
+   success; `self._tempdir` is preserved on cleanup failure and a
+   `FileNotFoundError` from a stale `cleanup()` call is treated as
+   confirmed-already-gone. New tests cover both the "reports failure,
+   really succeeded" and "reports success, really didn't" cases, plus
+   a retry that recovers after a transient tempdir-cleanup failure.
+
+**Verified**: focused suites (evidence/events/workspace/controller) 744
+passed; full suite 1860 passed including 3 real-Docker tests with
+`CODEAGENT_REQUIRE_DOCKER=1`; `git diff --check`/`py_compile` clean; no
+leftover containers, worktrees, or temp files. macOS/Git 2.54.0; Linux
+CI still pending, unchanged from before this pass.
+
+## Slice 2B-2 ambient-symlink hardening
+
+The correction pass above fixed defect 3 with a fixed named allowlist
+(`/tmp`/`/var`/`/etc` trusted unconditionally by name). Found — before
+this was ever exercised on Linux CI — that trusting those three names
+on *every* platform was itself too permissive: Linux does not make them
+symlinks at all, so the exception had no ambient justification there
+and would accept a hostile symlink placed at one of those exact names.
+
+- `src/codeagent/evidence.py`: replaced the name-only allowlist with
+  `_is_verified_ambient_symlink` — consulted only when
+  `_current_platform_is_darwin()` is true, and even then only when the
+  component's real resolved target (`os.path.realpath`) exactly matches
+  the recorded expectation in `_MACOS_AMBIENT_SYMLINK_TARGETS` (`/tmp`
+  → `/private/tmp`, `/var` → `/private/var`, `/etc` → `/private/etc`,
+  confirmed against this session's real macOS host via `os.readlink`).
+  A mismatched target, or any of the three names off Darwin, is refused
+  like any other hostile symlink component.
+- `tests/unit/test_evidence.py`: added a real, unmocked end-to-end test
+  under the genuine `/tmp` (skipped off Darwin), plus fully
+  platform-independent positive/negative tests (verified-target trusted
+  on simulated Darwin; mismatched target refused on simulated Darwin;
+  a genuinely matching target refused on simulated non-Darwin) and
+  direct unit coverage of `_is_verified_ambient_symlink`. Removed the
+  now-superseded single allowlist test. Net: 37 tests (from 33).
+- ADR 0003 Amendment 2's correction note extended to record this
+  second narrowing precisely, distinguishing it from the first
+  (already-exists-boundary) correction.
+- CLAUDE.md's living status updated to the current totals (see below);
+  the correction-pass entry above is left as the historical record of
+  what was true at that point in time, not retroactively edited.
+
+**Verified**: `tests/unit/test_evidence.py` 37 passed; full suite 1864
+passed including 3 real-Docker tests with `CODEAGENT_REQUIRE_DOCKER=1`;
+`git diff --check`/`py_compile` clean; no leftover containers,
+worktrees, or temp files. macOS/Git 2.54.0; Linux CI still pending.

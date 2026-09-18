@@ -831,6 +831,166 @@ def run_git_bounded(
     return result
 
 
+@dataclass(frozen=True)
+class BoundedPreviewResult:
+    """The outcome of a bounded-preview binary subprocess run (see
+    `run_git_bounded_preview`): raw stdout bytes truncated to at most
+    `limit` bytes, the confirmed exit code (`None` when the child was
+    killed after overflow, since a killed child's exit code is a signal
+    artifact, not a real command result), and whether the full output
+    was captured. `complete=False` means capture stopped at `limit`
+    bytes because more was available — the child was terminated and its
+    termination confirmed, never a silent partial capture left running."""
+
+    stdout: bytes
+    returncode: int | None
+    complete: bool
+
+
+def _drain_stdout_preview(
+    process: subprocess.Popen, *, deadline: float, limit: int
+) -> tuple[bytes, bool]:
+    """Like `_drain_stdout`, but treats exceeding `limit` as a normal
+    early return (`(bytes truncated to limit, False)`) instead of a
+    `_BoundedFailure` that discards the buffer — a caller capturing a
+    bounded preview wants the bytes seen so far, not nothing. Detects
+    overflow on the first byte past `limit` (the "`limit + 1`th byte")
+    and returns immediately, without reading any further. Every other
+    failure (a monitoring setup failure, a timeout, or an unreadable
+    pipe) still raises `_BoundedFailure`, exactly as `_drain_stdout`."""
+    try:
+        selector = selectors.DefaultSelector()
+    except Exception as exc:  # noqa: BLE001 — any setup failure is categorical
+        raise _BoundedFailure(GitSafetyFailure.PROCESS_SETUP_FAILED) from exc
+
+    buf = bytearray()
+    try:
+        try:
+            os.set_blocking(process.stdout.fileno(), False)
+            selector.register(process.stdout, selectors.EVENT_READ)
+        except Exception as exc:  # noqa: BLE001 — any setup failure is categorical
+            raise _BoundedFailure(GitSafetyFailure.PROCESS_SETUP_FAILED) from exc
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _BoundedFailure(GitSafetyFailure.GIT_COMMAND_TIMEOUT)
+            if not selector.select(timeout=remaining):
+                continue
+            try:
+                chunk = os.read(process.stdout.fileno(), _BOUNDED_READ_CHUNK)
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                raise _BoundedFailure(GitSafetyFailure.GIT_COMMAND_TIMEOUT) from exc
+            if not chunk:
+                return bytes(buf), True  # EOF: complete, never truncated.
+            buf += chunk
+            if len(buf) > limit:
+                del buf[limit:]
+                return bytes(buf), False  # overflow detected: stop draining now.
+    finally:
+        try:
+            selector.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            process.stdout.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _read_bounded_preview(
+    args: list[str],
+    *,
+    env: dict[str, str],
+    timeout: float,
+    limit: int,
+) -> BoundedPreviewResult:
+    """The bounded-preview counterpart to `_read_bounded`: on overflow,
+    stops draining, terminates and confirms reaping of the child (the
+    same `_terminate_and_confirm` abort path every other failure here
+    uses), and returns the `limit`-byte preview with `complete=False`
+    instead of raising and discarding it. Every other failure after
+    `Popen` succeeds (a monitoring setup failure, a timeout, or an
+    unconfirmed cleanup) still raises `GitSafetyError` categorically,
+    exactly like `_read_bounded`. No stdin support — nothing that needs
+    a bounded preview today also needs to write to the child.
+    """
+    deadline = time.monotonic() + timeout
+    try:
+        process = subprocess.Popen(
+            ["git", *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+    except OSError as exc:
+        raise GitSafetyError(
+            GitSafetyFailure.GIT_EXECUTABLE_UNAVAILABLE,
+            "the git executable could not be launched",
+        ) from exc
+
+    try:
+        buf, complete = _drain_stdout_preview(process, deadline=deadline, limit=limit)
+        if not complete:
+            _terminate_and_confirm(process, writer_thread=None, deadline=deadline)
+            return BoundedPreviewResult(stdout=buf, returncode=None, complete=False)
+        _confirm_exit(process, deadline=deadline)
+    except _BoundedFailure as failure:
+        _terminate_and_confirm(process, writer_thread=None, deadline=deadline)
+        raise GitSafetyError(failure.reason, _BOUNDED_FAILURE_MESSAGES[failure.reason]) from None
+    except GitSafetyError:
+        _terminate_and_confirm(process, writer_thread=None, deadline=deadline)
+        raise
+    except BaseException as exc:  # noqa: BLE001 — one unified cleanup path for anything else
+        _terminate_and_confirm(process, writer_thread=None, deadline=deadline)
+        raise GitSafetyError(
+            GitSafetyFailure.PROCESS_SETUP_FAILED,
+            "a git subprocess failed unexpectedly",
+        ) from exc
+
+    return BoundedPreviewResult(stdout=buf, returncode=process.returncode, complete=True)
+
+
+def run_git_bounded_preview(
+    repo_path: Path | str | None,
+    *args: str,
+    limit: int,
+    timeout: float = GIT_TIMEOUT_SECONDS,
+) -> BoundedPreviewResult:
+    """A bounded-preview counterpart to `run_git_bounded`, for a call
+    site that wants "capture up to `limit` bytes, and if there's more,
+    stop and say so clearly" instead of "fail if there's more than
+    `limit` bytes" — evidence capture's `git diff`/`git status` calls
+    (ADR 0003 Amendment 2 / ADR 0006 Amendment 4), which must persist a
+    clearly-incomplete preview rather than discard everything on
+    overflow.
+
+    Builds the exact same hardened baseline argv as every other function
+    here (via `_build_git_argv`), applied exactly once. Ordinary extra
+    arguments — including a caller's `enumerate_filter_neutralization()`
+    override argv — are passed through like any other Git argument.
+
+    A *complete* capture (`complete=True`) with a nonzero exit still
+    fails categorically (`GitSafetyFailure.BOUNDED_COMMAND_FAILED`),
+    exactly like `run_git_bounded` — only the overflow case is handled
+    differently, by returning a truncated, `complete=False` result
+    instead of raising. `run_git_bounded`'s own behavior, including its
+    contract of discarding the buffer and raising on any oversize
+    output, is completely unchanged by this function's existence.
+    """
+    argv = _build_git_argv(repo_path, *args)
+    result = _read_bounded_preview(argv[1:], env=git_environment(), timeout=timeout, limit=limit)
+    if result.complete and result.returncode != 0:
+        raise GitSafetyError(
+            GitSafetyFailure.BOUNDED_COMMAND_FAILED,
+            "a bounded git command exited with a nonzero status",
+        )
+    return result
+
+
 def _parse_git_version(text: str) -> tuple[int, int] | None:
     """Parse `major.minor` out of `git --version` output (e.g. "git
     version 2.54.0", "git version 2.54.0 (Apple Git-157)", "git version

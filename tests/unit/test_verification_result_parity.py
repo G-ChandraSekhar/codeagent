@@ -37,7 +37,10 @@ _EXIT_CODE_CANDIDATES = (None, 0, 1, 137)
 _ERROR_CANDIDATES = (None, _SOME_ERROR, _OTHER_ERROR, _OOM_ERROR)
 
 
-def _build_baseline_event(outcome, exit_code, error) -> None:
+_CLEANUP_STATUS_CANDIDATES = tuple(events.ContainerCleanupStatus)
+
+
+def _build_baseline_event(outcome, exit_code, error, cleanup_status) -> None:
     events.BaselineRecorded(
         run_id="r",
         sequence=0,
@@ -48,17 +51,19 @@ def _build_baseline_event(outcome, exit_code, error) -> None:
         command=("pytest",),
         exit_code=exit_code,
         duration_seconds=1.0,
+        cleanup_status=cleanup_status,
         error=error,
     )
 
 
-def _build_verification_result(outcome, exit_code, error) -> None:
+def _build_verification_result(outcome, exit_code, error, cleanup_status) -> None:
     VerificationResult(
         outcome=outcome,
         exit_code=exit_code,
         duration_seconds=1.0,
         stdout="",
         stderr="",
+        cleanup_status=cleanup_status,
         error=error,
     )
 
@@ -66,17 +71,20 @@ def _build_verification_result(outcome, exit_code, error) -> None:
 @pytest.mark.parametrize("outcome", list(events.VerificationOutcome))
 @pytest.mark.parametrize("exit_code", _EXIT_CODE_CANDIDATES)
 @pytest.mark.parametrize("error", _ERROR_CANDIDATES)
-def test_verification_result_and_baseline_event_agree(outcome, exit_code, error) -> None:
+@pytest.mark.parametrize("cleanup_status", _CLEANUP_STATUS_CANDIDATES)
+def test_verification_result_and_baseline_event_agree(
+    outcome, exit_code, error, cleanup_status
+) -> None:
     event_outcome: BaseException | None = None
     result_outcome: BaseException | None = None
 
     try:
-        _build_baseline_event(outcome, exit_code, error)
+        _build_baseline_event(outcome, exit_code, error, cleanup_status)
     except ValueError as exc:
         event_outcome = exc
 
     try:
-        _build_verification_result(outcome, exit_code, error)
+        _build_verification_result(outcome, exit_code, error, cleanup_status)
     except ValueError as exc:
         result_outcome = exc
 
@@ -84,7 +92,8 @@ def test_verification_result_and_baseline_event_agree(outcome, exit_code, error)
     result_rejected = result_outcome is not None
     assert event_rejected == result_rejected, (
         f"VerificationResult and BaselineRecorded disagree for "
-        f"outcome={outcome!r}, exit_code={exit_code!r}, error={error!r}: "
+        f"outcome={outcome!r}, exit_code={exit_code!r}, error={error!r}, "
+        f"cleanup_status={cleanup_status!r}: "
         f"event_rejected={event_rejected} ({event_outcome}), "
         f"result_rejected={result_rejected} ({result_outcome})"
     )
@@ -99,11 +108,12 @@ def test_at_least_one_accepted_and_one_rejected_combination_exists() -> None:
     for outcome in events.VerificationOutcome:
         for exit_code in _EXIT_CODE_CANDIDATES:
             for error in _ERROR_CANDIDATES:
-                try:
-                    _build_verification_result(outcome, exit_code, error)
-                    accepted += 1
-                except ValueError:
-                    rejected += 1
+                for cleanup_status in _CLEANUP_STATUS_CANDIDATES:
+                    try:
+                        _build_verification_result(outcome, exit_code, error, cleanup_status)
+                        accepted += 1
+                    except ValueError:
+                        rejected += 1
     assert accepted > 0
     assert rejected > 0
 
@@ -122,7 +132,7 @@ def test_public_validator_is_not_shadowed_by_a_private_copy() -> None:
 
     original = events_module.validate_verification_outcome_shape
 
-    def always_raise(outcome, exit_code, error):
+    def always_raise(outcome, exit_code, error, cleanup_status):
         raise ValueError("forced by test")
 
     events_module.validate_verification_outcome_shape = always_raise
@@ -134,6 +144,7 @@ def test_public_validator_is_not_shadowed_by_a_private_copy() -> None:
                 duration_seconds=1.0,
                 stdout="",
                 stderr="",
+                cleanup_status=events.ContainerCleanupStatus.CONFIRMED_ABSENT,
             )
     finally:
         events_module.validate_verification_outcome_shape = original

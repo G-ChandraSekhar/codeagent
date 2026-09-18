@@ -26,12 +26,17 @@ from codeagent.controller import PlanProposal, RunConfig, RunController
 from codeagent.report import build_report, render_json, render_text
 from tests.support.fakes import (
     FakeApprovalProvider,
+    FakeCheckpointSession,
+    FakeEvidenceSink,
     FakeModel,
     FakePatchApplier,
     FakeRepositoryReader,
     FakeVerifier,
+    FakeWorkspace,
     SteppingClock,
 )
+
+_LIFECYCLE_ID = "b" * 32
 
 PLAN = PlanProposal(
     problem_hypothesis="idempotency key dropped on retry",
@@ -52,6 +57,7 @@ def _build(
         run_id=run_id,
         task_statement="fix retry bug",
         approval_mode=domain.ApprovalMode.INTERACTIVE,
+        lifecycle_id=_LIFECYCLE_ID,
         max_repair_iterations=3,
         max_plan_revisions=2,
     )
@@ -62,6 +68,9 @@ def _build(
         FakeVerifier(verification_outcomes, baseline_outcome=baseline_outcome),
         FakePatchApplier(patch_should_fail),
         FakeRepositoryReader(),
+        FakeWorkspace(),
+        FakeCheckpointSession(),
+        FakeEvidenceSink(),
         clock=SteppingClock(),
     )
 

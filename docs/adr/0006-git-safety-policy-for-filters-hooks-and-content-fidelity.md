@@ -17,10 +17,11 @@ there is currently no trusted way to validate parent/
 target's own content (Amendment 3). The slice is implemented and
 passing its own tests locally (macOS, Git 2.54.0); Linux CI validation
 is pending — see Amendment 3 for exactly what evidence that implies
-and what it does not. **Amendment 4** (2026-09-17, design only, not
-implemented) extends this policy to `git diff` against working-tree
-content, found during Milestone 2 Slice 2B-2's evidence-capture design
-review; see the end of this document. Acceptance of this ADR's design
+and what it does not. **Amendment 4** (2026-09-17, implemented and
+locally macOS-verified, Linux CI pending) extends this policy to `git
+diff` against working-tree content, found during Milestone 2 Slice
+2B-2's evidence-capture design review; see the end of this document.
+Acceptance of this ADR's design
 is independent of implementation and of Linux validation — see
 Consequences.
 
@@ -1162,9 +1163,32 @@ validation, bounded I/O, commit-acceptance verification) is unaffected.
 
 ## Amendment 4 (Accepted 2026-09-17): `git diff` is a filter/external-diff/textconv execution point
 
-Implementation status: **not implemented — design only.** Found during
-the Milestone 2 Slice 2B-2 planning review (evidence-capture design),
-not during any patch.py/workspace.py implementation pass. Real,
+Implementation status: **implemented (2026-09-17) and locally verified
+on macOS; Linux CI validation is pending.** `src/codeagent/
+_git_safety.py` gained the planned `run_git_bounded_preview` primitive
+(a bounded-preview counterpart to `run_git_bounded`: on overflow it
+stops draining, terminates and confirms reaping of the child, and
+returns a `complete=False` truncated result instead of raising and
+discarding it — `run_git_bounded`'s own contract is unchanged), and
+`src/codeagent/evidence.py`'s `FilesystemEvidenceSink` calls it for
+both the governed `status` and `diff` commands, sharing one
+`enumerate_filter_neutralization()` result across both per this
+amendment's decision. Verified by `tests/unit/test_git_safety.py`'s 12
+new `run_git_bounded_preview` tests (normal completion, exact boundary,
+overflow, confirmed child termination, timeout, launch/setup failure,
+cleanup-unconfirmed, binary bytes, baseline/argv ordering) and
+`tests/unit/test_evidence.py`'s real positive-control hostile
+external-diff, textconv, clean-filter, and process-filter tests proving
+the production capture path suppresses all four — reproducing this
+amendment's own findings against the real implementation, not only in
+scratch probes. This status note does not revise anything in this
+amendment's decision text below, which remains the accepted design as
+written.
+
+Original planning-time status, preserved for the historical record (now
+superseded by the implementation status above): found during the
+Milestone 2 Slice 2B-2 planning review (evidence-capture design), not
+during any patch.py/workspace.py implementation pass. Real,
 positive-controlled probes were run against scratch fixture
 repositories outside this codebase. This amendment extends the ADR's
 existing filter/hook-safety model to a command class no prior amendment

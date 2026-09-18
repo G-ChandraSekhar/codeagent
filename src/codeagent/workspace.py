@@ -51,37 +51,48 @@ Git safety (ADR 0006), this slice's actual scope:
   racy-stat comparison and has no pre-materialization inspection point
   of its own.
 
-Explicitly **not** done in this slice (out of scope; see the ADR 0006
-workspace-integration session in ENGINEERING_LOG.md): `patch.py`,
-controller/checkpoint-ref/lifecycle-store integration, cancellation,
-reconciliation, CLI or frontend work, and ADR 0004's complete owned-
-resource lifecycle. In particular, `__exit__`'s cleanup fallback still
-calls `shutil.rmtree` and a repository-wide `git worktree prune` when
-`git worktree remove` itself fails — this is the same pre-existing gap
-threat-model T-M3 already flagged (ADR 0004 I2) and is **not** resolved
-here; only the *new* enter-time failure path (`_cleanup_failed_worktree`)
-is held to the stricter "no repository-wide sweep" standard this slice
-introduces for its own new code.
+Explicitly **not** done in this slice (out of scope): `patch.py`
+integration beyond what `entry_gate()`/`dispose()`/`preserve()` expose,
+checkpoint-ref/lifecycle-store durability, cancellation, reconciliation,
+CLI or frontend work, and ADR 0004's complete owned-resource lifecycle
+(locks, dead-run reconciliation, abandonment).
 
-Cleanup discipline (`__exit__`): the temporary directory is always
-removed, in a `finally`. `git worktree remove` failure is detected, not
-ignored; a stale registration left behind by that failure triggers a
-recovery attempt (`git worktree prune`) before being surfaced as
-`GitWorktreeCleanupError` — but only when no other exception is already
-propagating out of the `with` block, so a real cleanup problem is never
-allowed to replace and hide a real error the caller's code raised.
-Either way, the outcome is recorded on `self.cleanup_error` so a caller
-can check it even when it wasn't raised.
+Ownership and cleanup discipline (Milestone 2 slice 2B-2, ADR 0003
+Amendment 2) — `dispose()`/`preserve()`/`__exit__`:
+
+- `dispose()` is the **one real disposal path**: exact `git worktree
+  remove --force`, confirmed registration absence, and confirmed
+  directory absence. **No `shutil.rmtree` and no repository-wide `git
+  worktree prune` fallback anywhere in this module** — an unconfirmed
+  exact disposal raises `GitWorktreeCleanupError` loudly instead of
+  silently degrading to a broader sweep. (This closes the T-M3/ADR 0004
+  I2 gap `__exit__`'s previous prune/rmtree fallback left open; the
+  enter-time failure path, `_cleanup_failed_worktree`, already met this
+  "no repository-wide sweep" bar and is unchanged.)
+- `preserve()` marks the worktree deliberately retained — used only by
+  a controller when verifier/container cleanup is `UNCONFIRMED` — so
+  `__exit__` cannot silently dispose of a resource that was
+  intentionally kept for later reconciliation.
+- `__exit__` dispatches on the tri-state `active`/`disposed`/`preserved`
+  disposition: `preserved`/`disposed` are no-ops; `active` (either an
+  exception before a controller's own teardown began, or a direct,
+  non-controller caller) runs the same exact `dispose()` path. A direct
+  `with GitWorktree(...) as path:` caller therefore still gets exact,
+  idempotent, loudly-failing disposal with no special controller
+  involvement required.
+- The outcome is recorded on `self.cleanup_error` so a caller can check
+  it even when `__exit__` chose not to re-raise it (because another
+  exception was already propagating from the `with` block).
 """
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
+from typing import Literal
 
 from codeagent import _git_safety
 
@@ -169,6 +180,25 @@ class GitWorktree:
         self.path: Path | None = None
         self.cleanup_error: GitWorktreeCleanupError | None = None
         self._tempdir: tempfile.TemporaryDirectory[str] | None = None
+        self._initial_commit: str | None = None
+        # "active": ordinary state, not yet disposed or preserved.
+        # "disposed": dispose() has confirmed exact removal.
+        # "preserved": the controller deliberately retained this
+        # worktree (verifier/container cleanup was UNCONFIRMED) — see
+        # preserve()/dispose()/__exit__'s module-docstring-level
+        # ownership-transfer discipline (ADR 0003 Amendment 2).
+        self._disposition: Literal["active", "disposed", "preserved"] = "active"
+
+    @property
+    def initial_commit(self) -> str:
+        """The pinned starting commit this worktree was created from —
+        the sole authority for ADR 0003 Amendment 2's initial
+        checkpoint (no separate caller-controlled `initial_checkpoint_id`
+        exists). Raises before the worktree has ever been successfully
+        entered."""
+        if self._initial_commit is None:
+            raise GitWorktreeError("initial_commit is not available before __enter__ succeeds")
+        return self._initial_commit
 
     def _validate_source_repo(self) -> None:
         if not self.source_repo_path.is_dir():
@@ -350,7 +380,155 @@ class GitWorktree:
             raise
 
         self.path = worktree_path
+        self._initial_commit = source_head
         return self.path
+
+    def entry_gate(self, expected_commit: str) -> None:
+        """ADR 0003 Amendment 2's workspace entry gate: before
+        establishing or relying on a checkpoint (lazy establishment, or
+        resuming before a further patch attempt), freshly confirm the
+        worktree is exactly where it is expected to be:
+
+        - the worktree's freshly observed `HEAD` equals `expected_commit`;
+        - the staged index is clean relative to `HEAD`;
+        - the tracked working tree is clean relative to `HEAD`;
+        - there are no untracked paths at all.
+
+        Any condition that cannot be evaluated (a failed Git call) fails
+        closed via `GitWorktreeError` — never silently treated as
+        satisfied. This is an entry/resume-time gate only (ADR 0003
+        point 6): it says nothing about the tree's state once a patch
+        attempt is actively in progress.
+        """
+        if self.path is None:
+            raise GitWorktreeError("entry_gate requires an active worktree")
+
+        observed_head = self._rev_parse_at(self.path, "HEAD")
+        if observed_head != expected_commit:
+            raise GitWorktreeError(
+                "the worktree's HEAD does not match the expected checkpoint"
+            )
+
+        staged_diff = _run(self.path, "diff", "--cached", "--quiet", "HEAD", "--")
+        if staged_diff.returncode == 1:
+            raise GitWorktreeError("the worktree's staged index is not clean")
+        if staged_diff.returncode != 0:
+            raise GitWorktreeError("the worktree's staged index could not be inspected")
+
+        tree_diff = _run(self.path, "diff", "--quiet", "HEAD", "--")
+        if tree_diff.returncode == 1:
+            raise GitWorktreeError("the worktree's tracked working tree is not clean")
+        if tree_diff.returncode != 0:
+            raise GitWorktreeError("the worktree's tracked working tree could not be inspected")
+
+        status_result = _run(self.path, "status", "--porcelain=v1", "--untracked-files=all")
+        if status_result.returncode != 0:
+            raise GitWorktreeError("the worktree's status could not be inspected")
+        if status_result.stdout.strip() != "":
+            raise GitWorktreeError("the worktree contains untracked paths")
+
+    def _rev_parse_at(self, repo_path: Path, ref: str) -> str:
+        result = _run(repo_path, "rev-parse", ref)
+        if result.returncode != 0:
+            raise GitWorktreeError("git rev-parse failed for the worktree")
+        return result.stdout.strip()
+
+    def dispose(self) -> None:
+        """The one real disposal path: exact `git worktree remove
+        --force`, confirmed registration absence, and confirmed
+        directory absence. No `shutil.rmtree`, no `git worktree prune`
+        fallback anywhere in this path.
+
+        Idempotent: a no-op once already `disposed` or `preserved` (see
+        `preserve()`). Raises `GitWorktreeCleanupError` loudly if exact
+        disposal cannot be confirmed — never silently treated as
+        successful.
+        """
+        if self._disposition != "active":
+            return
+        if self.path is None:
+            self._disposition = "disposed"
+            return
+
+        worktree_path = self.path
+        # `git worktree remove`'s own reported outcome (nonzero exit, or
+        # an infrastructure error from `_run`) is deliberately NOT part
+        # of the success decision below — it is only an *attempt*. A
+        # command that reports failure can still have actually removed
+        # the registration (e.g. a race, a partial failure after the
+        # mutating effect already landed, or a wrapper/version
+        # difference in what counts as a reportable error); conversely
+        # a command that reports success is not itself trusted either.
+        # Only the independent final observation — registration status
+        # plus directory presence — decides whether disposal succeeded.
+        try:
+            _run(self.source_repo_path, "worktree", "remove", "--force", str(worktree_path))
+        except GitWorktreeError:
+            pass
+
+        registration_status = self._registration_status(worktree_path)
+        try:
+            directory_absent = not worktree_path.exists()
+        except OSError:
+            directory_absent = False
+
+        if registration_status is not False or not directory_absent:
+            raise GitWorktreeCleanupError(
+                "the git worktree could not be confirmed exactly removed"
+            )
+
+        # Only reached once the worktree's own registration and content
+        # are confirmed gone: the temporary directory wrapping it is now
+        # an ordinary (already-empty, or nearly so) directory, not live
+        # worktree content being force-deleted as a substitute for a
+        # failed `git worktree remove` — this is not the "rmtree
+        # fallback" this design forbids.
+        #
+        # `self._tempdir` is deliberately left alone (not cleared) on a
+        # tempdir-cleanup failure, so a later retry of dispose() — the
+        # worktree portion above being independently idempotent and
+        # already-confirmed-gone — can attempt the tempdir cleanup
+        # again rather than being permanently stuck. A `cleanup()` call
+        # that raises `FileNotFoundError` (the directory is already
+        # gone, e.g. a prior attempt actually succeeded despite raising
+        # for an unrelated reason) is treated as success, confirmed by
+        # the same real-observation discipline as the worktree check
+        # above rather than by trusting `cleanup()`'s own outcome alone.
+        if self._tempdir is not None:
+            tempdir_path = Path(self._tempdir.name)
+            try:
+                self._tempdir.cleanup()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise GitWorktreeCleanupError(
+                    "the temporary directory backing this worktree could not be removed"
+                ) from None
+            if tempdir_path.exists():
+                raise GitWorktreeCleanupError(
+                    "the temporary directory backing this worktree could not be confirmed removed"
+                )
+            self._tempdir = None
+
+        self.path = None
+        self._disposition = "disposed"
+
+    def preserve(self) -> None:
+        """Mark this worktree as deliberately retained. Called only by
+        the controller, only when verifier/container cleanup is
+        UNCONFIRMED: the worktree (and, separately, the controller's own
+        checkpoint session/ref — never touched by this method) must
+        survive so a future reconciliation pass can inspect it. Once
+        preserved, `__exit__` takes no action on it, and a subsequent
+        `dispose()` call is a no-op (see `dispose()`'s idempotence).
+
+        Raises `GitWorktreeError` if called from any state other than
+        `active` — preserving an already-disposed or already-preserved
+        worktree is a caller error, not a legal no-op.
+        """
+        if self._disposition != "active":
+            raise GitWorktreeError("cannot preserve a worktree that is not active")
+        self._disposition = "preserved"
 
     def _cleanup_failed_worktree(self, worktree_path: Path) -> GitWorktreeCleanupError | None:
         """Undo exactly the worktree registration this failed
@@ -416,49 +594,33 @@ class GitWorktree:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        cleanup_error: GitWorktreeCleanupError | None = None
-        try:
-            if self.path is not None:
-                removed_path = self.path
-                try:
-                    remove_result = _run(
-                        self.source_repo_path, "worktree", "remove", "--force", str(removed_path)
-                    )
-                    remove_failed = remove_result.returncode != 0
-                except GitWorktreeError:
-                    remove_failed = True
-                if remove_failed:
-                    # Recovery attempt: ensure the directory is actually
-                    # gone, then prune the now-stale registration.
-                    # NOT resolved to the narrower "exact removal only"
-                    # standard in this slice — see module docstring
-                    # (ADR 0004 I2).
-                    shutil.rmtree(removed_path, ignore_errors=True)
-                    try:
-                        _run(self.source_repo_path, "worktree", "prune")
-                    except GitWorktreeError:
-                        pass
-                    status = self._registration_status(removed_path)
-                    # Anything other than a *confirmed* absence (False)
-                    # — still registered (True), or the listing command
-                    # itself failed (None) — counts as an unresolved
-                    # cleanup failure. Never treat "couldn't check" as
-                    # "must be fine."
-                    if status is not False:
-                        cleanup_error = GitWorktreeCleanupError(
-                            "failed to remove the git worktree registration for this run "
-                            "even after pruning"
-                        )
-                self.path = None
-        finally:
-            if self._tempdir is not None:
-                self._tempdir.cleanup()
-                self._tempdir = None
+        """Tri-state dispatch (ADR 0003 Amendment 2's ownership-transfer
+        discipline):
 
-        self.cleanup_error = cleanup_error
-        if cleanup_error is not None and exc_type is None:
-            # Only raise when nothing else is already propagating —
-            # otherwise this would replace (mask) the real failure the
-            # with-block raised. The caller can still see cleanup_error
-            # on this instance either way.
-            raise cleanup_error
+        - `preserved`: the controller deliberately retained this
+          worktree (verifier/container cleanup was UNCONFIRMED) — do
+          nothing, so a `with`-block exit can never silently dispose of
+          a resource the controller chose to keep.
+        - `disposed`: `dispose()` already ran and confirmed exact
+          removal — idempotent no-op.
+        - `active`: `dispose()` was never called — either the
+          controller raised before its own teardown began, or this is a
+          direct (non-controller) caller. Performs the exact same
+          `dispose()` path a controller-driven disposal would, so a
+          direct `with GitWorktree(...) as path:` caller still gets
+          exact, idempotent, loudly-failing disposal.
+        """
+        if self._disposition in ("preserved", "disposed"):
+            return
+
+        try:
+            self.dispose()
+            self.cleanup_error = None
+        except GitWorktreeCleanupError as cleanup_error:
+            self.cleanup_error = cleanup_error
+            if exc_type is None:
+                # Only raise when nothing else is already propagating —
+                # otherwise this would replace (mask) the real failure
+                # the with-block raised. The caller can still see
+                # cleanup_error on this instance either way.
+                raise

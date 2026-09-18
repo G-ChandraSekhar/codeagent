@@ -35,15 +35,21 @@ an exact value.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 
 import pytest
 
 from codeagent import domain, events
+from codeagent.checkpoint_ref import CheckpointRef, new_lifecycle_id
+from codeagent.checkpoint_session import CheckpointSession
 from codeagent.controller import PlanProposal, RunConfig, RunController, SystemClock
+from codeagent.evidence import FilesystemEvidenceSink, parse_artifact
 from codeagent.executor import CONTAINER_NAME_PREFIX, DockerVerifier
 from codeagent.patch import GitPatchApplier, PatchOperation
 from codeagent.reader import WorktreeFileReader
@@ -133,7 +139,9 @@ def _no_stray_containers() -> None:
 
 
 def test_real_docker_e2e_failing_baseline_then_passing_verification() -> None:
-    with real_fixture_repo() as repo:
+    with real_fixture_repo() as repo, tempfile.TemporaryDirectory(
+        prefix="codeagent-evidence-"
+    ) as evidence_root:
         before_status = subprocess.run(
             ["git", "-C", str(repo), "status", "--porcelain=v1"],
             capture_output=True,
@@ -144,7 +152,12 @@ def test_real_docker_e2e_failing_baseline_then_passing_verification() -> None:
         ).stdout.strip()
         before_content = (repo / "jobs" / "worker.py").read_text()
 
-        with GitWorktree(repo, run_id="r-slice-c") as worktree_path:
+        worktree_lifecycle = GitWorktree(repo, run_id="r-slice-c")
+        lifecycle_id = new_lifecycle_id()
+        session = CheckpointSession(CheckpointRef(repo, lifecycle_id))
+        evidence_sink = FilesystemEvidenceSink(Path(evidence_root))
+
+        with worktree_lifecycle as worktree_path:
             verifier = DockerVerifier(worktree_path, command=FIXTURE_VERIFY_COMMAND, clock=SystemClock())
             applier = GitPatchApplier(
                 worktree_path,
@@ -159,6 +172,7 @@ def test_real_docker_e2e_failing_baseline_then_passing_verification() -> None:
                 task_statement="fix retry bug",
                 approval_mode=domain.ApprovalMode.INTERACTIVE,
                 repository_path=str(worktree_path),
+                lifecycle_id=lifecycle_id,
             )
             controller = RunController(
                 config,
@@ -167,6 +181,9 @@ def test_real_docker_e2e_failing_baseline_then_passing_verification() -> None:
                 verifier,
                 applier,
                 reader,
+                worktree_lifecycle,
+                session,
+                evidence_sink,
                 clock=SystemClock(),
             )
 
@@ -248,8 +265,34 @@ def test_real_docker_e2e_failing_baseline_then_passing_verification() -> None:
             assert "r-slice-c" in render_text(report)
             assert render_json(report)  # must not raise
 
-        # --- cleanup after success ---
+            # --- durable evidence artifact (ADR 0003 Amendment 2) ---
+            evidence_captured = next(
+                e for e in controller.log.events if isinstance(e, events.EvidenceCaptured)
+            )
+            assert evidence_captured.success is True
+            assert evidence_captured.complete is True
+            artifact_path = Path(evidence_root) / f"{lifecycle_id}.evidence"
+            assert artifact_path.exists()
+            assert (artifact_path.stat().st_mode & 0o777) == 0o600
+            header, payload = parse_artifact(artifact_path.read_bytes())
+            assert header["schema_version"] == 1
+            assert header["lifecycle_id"] == lifecycle_id
+            assert header["status"] == "complete"
+            assert header["complete"] is True
+            assert header["bytes_total"] == len(payload)
+            assert header["sha256_payload"] == hashlib.sha256(payload).hexdigest()
+            assert b"job.retry_count += 1" in payload
+            # --- worktree already disposed by _terminate, before run() returns ---
+            assert worktree_lifecycle.path is None
+
+        # --- cleanup after success: worktree, checkpoint ref, containers ---
         assert not worktree_path.exists()
+        ref_listing = subprocess.run(
+            ["git", "-C", str(repo), "for-each-ref", f"refs/codeagent/runs/{lifecycle_id}"],
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert ref_listing.strip() == ""
         _no_stray_containers()
 
         # --- original checkout unchanged ---
@@ -272,6 +315,7 @@ def test_real_docker_baseline_outcome_matches_current_buggy_fixture() -> None:
             assert result.outcome == events.VerificationOutcome.TEST_FAILURE
             assert result.exit_code == 1
             assert result.error is None
+            assert result.cleanup_status == events.ContainerCleanupStatus.CONFIRMED_ABSENT
             _assert_real_duration(result.duration_seconds)
         _no_stray_containers()
 

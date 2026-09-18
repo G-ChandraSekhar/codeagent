@@ -77,6 +77,16 @@ class ErrorDomain(str, Enum):
     PERSISTENCE = "persistence"
     POLICY = "policy"
     INTERNAL = "internal"
+    # ADR 0003 Amendment 2 / ADR 0006 Amendment 4 (Milestone 2 slice
+    # 2B-2): durable evidence-artifact capture, distinct from PATCH
+    # (which covers the patch *application* itself) and EXECUTOR (the
+    # verification container).
+    EVIDENCE = "evidence"
+    # ADR 0003 Amendment 2 (Milestone 2 slice 2B-2): checkpoint-ref and
+    # workspace-cleanup lifecycle failures, distinct from PATCH (the
+    # patch application content/mechanics) and EXECUTOR (the
+    # verification container).
+    LIFECYCLE = "lifecycle"
 
 
 @unique
@@ -163,6 +173,67 @@ class ErrorCode(str, Enum):
     # normal outcome.
     UNCLASSIFIED_FAILURE = "unclassified_failure"
 
+    # ErrorDomain.EVIDENCE — Milestone 2 slice 2B-2 (ADR 0003 Amendment
+    # 2 / ADR 0006 Amendment 4): the durable evidence-artifact capture
+    # attempted at terminal teardown, distinct from every patch/executor
+    # code above.
+    #
+    # An outright command/write/validation failure: nothing was
+    # published (no artifact_id/sha256/bytes_written receipt).
+    EVIDENCE_CAPTURE_FAILED = "evidence_capture_failed"
+    # Capture was truncated at the fixed size bound, or an untracked
+    # path was found at teardown (the current single-file engine cannot
+    # create files, so any untracked path makes the capture incomplete).
+    # A truncated preview artifact WAS published and carries a receipt.
+    EVIDENCE_INCOMPLETE = "evidence_incomplete"
+    # An artifact already exists under this lifecycle's exact name; this
+    # run's own attempt published nothing (no receipt) and the
+    # pre-existing artifact is left untouched.
+    EVIDENCE_ARTIFACT_COLLISION = "evidence_artifact_collision"
+    # The artifact was genuinely published (the no-replace hard link
+    # succeeded) but a step after that — confirming temp-file cleanup or
+    # the publishing directory's fsync — could not be confirmed. The
+    # published artifact is never deleted or overwritten in response to
+    # this; only the *housekeeping* confirmation is ambiguous. Carries a
+    # receipt, since the artifact really is durable at its final path.
+    EVIDENCE_DURABILITY_UNCONFIRMED = "evidence_durability_unconfirmed"
+
+    # ErrorDomain.LIFECYCLE — Milestone 2 slice 2B-2 (ADR 0003 Amendment
+    # 2): checkpoint-ref and workspace-cleanup lifecycle failures.
+    #
+    # A genuine compare-and-swap rejection of a checkpoint-ref mutation
+    # (codeagent.checkpoint_ref.MutationOutcome.UNCHANGED with no
+    # accompanying command/protocol failure) — the ref is confirmed
+    # unchanged, and nothing about the attempt itself misbehaved.
+    CHECKPOINT_REF_UPDATE_REJECTED = "checkpoint_ref_update_rejected"
+    # A known command/protocol failure (a timeout, a launch failure, an
+    # unacknowledged transaction stage) whose ref was independently
+    # confirmed still in its pre-state
+    # (codeagent.checkpoint_ref.MutationOutcome.UNCHANGED) — distinct
+    # from CHECKPOINT_REF_UPDATE_REJECTED because the *cause* is a real
+    # operational failure, not a plain compare-and-swap loss.
+    CHECKPOINT_REF_OPERATION_FAILED = "checkpoint_ref_operation_failed"
+    # The ref was confirmed at an unexpected direct value
+    # (MutationOutcome.UNEXPECTED) or confirmed to be a symbolic ref
+    # (MutationOutcome.SYMBOLIC) — either way, a state this module never
+    # accepts and never attempts to resolve automatically.
+    CHECKPOINT_REF_UNEXPECTED_STATE = "checkpoint_ref_unexpected_state"
+    # The ref's outcome could not be determined at all
+    # (MutationOutcome.UNKNOWN, including
+    # TRANSACTION_CLEANUP_UNCONFIRMED, which always forces UNKNOWN) —
+    # never treated as "unchanged" or safe to retry.
+    CHECKPOINT_REF_OUTCOME_UNKNOWN = "checkpoint_ref_outcome_unknown"
+    # workspace.entry_gate()'s freshly-observed precondition (HEAD at
+    # the expected commit, clean staged index, clean working tree, no
+    # untracked paths) failed or could not be evaluated, before any
+    # mutation was attempted.
+    WORKSPACE_ENTRY_GATE_FAILED = "workspace_entry_gate_failed"
+    # A worktree, checkpoint-ref, or container cleanup step at terminal
+    # teardown could not be confirmed — the run cannot report a clean
+    # result even though the underlying domain outcome may have
+    # succeeded (ADR 0003 Amendment 2's terminal precedence).
+    LIFECYCLE_CLEANUP_UNCONFIRMED = "lifecycle_cleanup_unconfirmed"
+
 
 ERROR_DOMAIN_BY_CODE: dict[ErrorCode, ErrorDomain] = {
     ErrorCode.MODEL_PROVIDER_REQUEST_FAILED: ErrorDomain.MODEL_PROVIDER,
@@ -183,6 +254,16 @@ ERROR_DOMAIN_BY_CODE: dict[ErrorCode, ErrorDomain] = {
     ErrorCode.POLICY_VIOLATION_SEVERE: ErrorDomain.POLICY,
     ErrorCode.INTERNAL_INVARIANT_VIOLATION: ErrorDomain.INTERNAL,
     ErrorCode.UNCLASSIFIED_FAILURE: ErrorDomain.INTERNAL,
+    ErrorCode.EVIDENCE_CAPTURE_FAILED: ErrorDomain.EVIDENCE,
+    ErrorCode.EVIDENCE_INCOMPLETE: ErrorDomain.EVIDENCE,
+    ErrorCode.EVIDENCE_ARTIFACT_COLLISION: ErrorDomain.EVIDENCE,
+    ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED: ErrorDomain.EVIDENCE,
+    ErrorCode.CHECKPOINT_REF_UPDATE_REJECTED: ErrorDomain.LIFECYCLE,
+    ErrorCode.CHECKPOINT_REF_OPERATION_FAILED: ErrorDomain.LIFECYCLE,
+    ErrorCode.CHECKPOINT_REF_UNEXPECTED_STATE: ErrorDomain.LIFECYCLE,
+    ErrorCode.CHECKPOINT_REF_OUTCOME_UNKNOWN: ErrorDomain.LIFECYCLE,
+    ErrorCode.WORKSPACE_ENTRY_GATE_FAILED: ErrorDomain.LIFECYCLE,
+    ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED: ErrorDomain.LIFECYCLE,
 }
 
 

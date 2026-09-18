@@ -73,6 +73,7 @@ class EventType(str, Enum):
     VERIFICATION_COMPLETED = "verification_completed"
     BUDGET_EXCEEDED = "budget_exceeded"
     RUN_FINISHED = "run_finished"
+    EVIDENCE_CAPTURED = "evidence_captured"
 
 
 @unique
@@ -86,6 +87,32 @@ class VerificationOutcome(str, Enum):
     TIMEOUT = "timeout"
     ENVIRONMENT_FAILURE = "environment_failure"
     COMMAND_START_FAILURE = "command_start_failure"
+
+
+@unique
+class ContainerCleanupStatus(str, Enum):
+    """Whether a verification container's cleanup was actually
+    confirmed — Milestone 2 slice 2B-2 (ADR 0003 Amendment 2). Replaces
+    a bare boolean/defaulted cleanup flag: there is no permissive
+    default anywhere this is used, so every construction site must
+    supply one explicitly.
+
+    - `NOT_APPLICABLE`: `docker create` was never invoked for this
+      attempt — nothing could have been left behind. Legal only for a
+      failure that occurs *before* the create invocation begins; once
+      that invocation is attempted (including a bare launch failure),
+      cleanup must be confirmed one way or the other, never reported as
+      not-applicable.
+    - `CONFIRMED_ABSENT`: cleanup ran and a genuine listing afterward
+      confirmed the container's exact name is gone.
+    - `UNCONFIRMED`: cleanup was attempted but could not be confirmed —
+      a nonzero exit, an unparseable listing, or the name still present.
+      A cleanup *attempt* is not a cleanup *guarantee*.
+    """
+
+    NOT_APPLICABLE = "not_applicable"
+    CONFIRMED_ABSENT = "confirmed_absent"
+    UNCONFIRMED = "unconfirmed"
 
 
 @unique
@@ -195,26 +222,62 @@ def _validate_error_for_verification_outcome(
         )
 
 
+def _validate_cleanup_status_for_outcome(
+    outcome: VerificationOutcome, cleanup_status: ContainerCleanupStatus
+) -> None:
+    """Cleanup-status/outcome consistency (Milestone 2 slice 2B-2):
+
+    - `UNCONFIRMED` implies `outcome is ENVIRONMENT_FAILURE` — the
+      executor already overrides any provisional outcome to
+      ENVIRONMENT_FAILURE whenever cleanup cannot be confirmed, so
+      PASSED/TEST_FAILURE/TIMEOUT/COMMAND_START_FAILURE can never pair
+      with UNCONFIRMED.
+    - `NOT_APPLICABLE` implies `outcome` is `COMMAND_START_FAILURE` or
+      `ENVIRONMENT_FAILURE` — only a failure before any container ever
+      ran can have nothing to clean up; PASSED/TEST_FAILURE/TIMEOUT all
+      require a container to have actually run.
+    - `CONFIRMED_ABSENT` is legal for every outcome.
+    """
+    if cleanup_status is ContainerCleanupStatus.UNCONFIRMED:
+        if outcome is not VerificationOutcome.ENVIRONMENT_FAILURE:
+            raise ValueError(
+                "cleanup_status UNCONFIRMED requires outcome ENVIRONMENT_FAILURE, "
+                f"got {outcome!r}"
+            )
+    elif cleanup_status is ContainerCleanupStatus.NOT_APPLICABLE:
+        if outcome not in (
+            VerificationOutcome.COMMAND_START_FAILURE,
+            VerificationOutcome.ENVIRONMENT_FAILURE,
+        ):
+            raise ValueError(
+                "cleanup_status NOT_APPLICABLE requires outcome COMMAND_START_FAILURE or "
+                f"ENVIRONMENT_FAILURE, got {outcome!r}"
+            )
+
+
 def validate_verification_outcome_shape(
     outcome: VerificationOutcome,
     exit_code: int | None,
     error: OperationalError | None,
+    cleanup_status: ContainerCleanupStatus,
 ) -> None:
     """The single, public rule set for whether an (outcome, exit_code,
-    error) triple is internally consistent — shared by BaselineRecorded,
-    VerificationCompleted, and controller.VerificationResult.
+    error, cleanup_status) quadruple is internally consistent — shared
+    by BaselineRecorded, VerificationCompleted, and
+    controller.VerificationResult.
 
     This is the one function outside this module that production code
     (controller.py, executor.py) may call to validate a verification
-    outcome's shape; the two underscore-prefixed helpers above are this
+    outcome's shape; the underscore-prefixed helpers above are this
     module's own implementation detail. Keeping validation behind one
-    public entry point, rather than two private functions called
-    directly from another module, is what makes it impossible for
+    public entry point, rather than private functions called directly
+    from another module, is what makes it impossible for
     VerificationResult's rules to quietly drift from these events'
     rules — see tests/unit/test_verification_result_parity.py.
     """
     _validate_exit_code_for_outcome(outcome, exit_code)
     _validate_error_for_verification_outcome(outcome, error)
+    _validate_cleanup_status_for_outcome(outcome, cleanup_status)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -320,13 +383,16 @@ class BaselineRecorded(Event):
     command: tuple[str, ...]
     exit_code: int | None
     duration_seconds: float
+    cleanup_status: ContainerCleanupStatus
     error: OperationalError | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _require_nonempty_tuple("command", self.command)
         _require_nonnegative("duration_seconds", self.duration_seconds)
-        validate_verification_outcome_shape(self.outcome, self.exit_code, self.error)
+        validate_verification_outcome_shape(
+            self.outcome, self.exit_code, self.error, self.cleanup_status
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -521,6 +587,22 @@ class ToolCompleted(Event):
             ErrorCode.PATCH_APPLICATION_FAILED,
             ErrorCode.PATCH_UNSUPPORTED_GIT_SUBSTRATE,
             ErrorCode.PATCH_REPOSITORY_OBJECTS_UNAVAILABLE,
+            # Milestone 2 slice 2B-2 (ADR 0003 Amendment 2): a
+            # single apply_patch transaction now spans the workspace
+            # entry gate, lazy checkpoint establishment/advance, and the
+            # approved-path postcondition — each can fail this same tool
+            # call, and each needs its own precise, legal code here
+            # rather than an occurrence with nowhere legal to be
+            # reported.
+            ErrorCode.WORKSPACE_ENTRY_GATE_FAILED,
+            ErrorCode.CHECKPOINT_REF_UPDATE_REJECTED,
+            ErrorCode.CHECKPOINT_REF_OPERATION_FAILED,
+            ErrorCode.CHECKPOINT_REF_UNEXPECTED_STATE,
+            ErrorCode.CHECKPOINT_REF_OUTCOME_UNKNOWN,
+            # The approved-path postcondition failure (a PatchApplier
+            # that changed files outside the approved plan) — ADR 0003
+            # Amendment 1 point 4's ordering.
+            ErrorCode.INTERNAL_INVARIANT_VIOLATION,
         }
     )
 
@@ -613,13 +695,16 @@ class VerificationCompleted(Event):
     duration_seconds: float
     fail_to_pass: tuple[str, ...]
     pass_to_pass_broken: tuple[str, ...]
+    cleanup_status: ContainerCleanupStatus
     error: OperationalError | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _require_nonempty_tuple("command", self.command)
         _require_nonnegative("duration_seconds", self.duration_seconds)
-        validate_verification_outcome_shape(self.outcome, self.exit_code, self.error)
+        validate_verification_outcome_shape(
+            self.outcome, self.exit_code, self.error, self.cleanup_status
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -660,6 +745,118 @@ class BudgetExceeded(Event):
                 f"(limit_value={self.limit_value!r}, observed_value={self.observed_value!r}, "
                 f"projected_value={self.projected_value!r})"
             )
+
+
+@dataclass(frozen=True, kw_only=True)
+class EvidenceCaptured(Event):
+    """Milestone 2 slice 2B-2 (ADR 0003 Amendment 2 / ADR 0006 Amendment
+    4): the outcome of attempting to capture and durably publish the
+    run's evidence artifact at terminal teardown. Always attempted,
+    regardless of whether the run's underlying domain outcome
+    succeeded, and never blocks any subsequent cleanup step.
+
+    `artifact_id`, `sha256_payload`, and `bytes_written` are the
+    artifact's receipt: present together if and only if an artifact was
+    genuinely published under that identity, absent together otherwise
+    — never partially present. No raw diff payload or absolute host
+    path ever appears in this event; the receipt is metadata about a
+    file that exists elsewhere, not the file's content or location.
+
+    Exactly four shapes are legal:
+    - complete: `success=True`, `complete=True`, `error=None`, receipt
+      present.
+    - incomplete preview (truncated, or an untracked path was found):
+      `success=False`, `complete=False`,
+      `error.code=EVIDENCE_INCOMPLETE`, receipt present (a preview
+      artifact really was published).
+    - durability unconfirmed (the artifact published successfully, but
+      a step after the no-replace publish — a temp-file cleanup or the
+      publishing directory's fsync — could not be confirmed):
+      `success=False`, `complete=True`,
+      `error.code=EVIDENCE_DURABILITY_UNCONFIRMED`, receipt present.
+      The published artifact itself is never deleted or overwritten in
+      response to this.
+    - capture failed outright, or a collision with an existing artifact
+      under the same identity: `success=False`, `complete=False`,
+      `error.code` one of `EVIDENCE_CAPTURE_FAILED`/
+      `EVIDENCE_ARTIFACT_COLLISION`, no receipt (nothing this run
+      produced was ever published).
+    """
+
+    event_type: ClassVar[EventType] = EventType.EVIDENCE_CAPTURED
+    success: bool
+    complete: bool
+    artifact_id: str | None = None
+    sha256_payload: str | None = None
+    bytes_written: int | None = None
+    error: OperationalError | None = None
+
+    _RECEIPT_ERROR_CODES: ClassVar[frozenset[ErrorCode]] = frozenset(
+        {ErrorCode.EVIDENCE_INCOMPLETE, ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED}
+    )
+    _NO_RECEIPT_ERROR_CODES: ClassVar[frozenset[ErrorCode]] = frozenset(
+        {ErrorCode.EVIDENCE_CAPTURE_FAILED, ErrorCode.EVIDENCE_ARTIFACT_COLLISION}
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        receipt_fields_present = (
+            self.artifact_id is not None,
+            self.sha256_payload is not None,
+            self.bytes_written is not None,
+        )
+        if len(set(receipt_fields_present)) != 1:
+            raise ValueError(
+                "artifact_id, sha256_payload, and bytes_written must be present or "
+                f"absent together, got {receipt_fields_present!r}"
+            )
+        has_receipt = receipt_fields_present[0]
+        if has_receipt:
+            _require_nonempty("artifact_id", self.artifact_id)
+            _require_nonempty("sha256_payload", self.sha256_payload)
+            _require_nonnegative("bytes_written", self.bytes_written)
+
+        if self.success:
+            if self.error is not None:
+                raise ValueError(f"error must be None when success is True, got {self.error!r}")
+            if not self.complete:
+                raise ValueError("success=True requires complete=True")
+            if not has_receipt:
+                raise ValueError("a successful capture must carry receipt metadata")
+            return
+
+        if self.error is None:
+            raise ValueError("error must be set when success is False")
+        code = self.error.code
+        if code in self._RECEIPT_ERROR_CODES:
+            if not has_receipt:
+                raise ValueError(
+                    f"error code {code!r} requires receipt metadata "
+                    "(an artifact was genuinely published)"
+                )
+        elif code in self._NO_RECEIPT_ERROR_CODES:
+            if has_receipt:
+                raise ValueError(
+                    f"error code {code!r} must not carry receipt metadata "
+                    "(nothing was published)"
+                )
+        else:
+            raise ValueError(
+                f"error.code must be one of "
+                f"{sorted(c.value for c in self._RECEIPT_ERROR_CODES | self._NO_RECEIPT_ERROR_CODES)}, "
+                f"got {code!r}"
+            )
+        if code is ErrorCode.EVIDENCE_INCOMPLETE and self.complete:
+            raise ValueError("EVIDENCE_INCOMPLETE requires complete=False")
+        if code is ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED and not self.complete:
+            # ADR 0003 Amendment 2's terminal precedence: an incomplete
+            # capture that also hits ambiguous post-link housekeeping
+            # must be reported as EVIDENCE_INCOMPLETE, never as
+            # EVIDENCE_DURABILITY_UNCONFIRMED — this pairing would mean
+            # the precedence rule was not applied upstream.
+            raise ValueError("EVIDENCE_DURABILITY_UNCONFIRMED requires complete=True")
+        if code in self._NO_RECEIPT_ERROR_CODES and self.complete:
+            raise ValueError(f"error code {code!r} requires complete=False")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -723,6 +920,7 @@ AnyEvent = (
     | VerificationCompleted
     | BudgetExceeded
     | RunFinished
+    | EvidenceCaptured
 )
 
 EVENT_CLASSES_BY_TYPE: dict[EventType, type[Event]] = {
@@ -742,4 +940,5 @@ EVENT_CLASSES_BY_TYPE: dict[EventType, type[Event]] = {
     VerificationCompleted.event_type: VerificationCompleted,
     BudgetExceeded.event_type: BudgetExceeded,
     RunFinished.event_type: RunFinished,
+    EvidenceCaptured.event_type: EvidenceCaptured,
 }

@@ -271,19 +271,96 @@ Stage 2 (of the four-stage planning process in
   create/advance ordering, workspace ownership, worktree-before-ref
   teardown, event ordering and error identity are all slice 2B-2, and
   ADR 0004's durable store remains Milestone 3.
-  **Pre-2B-2 architecture decision set (2026-09-17): design accepted,
-  nothing implemented.** `docs/adr/0003-recover-partial-patches-by-
-  replacing-worktree.md` Amendment 2 and `docs/adr/0006-git-safety-
-  policy-for-filters-hooks-and-content-fidelity.md` Amendment 4
-  (both Accepted) settle lazy checkpoint establishment, a durable
-  self-describing evidence artifact, gated teardown ordering, terminal
-  precedence, a new `ErrorDomain.EVIDENCE`/`ErrorDomain.LIFECYCLE`
-  taxonomy, and a required no-default `ContainerCleanupStatus` for
-  Slice 2B-2. This is documentation only — no `evidence.py`, no
-  `workspace.py`/`executor.py`/`controller.py` changes, no new events
-  or tests exist yet. Do not claim any production evidence-capture or
-  lifecycle-cleanup guarantee until 2B-2 is actually implemented and
-  verified.
+  **Milestone 2 Slice 2B-2 is implemented (2026-09-17) per
+  `docs/adr/0003-recover-partial-patches-by-replacing-worktree.md`
+  Amendment 2 and `docs/adr/0006-git-safety-policy-for-filters-hooks-
+  and-content-fidelity.md` Amendment 4 — verified locally on macOS with
+  a real Docker daemon; Linux CI validation and SHA-256 object-format
+  coverage are still pending.**
+  - `src/codeagent/evidence.py` (new): `FilesystemEvidenceSink`
+    implements the accepted durable-evidence-artifact design in full —
+    strictly observational `status`+`diff` capture sharing one
+    `enumerate_filter_neutralization()` result, the framed
+    magic/header/payload binary format, component-aware containment,
+    owner-only `0700`/`0600` permissions independent of umask, atomic
+    same-directory no-replace hard-link publication, the 1 MiB hard
+    bound with immediate child termination on overflow (no fabricated
+    totals), and the four `EvidenceCaptured` shapes
+    (complete/incomplete/durability-unconfirmed/capture-failed or
+    collision). 37 tests, including real hostile external-diff/
+    textconv/clean-filter/process-filter positive controls proving the
+    production capture path — not a scratch probe — suppresses each.
+  - `src/codeagent/_git_safety.py` gained `run_git_bounded_preview` (a
+    bounded-preview counterpart to `run_git_bounded`: overflow stops
+    draining, confirms the child terminated, and returns a truncated
+    `complete=False` result instead of raising and discarding it;
+    `run_git_bounded`'s own contract is unchanged). 12 new tests.
+  - `src/codeagent/workspace.py`: `GitWorktree` gained `initial_commit`,
+    `entry_gate()`, `dispose()`, `preserve()`, and a tri-state
+    `active`/`disposed`/`preserved` `__exit__` dispatch. **Every
+    `shutil.rmtree`/repository-wide `git worktree prune` fallback is
+    removed** — an unconfirmed exact disposal now raises
+    `GitWorktreeCleanupError` loudly instead of degrading to a broader
+    sweep. 18 new tests, including a static AST-level proof that
+    `rmtree` and `"prune"` no longer appear anywhere in the module.
+  - `src/codeagent/executor.py`: `events.ContainerCleanupStatus`
+    (`NOT_APPLICABLE`/`CONFIRMED_ABSENT`/`UNCONFIRMED`, no production
+    default anywhere) threaded through `_attempt`/`_execute`;
+    `create_attempted` is set immediately before the `docker create`
+    call, so a bare launch failure still requires cleanup confirmation
+    rather than being reported `NOT_APPLICABLE`. `NOT_APPLICABLE`
+    itself is not reachable through any path in today's `_attempt` (no
+    pre-create validation exists yet) — verified directly against the
+    pure classification function instead of fabricating a Docker
+    scenario for it.
+  - `src/codeagent/controller.py`: `RunConfig.lifecycle_id` required
+    and validated (32 lowercase hex); `initial_checkpoint_id` removed
+    (the workspace's `initial_commit` is now the sole authority, and
+    seeds `_last_checkpoint_id` at construction). `RunController` takes
+    three new required collaborators (`workspace`, `session`,
+    `evidence_sink`). `_dispatch_apply_patch` now runs the full ADR
+    0003 Amendment 1/2 order (entry gate → lazy `establish()` only from
+    `ABSENT` → apply → approved-path postcondition → `advance()` → only
+    then `ToolCompleted(success=True)`/`CheckpointCreated`/
+    `PatchApplied`), with `_map_checkpoint_error` implementing the
+    exact reason+`MutationOutcome` → `ErrorCode` mapping. A new
+    `_terminate` method replaces every direct `_transition`+`_finish`
+    call site: it always attempts evidence capture first, then gates
+    worktree disposal/checkpoint-ref deletion on verifier-cleanup and
+    disposal confirmation, then applies the six-tier terminal
+    precedence (any cleanup unconfirmed → evidence failure → the
+    original result), overriding the trigger to `UNRECOVERABLE_ERROR`
+    when precedence selects anything but the original outcome
+    (`domain.TerminalReason` has no separate slot for "succeeded but
+    teardown didn't").
+  - `tests/support/fakes.py` gained `FakeWorkspace`,
+    `FakeCheckpointSession` (raising the real
+    `CheckpointRefError`/`CheckpointSessionError` types so the
+    controller's mapping logic is exercised identically to the real
+    collaborator), and `FakeEvidenceSink`.
+  - `tests/integration/test_slice_b.py` and `test_slice_c.py` now wire
+    real `CheckpointRef`/`CheckpointSession`/`FilesystemEvidenceSink`
+    end to end (the latter with a real Docker daemon): both confirm the
+    checkpoint ref and worktree are genuinely absent after teardown,
+    the evidence artifact is genuinely published with correct framing/
+    hash/content, and (slice C) no container is left behind.
+  - **Full suite: 1864 passed** (current; up from 1804 before this
+    slice, through two subsequent correction passes — see
+    `ENGINEERING_LOG.md`'s "correction pass" and "ambient-symlink
+    hardening" entries for the intermediate totals those runs actually
+    produced at the time), including the 3 real-Docker tests with
+    `CODEAGENT_REQUIRE_DOCKER=1` — all on macOS/Git 2.54.0.
+    `src/codeagent/evidence.py`'s ambient-symlink exception
+    (`/tmp`/`/var`/`/etc`) is now gated to a verified macOS/Darwin
+    target match, never trusted by name alone or on another platform;
+    `tests/unit/test_evidence.py` is now 37 tests. **Not yet done**:
+    Linux CI validation; SHA-256 object-format exercise (ADR 0003's own
+    required-test list); a dedicated test for every scenario in the
+    original 2B-2 task's exhaustive list (several are exercised only
+    incidentally via the real end-to-end tests, not each via its own
+    dedicated unit test); ADR 0004's durable lifecycle store, locks, reconciliation,
+    abandonment, and CLI/frontend work remain entirely Milestone 3, as
+    already scoped.
   **`docs/adr/0006-git-safety-policy-for-filters-hooks-and-content-fidelity.md`
   (Accepted) is now implemented for `src/codeagent/_git_safety.py` and
   `src/codeagent/workspace.py`**: the shared foundation module
