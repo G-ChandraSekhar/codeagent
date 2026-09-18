@@ -1,9 +1,13 @@
 # ADR 0003: Recover partial multi-file patches by replacing the worktree, not by per-file rollback
 
 Status: Accepted. Amended 2026-09-15 by Amendment 1 (Accepted): durable
-checkpoint reachability through hidden Git refs — see the end of this
-document. Everything above "Amendment 1" is the original decision,
-unchanged.
+checkpoint reachability through hidden Git refs. Amended 2026-09-17 by
+Amendment 2 (Accepted): lazy checkpoint establishment, durable evidence
+capture, gated teardown ordering, and terminal precedence — see the end
+of this document. Everything above "Amendment 1" is the original
+decision, unchanged; Amendment 1 is unchanged by Amendment 2 except
+where Amendment 2 explicitly narrows its point 4 ("establish, then
+rely") ordering.
 
 ## Context
 
@@ -493,3 +497,211 @@ Code reading of `src/codeagent/patch.py`, `src/codeagent/controller.py`,
 and `src/codeagent/workspace.py` at commit `567db62`. No spike evidence
 exists for this mechanism; the required tests above are the evidence
 obligation.
+
+---
+
+## Amendment 2 (Accepted 2026-09-17): lazy checkpoint establishment, durable evidence capture, gated teardown, and terminal precedence
+
+Implementation status: **not implemented.** This amendment records
+author decisions reached through a multi-round planning-only
+architecture review for Milestone 2 Slice 2B-2 (integrating
+`checkpoint_ref.py`/`checkpoint_session.py` into `controller.py`/
+`workspace.py`/`patch.py`). Every empirical claim below was verified by
+real, positive-controlled Git probes in scratch directories during that
+review, not asserted from documentation. Nothing in this amendment
+exists in production code yet; Slice 2B-1 (`checkpoint_ref.py`'s
+`MutationOutcome`, `checkpoint_session.py`) remains implemented and
+unwired, exactly as recorded in `ENGINEERING_LOG.md`.
+
+### 1. Lazy checkpoint establishment (narrows Amendment 1 point 4)
+
+Amendment 1 point 4 said the initial ref is created "after the worktree
+is confirmed and before any patch attempt." This is narrowed to an
+exact moment: the initial ref is created **inside the first
+`apply_patch` transaction**, after that call's `ToolRequested` and
+`PolicyDecisionRecorded` have been emitted, after `workspace`'s entry
+gate has freshly confirmed `HEAD == workspace.initial_commit` plus a
+clean staged index, a clean working tree, and no untracked paths — and
+strictly before `PatchApplier.apply()` runs or any worktree mutation
+begins.
+
+- `workspace.initial_commit` is the **sole authority** for the pinned
+  starting checkpoint SHA. `RunConfig.initial_checkpoint_id` is removed
+  as caller-controlled input; no such field exists in 2B-2.
+- **A run that never issues `apply_patch` never creates a checkpoint
+  ref.** A run that is rejected, revised, or ends in `EXPLORE`/`PLAN`/
+  `APPROVAL` without an accepted patch has no ref to advance, preserve,
+  or delete — terminal teardown's ref-deletion step (Amendment 1 point
+  7.4) is then a no-op, not a failure.
+
+### 2. Durable evidence artifact
+
+Before a disposable worktree may be discarded and recreated from the
+last accepted checkpoint on a handled failure, or destroyed at terminal
+teardown, a **durable, self-describing evidence artifact** must exist
+outside both the disposable worktree and the trusted source repository:
+
+- **Format**: one binary-safe framed file — a bounded metadata header
+  (schema version, lifecycle id, capture status, payload encoding,
+  bytes written, completeness, and the payload's SHA-256, all embedded
+  in the artifact's own bytes, never relying on the in-memory
+  `EvidenceCaptured` event surviving process exit) followed by the raw
+  diff payload. Diff output is treated as arbitrary binary bytes end to
+  end — never decoded or re-encoded.
+- **Directory/file permissions**: the output directory is owner-only,
+  exact mode `0700`; the artifact file is exact mode `0600`, verified
+  by `fchmod` plus an explicit mode check, independent of umask.
+- **Containment**: the output directory's canonical (fully resolved)
+  path is proven outside both the source repository and the disposable
+  worktree using **component-aware comparison** (resolved path
+  components / `commonpath`), never string-prefix comparison; every
+  parent path component is validated symlink-free, not only the final
+  directory.
+- **Publication is atomic and never replaces an existing artifact**:
+  written to a same-directory temporary file, fsynced, then published
+  by a same-directory hard link under the final lifecycle-derived name,
+  with the parent directory fsynced afterward. An artifact already
+  present under that name is a **structured collision refusal**, not an
+  overwrite.
+- **Post-link ambiguity never deletes or overwrites a published
+  artifact.** If the hard link itself succeeds but a subsequent
+  temp-file unlink or directory fsync cannot be confirmed, the
+  published artifact is left exactly as published; the ambiguity is
+  reported (`EVIDENCE_DURABILITY_UNCONFIRMED`) but never used to justify
+  removing or replacing real, durable evidence.
+- **Hard bound, current engine**: capture is capped at 1 MiB for
+  today's single-file text-replacement patch engine. Reaching the bound
+  stops capture, terminates and reaps the Git child, and marks the
+  artifact **incomplete** — capture never continues draining a stream
+  solely to compute an exact total byte count or a full-stream hash;
+  those fields are absent, never fabricated, on an incomplete artifact.
+  **This bound must be re-derived, not assumed, before any multi-file
+  or add-file patch capability exists** — it is sized for the current
+  engine only.
+- **Incompleteness always prevents a clean result.** A truncated
+  preview is persisted only when unambiguously labeled incomplete in
+  its own header, and its existence never substitutes for a complete
+  capture.
+- **Untracked paths make v1 evidence incomplete.** Because today's
+  patch engine cannot create files, any untracked path detected at
+  evidence-capture time (via read-only `git status`, never by mutating
+  the index) means evidence is incomplete for that run. This is a
+  narrow, current-engine-specific rule, not a general claim about
+  future add-file support.
+- **Evidence collection is strictly observational.** It never runs
+  `git add`, `git add --intent-to-add`, `update-index`, `checkout`, or
+  any other command that mutates the index or working tree — including
+  to work around the untracked-path blindness above.
+
+### 3. The exact observational command, and what it does and does not prove
+
+```
+git diff --binary --full-index --find-renames --no-ext-diff --no-textconv <initial_commit> --
+```
+run under ADR 0006's hardened baseline, plus one freshly enumerated
+filter-neutralization set (`_git_safety.enumerate_filter_neutralization`)
+reused, unchanged, for both this call and the companion bounded
+`git status` call used to detect untracked paths (see ADR 0006
+amendment below for why both need it).
+
+This single-endpoint invocation is empirically proven (this review) to
+combine committed, staged, and unstaged tracked changes in one call.
+**It is not claimed to correctly capture add, delete, rename, or binary
+patch operations** — today's `GitPatchApplier` supports only single-file
+text replacement on an already-tracked file and cannot produce any of
+those shapes, so the command's `--find-renames`/`--binary` flags are
+correctly formed for a future engine but are **not exercised or proven**
+by any test in this slice. A future multi-file/add/delete/rename/binary
+patch engine must independently validate this command's behavior for
+those operation kinds before relying on this design's completeness
+claim.
+
+### 4. Gated teardown ordering
+
+Evidence capture is always attempted first and never blocks any
+subsequent cleanup step, regardless of its own outcome:
+
+1. **Attempt evidence capture.** (Always; outcome recorded, never
+   gates what follows.)
+2. **If verifier/container cleanup is `UNCONFIRMED`**: call
+   `workspace.preserve()` (preserving the worktree) and skip
+   checkpoint-session deletion; this branch skips steps 3–4 entirely.
+   Any checkpoint ref already created (section 1) therefore remains,
+   since nothing asked it to be deleted. **If no `apply_patch` call
+   ever occurred in this run, no ref was ever created (section 1), and
+   this step neither invents one nor claims one exists** — "preserved"
+   describes the worktree and, where a ref exists, that ref; it is not
+   a claim that a ref is always present.
+3. **Otherwise, exact worktree disposal** via `workspace.dispose()` — no
+   `shutil.rmtree` and no `git worktree prune` fallback anywhere in this
+   path.
+4. **If disposal itself cannot be confirmed**: skip checkpoint-ref
+   deletion — an unconfirmed worktree may still reference the ref's
+   commit, so deleting the ref first would be premature.
+5. **Otherwise, checkpoint-ref deletion** via the existing
+   compare-and-swap delete (Amendment 1 point 3).
+6. **`RunFinished`**, carrying whichever terminal error the precedence
+   below selects.
+
+### 5. Terminal precedence
+
+```
+a. any verifier/container, worktree, or checkpoint-ref cleanup step unconfirmed → LIFECYCLE_CLEANUP_UNCONFIRMED
+b. evidence incomplete                                                          → EVIDENCE_INCOMPLETE
+c. evidence durability unconfirmed (post-link ambiguity)                        → EVIDENCE_DURABILITY_UNCONFIRMED
+d. evidence artifact collision                                                  → EVIDENCE_ARTIFACT_COLLISION
+e. evidence capture failure                                                     → EVIDENCE_CAPTURE_FAILED
+f. otherwise                                                                    → the run's original result stands
+```
+Evidence failure or incompleteness of any kind never blocks the
+teardown sequence in section 4 from running to whatever point it can
+reach; it only ever prevents `RunFinished` from reporting a clean
+result.
+
+### 6. Error taxonomy
+
+A new `ErrorDomain.EVIDENCE` with four distinct codes —
+`EVIDENCE_CAPTURE_FAILED`, `EVIDENCE_INCOMPLETE`,
+`EVIDENCE_ARTIFACT_COLLISION`, `EVIDENCE_DURABILITY_UNCONFIRMED` — and a
+new `ErrorDomain.LIFECYCLE` covering checkpoint-ref and workspace
+cleanup-confirmation failures (`LIFECYCLE_CLEANUP_UNCONFIRMED`). Exact
+enum member names beyond these are fixed at implementation time and
+pinned exhaustively by `errors.py`/`events.py` tests, per this
+project's existing errors-taxonomy discipline.
+
+### 7. Structured Docker/container cleanup status
+
+`ContainerCleanupStatus` (`NOT_APPLICABLE` / `CONFIRMED_ABSENT` /
+`UNCONFIRMED`) replaces any boolean or defaulted cleanup flag on
+`VerificationResult` and its mirrored events — **no production default
+value anywhere**; every construction site supplies it explicitly.
+`NOT_APPLICABLE` applies **only** when execution fails before a
+`docker create` invocation is ever issued. Once that invocation begins,
+every subsequent outcome — a nonzero exit, a timeout, an ambiguous
+inspect result, or an OOM kill — requires an exact cleanup/absence
+confirmation using the already-generated container name before the
+result is reported, and resolves to `CONFIRMED_ABSENT` or `UNCONFIRMED`
+accordingly, never assumed.
+
+### Milestone boundary
+
+Everything in this amendment is Milestone 2 Slice 2B-2 scope. ADR 0004's
+durable lifecycle store, repository/lifecycle locks, startup
+reconciliation, abandonment, and container labels/attribution remain
+Milestone 3, unaffected by this amendment.
+
+### Evidence
+
+Real, positive-controlled Git probes run in scratch directories
+(outside this repository) during the 2B-2 architecture review:
+single-endpoint `git diff` combining committed/staged/unstaged changes;
+`--no-ext-diff`/`--no-textconv` independently suppressing external-diff
+and textconv execution; a hostile `clean` filter and a hostile
+`.process` filter both executing during plain `git diff` despite all
+four proposed flags, and both suppressed once
+`enumerate_filter_neutralization`'s overrides are applied to the same
+call; and observational `git diff` being completely blind to untracked
+files under every flag combination tested, with `git status
+--porcelain=v1` the only read-only detector. No code exists yet; the
+file/test plan recorded in `ENGINEERING_LOG.md`'s 2B-2 planning entry is
+the implementation obligation this amendment creates.

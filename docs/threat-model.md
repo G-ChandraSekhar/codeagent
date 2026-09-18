@@ -1528,7 +1528,17 @@ this detailed entry states.
   `patch.py` (`_check_repository_wide_attribute_safety`) but is
   deliberately unused, preserved only for potential future reuse once a
   trusted, independent-of-target-content attribute-layer inspection
-  mechanism exists.
+  mechanism exists. **A new governed command class is accepted but not
+  implemented**: ADR 0006 Amendment 4 / ADR 0003 Amendment 2 record
+  that `git diff` against working-tree content (planned for Milestone 2
+  Slice 2B-2's evidence-capture design) executes `clean`/`.process`
+  filters exactly as `git status` does, unaffected by
+  `--no-ext-diff`/`--no-textconv`, and is suppressed by the same
+  `enumerate_filter_neutralization` backstop already used for `status`
+  — verified only by scratch-directory probes outside this repository,
+  not by any production code or test. T-M3 remains open until that
+  code exists and passes cross-platform acceptance tests, same as the
+  rest of this entry.
 - Owning milestone/spike: Milestone 2 (before patch integration), then
   reviewed again when ADR 0004's lifecycle work adds Git invocations
 

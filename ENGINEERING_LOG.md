@@ -1378,3 +1378,39 @@ clean; no leftover containers, worktrees, refs or Git processes.
 macOS/Git 2.54.0; Linux CI pending. **Next**: 2B-2 — entry gate,
 create/advance ordering, workspace ownership, worktree-before-ref
 teardown, event ordering, error identity.
+
+## Session (2026-09-17): pre-2B-2 architecture decision set (documentation only, no code)
+
+**Nothing implemented; 2B-1 remains implemented and unwired.**
+Planning-only review, recorded as **ADR 0003 Amendment 2** and
+**ADR 0006 Amendment 4** (both Accepted). No production file, test, or
+event schema changed; detail lives in the amendments.
+
+- **Lazy checkpoint establishment**: the initial ref is created inside
+  the first `apply_patch` transaction, after `ToolRequested`/
+  `PolicyDecisionRecorded` and the entry gate, before any mutation.
+  `workspace.initial_commit` is the sole starting-checkpoint authority;
+  `RunConfig.initial_checkpoint_id` is removed. No `apply_patch` call
+  means no ref.
+- **Durable evidence artifact**: binary-safe, self-describing, published
+  atomically outside both the source repository and the disposable
+  worktree, owner-only `0700`/`0600`, 1 MiB hard bound for the current
+  single-file engine only (not assumed for future multi-file/add-file
+  support), never fabricating totals/hashes for a truncated capture.
+- **New finding**: `git diff` against working-tree content executes
+  `clean`/`.process` filters, unaffected by `--no-ext-diff`/
+  `--no-textconv`; `enumerate_filter_neutralization` suppresses it (ADR
+  0006 Amendment 4).
+- **Gated teardown/precedence**: evidence capture always attempted
+  first, never blocking cleanup; verifier-cleanup-unconfirmed preserves
+  the worktree and skips checkpoint-session deletion; otherwise exact
+  disposal, then (if confirmed) ref deletion; `RunFinished.error` order
+  is cleanup-unconfirmed > evidence-incomplete >
+  evidence-durability-unconfirmed > evidence-artifact-collision >
+  evidence-capture-failed > original result. No `rmtree`/`prune`.
+- **New taxonomy**: `ErrorDomain.EVIDENCE` (4 codes),
+  `ErrorDomain.LIFECYCLE`, and a required no-default
+  `ContainerCleanupStatus` (`NOT_APPLICABLE`/`CONFIRMED_ABSENT`/
+  `UNCONFIRMED`), `NOT_APPLICABLE` legal only before `docker create`.
+- **Status**: Accepted designs, not implementations. **Next: implement
+  2B-2.**

@@ -17,8 +17,12 @@ there is currently no trusted way to validate parent/
 target's own content (Amendment 3). The slice is implemented and
 passing its own tests locally (macOS, Git 2.54.0); Linux CI validation
 is pending — see Amendment 3 for exactly what evidence that implies
-and what it does not. Acceptance of this ADR's design is independent
-of implementation and of Linux validation — see Consequences.
+and what it does not. **Amendment 4** (2026-09-17, design only, not
+implemented) extends this policy to `git diff` against working-tree
+content, found during Milestone 2 Slice 2B-2's evidence-capture design
+review; see the end of this document. Acceptance of this ADR's design
+is independent of implementation and of Linux validation — see
+Consequences.
 
 ## Context
 
@@ -1155,3 +1159,125 @@ validation, bounded I/O, commit-acceptance verification) is unaffected.
   exists.
 - Linux validation — unchanged: macOS/Git 2.54.0 only.
 - Linux CI validation of this amendment's changes.
+
+## Amendment 4 (Accepted 2026-09-17): `git diff` is a filter/external-diff/textconv execution point
+
+Implementation status: **not implemented — design only.** Found during
+the Milestone 2 Slice 2B-2 planning review (evidence-capture design),
+not during any patch.py/workspace.py implementation pass. Real,
+positive-controlled probes were run against scratch fixture
+repositories outside this codebase. This amendment extends the ADR's
+existing filter/hook-safety model to a command class no prior amendment
+addressed; it does not revise or narrow anything in Amendments 1–3.
+
+### New finding
+
+`git diff` against working-tree content is a filter/external-diff/
+textconv execution point, exactly as `git status` already is per this
+ADR's existing racy-stat reasoning (section 4) — a previously
+unaddressed gap, since no prior slice needed to run `git diff` against
+live working-tree content.
+
+- **`--no-ext-diff` and `--no-textconv` independently and correctly
+  suppress `diff.external` and per-path `textconv` execution
+  respectively** — proven with real positive controls: each driver
+  fires without its corresponding flag, and is silent with it. (A
+  per-path `textconv` probe must be run in a fixture isolated from
+  `diff.external`, since an active `diff.external` driver shadows
+  per-file `textconv` entirely — a real interaction found while
+  isolating the two controls.)
+- **Neither flag suppresses a `clean` or `.process` filter driver.** A
+  hostile `clean` filter, and independently a hostile `.process`
+  filter, both executed during a bare `git diff <commit> --` call with
+  all four of `--binary --full-index --find-renames --no-ext-diff
+  --no-textconv` already present — none of those flags touch filter
+  execution.
+- **`enumerate_filter_neutralization`'s existing overrides, already
+  used for `git status`, suppress both** when applied to the same
+  `git diff` invocation: the hostile `clean`-filter marker disappears,
+  and the hostile `.process`-filter marker disappears (with the call
+  then legitimately failing, exit 128, because a `required=true`
+  driver with only `.process` configured and now-cleared has no
+  `.clean` fallback — correct fail-closed behavior, already covered by
+  "nonzero exit is a capture failure," not a new failure mode needing
+  separate handling).
+- **Purely observational `git diff` is completely blind to untracked
+  files** under every flag combination tested; only read-only
+  `git status --porcelain=v1` detects them. This is not a filter/hook
+  finding but is recorded here because it shapes the same governed
+  command's safe usage (ADR 0003 Amendment 2 section 2's untracked-path
+  rule).
+
+### Decision
+
+- **Every governed `git diff` invocation against working-tree content
+  is a governed command under section 1's secondary control**: filter
+  drivers are enumerated and neutralized for it exactly as for `status`/
+  `add`/`commit`, using `enumerate_filter_neutralization`. `--no-ext-diff`
+  and `--no-textconv` remain independently required on the same
+  invocation — the two defenses are additive, not substitutes for each
+  other.
+- **One logical operation that issues both a `status` and a `diff` call
+  (e.g. evidence capture) enumerates filter configuration exactly
+  once** and reuses that single bounded, validated neutralization
+  snapshot, unchanged, for both calls. This prevents the two commands
+  from ever being governed by independently-derived override sets (one
+  call neutralized against a driver set the other never saw). **It does
+  not claim protection against a concurrent local actor modifying Git
+  configuration after enumeration** — such concurrent direct
+  repository/configuration manipulation is a local-process-level attack
+  already out of scope under threat-model assumption A4. Without A4,
+  neither reusing one enumeration nor re-enumerating before each call
+  would provide a race-free guarantee on its own; single-enumeration
+  reuse is adopted here for consistency between the two calls, not as a
+  race-closing control.
+- **Both the governed `status` and `diff` calls are binary/NUL-safe and
+  bounded.** `status` output is parsed NUL-delimited
+  (`--porcelain=v1 -z`); `diff` output is treated as opaque binary
+  bytes end to end, never decoded or re-encoded.
+- **A new shared primitive, `run_git_bounded_preview`, is planned** in
+  `_git_safety.py` for exactly this class of call (a bounded, binary,
+  bulk-capture read where "stop early and report incomplete" is
+  correct, as distinct from `run_git_bounded`'s existing "fail on
+  overflow" contract):
+  - Applies the section 5 hardened baseline exactly once per call, plus
+    the caller-supplied filter-neutralization overrides.
+  - Caps captured bytes at a caller-supplied bound (1 MiB for the
+    current evidence-capture use).
+  - On overflow (the bound-plus-one-th byte), terminates and reaps the
+    child using the existing bounded-subprocess kill/reap machinery
+    (`_read_bounded`'s unified `_terminate_and_confirm` abort path) and
+    reports `complete=False` with the preview bytes captured so far —
+    never continuing to drain the remainder for an exact total or a
+    full-stream hash.
+  - An unconfirmed child-process cleanup after overflow **fails
+    closed** — reported as a structured process-cleanup failure, not
+    silently treated as a successful truncation.
+  - `run_git_bounded`'s existing semantics (whole-output capture,
+    categorical failure on nonzero exit) are **unchanged** — this is a
+    new, additional primitive for a different contract, not a
+    modification of the existing one.
+
+### Consequences
+
+- ADR 0003 Amendment 2's evidence-capture design (section 3 there)
+  depends on this amendment's neutralization requirement and planned
+  `run_git_bounded_preview` primitive; neither exists in production
+  code yet.
+- This amendment does not change T-M3's status: `git diff` was never
+  previously a governed command in production code, so this is new
+  scope being brought under the existing policy, not a regression being
+  fixed.
+
+### Evidence
+
+Real, positive-controlled probes in scratch fixture repositories
+(outside this codebase): single-endpoint `git diff <commit> --`
+combining committed/staged/unstaged changes; isolated `diff.external`
+and `textconv` positive/negative controls; a hostile `clean` filter and
+a hostile `.process` filter both firing during unneutralized `git diff`
+and both suppressed by `enumerate_filter_neutralization`'s existing
+overrides; and untracked-file blindness under every flag combination
+tested. No implementation or test exists yet in this repository for any
+of the above; `run_git_bounded_preview` and its callers are the
+implementation obligation this amendment creates.

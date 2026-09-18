@@ -271,6 +271,19 @@ Stage 2 (of the four-stage planning process in
   create/advance ordering, workspace ownership, worktree-before-ref
   teardown, event ordering and error identity are all slice 2B-2, and
   ADR 0004's durable store remains Milestone 3.
+  **Pre-2B-2 architecture decision set (2026-09-17): design accepted,
+  nothing implemented.** `docs/adr/0003-recover-partial-patches-by-
+  replacing-worktree.md` Amendment 2 and `docs/adr/0006-git-safety-
+  policy-for-filters-hooks-and-content-fidelity.md` Amendment 4
+  (both Accepted) settle lazy checkpoint establishment, a durable
+  self-describing evidence artifact, gated teardown ordering, terminal
+  precedence, a new `ErrorDomain.EVIDENCE`/`ErrorDomain.LIFECYCLE`
+  taxonomy, and a required no-default `ContainerCleanupStatus` for
+  Slice 2B-2. This is documentation only — no `evidence.py`, no
+  `workspace.py`/`executor.py`/`controller.py` changes, no new events
+  or tests exist yet. Do not claim any production evidence-capture or
+  lifecycle-cleanup guarantee until 2B-2 is actually implemented and
+  verified.
   **`docs/adr/0006-git-safety-policy-for-filters-hooks-and-content-fidelity.md`
   (Accepted) is now implemented for `src/codeagent/_git_safety.py` and
   `src/codeagent/workspace.py`**: the shared foundation module
