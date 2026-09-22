@@ -651,6 +651,54 @@ def test_object_ids_are_validated_against_the_repositorys_own_format() -> None:
     assert session.accepted_sha == A256
 
 
+def test_all_zero_oid_refused_by_session_establish_sha1() -> None:
+    # ADR 0004 section 5: the zero OID is a Git-argv-only value
+    # (checkpoint_ref.ObjectFormat.zero_oid), never an operator-
+    # supplied or persisted transition value -- checked here at the
+    # CheckpointSession boundary, not only in CheckpointTransition's
+    # own __post_init__.
+    ref = _RecordingRef()
+    session = CheckpointSession(ref)
+
+    with pytest.raises(CheckpointSessionError) as excinfo:
+        session.establish("0" * 40)
+
+    assert excinfo.value.reason is CheckpointSessionFailure.MALFORMED_OID
+    assert ref.calls == []
+    assert session.intent is CheckpointIntent.ABSENT
+
+
+def test_all_zero_oid_refused_by_session_establish_sha256() -> None:
+    ref = _RecordingRef(hex_length=64)
+    session = CheckpointSession(ref)
+
+    with pytest.raises(CheckpointSessionError) as excinfo:
+        session.establish("0" * 64)
+
+    assert excinfo.value.reason is CheckpointSessionFailure.MALFORMED_OID
+    assert ref.calls == []
+
+
+def test_all_zero_oid_refused_by_checkpoint_transition_directly_sha1() -> None:
+    # The shared validation boundary itself: CheckpointTransition's own
+    # __post_init__, independent of any CheckpointSession.
+    with pytest.raises(ValueError):
+        CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha="0" * 40)
+
+
+def test_all_zero_oid_refused_by_checkpoint_transition_directly_sha256() -> None:
+    with pytest.raises(ValueError):
+        CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha="0" * 64)
+
+
+def test_ordinary_nonzero_oids_remain_accepted_sha1_and_sha256() -> None:
+    # Confirms the zero-OID fix does not overreach.
+    t1 = CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=A)
+    assert t1.accepted_sha == A
+    t2 = CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=A256)
+    assert t2.accepted_sha == A256
+
+
 # --------------------------------------------------------------------
 # Against a real repository and a real CheckpointRef
 # --------------------------------------------------------------------

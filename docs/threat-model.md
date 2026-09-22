@@ -640,14 +640,22 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   Amendment 1) implements the generic verified nonblocking lock
   primitive and `acquire_repository_lock` (`state_locks.py`), plus the
   trusted state-root and repository-identity substrate a run-level lock
-  would key on (`state_root.py`, `repo_identity.py`) — but none of it is
-  wired into `RunController` or any entry point. Nothing today actually
-  gates a run's start on acquiring that lock, so two concurrent
-  invocations against the same repository are still not prevented.
-- Planned control: controller entry-gating on `acquire_repository_lock`
-  before a run starts; a durable `lifecycle.json` record; and
-  reconciliation of a dead run's lock/lifecycle state (ADR 0004
-  §6/§10, Slice 3A-2 and later Milestone 3 work) — all still
+  would key on (`state_root.py`, `repo_identity.py`). Slice 3A-2
+  (`lifecycle_store.py`) now additionally implements the composition
+  itself — Git preflight, repository-lock acquisition, an exclusively
+  created `runs/<lifecycle_id>/` directory, the lifecycle lock
+  (`acquire_lifecycle_lock`), and an atomically published initial
+  `PREPARING` `lifecycle.json` — and a real cross-process test confirms
+  both locks are mutually exclusive between two separate OS processes.
+  None of this is wired into `RunController`, the CLI, or any other
+  entry point: nothing today actually calls this composition before a
+  real run starts, so two concurrent invocations against the same
+  repository are still not prevented in practice.
+- Planned control: controller entry-gating on `prepare_lifecycle()`
+  before a run starts; automatic pre-run reconciliation of a dead run's
+  lock/lifecycle state (ADR 0004 §10, inserted after repository-lock
+  acquisition and repository-identity validation but before a new
+  lifecycle_id is minted); and abandonment (ADR 0004 §11) — all still
   unimplemented
 - Evidence/future test: adversarial test starting two runs concurrently,
   asserting the second is rejected rather than silently corrupting state

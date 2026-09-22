@@ -28,6 +28,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import stat
 from dataclasses import dataclass
 from enum import Enum, unique
@@ -69,6 +70,7 @@ class LifecycleFsFailure(str, Enum):
     FSYNC_FAILED = "fsync_failed"
     IO_FAILED = "io_failed"
     ENVIRONMENT_INVALID = "environment_invalid"
+    INSTALLED_DURABILITY_UNCONFIRMED = "installed_durability_unconfirmed"
 
 
 class LifecycleFsError(Exception):
@@ -812,3 +814,159 @@ def ensure_bounded_ancestor(base: str, components: list[str]) -> None:
                 LifecycleFsFailure.SUBSTRATE_UNAVAILABLE,
                 "a conventional state-root ancestor directory could not be created",
             ) from None
+
+
+def create_exclusive_directory_at(parent_fd: int, basename: str) -> int:
+    """Create `basename` beneath `parent_fd` **exclusively** — never
+    adopting a pre-existing entry, unlike `open_managed_directory_chain`
+    (which tolerates `FileExistsError` as ordinary idempotent
+    traversal for a *shared* managed directory). Used for a namespace
+    that must never collide with existing state, e.g. a fresh
+    `runs/<lifecycle-id>/` directory (Milestone 3 Slice 3A-2).
+
+    `FileExistsError` propagates unmodified so the caller can
+    distinguish a genuine collision from every other failure — this
+    function never converts it into, or confuses it with, any other
+    `LifecycleFsError`. On any other failure after the directory was
+    created, the directory itself is left in place (never removed) —
+    consistent with this module's "never delete ambiguous state"
+    discipline; only the descriptor this function itself opened is
+    cleaned up.
+    """
+    _validate_path_component(basename)
+    try:
+        os.mkdir(basename, 0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        raise
+    except OSError:
+        raise LifecycleFsError(
+            LifecycleFsFailure.SUBSTRATE_UNAVAILABLE,
+            "an exclusive managed directory could not be created",
+        ) from None
+    _validate_managed_directory_state(basename, dir_fd=parent_fd)
+    flags = os.O_RDONLY | _directory_flag() | _nofollow_flag() | _cloexec_flag()
+    try:
+        fd = os.open(basename, flags, dir_fd=parent_fd)
+    except OSError:
+        raise LifecycleFsError(
+            LifecycleFsFailure.SUBSTRATE_UNAVAILABLE,
+            "an exclusive managed directory could not be opened",
+        ) from None
+    try:
+        _assert_cloexec(fd)
+    except BaseException as exc:
+        _dominant_cleanup([fd], exc)
+        raise
+    return fd
+
+
+def _cleanup_publication_temp_file(dir_fd: int, basename: str, primary: BaseException | None) -> None:
+    """Best-effort removal of exactly the one temporary file a failed
+    `publish_private_file_atomically_at` attempt created — never a
+    broader sweep. A confirmed-absent target (`FileNotFoundError`,
+    e.g. because a concurrent successful `os.replace` already consumed
+    it) is not a failure. Any other removal failure is
+    `CLEANUP_UNCONFIRMED`, chained from `primary` (the original
+    failure that triggered this cleanup) when there is one."""
+    try:
+        os.unlink(basename, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return
+    except OSError:
+        cleanup_error = LifecycleFsError(
+            LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+            "a temporary publication file could not be confirmed removed",
+        )
+        if primary is not None:
+            raise cleanup_error from primary
+        raise cleanup_error from None
+
+
+def publish_private_file_atomically_at(
+    dir_fd: int, final_basename: str, data: bytes, *, mode: int = 0o600
+) -> None:
+    """Atomically publish `data` as `final_basename` beneath `dir_fd`:
+    create a private, same-directory, randomly-suffixed temporary file
+    (via `open_private_create_exclusive_at` — `O_CREAT | O_EXCL |
+    O_NOFOLLOW | O_CLOEXEC`, exact-mode/ownership-verified), write the
+    complete content, `fsync` the file, close it, `os.replace` it over
+    `final_basename` (both ends `dir_fd`-relative — never a fresh
+    full-pathname lookup), then `fsync` the directory. Never trusts a
+    temporary file's own name as a target; a caller that must never
+    overwrite an existing `final_basename` verifies that itself first
+    (structurally guaranteed for Slice 3A-2's own use: `final_basename`
+    lives inside a directory `create_exclusive_directory_at` just
+    created, so it cannot already exist).
+
+    Failure handling distinguishes three outcomes, never conflating
+    them under one reason:
+
+    - **Publication failed before installation** (write, file `fsync`,
+      close, or `os.replace` itself failed): `final_basename` was never
+      installed, and the exact temporary file this call created is
+      cleaned up. Reported with the underlying primitive's own reason
+      (`IO_FAILED`, `FSYNC_FAILED`, or `SUBSTRATE_UNAVAILABLE` for a
+      failed `os.replace`) — a cleanup failure dominates and chains
+      from this original failure, per this module's uniform
+      descriptor/file-cleanup discipline.
+    - **Installed but durability unconfirmed**: `os.replace` already
+      confirmed `final_basename` now holds the new content — a later
+      reader will see it — but the trailing directory `fsync` then
+      failed, so the directory entry's durability cannot be confirmed.
+      This is reported as `INSTALLED_DURABILITY_UNCONFIRMED`, distinct
+      from the pre-installation `FSYNC_FAILED` case above even though
+      both call `fsync_fd` — never the ambiguous, ordinary
+      `FSYNC_FAILED` a caller could otherwise mistake for "nothing was
+      installed." `final_basename` is never deleted or reverted on
+      this path. There is nothing left to clean up: the temporary name
+      no longer exists once `os.replace` succeeds.
+    - **Exact-temp cleanup unconfirmed**: the one temporary file this
+      call created could not itself be confirmed removed after a
+      pre-installation failure — `CLEANUP_UNCONFIRMED`, chained from
+      that original failure.
+    """
+    _validate_path_component(final_basename)
+    temp_basename = f".{final_basename}.tmp-{secrets.token_hex(8)}"
+    try:
+        fd = open_private_create_exclusive_at(dir_fd, temp_basename, mode)
+    except FileExistsError:
+        raise LifecycleFsError(
+            LifecycleFsFailure.SUBSTRATE_UNAVAILABLE,
+            "a private temporary publication file could not be created",
+        ) from None
+
+    try:
+        try:
+            write_all_eintr_safe(fd, data)
+            fsync_fd(fd)
+        except BaseException as exc:
+            _dominant_cleanup([fd], exc)
+            raise
+        else:
+            close_confirmed([fd])
+    except BaseException as exc:
+        _cleanup_publication_temp_file(dir_fd, temp_basename, exc)
+        raise
+
+    try:
+        os.replace(temp_basename, final_basename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except OSError:
+        replace_error = LifecycleFsError(
+            LifecycleFsFailure.SUBSTRATE_UNAVAILABLE,
+            "a publication temporary file could not be atomically installed",
+        )
+        _cleanup_publication_temp_file(dir_fd, temp_basename, replace_error)
+        raise replace_error from None
+
+    try:
+        fsync_fd(dir_fd)
+    except LifecycleFsError as exc:
+        # os.replace already confirmed final_basename is installed;
+        # this is a distinct outcome from a pre-installation FSYNC_FAILED
+        # (write_all_eintr_safe/fsync_fd on the temp file above) and must
+        # never be reported under the same reason. final_basename is
+        # never deleted or reverted here.
+        raise LifecycleFsError(
+            LifecycleFsFailure.INSTALLED_DURABILITY_UNCONFIRMED,
+            "the publication file was installed but its directory entry's durability could not be confirmed",
+        ) from exc

@@ -554,3 +554,133 @@ def test_real_lock_acquirable_after_holder_sigkilled(tmp_path):
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# acquire_lifecycle_lock (Milestone 3 Slice 3A-2)
+# ---------------------------------------------------------------------------
+
+
+def test_acquire_lifecycle_lock_basic(tmp_path):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        handle = sl.acquire_lifecycle_lock(
+            parent_fd, repo_key="a" * 32, lifecycle_id="b" * 32, diagnostic_path="x"
+        )
+        assert handle.is_held
+        assert handle.scope == sl.LockScope(kind=sl.LockKind.LIFECYCLE, repo_key="a" * 32, lifecycle_id="b" * 32)
+        handle.release()
+        assert not handle.is_held
+    finally:
+        os.close(parent_fd)
+
+
+def test_acquire_lifecycle_lock_validates_repo_key_and_lifecycle_id():
+    with pytest.raises(lf.LifecycleFsError):
+        sl.acquire_lifecycle_lock(0, repo_key="not-hex", lifecycle_id="b" * 32, diagnostic_path="x")
+    with pytest.raises(lf.LifecycleFsError):
+        sl.acquire_lifecycle_lock(0, repo_key="a" * 32, lifecycle_id="not-hex", diagnostic_path="x")
+
+
+def test_acquire_lifecycle_lock_busy_when_already_held(tmp_path):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        handle1 = sl.acquire_lifecycle_lock(
+            parent_fd, repo_key="a" * 32, lifecycle_id="b" * 32, diagnostic_path="x"
+        )
+        with pytest.raises(sl.LockError) as excinfo:
+            sl.acquire_lifecycle_lock(parent_fd, repo_key="a" * 32, lifecycle_id="b" * 32, diagnostic_path="x")
+        assert excinfo.value.reason is sl.LockFailure.BUSY
+        handle1.release()
+    finally:
+        os.close(parent_fd)
+
+
+def test_acquire_lifecycle_lock_does_not_close_caller_owned_parent_fd(tmp_path):
+    # Unlike acquire_repository_lock, this wrapper opens no short-lived
+    # parent-fd of its own: parent_fd remains open and usable by the
+    # caller after acquisition (and after release), since it is the
+    # long-lived run-directory descriptor the caller continues to own.
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        handle = sl.acquire_lifecycle_lock(
+            parent_fd, repo_key="a" * 32, lifecycle_id="b" * 32, diagnostic_path="x"
+        )
+        # parent_fd is still valid: a fresh fstat succeeds.
+        os.fstat(parent_fd)
+        handle.release()
+        os.fstat(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _child_hold_lifecycle_lock(run_dir_path: str, repo_key: str, lifecycle_id: str, ready_evt, release_evt) -> None:
+    import codeagent.state_locks as _sl
+
+    parent_fd = os.open(run_dir_path, os.O_RDONLY | os.O_DIRECTORY)
+    handle = _sl.acquire_lifecycle_lock(
+        parent_fd, repo_key=repo_key, lifecycle_id=lifecycle_id, diagnostic_path=run_dir_path
+    )
+    ready_evt.set()
+    release_evt.wait(timeout=30)
+
+
+def test_real_two_process_lifecycle_lock_contention_and_release(tmp_path):
+    run_dir = tmp_path / "run-dir"
+    run_dir.mkdir()
+    repo_key = "f" * 32
+    lifecycle_id = "e" * 32
+    ctx = multiprocessing.get_context("spawn")
+    ready_evt = ctx.Event()
+    release_evt = ctx.Event()
+    proc = ctx.Process(
+        target=_child_hold_lifecycle_lock, args=(str(run_dir), repo_key, lifecycle_id, ready_evt, release_evt)
+    )
+    proc.start()
+    try:
+        assert ready_evt.wait(timeout=10)
+        parent_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(sl.LockError) as excinfo:
+                sl.acquire_lifecycle_lock(
+                    parent_fd, repo_key=repo_key, lifecycle_id=lifecycle_id, diagnostic_path=str(run_dir)
+                )
+            assert excinfo.value.reason is sl.LockFailure.BUSY
+        finally:
+            os.close(parent_fd)
+    finally:
+        release_evt.set()
+        proc.join(timeout=10)
+
+
+def test_real_lifecycle_lock_acquirable_after_holder_sigkilled(tmp_path):
+    run_dir = tmp_path / "run-dir"
+    run_dir.mkdir()
+    repo_key = "1" + "a" * 31
+    lifecycle_id = "2" + "b" * 31
+    ctx = multiprocessing.get_context("spawn")
+    ready_evt = ctx.Event()
+    release_evt = ctx.Event()
+    proc = ctx.Process(
+        target=_child_hold_lifecycle_lock, args=(str(run_dir), repo_key, lifecycle_id, ready_evt, release_evt)
+    )
+    proc.start()
+    try:
+        assert ready_evt.wait(timeout=10)
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.join(timeout=10)
+        assert proc.exitcode is not None and proc.exitcode != 0
+
+        parent_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            handle = sl.acquire_lifecycle_lock(
+                parent_fd, repo_key=repo_key, lifecycle_id=lifecycle_id, diagnostic_path=str(run_dir)
+            )
+            assert handle.is_held
+            handle.release()
+        finally:
+            os.close(parent_fd)
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)

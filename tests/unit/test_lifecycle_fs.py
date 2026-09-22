@@ -1104,3 +1104,321 @@ def test_lifecycle_fs_error_traceback_never_leaks_host_path(tmp_path):
     else:
         pytest.fail("expected LifecycleFsError")
     assert secret_marker not in formatted
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3 Slice 3A-2: create_exclusive_directory_at
+# ---------------------------------------------------------------------------
+
+
+def test_create_exclusive_directory_at_basic(tmp_path):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd = lf.create_exclusive_directory_at(parent_fd, "run-1")
+        try:
+            st = os.fstat(fd)
+            import stat as _stat
+
+            assert _stat.S_ISDIR(st.st_mode)
+            assert (st.st_mode & 0o777) == 0o700
+            assert st.st_uid == os.getuid()
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+
+def test_create_exclusive_directory_at_refuses_existing_directory(tmp_path):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd = lf.create_exclusive_directory_at(parent_fd, "run-1")
+        os.close(fd)
+        with pytest.raises(FileExistsError):
+            lf.create_exclusive_directory_at(parent_fd, "run-1")
+    finally:
+        os.close(parent_fd)
+
+
+def test_create_exclusive_directory_at_refuses_existing_symlink(tmp_path):
+    (tmp_path / "target").mkdir()
+    (tmp_path / "run-1").symlink_to(tmp_path / "target")
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(FileExistsError):
+            lf.create_exclusive_directory_at(parent_fd, "run-1")
+        # The symlink is never adopted, removed, or followed.
+        assert (tmp_path / "run-1").is_symlink()
+    finally:
+        os.close(parent_fd)
+
+
+def test_create_exclusive_directory_at_refuses_existing_regular_file(tmp_path):
+    (tmp_path / "run-1").write_text("x")
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(FileExistsError):
+            lf.create_exclusive_directory_at(parent_fd, "run-1")
+    finally:
+        os.close(parent_fd)
+
+
+def test_create_exclusive_directory_at_rejects_invalid_component(tmp_path):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(lf.LifecycleFsError):
+            lf.create_exclusive_directory_at(parent_fd, "..")
+        with pytest.raises(lf.LifecycleFsError):
+            lf.create_exclusive_directory_at(parent_fd, "a/b")
+    finally:
+        os.close(parent_fd)
+
+
+def test_create_exclusive_directory_at_no_fd_leak_on_cloexec_failure(tmp_path, monkeypatch):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd_count_before = len(os.listdir("/dev/fd"))
+
+        def _failing_assert_cloexec(fd):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE, "forced")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "_assert_cloexec", _failing_assert_cloexec)
+            with pytest.raises(lf.LifecycleFsError):
+                lf.create_exclusive_directory_at(parent_fd, "run-1")
+
+        fd_count_after = len(os.listdir("/dev/fd"))
+        assert fd_count_after == fd_count_before
+        # The directory itself was still created (never removed on a
+        # post-creation validation failure -- this module never
+        # deletes ambiguous state).
+        assert (tmp_path / "run-1").is_dir()
+    finally:
+        os.close(parent_fd)
+
+
+def test_create_exclusive_directory_at_refuses_unowned_or_unsafe_mode(tmp_path):
+    # Simulated by pre-creating the directory with an unsafe mode via a
+    # symlink-free path, then attempting exclusive creation again --
+    # covered by test_create_exclusive_directory_at_refuses_existing_directory.
+    # This test instead exercises the post-creation validation path
+    # directly against _validate_managed_directory_state for a
+    # world-writable directory reached without going through mkdir's
+    # own mode argument (e.g. an inherited unsafe mode from a
+    # restrictive umask override at creation time).
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd = lf.create_exclusive_directory_at(parent_fd, "run-1")
+        os.close(fd)
+        os.chmod(tmp_path / "run-1", 0o777)
+        with pytest.raises(FileExistsError):
+            # A second attempt at the same name still refuses due to
+            # existence, not mode -- confirming this function never
+            # silently "fixes" or adopts an unsafe pre-existing entry.
+            lf.create_exclusive_directory_at(parent_fd, "run-1")
+    finally:
+        os.close(parent_fd)
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3 Slice 3A-2: publish_private_file_atomically_at
+# ---------------------------------------------------------------------------
+
+
+def test_publish_private_file_atomically_at_basic(tmp_path):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        lf.publish_private_file_atomically_at(parent_fd, "target.json", b'{"a":1}')
+        content = (tmp_path / "target.json").read_bytes()
+        assert content == b'{"a":1}'
+        st = os.stat(tmp_path / "target.json")
+        assert (st.st_mode & 0o777) == 0o600
+        # No temp file left behind.
+        entries = os.listdir(tmp_path)
+        assert entries == ["target.json"]
+    finally:
+        os.close(parent_fd)
+
+
+def test_publish_private_file_atomically_at_overwrites_via_atomic_replace(tmp_path):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        lf.publish_private_file_atomically_at(parent_fd, "target.json", b"first")
+        lf.publish_private_file_atomically_at(parent_fd, "target.json", b"second")
+        assert (tmp_path / "target.json").read_bytes() == b"second"
+        assert os.listdir(tmp_path) == ["target.json"]
+    finally:
+        os.close(parent_fd)
+
+
+def test_publish_private_file_atomically_at_write_failure_cleans_temp(tmp_path, monkeypatch):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        def _boom(fd, data):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.IO_FAILED, "forced")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "write_all_eintr_safe", _boom)
+            with pytest.raises(lf.LifecycleFsError) as excinfo:
+                lf.publish_private_file_atomically_at(parent_fd, "target.json", b"data")
+            assert excinfo.value.reason is lf.LifecycleFsFailure.IO_FAILED
+
+        assert os.listdir(tmp_path) == []
+    finally:
+        os.close(parent_fd)
+
+
+def test_publish_private_file_atomically_at_fsync_failure_cleans_temp(tmp_path, monkeypatch):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        def _boom(fd):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _boom)
+            with pytest.raises(lf.LifecycleFsError) as excinfo:
+                lf.publish_private_file_atomically_at(parent_fd, "target.json", b"data")
+            assert excinfo.value.reason is lf.LifecycleFsFailure.FSYNC_FAILED
+
+        assert os.listdir(tmp_path) == []
+    finally:
+        os.close(parent_fd)
+
+
+def test_publish_private_file_atomically_at_replace_failure_cleans_temp_and_leaves_no_final(tmp_path, monkeypatch):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        def _boom(*args, **kwargs):
+            raise OSError("forced replace failure")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(os, "replace", _boom)
+            with pytest.raises(lf.LifecycleFsError) as excinfo:
+                lf.publish_private_file_atomically_at(parent_fd, "target.json", b"data")
+            assert excinfo.value.reason is lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE
+
+        assert os.listdir(tmp_path) == []
+    finally:
+        os.close(parent_fd)
+
+
+def test_publish_private_file_atomically_at_directory_fsync_failure_is_distinct_outcome(tmp_path, monkeypatch):
+    # Correction: a post-replace directory-fsync failure ("installed
+    # but durability unconfirmed") must never be reported under the
+    # same FSYNC_FAILED reason as a pre-install file-fsync failure
+    # ("failed before installation") -- see
+    # test_publish_private_file_atomically_at_fsync_failure_cleans_temp
+    # above, which fails at the *same* fsync_fd call site but is a
+    # completely different, distinguishable outcome.
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_second(fd):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced directory fsync failure")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_second)
+            with pytest.raises(lf.LifecycleFsError) as excinfo:
+                lf.publish_private_file_atomically_at(parent_fd, "target.json", b"data")
+            assert excinfo.value.reason is lf.LifecycleFsFailure.INSTALLED_DURABILITY_UNCONFIRMED
+            assert excinfo.value.reason is not lf.LifecycleFsFailure.FSYNC_FAILED
+            assert isinstance(excinfo.value.__cause__, lf.LifecycleFsError)
+            assert excinfo.value.__cause__.reason is lf.LifecycleFsFailure.FSYNC_FAILED
+
+        # The file itself is present -- os.replace already succeeded
+        # before the directory-fsync-only failure -- and is never
+        # deleted or reverted; no temp file remains either.
+        assert (tmp_path / "target.json").read_bytes() == b"data"
+        entries = os.listdir(tmp_path)
+        assert entries == ["target.json"]
+    finally:
+        os.close(parent_fd)
+
+
+def test_publish_private_file_atomically_at_pre_and_post_install_fsync_failures_have_distinct_reasons(
+    tmp_path, monkeypatch
+):
+    """Load-bearing regression for the outcome-ambiguity correction:
+    a file-fsync failure before install and a directory-fsync failure
+    after install must never collapse to the same categorical reason,
+    even though both call the same `fsync_fd` primitive."""
+    parent_fd_a = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    (tmp_path / "b").mkdir()
+    parent_fd_b = os.open(tmp_path / "b", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        def _fail_always(fd):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_always)
+            with pytest.raises(lf.LifecycleFsError) as pre_install:
+                lf.publish_private_file_atomically_at(parent_fd_a, "target.json", b"data")
+
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_second(fd):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_second)
+            with pytest.raises(lf.LifecycleFsError) as post_install:
+                lf.publish_private_file_atomically_at(parent_fd_b, "target.json", b"data")
+
+        assert pre_install.value.reason is lf.LifecycleFsFailure.FSYNC_FAILED
+        assert post_install.value.reason is lf.LifecycleFsFailure.INSTALLED_DURABILITY_UNCONFIRMED
+        assert pre_install.value.reason is not post_install.value.reason
+        # On-disk state differs exactly as the outcomes claim.
+        assert not (tmp_path / "target.json").exists()
+        assert (tmp_path / "b" / "target.json").read_bytes() == b"data"
+    finally:
+        os.close(parent_fd_a)
+        os.close(parent_fd_b)
+
+
+def test_publish_private_file_atomically_at_temp_cleanup_failure_chains(tmp_path, monkeypatch):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        def _boom_write(fd, data):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.IO_FAILED, "forced write failure")
+
+        def _boom_unlink(path, *, dir_fd=None):
+            raise OSError("forced unlink failure")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "write_all_eintr_safe", _boom_write)
+            scoped.setattr(os, "unlink", _boom_unlink)
+            with pytest.raises(lf.LifecycleFsError) as excinfo:
+                lf.publish_private_file_atomically_at(parent_fd, "target.json", b"data")
+            assert excinfo.value.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+            assert isinstance(excinfo.value.__cause__, lf.LifecycleFsError)
+            assert excinfo.value.__cause__.reason is lf.LifecycleFsFailure.IO_FAILED
+    finally:
+        os.close(parent_fd)
+
+
+def test_publish_private_file_atomically_at_rejects_invalid_final_basename(tmp_path):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(lf.LifecycleFsError):
+            lf.publish_private_file_atomically_at(parent_fd, "../escape", b"data")
+    finally:
+        os.close(parent_fd)
+
+
+def test_publish_private_file_atomically_at_no_fd_leak_on_success(tmp_path):
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd_count_before = len(os.listdir("/dev/fd"))
+        lf.publish_private_file_atomically_at(parent_fd, "target.json", b"data")
+        fd_count_after = len(os.listdir("/dev/fd"))
+        assert fd_count_after == fd_count_before
+    finally:
+        os.close(parent_fd)

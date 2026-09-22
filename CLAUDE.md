@@ -488,14 +488,82 @@ Stage 2 (of the four-stage planning process in
   `CODEAGENT_REQUIRE_DOCKER=1`); and a post-run check confirmed no
   leftover `codeagent-verify` containers, extra worktrees,
   `refs/codeagent` refs, child processes, or temp state roots.
-  **Unwired**: no `RunController`, CLI, or lifecycle-lock integration
-  exists yet — that is Slice 3A-2 and later Milestone 3 work. A
-  focused security review of these four files, limited to high/medium
-  exploitable findings at an >=8/10 reporting threshold, produced no
-  reportable finding — two candidates were independently rejected at
-  3/10 and 2/10; this is not a claim that the slice or codebase is
-  vulnerability-free or fully audited. See `ENGINEERING_LOG.md`'s
-  dated entry for both candidates and why each was rejected.
+  **Unwired**: no `RunController` or CLI integration exists yet —
+  Slice 3A-2 (below) implements the lifecycle-lock wrapper itself, but
+  wiring either slice's primitives into a real entry point remains
+  later Milestone 3 work. A focused security review of these four
+  files, limited to high/medium exploitable findings at an >=8/10
+  reporting threshold, produced no reportable finding — two candidates
+  were independently rejected at 3/10 and 2/10; this is not a claim
+  that the slice or codebase is vulnerability-free or fully audited.
+  See `ENGINEERING_LOG.md`'s dated entry for both candidates and why
+  each was rejected.
+- **Milestone 3 Slice 3A-2** (durable lifecycle storage), per
+  `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s §16
+  steps 8–11, **is implemented and locally validated on macOS
+  (2026-09-22), but not wired into production and not yet validated on
+  Linux CI.** `src/codeagent/lifecycle_store.py` implements the exact
+  accepted composition — `check_git_preflight()`, repository discovery,
+  the trusted state root, the repository lock, `repo.json`, a fresh
+  exclusive `runs/<lifecycle_id>/` directory, the lifecycle lock, and
+  an atomically published initial `PREPARING` `lifecycle.json` — all
+  strictly before any Docker container, disposable worktree, or
+  checkpoint ref exists. Two small additions to Slice 3A-1's own
+  modules back it: `_lifecycle_fs.py` gained
+  `create_exclusive_directory_at()` (refuses, never adopts, a
+  pre-existing entry) and `publish_private_file_atomically_at()`
+  (same-directory temp file, write, `fsync`, `os.replace`, directory
+  `fsync`, exact-temp-file-only cleanup on failure — with a dedicated
+  `LifecycleFsFailure.INSTALLED_DURABILITY_UNCONFIRMED` reason so a
+  post-replace directory-`fsync` failure is never conflated with a
+  pre-installation `FSYNC_FAILED`, a real ambiguity a review caught and
+  this slice's own correction pass fixed); `state_locks.py` gained
+  `acquire_lifecycle_lock()`. The initial `lifecycle.json`'s
+  `checkpoint_ref` field reuses `checkpoint_session.CheckpointIntent`/
+  `CheckpointTransition` directly rather than a second copy of ADR
+  0004 §5's combination table. `LifecycleLease` retains the state-root
+  descriptor, run-directory descriptor, repository lock, and lifecycle
+  lock for the caller's lifetime, releasing them on `close()` in the
+  exact required order (lifecycle lock, run-directory descriptor,
+  repository lock, state-root descriptor), attempting every stage
+  regardless of an earlier stage's outcome.
+  `validate_lifecycle_json_schema()` is object-format-aware for every
+  non-null persisted Git object id in `checkpoint_ref` (exact
+  lowercase-hex SHA-1/SHA-256 matching the repository's actual
+  format, never an arbitrary nonempty placeholder or the all-zero OID
+  — the latter is refused at the shared `checkpoint_session.
+  _require_oid_shape()` boundary `CheckpointTransition` itself uses,
+  per ADR 0004 §5's "the zero OID appears only in Git argv," not by a
+  second check in `lifecycle_store.py`), and is **deliberately
+  narrowed** to the one `worktree`/`failure` shape this slice actually
+  produces (`absent`/`null`) rather than describing a partial future
+  validator as complete — the ADR does not yet give those two fields a
+  combination table as precise as containers' or checkpoint_ref's.
+  Verified: `py_compile` on all seven changed/new files (including
+  `checkpoint_session.py`); the directly affected test files
+  (`test_checkpoint_session.py`, `test_checkpoint_ref.py`,
+  `test_lifecycle_store.py`, `test_lifecycle_fs.py`,
+  `test_state_locks.py`) collected and passed together, 474 passed;
+  the five focused test files (`test_lifecycle_fs.py`,
+  `test_repo_identity.py`, `test_state_locks.py`, `test_state_root.py`,
+  `test_lifecycle_store.py`) collected and passed together, 311
+  passed, in both forward and reverse file order; the full local
+  suite: 2,180 passed. With a real Docker daemon and
+  `CODEAGENT_REQUIRE_DOCKER=1`, the 3 dedicated real-Docker tests: 3
+  passed, 0 skipped; the complete suite: 2,180 passed, 0 skipped, with
+  no leftover `codeagent-verify` containers
+  afterward. A real two-process test confirms both the repository
+  lock and the lifecycle lock are cross-process exclusive, and a real
+  SIGKILL test confirms a fresh process can still acquire both locks
+  afterward, creating a new, separate lifecycle_id/run directory
+  rather than adopting the dead run's own directory. **Unwired**: no
+  `RunController` or CLI integration exists yet. **Not implemented**:
+  automatic pre-run reconciliation, abandonment, the maintenance
+  trace, and any container/worktree/checkpoint-ref attribution or
+  mutation (a static AST-based test confirms none is reachable from
+  this module) — all later Milestone 3 work. **T-E1 is not mitigated
+  by this slice alone** (`docs/threat-model.md`): nothing yet calls
+  `prepare_lifecycle()` before a real run starts.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

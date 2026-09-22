@@ -154,11 +154,20 @@ class CheckpointSessionError(Exception):
         self.message = message
 
 
+def _is_all_zero_oid(value: str) -> bool:
+    return set(value) == {"0"}
+
+
 def _require_oid_shape(name: str, value: str) -> None:
     if not isinstance(value, str) or not _OID_RE.fullmatch(value):
         raise ValueError(
             f"{name} must be exactly 40 or 64 lowercase hexadecimal characters"
         )
+    if _is_all_zero_oid(value):
+        # ADR 0004 section 5: null means "no ref"; the zero OID appears
+        # only in Git argv (checkpoint_ref.ObjectFormat.zero_oid),
+        # never as a persisted or in-memory transition-record value.
+        raise ValueError(f"{name} must not be the all-zero object id")
 
 
 @dataclass(frozen=True)
@@ -385,12 +394,19 @@ class CheckpointSession:
         """Validate an object id against the *repository's* actual
         object format, not merely against a generic hex shape — a
         40-character id is malformed in a SHA-256 repository and vice
-        versa."""
+        versa. Also refuses the all-zero object id: ADR 0004 section 5
+        reserves it strictly for Git argv (`ObjectFormat.zero_oid`),
+        never as an operator-supplied or persisted transition value —
+        checked here too, not only in `CheckpointTransition`'s own
+        `__post_init__`, so `establish()`/`advance()` never let a raw
+        `ValueError` escape past this module's own sanitized
+        `CheckpointSessionError` boundary."""
         expected_length = self._ref.object_format.hex_length
         if (
             not isinstance(value, str)
             or len(value) != expected_length
             or not re.fullmatch(r"[0-9a-f]+", value)
+            or _is_all_zero_oid(value)
         ):
             raise CheckpointSessionError(
                 CheckpointSessionFailure.MALFORMED_OID,

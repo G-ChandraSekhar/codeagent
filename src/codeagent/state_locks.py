@@ -369,6 +369,30 @@ def acquire_repository_lock(state_root, repo_key: str) -> LockHandle:
     return handle
 
 
+def acquire_lifecycle_lock(
+    run_dir_fd: int, *, repo_key: str, lifecycle_id: str, diagnostic_path: str
+) -> LockHandle:
+    """Acquire the lifecycle lock `lifecycle.lock` beneath the caller's
+    own already-open, long-lived `run_dir_fd` — the run directory
+    (`runs/<lifecycle-id>/`, Milestone 3 Slice 3A-2) that the caller
+    created and continues to own for the lifetime of the run. Unlike
+    `acquire_repository_lock`, this wrapper opens no short-lived
+    parent-directory descriptor of its own to clean up: `run_dir_fd` is
+    owned and released by the caller (the lifecycle lease), not by this
+    function, per ADR 0004 Amendment 1 section 12's 3A-1/3A-2 lock
+    ordering boundary.
+    """
+    validate_hex32(repo_key, field_name="repo_key")
+    validate_hex32(lifecycle_id, field_name="lifecycle_id")
+    scope = LockScope(kind=LockKind.LIFECYCLE, repo_key=repo_key, lifecycle_id=lifecycle_id)
+    return acquire_lock_nonblocking_at(
+        run_dir_fd,
+        "lifecycle.lock",
+        scope=scope,
+        diagnostic_path=diagnostic_path,
+    )
+
+
 def _dominant_parent_cleanup(parent_fd: int, *, primary: LockError | None) -> None:
     try:
         close_confirmed([parent_fd])
