@@ -12,22 +12,26 @@ lifecycle IDs, `CheckpointSession`'s in-memory transition record,
 `RunController` integration, gated worktree/checkpoint-ref teardown,
 and evidence capture (all Milestone 2 Slice 2B-1/2B-2, per
 `CLAUDE.md`). Slice 3A-1's state-root/identity/lock substrate
-(Amendment 1) is now **implemented and locally validated on macOS**:
-`state-root.json` init/validation, trusted repository identity and
-context discovery, `repo.json` creation/validation, and the
-repository/generic lock primitive — see Amendment 1's "Implementation
-status" note below for the exact module list, verification, and
-scope. Slice 3A-2 (`lifecycle_store.py`) now additionally implements
+(Amendment 1) is now **implemented, locally validated on macOS, and
+confirmed on GitHub-hosted Linux CI**: `state-root.json` init/
+validation, trusted repository identity and context discovery,
+`repo.json` creation/validation, and the repository/generic lock
+primitive — see Amendment 1's "Implementation status" note below for
+the exact module list, verification, and scope. Slice 3A-2
+(`lifecycle_store.py`) now additionally implements
 `runs/<lifecycle-id>/` exclusive creation, the lifecycle-lock wrapper
 (`acquire_lifecycle_lock`), and the atomically published initial
-`PREPARING` `lifecycle.json` projection — see §16's own "Implementation
-status" note (added after step 7) for the exact module list,
-verification, and scope. Both slices remain **unwired**: no
-controller or CLI integration exists, and Linux CI validation is
-pending for 3A-2. The rest of the durable Milestone 3 lifecycle
-substrate this ADR describes remains entirely unimplemented: durable
-attribution, reconciliation, abandonment, and the maintenance trace.
-See "Implementation order" below.
+`PREPARING` `lifecycle.json` projection — also implemented, locally
+validated, and confirmed on GitHub-hosted Linux CI (commit `8aefa5f`,
+run
+[35794177790](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35794177790),
+`ubuntu-24.04` x86_64, Python 3.12, success) — see §16's own
+"Implementation status" note (added after step 7) for the exact module
+list, verification, and scope. Both slices remain **unwired**: no
+controller or CLI integration exists. The rest of the durable
+Milestone 3 lifecycle substrate this ADR describes remains entirely
+unimplemented: durable attribution, reconciliation, abandonment, and
+the maintenance trace. See "Implementation order" below.
 
 ## Context
 
@@ -1192,13 +1196,25 @@ focused security review of the four files, limited to high/medium
 exploitable findings at an >=8/10 reporting threshold, produced no
 reportable finding — two candidates were independently rejected at
 3/10 and 2/10; this is not a claim that the slice is vulnerability-free
-or fully audited. This is macOS-only evidence — **Linux
-CI validation is pending**, matching the caveat this ADR already
-carries for the rest of the Slice 3A-1 substrate. Nothing from this
-slice is wired into `RunController`, the CLI, or any lifecycle-lock
-integration; that remains Slice 3A-2 and later Milestone 3 work per
-"Milestone boundary" above. This note does not amend or restate the
-accepted design above it — it records implementation status only.
+or fully audited (the security review itself was a macOS-only pass and
+was not repeated on CI). This slice's implementation and automated
+test coverage were also exercised successfully on GitHub-hosted Ubuntu
+CI: commit `8aefa5f`, run
+[35794177790](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35794177790)
+(`ubuntu-24.04` x86_64, Python 3.12) concluded success — the dedicated
+mandatory real-Docker step passed 3/3 with no skips, the complete-
+suite step passed 2,177 with 3 skipped (those 3 are exactly the
+real-Docker tests already exercised for real in the dedicated step,
+not a Docker-unavailability skip), and no leftover
+`codeagent-verify` containers remained afterward. This is
+`ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+ARM64 claim. Slice 3A-2 now implements the lifecycle-lock wrapper and
+the `prepare_lifecycle()` composition (see that slice's own
+"Implementation status" note below); the remaining limitation is that
+neither slice is wired into `RunController`, the CLI, or any other
+real entry point — that wiring remains later Milestone 3 work. This
+note does not amend or restate the accepted design above it — it
+records implementation status only.
 
 ### Implementation status (Slice 3A-2, added 2026-09-22)
 
@@ -1325,7 +1341,20 @@ process can still acquire both locks afterward (kernel-released
 than adopting or touching the dead run's own directory — matching
 this slice's explicit non-goal of reconciliation. Local evidence spans
 both macOS and, via the real-Docker run above, the Docker Desktop
-Linux VM; **Linux CI (GitHub Actions) validation is still pending.**
+Linux VM. **GitHub-hosted Linux CI is now confirmed**: commit
+`8aefa5f`, run
+[35794177790](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35794177790)
+(`ubuntu-24.04` x86_64, Python 3.12) concluded success — the pinned
+verification image was pulled and confirmed `linux/amd64`; the
+dedicated mandatory real-Docker step passed 3/3 with no skips; the
+complete-suite step passed 2,177 with 3 skipped (exactly the
+real-Docker tests already exercised for real in the dedicated step
+immediately before it, not a Docker-unavailability skip); no leftover
+`codeagent-verify` containers remained afterward. This is
+`ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+ARM64 claim, and it confirms this slice's own composition and test
+suite only — it does not itself mitigate T-E1 or wire `prepare_
+lifecycle()` into `RunController` or the CLI.
 
 Not implemented, per this ADR's own accepted 3A-1/3A-2 boundary:
 automatic pre-run reconciliation (§10 — the exact insertion point is

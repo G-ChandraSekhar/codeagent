@@ -1822,3 +1822,33 @@ this slice alone: nothing yet calls `prepare_lifecycle()` before a
 real run starts. Automatic reconciliation, abandonment, the
 maintenance trace, and controller/CLI wiring remain later Milestone 3
 work, unchanged in scope by this entry.
+
+## 2026-09-22: GitHub-hosted Linux CI confirmed for Slices 3A-1 and 3A-2
+
+Commit `8aefa5f01f595a4f550823d90ed7f12a0bde9ba6` (the zero-OID
+correction pass on top of Slice 3A-2, which also carries the Slice
+3A-1 code unchanged) was pushed to `main` and its resulting GitHub
+Actions run,
+[35794177790](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35794177790),
+concluded `success` on GitHub-hosted `ubuntu-24.04` x86_64, Python
+3.12. This closes the "Linux CI validation is pending" caveat this log
+and `CLAUDE.md`/`docs/adr/0004-...md` carried for both Slice 3A-1 and
+Slice 3A-2 up to and including the prior entry above — that entry is
+left unchanged as an accurate record of what was true at the time it
+was written, before this push and run existed.
+
+Exact run evidence: the pinned verification image was pulled and
+confirmed `linux/amd64`; the dedicated mandatory real-Docker step
+passed 3/3 with no skips; the complete-suite step passed 2,177 with 3
+skipped — those 3 skips are exactly the real-Docker tests already
+exercised for real in the dedicated step immediately before it, a
+deliberate two-step design, not a Docker-unavailability skip; no
+leftover `codeagent-verify` containers remained afterward.
+
+This is `ubuntu-24.04` x86_64 GitHub-hosted evidence specifically —
+not a general Linux claim and not ARM64 CI coverage. It confirms
+Slice 3A-1's and Slice 3A-2's own composition and test suites only.
+It does not change scope: `prepare_lifecycle()` remains unwired from
+`RunController` and the CLI, T-E1 remains unmitigated for that reason,
+and automatic reconciliation, abandonment, the maintenance trace, and
+controller/CLI wiring remain later Milestone 3 work.

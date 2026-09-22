@@ -461,9 +461,13 @@ Stage 2 (of the four-stage planning process in
 - **Milestone 3 Slice 3A-1** (trusted lifecycle state-root, repository
   identity, and repository/generic lock primitives), per
   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
-  "Amendment 1 (Accepted 2026-09-18)", **is implemented and locally
-  validated on macOS (2026-09-22), but not wired into production and
-  not yet validated on Linux CI.** `src/codeagent/_lifecycle_fs.py`
+  "Amendment 1 (Accepted 2026-09-18)", **is implemented, locally
+  validated on macOS (2026-09-22), and confirmed on GitHub-hosted
+  Linux CI** (commit `8aefa5f`, run
+  [35794177790](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35794177790),
+  `ubuntu-24.04` x86_64, Python 3.12, success — see the 3A-2 entry
+  below for the exact totals this same run also covers). It is still
+  **not wired into production**. `src/codeagent/_lifecycle_fs.py`
   (shared fd-based filesystem-safety primitives, including
   `resolve_state_root_path()`), `state_root.py` (state-root init/
   validation), `state_locks.py` (the generic verified nonblocking lock
@@ -500,9 +504,13 @@ Stage 2 (of the four-stage planning process in
   each was rejected.
 - **Milestone 3 Slice 3A-2** (durable lifecycle storage), per
   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s §16
-  steps 8–11, **is implemented and locally validated on macOS
-  (2026-09-22), but not wired into production and not yet validated on
-  Linux CI.** `src/codeagent/lifecycle_store.py` implements the exact
+  steps 8–11, **is implemented, locally validated on macOS
+  (2026-09-22), and confirmed on GitHub-hosted Linux CI** (commit
+  `8aefa5f`, run
+  [35794177790](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35794177790),
+  `ubuntu-24.04` x86_64, Python 3.12, success — see below for the
+  exact totals). It is still **not wired into production**.
+  `src/codeagent/lifecycle_store.py` implements the exact
   accepted composition — `check_git_preflight()`, repository discovery,
   the trusted state root, the repository lock, `repo.json`, a fresh
   exclusive `runs/<lifecycle_id>/` directory, the lifecycle lock, and
@@ -548,11 +556,20 @@ Stage 2 (of the four-stage planning process in
   `test_repo_identity.py`, `test_state_locks.py`, `test_state_root.py`,
   `test_lifecycle_store.py`) collected and passed together, 311
   passed, in both forward and reverse file order; the full local
-  suite: 2,180 passed. With a real Docker daemon and
-  `CODEAGENT_REQUIRE_DOCKER=1`, the 3 dedicated real-Docker tests: 3
-  passed, 0 skipped; the complete suite: 2,180 passed, 0 skipped, with
-  no leftover `codeagent-verify` containers
-  afterward. A real two-process test confirms both the repository
+  suite (macOS): 2,180 passed. With a real Docker daemon and
+  `CODEAGENT_REQUIRE_DOCKER=1` (macOS), the 3 dedicated real-Docker
+  tests: 3 passed, 0 skipped; the complete suite: 2,180 passed, 0
+  skipped, with no leftover `codeagent-verify` containers afterward.
+  **GitHub-hosted Linux CI** (commit `8aefa5f`, run `35794177790`,
+  `ubuntu-24.04` x86_64, Python 3.12): the pinned verification image
+  was pulled and confirmed `linux/amd64`; the dedicated mandatory
+  real-Docker step, 3 passed, no skips; the complete-suite step, 2,177
+  passed, 3 skipped — those 3 skips are exactly the real-Docker tests
+  already exercised for real in the dedicated step immediately before
+  it, not a Docker-unavailability skip; no leftover
+  `codeagent-verify` containers afterward. This is GitHub-hosted
+  `ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+  ARM64 claim. A real two-process test confirms both the repository
   lock and the lifecycle lock are cross-process exclusive, and a real
   SIGKILL test confirms a fresh process can still acquire both locks
   afterward, creating a new, separate lifecycle_id/run directory
