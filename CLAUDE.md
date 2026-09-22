@@ -459,12 +459,43 @@ Stage 2 (of the four-stage planning process in
   mechanisms as Milestone 3 lifecycle work. S5 spike code is not reused
   in production.
 - **Milestone 3 Slice 3A-1** (trusted lifecycle state-root, repository
-  identity, and repository/generic lock primitives) is **accepted and
-  design-complete but not implemented**: see
+  identity, and repository/generic lock primitives), per
   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
-  "Amendment 1 (Accepted 2026-09-18)". No `state_root.py`,
-  `repo_identity.py`, `state_locks.py`, or `_lifecycle_fs.py` module
-  exists yet; nothing from this slice is wired into production code.
+  "Amendment 1 (Accepted 2026-09-18)", **is implemented and locally
+  validated on macOS (2026-09-22), but not wired into production and
+  not yet validated on Linux CI.** `src/codeagent/_lifecycle_fs.py`
+  (shared fd-based filesystem-safety primitives, including
+  `resolve_state_root_path()`), `state_root.py` (state-root init/
+  validation), `state_locks.py` (the generic verified nonblocking lock
+  primitive plus `acquire_repository_lock`), and `repo_identity.py`
+  (trusted repository identity/context discovery and `repo.json`
+  persistence) all exist, each with a matching focused test module. A
+  correction pass fixed a real in-process test regression — a shared-
+  module `importlib.reload` that desynchronized exception-class
+  identity across these four modules once collected together, plus
+  several mid-test `monkeypatch.undo()` sites — with a subprocess-
+  isolated capability test and `monkeypatch.context()` scoping; that
+  specific fix changed no production behavior. Separately, earlier
+  hardening passes in this same slice *did* change production
+  behavior: fail-closed operation-time capability loading (the
+  `fcntl` module is now lazily imported and never crashes the module
+  at import time), descriptor ownership/cleanup, private-file
+  validation, lock-cleanup classification, state-root probing, and
+  `repo.json` validation were all corrected before final verification.
+  Verified: the four focused test files collected and passed together
+  as 199/199 in both forward and reverse file order; the full suite
+  passed 2063/2063 (including the 3 real-Docker tests with
+  `CODEAGENT_REQUIRE_DOCKER=1`); and a post-run check confirmed no
+  leftover `codeagent-verify` containers, extra worktrees,
+  `refs/codeagent` refs, child processes, or temp state roots.
+  **Unwired**: no `RunController`, CLI, or lifecycle-lock integration
+  exists yet — that is Slice 3A-2 and later Milestone 3 work. A
+  focused security review of these four files, limited to high/medium
+  exploitable findings at an >=8/10 reporting threshold, produced no
+  reportable finding — two candidates were independently rejected at
+  3/10 and 2/10; this is not a claim that the slice or codebase is
+  vulnerability-free or fully audited. See `ENGINEERING_LOG.md`'s
+  dated entry for both candidates and why each was rejected.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

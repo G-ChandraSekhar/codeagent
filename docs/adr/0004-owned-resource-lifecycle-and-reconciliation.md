@@ -11,12 +11,19 @@ Milestone 2 prerequisites exist in production code: generated
 lifecycle IDs, `CheckpointSession`'s in-memory transition record,
 `RunController` integration, gated worktree/checkpoint-ref teardown,
 and evidence capture (all Milestone 2 Slice 2B-1/2B-2, per
-`CLAUDE.md`). The durable Milestone 3 lifecycle substrate this ADR
-itself describes remains unimplemented: `state-root.json`, `repo.json`,
-the repository/lifecycle locks, `lifecycle.json`, durable attribution,
-reconciliation, abandonment, and the maintenance trace. Slice 3A-1's
-state-root/identity/lock design is Accepted (Amendment 1) but not
-implemented. See "Implementation order" below.
+`CLAUDE.md`). Slice 3A-1's state-root/identity/lock substrate
+(Amendment 1) is now **implemented and locally validated on macOS**:
+`state-root.json` init/validation, trusted repository identity and
+context discovery, `repo.json` creation/validation, and the
+repository/generic lock primitive — see Amendment 1's "Implementation
+status" note below for the exact module list, verification, and
+scope. It remains **unwired**: no controller, CLI, or lifecycle-lock
+integration exists, and Linux CI validation is pending. The rest of
+the durable Milestone 3 lifecycle substrate this ADR describes remains
+entirely unimplemented: `lifecycle.json`, `runs/<lifecycle-id>/`,
+the lifecycle-lock wrapper, durable attribution, reconciliation,
+abandonment, and the maintenance trace. See "Implementation order"
+below.
 
 ## Context
 
@@ -1140,3 +1147,39 @@ computation of the pinned `repo_key` test vector in §1. No
 implementation exists yet; the test matrix recorded in
 `ENGINEERING_LOG.md`'s Slice 3A-1 planning entry is the implementation
 obligation this amendment creates.
+
+### Implementation status (Slice 3A-1, added 2026-09-22)
+
+Implemented and locally validated on macOS: `src/codeagent/
+_lifecycle_fs.py` (shared fd-based filesystem-safety primitives,
+including `resolve_state_root_path()` per §5 and §16 step 2),
+`state_root.py` (§2, §15), `state_locks.py` (§11, §12's generic
+primitive), and `repo_identity.py` (§4, §13, §14), with matching test
+modules. A prior in-process test regression (a shared-module
+`importlib.reload` that desynchronized exception class identity across
+these four modules, plus several mid-test `monkeypatch.undo()` sites)
+was found and corrected with a subprocess-isolated capability test and
+`monkeypatch.context()` scoping; that specific fix changed no
+production behavior. Separately, earlier hardening passes in this
+slice did change production behavior — fail-closed operation-time
+capability loading, descriptor ownership/cleanup, private-file
+validation, lock-cleanup classification, state-root probing, and
+`repo.json` validation were all corrected before final verification.
+Verified: `py_compile` on all eight files; the four focused test files
+collected and passed together as 199/199 in both forward and reverse
+file order (no cross-test ordering dependency); the full suite passed
+(2063/2063, including the 3 real-Docker tests with
+`CODEAGENT_REQUIRE_DOCKER=1`); and a post-run resource check confirmed
+no leftover `codeagent-verify` containers, extra git worktrees,
+`refs/codeagent` refs, child processes, or temp state roots. A
+focused security review of the four files, limited to high/medium
+exploitable findings at an >=8/10 reporting threshold, produced no
+reportable finding — two candidates were independently rejected at
+3/10 and 2/10; this is not a claim that the slice is vulnerability-free
+or fully audited. This is macOS-only evidence — **Linux
+CI validation is pending**, matching the caveat this ADR already
+carries for the rest of the Slice 3A-1 substrate. Nothing from this
+slice is wired into `RunController`, the CLI, or any lifecycle-lock
+integration; that remains Slice 3A-2 and later Milestone 3 work per
+"Milestone boundary" above. This note does not amend or restate the
+accepted design above it — it records implementation status only.

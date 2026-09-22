@@ -635,18 +635,32 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   correction below)
 - Impact: metadata corruption, confusing/incorrect event traces, or a failed
   worktree operation
-- Implemented control: none yet
-- Planned control: a run-level lock (e.g. a lockfile keyed on the repository
-  path) preventing two concurrent CodeAgent runs against the same source
-  repository; v1 explicitly does not support concurrent runs against one
-  repo
+- Implemented control: **not mitigated or resolved.** Milestone 3 Slice
+  3A-1 (`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`
+  Amendment 1) implements the generic verified nonblocking lock
+  primitive and `acquire_repository_lock` (`state_locks.py`), plus the
+  trusted state-root and repository-identity substrate a run-level lock
+  would key on (`state_root.py`, `repo_identity.py`) — but none of it is
+  wired into `RunController` or any entry point. Nothing today actually
+  gates a run's start on acquiring that lock, so two concurrent
+  invocations against the same repository are still not prevented.
+- Planned control: controller entry-gating on `acquire_repository_lock`
+  before a run starts; a durable `lifecycle.json` record; and
+  reconciliation of a dead run's lock/lifecycle state (ADR 0004
+  §6/§10, Slice 3A-2 and later Milestone 3 work) — all still
+  unimplemented
 - Evidence/future test: adversarial test starting two runs concurrently,
   asserting the second is rejected rather than silently corrupting state
-- Residual risk: **accepted for v1** — single-run-per-repository is a stated
-  constraint (`PROJECT_BRIEF.md`: "one task and one repository per run"),
-  not a gap to close, but the *enforcement* of that constraint (rejecting a
-  second concurrent run cleanly) is still planned, not implemented
-- Owning milestone/spike: Stage-2 worktree spike (S1's successor), Milestone 1
+- Residual risk: **accepted for v1 as a stated constraint, but not yet
+  enforced** — single-run-per-repository is a stated constraint
+  (`PROJECT_BRIEF.md`: "one task and one repository per run"), not a gap
+  to close, but the underlying lock/identity substrate existing is not
+  the same as the constraint being enforced; enforcement requires the
+  controller wiring, durable lifecycle records, and reconciliation
+  listed above
+- Owning milestone/spike: Stage-2 worktree spike (S1's successor),
+  Milestone 1 constraint statement; Milestone 3 Slice 3A-1 (substrate,
+  implemented but unwired) and Slice 3A-2+ (enforcement, unimplemented)
 
 **T-E2 — TOCTOU between patch validation and application.**
 - Asset/objective: O1

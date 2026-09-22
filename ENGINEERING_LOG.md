@@ -1592,3 +1592,53 @@ identity, repository/generic lock primitives) completed a five-round,
 planning-only architecture review and is now **Accepted** as ADR 0004
 Amendment 1 — design-complete, not implemented. No production module
 exists yet; implementation is the next Milestone 3 step.
+
+## 2026-09-22: Slice 3A-1 implemented and locally validated; still unwired
+
+Implemented ADR 0004 Amendment 1's state-root/identity/lock substrate:
+`src/codeagent/_lifecycle_fs.py`, `state_root.py`, `state_locks.py`,
+`repo_identity.py`, each with a matching focused test module. A
+correction pass fixed a real in-process test regression found while
+combining the four focused test files: `test_lifecycle_fs.py`'s
+capability test used `importlib.reload()` on a shared module, which
+recreated its exception classes as new objects while the other three
+modules kept the originals bound via `from X import Y` — making later
+`except` matching order-dependent across the whole pytest process.
+Fixed by moving that test into an isolated subprocess, and by
+replacing every mid-test `monkeypatch.undo()` (several of which
+patched `os`/`fcntl` module-wide) with scoped `monkeypatch.context()`
+blocks so cleanup is guaranteed even on an unexpected assertion
+failure — this specific fix changed no production behavior. Separately,
+earlier hardening passes in this same slice *did* change production
+behavior before final verification: the top-level `import fcntl` was
+removed from `_lifecycle_fs.py`/`state_locks.py` in favor of a
+lazily-imported, fail-closed operation-time capability seam (per ADR
+0004's own operation-time capability rule), and descriptor
+ownership/cleanup, private-file validation, lock-cleanup
+classification, state-root probing, and `repo.json` validation were
+all corrected. A follow-up security review of the four new files,
+limited to high/medium exploitable findings at an >=8/10 reporting
+threshold, produced no reportable finding. Two candidates were
+identified and independently rejected: unvalidated ancestor
+directories in `ensure_bounded_ancestor` (3/10 confidence — the leaf
+state-root directory is independently re-validated regardless of
+ancestor provenance) and a missing `check_git_preflight()` call in
+`repo_identity.py` (2/10 confidence — `run_git()` already applies the
+mandatory hardened argv/environment unconditionally). Neither is a
+concrete, exploitable gap, and this is not a claim that the slice or
+codebase is vulnerability-free or fully audited. No vulnerability
+recorded; `check_git_preflight()` before the first repository
+operation is carried forward as a Slice 3A-2 integration invariant,
+not a 3A-1 defect.
+
+**Verified**: the four focused test files collected and passed
+together as 199/199 in both forward and reverse file order (no
+cross-test ordering dependency); full suite 2063/2063, including the 3
+real-Docker tests with `CODEAGENT_REQUIRE_DOCKER=1`; `py_compile` and
+`git diff --check` (including untracked files) clean; no leftover
+`codeagent-verify` containers, extra worktrees, `refs/codeagent` refs,
+child processes, or temp state roots. macOS/Git 2.54.0 only — Linux CI
+validation is still pending. Nothing from this slice is wired into
+`RunController`, the CLI, or any lifecycle-lock integration; that is
+Slice 3A-2 and later Milestone 3 work, unchanged in scope by this
+entry.
