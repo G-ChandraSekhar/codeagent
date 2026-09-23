@@ -2455,3 +2455,306 @@ since nothing yet calls `prepare_lifecycle()` before a real run starts).
 The earlier dated entries for these three slices, which truthfully
 stated Linux CI validation was pending at the time they were written,
 are left unmodified.
+
+## 2026-09-23: Milestone 3 Slice 3B-4 — bounded Docker control-plane execution and validated container-ID capture
+
+Implemented after two planning correction rounds: the first proposed
+recommendation (a three-hook, incomplete container-transition
+publisher seam) was rejected as an unused abstraction that would need
+later replacement — no concrete adapter, no real durable transition,
+no validated ID, and unresolved error behavior. A second round
+identified the real prerequisite: bounded Docker control-plane
+execution and validated container-ID capture, independently useful
+today and demonstrably required before any complete lifecycle-aware
+container producer slice.
+
+New shared module `src/codeagent/_bounded_subprocess.py`:
+`run_bounded_stdout()` owns the complete launch/monitor/read/wait/
+kill/confirm lifecycle behind one call, modeled closely on
+`codeagent._git_safety`'s own proven `_read_bounded` design (structured
+argv, no shell, one monotonic deadline, a single cleanup-and-raise
+path). `BoundedProcessFailure` distinguishes `LAUNCH_FAILED`
+(categorically distinct, no process to clean up),
+`MONITORING_FAILED`, `TIMED_OUT`, `OUTPUT_LIMIT_EXCEEDED`, and
+`TERMINATION_UNCONFIRMED` (which dominates and is raised explicitly
+`from` a fully-formed `BoundedProcessError` representing the original
+failure — a correction made during implementation: the first draft
+chained from the internal-only `_BoundedFailure` signal type instead,
+which would have leaked that private type into a public exception's
+`__cause__`).
+
+`codeagent.reconciliation.py` is refactored to use this shared runner:
+its own former private copy of the identical logic
+(`_drain_bounded`/`_kill_and_confirm`/`_BoundedReadFailure`) is
+removed rather than kept duplicated merely to preserve two tests that
+called it directly — those two tests are replaced by direct coverage
+of the shared primitive in the new `tests/unit/test_bounded_
+subprocess.py`, and every other `test_reconciliation.py` test passes
+unmodified, proving the extraction changed no observable behavior.
+
+`codeagent.executor.py`: every non-streaming Docker control-plane
+command (`create`/`inspect`/`rm`/`ps -a`) now runs through
+`_run_docker()`, rewritten to call the shared runner with its own
+fixed, documented, non-arbitrary byte limit and timeout per command —
+these four commands previously had **no timeout and no output bound
+at all**, a real, independent gap this slice closes (`docker start
+--attach`'s own separately-bounded streaming collection and its own
+caller-configured timeout are unchanged). `_parse_create_id()`
+strictly validates a successful create's stdout as exactly 64
+lowercase hex characters plus one trailing LF, rejecting every other
+shape categorically and never trusting an ID from a nonzero create
+result. Once validated, `start`/`inspect`/`rm` all target that
+immutable ID rather than the mutable generated name. Final cleanup
+confirmation performs one fresh, unfiltered, `--no-trunc`
+`docker ps -a --format '{{.ID}}\t{{.Names}}'` listing, strictly parsed
+by `_parse_cleanup_listing()` (exactly one record per nonempty line,
+duplicate ID/name rejected as ambiguous), requiring both the exact
+name and, when available, the exact ID to be absent.
+
+Introduces no lifecycle publisher, no lifecycle-store adapter, no
+deterministic lifecycle-derived container name, no ownership label,
+and no controller wiring — legacy UUID-suffixed naming is unchanged,
+and no lifecycle projection is written anywhere in this module.
+
+**Verified**: `py_compile` clean on all four changed/new production
+and test files. Two real test-fixture bugs found and fixed during
+verification, neither a production defect: `_name_only_listing()`'s
+helper initially paired every name with the *same* dummy container ID,
+so any test listing more than one name tripped `_parse_cleanup_
+listing()`'s own duplicate-ID rejection — fixed to generate a distinct
+dummy ID per name. Several "confirmed gone" test fixtures reused the
+fixed valid container ID as if it were an unrelated listing entry,
+which — correctly, per the new dual-identity confirmation rule — made
+cleanup register as unconfirmed (the ID appeared to still be present);
+fixed by pairing "confirmed gone" fixtures with a genuinely distinct
+dummy ID, while the fixtures deliberately testing "still present"
+detection via ID match were left as originally written. `test_
+executor.py`: 95 passed (up from 63). `test_bounded_subprocess.py`:
+16 passed (new). `test_reconciliation.py`: 67 passed (net -1: two
+direct private-helper tests removed, one launch-failure test's
+monkeypatch target updated). The three directly affected files
+together: 178 passed. The established eight-file focused set plus
+these three, collected and passed together: 805 passed, in both
+forward and reverse file order. Full local suite: 2,383 passed. With a
+real Docker daemon and `CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as
+a failure): the 3 dedicated real-Docker tests, 3 passed, 0 skipped —
+exercising the real full create/ID-capture/ID-targeted-start-inspect-
+remove/dual-identity-cleanup path end to end, not only mocked unit
+coverage; the complete suite, 2,383 passed, 0 skipped; no leftover
+`codeagent-verify` containers, extra worktrees, `refs/codeagent` refs,
+child processes, or temp state roots afterward. `git diff --check`
+clean.
+
+`docs/threat-model.md`'s T-G4 is updated to distinguish the
+pre-existing, unchanged 64 KiB verification-command stream bound
+(Milestone 1) from this slice's newly-bounded Docker control-plane
+calls (previously entirely unbounded and untimed-out) — no claim of
+lifecycle attribution, crash recovery, or T-F1 mitigation is made,
+since none of that exists yet. Linux CI validation is still pending
+for this slice.
+
+## 2026-09-23: Slice 3B-4 correction pass — narrow, pre-review fixes
+
+A pre-commit correction pass on Slice 3B-4, prompted by a joint review
+of the unstaged diff, found and fixed eight real gaps before this
+slice was considered final. None changed the slice's scope (no naming,
+labeling, or lifecycle-integration work was introduced).
+
+1. **Unbounded per-syscall read request.** `_drain()` called
+   `os.read(fd, _BOUNDED_READ_CHUNK)` unconditionally — a flat 64 KiB
+   request regardless of how close to the caller's limit the buffer
+   already was. A 65-byte-limited command (`docker create`) could
+   therefore read up to ~64 KiB into memory in one syscall before
+   overflow was even detected, contradicting the documented "never
+   requests more than the remaining allowance" bound. Fixed:
+   `to_read = min(_BOUNDED_READ_CHUNK, limit + 1 - len(buf))`, computed
+   fresh every iteration.
+2. **Kill-confirmation deadline drift.** `_terminate_and_confirm`
+   computed `confirm_deadline = max(deadline, time.monotonic()) +
+   _KILL_CONFIRM_GRACE_SECONDS` — since `deadline` is the *original*
+   command deadline, an early failure (e.g. an overflow detected 1
+   second into a 30-second budget) let `max(deadline, now)` evaluate to
+   the still-distant original deadline, granting a kill-confirmation
+   wait of up to ~29 remaining seconds plus the 2-second grace period,
+   nowhere close to "a fixed grace window." Fixed: `_terminate_and_
+   confirm` now takes no `deadline` parameter at all and computes
+   `confirm_deadline = time.monotonic() + _KILL_CONFIRM_GRACE_SECONDS`
+   fresh, unconditionally.
+3. **Cancellation exceptions swallowed.** The outer `except BaseException
+   as exc:` handler in `run_bounded_stdout` converted *everything* not
+   already handled — including `KeyboardInterrupt`/`SystemExit`/
+   `GeneratorExit` — into `BoundedProcessError(MONITORING_FAILED)`,
+   silently discarding a real interrupt's identity and type. Fixed:
+   ordinary `Exception`s are still mapped to `MONITORING_FAILED`, but a
+   genuine `BaseException` that is not an `Exception` now still
+   triggers cleanup, then either re-raises the *exact original
+   instance* unchanged (cleanup succeeded) or raises
+   `BoundedProcessError(TERMINATION_UNCONFIRMED)` (reap not confirmed)
+   or `BoundedProcessError(CLEANUP_UNCONFIRMED)` (reap confirmed but a
+   descriptor close was not), explicitly `from` that original exception
+   in either case — never wrapped into an ordinary categorical outcome.
+   `_drain`'s own inner exception handler
+   was widened from `except _BoundedFailure` to `except BaseException`
+   for the same reason: a cancellation-style exception reaching the
+   read loop must still trigger `_drain`'s own descriptor cleanup
+   before propagating, not skip it entirely.
+4. **Incomplete argument validation.** The prior validation
+   (`if not argv or not all(argv): raise ValueError(...)`) had a real
+   correctness bug beyond mere incompleteness: a bare `str` argv (e.g.
+   `"ls -la"`) iterates as individual *characters*, each truthy, so
+   `not all(argv)` was `False` and the string silently passed
+   validation, then `list(argv)` exploded it into single-character
+   "arguments." Neither `stdout_limit` nor `timeout_seconds` rejected a
+   `bool` (Python's `bool` is an `int` subclass, so `True`/`False`
+   silently passed as `1`/`0`), and `timeout_seconds` had no validation
+   at all. Fixed: a new `_validate_call_arguments()` runs before any
+   deadline is computed, rejecting a bare `str`/`bytes` argv, a
+   non-string or empty element, a NUL-containing element, a `bool` or
+   non-positive `stdout_limit`, and a `bool`, non-finite, or
+   non-positive `timeout_seconds` — every rejection is fixed,
+   sanitized text that never echoes the caller's actual value.
+5. **Misclassified read/wait failures.** A genuine `os.read()` `OSError`
+   was mapped to `TIMED_OUT`, conflating "the pipe itself errored" with
+   "nothing became ready before the deadline." `_confirm_exit` and
+   `_terminate_and_confirm` each caught only `subprocess.
+   TimeoutExpired`, letting any other `wait()` failure escape raw.
+   Fixed: a read `OSError` is now `MONITORING_FAILED`; both `wait()`
+   call sites now catch `Exception` broadly, with a non-timeout failure
+   still becoming a categorical outcome (`MONITORING_FAILED` during
+   ordinary completion confirmation, `TERMINATION_UNCONFIRMED` during
+   termination confirmation) rather than escaping raw.
+6. **Silently swallowed descriptor-close failures.** `selector.close()`
+   and `process.stdout.close()` (in both `_drain` and `_terminate_and_
+   confirm`) were wrapped in bare `except Exception: pass`, meaning a
+   close failure was indistinguishable from success even on an
+   otherwise fully successful drain. Fixed: a new
+   `BoundedProcessFailure.CLEANUP_UNCONFIRMED` reason surfaces any such
+   failure, attempted on every path (success included), dominating a
+   clean result and chaining from whatever read or termination failure
+   preceded it (never the raw close exception, and never discarded).
+   `run_bounded_stdout`'s outer handler was also corrected to surface
+   `_drain`'s own internal chain (a `CLEANUP_UNCONFIRMED` raised `from`
+   a deeper read failure) as a proper nested public
+   `BoundedProcessError` chain, not just the outermost reason.
+7. **Loose container-name acceptance.** `executor._parse_cleanup_
+   listing()` accepted any nonempty string as a valid container name,
+   never validating it against Docker's own container-name grammar.
+   Fixed: a new `_CONTAINER_NAME_RE` (`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+   is now required for every row's name field — whitespace, a carriage
+   return, NUL, Unicode, or leading/embedded punctuation all now make
+   the entire listing untrusted, not merely that one row.
+8. **Docstring overclaim.** `run_bounded_stdout`'s docstring did not
+   explicitly disclaim that its deadline could interrupt the
+   synchronous `Popen()` call itself. Corrected to state plainly that
+   the deadline governs monitoring/read/wait only after a child process
+   object is returned by `Popen`.
+
+Two test-infrastructure bugs were found and fixed during this same
+pass's own verification, neither a production defect: patching
+`os.read` process-wide in several new tests also intercepted
+`subprocess.Popen`'s own internal errpipe read (used on some code
+paths to detect a child's `exec()` failure) whenever the fake
+`Popen` factory's argument shape triggered CPython's traditional
+fork-based launch path rather than `posix_spawn` — corrected by
+filtering the injected/spied behavior to the target subprocess's own
+stdout fd, captured after real `Popen()` returns. One test's own
+assertion assumed a `wait()` failure would classify as
+`MONITORING_FAILED` without accounting for the same permanently-broken
+`wait()` also dominating to `TERMINATION_UNCONFIRMED` when it recurred
+during termination cleanup — corrected to make the fake `wait()` fail
+only on its first call.
+
+**Verified**: `py_compile` clean on all six changed/new production and
+test files. `test_executor.py`: 113 passed (up from 95; 18 new
+container-name-grammar tests). `test_bounded_subprocess.py`: 47 passed
+(up from 16; 31 new tests covering all eight findings).
+`test_reconciliation.py`: unchanged at 67 passed. The three directly
+affected files together: 227 passed. The established eight-file
+focused set plus these three, collected and passed together: 854
+passed, in both forward and reverse file order. Full local suite:
+2,432 passed. With a real Docker daemon and
+`CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a failure): the 3
+dedicated real-Docker tests, 3 passed, 0 skipped — confirming the
+tightened container-name grammar accepts real Docker's own generated
+names and the corrected read-bound/deadline logic doesn't change real
+behavior; the complete suite, 2,432 passed, 0 skipped; no leftover
+`codeagent-verify` containers, extra worktrees, `refs/codeagent` refs,
+child processes, or temp state roots afterward. `git diff --check`
+clean.
+
+`docs/threat-model.md`'s T-G4 wording was reviewed and found not
+materially altered by this correction pass (it describes the aggregate
+byte bound, which was always eventually enforced; only the transient
+per-syscall over-read risk before detection is what this pass closes),
+so it is left as committed. No other documentation claim from the
+original slice needed correction.
+
+## 2026-09-23: Slice 3B-4 second correction pass — narrower, review-driven
+
+A second, narrower joint review of the still-unstaged Slice 3B-4 diff
+(after the first eight-finding correction pass above) found three
+further real issues, none changing scope or behavior beyond the fix
+itself.
+
+1. **Incomplete public failure chain under repeated cleanup failure.**
+   `run_bounded_stdout`'s outer handler already converted a chained
+   internal `_drain()` failure (`CLEANUP_UNCONFIRMED` `from` a deeper
+   `_BoundedFailure` such as `OUTPUT_LIMIT_EXCEEDED`) into a public
+   `inner_cause`, but never attached it to `original` before possibly
+   using `original` as the `from` target of a *further* raise if
+   `_terminate_and_confirm` then also failed — in exactly that
+   double-failure case, the deepest read failure silently vanished from
+   the public chain (the final exception's `__cause__` pointed to
+   `original`, but `original.__cause__` was still unset). Fixed:
+   `original.__cause__` is now set to `inner_cause` immediately, before
+   `_terminate_and_confirm` is even attempted, so both the success path
+   (`raise original from inner_cause`) and the repeated-failure path
+   (`raise ... from original`, where `original` now already carries its
+   own cause) preserve the complete chain.
+2. **Cancellation-cleanup-failure docstring overclaim.** Both the
+   module-level docstring and `run_bounded_stdout`'s own docstring
+   stated that a cancellation-style `BaseException`'s cleanup failure
+   always becomes `TERMINATION_UNCONFIRMED` — true only when the
+   process itself cannot be confirmed reaped; when reap succeeds but a
+   descriptor close does not, the actual (already-correct) code
+   produces `CLEANUP_UNCONFIRMED` instead, which the docstrings never
+   mentioned. Corrected both to name both outcomes explicitly.
+3. **`executor._run_docker()` documentation drift.** Its docstring
+   still claimed one deadline covers "launch through confirmed
+   termination," contradicting the shared runner's own (already
+   correct, from the first pass) disclosure that the deadline cannot
+   bound the synchronous `Popen()` launch itself. Corrected to state
+   the deadline governs monitoring/read/wait only after the `docker`
+   process is launched. Its failure-list wording (and
+   `_DockerControlPlaneFailure`'s own docstring) was also loosened from
+   an incomplete enumeration (missing `MONITORING_FAILED` and
+   `CLEANUP_UNCONFIRMED`, both real since the first correction pass) to
+   durable categorical phrasing that doesn't need updating every time a
+   new reason is added.
+
+`CLAUDE.md` and this log's own first-correction-pass entry both
+independently reproduced the same "only `TERMINATION_UNCONFIRMED`"
+cancellation overclaim finding 2 corrects; both are updated alongside
+the code. `docs/threat-model.md` was inspected and found to contain no
+claim these three fixes make inaccurate — left unchanged.
+
+**Verified**: `py_compile` clean on both changed production files and
+the one changed test file. Two new regression tests in `test_bounded_
+subprocess.py` force all three chain levels (a real `OUTPUT_LIMIT_
+EXCEEDED` read failure, a descriptor-close failure inside `_drain()`,
+and a second failure during `_terminate_and_confirm()`) and assert the
+complete public cause chain plus that no internal `_BoundedFailure`
+ever appears in it — one variant with a repeated `CLEANUP_UNCONFIRMED`
+(`CLEANUP_UNCONFIRMED -> CLEANUP_UNCONFIRMED -> OUTPUT_LIMIT_EXCEEDED`),
+one with a dominant `TERMINATION_UNCONFIRMED`
+(`TERMINATION_UNCONFIRMED -> CLEANUP_UNCONFIRMED -> OUTPUT_LIMIT_
+EXCEEDED`). `test_bounded_subprocess.py`: 49 passed (up from 47). The
+three directly affected files together: 229 passed. The established
+eight-file focused set plus these three, collected and passed
+together: 856 passed, in both forward and reverse file order. Full
+local suite: 2,434 passed. With a real Docker daemon and
+`CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a failure): the 3
+dedicated real-Docker tests, 3 passed, 0 skipped; the complete suite,
+2,434 passed, 0 skipped; no leftover `codeagent-verify` containers,
+extra worktrees, `refs/codeagent` refs, child processes, or temp state
+roots afterward. `git diff --check` clean.

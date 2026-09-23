@@ -35,14 +35,12 @@ from __future__ import annotations
 import os
 import re
 import secrets
-import selectors
 import stat
-import subprocess
-import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum, unique
 
+from ._bounded_subprocess import BoundedProcessError, run_bounded_stdout
 from ._git_safety import GIT_TIMEOUT_SECONDS, GitSafetyError, run_git_bounded
 from ._lifecycle_fs import (
     LifecycleFsError,
@@ -95,11 +93,6 @@ _DOCKER_TIMEOUT_SECONDS = 30.0
 # read a caller might mistake for the complete picture.
 _DOCKER_OUTPUT_MAX_BYTES = 1_048_576
 _WORKTREE_LISTING_MAX_BYTES = 1_048_576
-# Mirrors codeagent._git_safety's own _KILL_CONFIRM_GRACE_SECONDS: not
-# additional time to make progress, only enough to let an already-
-# issued SIGKILL actually be reaped.
-_KILL_CONFIRM_GRACE_SECONDS = 2.0
-_BOUNDED_READ_CHUNK = 65_536
 
 
 @unique
@@ -193,109 +186,26 @@ class _DockerListingError(Exception):
     pass
 
 
-class _BoundedReadFailure(Exception):
-    """Internal-only signal from `_drain_bounded` to its callers: a
-    monitoring-setup failure, a timeout, or an output-size overflow.
-    The caller always kills and confirms termination of the child
-    before converting this into its own categorical error — mirrors
-    `codeagent._git_safety`'s own `_BoundedFailure`/`_drain_stdout`
-    shape, generalized here for a non-Git subprocess (Docker)."""
-
-
-def _drain_bounded(process: subprocess.Popen, *, deadline: float, limit: int) -> bytes:
-    """Read at most `limit + 1` bytes of `process.stdout`, non-blocking,
-    under `deadline`. Raises `_BoundedReadFailure` on a monitoring
-    failure, a timeout, or an oversize read — the caller discards the
-    buffer and kills the child in every case; a truncated read is never
-    silently trusted as the complete listing (a false "absent"
-    conclusion from a partial view would be worse than refusing)."""
-    try:
-        selector = selectors.DefaultSelector()
-    except Exception as exc:  # noqa: BLE001 - any setup failure is categorical
-        raise _BoundedReadFailure("subprocess output could not be monitored") from exc
-
-    buf = bytearray()
-    try:
-        try:
-            os.set_blocking(process.stdout.fileno(), False)
-            selector.register(process.stdout, selectors.EVENT_READ)
-        except Exception as exc:  # noqa: BLE001 - any setup failure is categorical
-            raise _BoundedReadFailure("subprocess output could not be monitored") from exc
-
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _BoundedReadFailure("subprocess did not finish within its time limit")
-            if not selector.select(timeout=remaining):
-                continue
-            try:
-                chunk = os.read(process.stdout.fileno(), _BOUNDED_READ_CHUNK)
-            except BlockingIOError:
-                continue
-            except OSError as exc:
-                raise _BoundedReadFailure("subprocess output could not be read") from exc
-            if not chunk:
-                return bytes(buf)
-            buf += chunk
-            if len(buf) > limit:
-                raise _BoundedReadFailure("subprocess produced more output than its fixed safety bound allows")
-    finally:
-        try:
-            selector.close()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            process.stdout.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _kill_and_confirm(process: subprocess.Popen, *, deadline: float) -> None:
-    """The single abort path for a bounded-read failure: kill the
-    child and confirm it was reaped within a bounded grace window.
-    Raises `_BoundedReadFailure` if termination cannot be confirmed —
-    never returns having silently left the child running."""
-    try:
-        process.kill()
-    except Exception:  # noqa: BLE001 - still attempt to confirm exit below
-        pass
-    confirm_deadline = max(deadline, time.monotonic()) + _KILL_CONFIRM_GRACE_SECONDS
-    try:
-        process.wait(timeout=max(0.0, confirm_deadline - time.monotonic()))
-    except subprocess.TimeoutExpired as exc:
-        raise _BoundedReadFailure("subprocess could not be confirmed terminated") from exc
-
-
 def _docker_ps_all_names() -> set[str]:
     """One bounded, unfiltered, timeout-controlled, no-shell
     `docker ps -a` listing of every container name (running or
     stopped) — never a name-filtered or label-filtered query (I2).
-    Output is capped at `_DOCKER_OUTPUT_MAX_BYTES`; a timeout or
-    overflow kills the child and confirms it was reaped before this
-    function raises."""
+    Output is capped at `_DOCKER_OUTPUT_MAX_BYTES` via the shared
+    `_bounded_subprocess.run_bounded_stdout`, which owns the complete
+    launch/monitor/read/wait/kill/confirm lifecycle; a timeout or
+    overflow is confirmed-terminated before this function raises."""
     argv = ["docker", "ps", "-a", "--no-trunc", "--format", "{{.Names}}"]
-    deadline = time.monotonic() + _DOCKER_TIMEOUT_SECONDS
     try:
-        process = subprocess.Popen(
-            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        result = run_bounded_stdout(
+            argv, timeout_seconds=_DOCKER_TIMEOUT_SECONDS, stdout_limit=_DOCKER_OUTPUT_MAX_BYTES
         )
-    except OSError as exc:
-        raise _DockerListingError("the docker executable could not be launched") from exc
-
-    try:
-        stdout = _drain_bounded(process, deadline=deadline, limit=_DOCKER_OUTPUT_MAX_BYTES)
-        process.wait(timeout=max(0.0, deadline - time.monotonic()))
-    except (_BoundedReadFailure, subprocess.TimeoutExpired) as exc:
-        try:
-            _kill_and_confirm(process, deadline=deadline)
-        except _BoundedReadFailure as cleanup_exc:
-            raise _DockerListingError("a docker listing child could not be confirmed terminated") from cleanup_exc
+    except BoundedProcessError as exc:
         raise _DockerListingError("docker listing failed, timed out, or exceeded its output bound") from exc
 
-    if process.returncode != 0:
+    if result.returncode != 0:
         raise _DockerListingError("docker listing exited with a nonzero status")
     try:
-        text = stdout.decode("utf-8")
+        text = result.stdout.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise _DockerListingError("docker listing produced invalid UTF-8 output") from exc
     return {name for name in text.splitlines() if name}

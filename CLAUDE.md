@@ -859,6 +859,184 @@ Stage 2 (of the four-stage planning process in
   evidence specifically, not a general Linux or ARM64 claim, and is
   implementation/test-suite evidence only — it does not constitute or
   substitute for a security review.
+- **Milestone 3 Slice 3B-4** (bounded Docker control-plane execution
+  and validated container-ID capture), the smallest dependency-correct
+  prerequisite identified before any complete lifecycle-aware container
+  producer slice, **is implemented and locally validated on macOS
+  (2026-09-23)**. It introduces **no lifecycle publisher, no
+  lifecycle-store adapter, no deterministic lifecycle-derived
+  container name, no ownership label, and no controller wiring** —
+  container naming remains the legacy UUID-suffixed scheme
+  (`codeagent-verify-<label>-<uuid12>`), and no lifecycle projection is
+  written anywhere in `executor.py`. New shared module
+  `src/codeagent/_bounded_subprocess.py`: `run_bounded_stdout()` owns
+  the complete launch/monitor/read/wait/kill/confirm lifecycle for a
+  structured-argv, no-shell, no-stdin subprocess behind one call,
+  rather than exposing separate drain/kill primitives a caller could
+  combine incorrectly — the same discipline `codeagent._git_safety`'s
+  own `_read_bounded` already established for Git subprocesses,
+  generalized here. Never returns truncated output as complete; a
+  monitoring failure, timeout, or output-bound overflow always kills
+  the child and confirms it was reaped before raising
+  `BoundedProcessError`, and if that confirmation itself fails,
+  `TERMINATION_UNCONFIRMED` dominates, raised explicitly `from` a
+  fully-formed `BoundedProcessError` representing the original failure
+  (never the internal-only `_BoundedFailure` signal type, and never
+  left to incidental `__context__`). `codeagent.reconciliation.py` is
+  refactored to use this shared runner in place of its own former
+  private copy of the identical logic (`_drain_bounded`/
+  `_kill_and_confirm`/`_BoundedReadFailure`, now removed) — every
+  existing `test_reconciliation.py` test passes unmodified in
+  behavior, proving the extraction changed nothing observable.
+  `codeagent.executor.py`: every non-streaming Docker control-plane
+  command (`create`/`inspect`/`rm`/`ps -a`) now runs through this
+  shared runner with its own fixed, documented byte limit and timeout
+  (`_CREATE_ID_MAX_BYTES=65`, `_INSPECT_STATE_MAX_BYTES=64KiB`,
+  `_RM_OUTPUT_MAX_BYTES=4096`, `_CLEANUP_LISTING_MAX_BYTES=1MiB`, all
+  at `_DOCKER_CONTROL_PLANE_TIMEOUT_SECONDS=30.0`) — previously **these
+  four commands had no timeout and no output bound at all**, a real,
+  independent gap this slice closes; `docker start --attach`'s own
+  separately-bounded streaming collection (`_MAX_STREAM_BYTES`,
+  Milestone 1) and its own timeout (the caller-configured verification
+  budget) are unchanged. A new `_DockerControlPlaneFailure` exception
+  (distinct from `_DockerLaunchError`) classifies any post-launch
+  categorical failure on any of these four commands (a timeout, an
+  output-bound overflow, a monitoring failure, an unconfirmed
+  termination, or an unconfirmed descriptor cleanup) as
+  `ENVIRONMENT_FAILURE`, the same treatment a malformed or failed
+  inspection already received before this slice — no new `ErrorCode`.
+  `_parse_create_id()` strictly validates a successful (zero-exit)
+  `docker create`'s stdout as exactly 64 lowercase hex characters plus
+  one trailing LF (65 bytes total), rejecting every other shape
+  (empty, missing/extra newlines, CRLF, uppercase, abbreviated,
+  non-hex, embedded NUL, whitespace, trailing data) categorically —
+  never trusting or acting on an ID from a nonzero create result, and
+  never starting the container on a malformed one (cleanup still
+  targets the exact generated name in that case, since a real
+  container may exist). Once a valid ID is captured, `docker start
+  --attach`, the final-state `docker inspect`, and `docker rm --force`
+  all target that immutable ID instead of the mutable generated name —
+  closing a rename/name-reuse race that could otherwise redirect a
+  later mutation to a different container. Final cleanup confirmation
+  now performs one fresh, unfiltered, `--no-trunc`
+  `docker ps -a --format '{{.ID}}\t{{.Names}}'` listing, strictly
+  parsed (`_parse_cleanup_listing()`: exactly one ID/name record per
+  nonempty line, ID exactly 64 lowercase hex, name nonempty, no
+  duplicate ID or name — any malformed row or ambiguity means
+  unconfirmed, never partially trusted), and requires **both** the
+  exact generated name and (when a valid ID exists) that exact ID to
+  be absent — closing the ambiguity where a container's ID reappears
+  live under a different name. `docker rm`'s own return code remains,
+  as before, never authoritative for removal; a control-plane failure
+  on `rm` itself still proceeds to the independent listing
+  confirmation rather than short-circuiting.
+  **A correction pass (2026-09-23) fixed eight real gaps found by
+  review before this slice was considered final**, none of them
+  changing the naming/labeling/lifecycle-integration scope above:
+  (1) each individual `os.read()` call is now capped to the caller's
+  *remaining* allowance (`min(_BOUNDED_READ_CHUNK, limit + 1 -
+  len(buffer))`), never a flat 64 KiB chunk regardless of how close to
+  the limit the buffer already was — previously a 65-byte-limited
+  command could read up to ~64 KiB before overflow was even detected;
+  (2) kill-confirmation now uses a grace deadline computed fresh at the
+  moment of the kill attempt (`time.monotonic() +
+  _KILL_CONFIRM_GRACE_SECONDS`), never derived from or extended by the
+  original command deadline — previously an early failure on a
+  30-second command could grant a ~32-second kill-confirmation wait;
+  (3) a cancellation-style `BaseException` (`KeyboardInterrupt`,
+  `SystemExit`, `GeneratorExit`) is never translated into a categorical
+  `BoundedProcessError` — cleanup is still attempted, but the exact
+  original exception instance propagates unchanged on success; if
+  cleanup instead fails, the result is `BoundedProcessError(
+  TERMINATION_UNCONFIRMED)` (reap not confirmed) or `BoundedProcessError(
+  CLEANUP_UNCONFIRMED)` (reap confirmed but a descriptor close was not),
+  chained from that original exception;
+  (4) `run_bounded_stdout` now fully validates every call argument
+  (rejecting a bare `str`/`bytes` argv, a non-string or NUL-containing
+  element, a `bool`/wrong-typed/non-positive `stdout_limit`, and a
+  `bool`/wrong-typed/non-finite/non-positive `timeout_seconds`) before
+  any deadline is computed or process launched, with fixed sanitized
+  `ValueError` text that never echoes the caller's actual argv or
+  value; (5) a genuine `os.read()`/pipe I/O error is now classified
+  `MONITORING_FAILED`, not conflated with `TIMED_OUT`, and any
+  non-`TimeoutExpired` `wait()` failure (during either ordinary
+  completion confirmation or termination confirmation itself) is still
+  categorical rather than a raw exception escaping; (6) a new
+  `BoundedProcessFailure.CLEANUP_UNCONFIRMED` reason means a
+  descriptor-close failure (the selector, either stdout close) is never
+  silently swallowed — attempted on every path including an otherwise-
+  fully-successful drain, dominating a clean result and chaining from
+  whatever read or termination failure preceded it; (7)
+  `executor._parse_cleanup_listing()` now validates each listing row's
+  name against Docker's own container-name grammar
+  (`_CONTAINER_NAME_RE`: ASCII-alphanumeric first character, then
+  alphanumeric/underscore/period/hyphen) rather than accepting any
+  merely-nonempty string, so whitespace, a carriage return, NUL,
+  Unicode, or leading/embedded punctuation in a name row now makes the
+  whole listing untrusted; (8) `run_bounded_stdout`'s own docstring is
+  corrected to state explicitly that its deadline governs monitoring/
+  read/wait only *after* a child process object is returned by `Popen`
+  — it does not and cannot bound the synchronous `Popen()` call itself.
+  Two test-infrastructure bugs were also found and fixed during this
+  same pass, neither a production defect: globally patching `os.read`
+  in several new tests also intercepted `subprocess.Popen`'s own
+  internal errpipe read on some code paths (used to detect a child's
+  `exec()` failure), corrected to filter by the target subprocess's own
+  fd; and one test's assertion assumed a `wait()` failure classifies as
+  `MONITORING_FAILED` without accounting for the same failure also
+  dominating to `TERMINATION_UNCONFIRMED` when it recurs during
+  termination cleanup, corrected to make `wait()` fail only once.
+  Verified (post-correction-pass totals): the three directly affected
+  files (`test_executor.py`, `test_reconciliation.py`, `test_bounded_
+  subprocess.py`) together, 227 passed (up from 178: `test_executor.py`
+  113, up from 95; `test_bounded_subprocess.py` 47, up from 16;
+  `test_reconciliation.py` unchanged at 67); the established
+  eight-file focused set plus these three collected and passed
+  together, 854 passed (up from 805), in both forward and reverse file
+  order; the full local suite (macOS): 2,432 passed (up from 2,383).
+  With a real Docker daemon and `CODEAGENT_REQUIRE_DOCKER=1` (a skip
+  treated as a failure): the 3 dedicated real-Docker tests, 3 passed,
+  0 skipped (confirming the tightened container-name grammar and
+  read-bound fix don't affect real Docker naming/behavior); the
+  complete suite, 2,432 passed, 0 skipped; no leftover
+  `codeagent-verify` containers, extra worktrees, `refs/codeagent`
+  refs, child processes, or temp state roots afterward.
+  `docs/threat-model.md`'s T-G4 is updated to distinguish the
+  pre-existing, unchanged verification-command stream bound from this
+  slice's newly-bounded Docker control-plane calls — no claim of
+  lifecycle attribution, crash recovery, or T-F1 mitigation is made;
+  none of that exists yet.
+  **A second, narrower correction pass (2026-09-23) fixed one further
+  real gap the first pass's own fix had introduced**: when `_drain()`
+  raised `CLEANUP_UNCONFIRMED` chained from a deeper read failure (e.g.
+  `OUTPUT_LIMIT_EXCEEDED`), `run_bounded_stdout`'s outer handler built
+  the public `inner_cause` but never attached it to `original` before
+  possibly using `original` as a `from` target if `_terminate_and_
+  confirm` then also failed — silently losing the deepest failure from
+  the public chain in exactly that double-failure case. Fixed by
+  attaching `inner_cause` to `original.__cause__` before it is ever
+  used. Two docstring overclaims were also corrected: the cancellation-
+  preserving cleanup-failure path can produce `CLEANUP_UNCONFIRMED` as
+  well as `TERMINATION_UNCONFIRMED` (both were previously described as
+  only the latter), and `executor._run_docker()`'s own docstring
+  wrongly claimed its deadline covers "launch through confirmed
+  termination" — corrected to state the deadline governs only
+  monitoring/read/wait after the `docker` process is launched, matching
+  the shared runner's own accurate wording; its failure-list wording was
+  also loosened from an incomplete enumeration to durable categorical
+  phrasing. Verified: `test_bounded_subprocess.py` 49 passed (up from
+  47; 2 new three-level chain-preservation regressions, one via a
+  repeated `CLEANUP_UNCONFIRMED`, one via a dominant
+  `TERMINATION_UNCONFIRMED`, both asserting every node in the raised
+  chain is a public `BoundedProcessError` with no internal
+  `_BoundedFailure` exposed); the three directly affected files
+  together, 229 passed; the established eight-file focused set plus
+  these three, 856 passed, in both forward and reverse file order; full
+  local suite, 2,434 passed; with `CODEAGENT_REQUIRE_DOCKER=1`, the 3
+  dedicated real-Docker tests, 3 passed, 0 skipped, and the complete
+  suite, 2,434 passed, 0 skipped; no leftover containers, worktrees,
+  refs, processes, or temp state roots afterward. Linux CI validation
+  is still pending.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

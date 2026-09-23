@@ -919,7 +919,21 @@ is acceptable; silently persisting real content with no redactor is not.
 - Source: A long repair loop, a tool producing large output repeatedly, or a
   verification command with enormous stdout/stderr
 - Impact: disk exhaustion from the event log itself
-- Implemented control: none yet
+- Implemented control: **partial, for two distinct subprocess-output
+  paths, neither one the general per-run event-log budget this entry's
+  own title names.** `codeagent.executor.DockerVerifier`'s streamed
+  verification-command stdout/stderr (`docker start --attach`) has been
+  bounded at 64 KiB per stream (`_MAX_STREAM_BYTES`) since Milestone 1
+  slice C, unchanged by the entry below. **Milestone 3 Slice 3B-4**
+  additionally bounds every non-streaming Docker *control-plane*
+  command this module issues (`create`/`inspect`/`rm`/`ps -a`) via the
+  shared `codeagent._bounded_subprocess.run_bounded_stdout` runner,
+  each with its own fixed, documented byte limit and a fixed timeout
+  (previously **unbounded and untimed-out entirely** — a real,
+  independent gap this slice closes, distinct from the verification
+  command's own already-bounded stdout/stderr). Neither of these is
+  the general per-run event-log size budget this entry's own title
+  describes; that remains unimplemented.
 - Planned control: per-stream output byte caps (guide §9.2: 64 KiB per
   stream per process) applied before anything is persisted into an event;
   overall wall-clock/iteration budgets (already modeled in `domain.py` via
@@ -928,8 +942,10 @@ is acceptable; silently persisting real content with no redactor is not.
   of output, asserting the persisted event is truncated with truncation
   noted, not the full payload
 - Residual risk: substantially mitigated once output caps are implemented
-  and tested; today, no cap exists because no executor exists. Residual
-  exposure from a misconfigured or bypassed cap, not claimed to be zero
+  and tested; today, the general event-log budget does not exist because
+  no such budget mechanism has been built. Residual exposure from a
+  misconfigured or bypassed cap on the two subprocess-output paths that
+  are bounded, not claimed to be zero
 - Owning milestone/spike: Milestone 3
 
 **T-G5 — Truncated log on crash mid-write.**

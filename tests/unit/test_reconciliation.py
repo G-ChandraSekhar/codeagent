@@ -986,36 +986,23 @@ def test_real_sigkill_then_reconcile_with_real_docker_git_ref_inspection(tmp_pat
 
 # ---------------------------------------------------------------------------
 # Correction pass, finding 1: bounded external inspection
+#
+# Slice 3B-4: the bounded-drain/kill-and-confirm primitives this
+# section used to test directly (`rc._drain_bounded`/`rc._kill_and_
+# confirm`) were extracted into the shared `codeagent._bounded_
+# subprocess` module and are now tested directly there
+# (`tests/unit/test_bounded_subprocess.py`) — this module no longer
+# has a private copy to test. `_docker_ps_all_names()`'s own launch-
+# failure behavior is still covered below, now through the shared
+# module's `subprocess.Popen`.
 # ---------------------------------------------------------------------------
-
-
-def test_drain_bounded_overflow_confirms_termination():
-    process = subprocess.Popen(
-        ["python3", "-c", "import sys,time; sys.stdout.write('x'*100000); sys.stdout.flush(); time.sleep(5)"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    deadline = time.monotonic() + 5.0
-    with pytest.raises(rc._BoundedReadFailure):
-        rc._drain_bounded(process, deadline=deadline, limit=10)
-    rc._kill_and_confirm(process, deadline=deadline)
-    assert process.poll() is not None
-
-
-def test_drain_bounded_timeout_confirms_termination():
-    process = subprocess.Popen(["sleep", "5"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    deadline = time.monotonic() + 0.2
-    with pytest.raises(rc._BoundedReadFailure):
-        rc._drain_bounded(process, deadline=deadline, limit=1_000_000)
-    rc._kill_and_confirm(process, deadline=deadline)
-    assert process.poll() is not None
 
 
 def test_docker_ps_all_names_launch_failure_is_docker_listing_error(monkeypatch):
     def _boom(*a, **k):
         raise OSError("no docker")
 
-    monkeypatch.setattr(rc.subprocess, "Popen", _boom)
+    monkeypatch.setattr("codeagent._bounded_subprocess.subprocess.Popen", _boom)
     with pytest.raises(rc._DockerListingError):
         rc._docker_ps_all_names()
 

@@ -42,6 +42,22 @@ OSError launching the listing itself, or the name still present),
 the outcome is always ENVIRONMENT_FAILURE, overriding whatever the
 container's own exit state would otherwise have produced: a cleanup
 *attempt* is not a cleanup *guarantee*.
+
+Milestone 3 Slice 3B-4 adds bounded, timeout-controlled execution for
+every non-streaming Docker control-plane command (`create`, `inspect`,
+`rm`, `ps -a`) via the shared `codeagent._bounded_subprocess` runner —
+these previously had no timeout at all and captured output with no
+size bound — plus strict capture and validation of `docker create`'s
+full container ID. Once a valid ID exists, `start`/`inspect`/`rm` all
+target that immutable ID rather than the mutable generated name, and
+final cleanup confirmation checks a single fresh, unfiltered,
+`--no-trunc` listing for the absence of *both* the exact generated
+name and (when one was captured) the exact ID — closing the ambiguity
+where a container's ID reappears live under a different name. This
+slice introduces no lifecycle publisher, no lifecycle-store adapter,
+no deterministic lifecycle-derived name, and no ownership label —
+container naming remains the legacy UUID-suffixed scheme, and no
+lifecycle projection is written anywhere in this module.
 """
 
 from __future__ import annotations
@@ -55,6 +71,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from codeagent import events
+from codeagent._bounded_subprocess import BoundedProcessError, BoundedProcessFailure, run_bounded_stdout
 from codeagent.controller import Clock, SystemClock, VerificationResult
 from codeagent.errors import ErrorCode, OperationalError
 
@@ -70,44 +87,65 @@ _DIGEST_PINNED_IMAGE_RE = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
 
 _MAX_STREAM_BYTES = 64 * 1024
 
-_SECURITY_FLAGS: tuple[str, ...] = (
-    "--network",
-    "none",
-    "--read-only",
-    "--tmpfs",
-    "/tmp:rw,size=64m",
-    "--memory",
-    "512m",
-    # Without --memory-swap, --memory alone does not cap the combined
-    # memory+swap allowance: Stage-2 spike S4's retained evidence
-    # observed HostConfig.Memory=512 MiB but
-    # HostConfig.MemorySwap=1024 MiB total (i.e. ~512 MiB of additional
-    # swap on top of the memory limit) on both macOS/Docker Desktop and
-    # native Linux Docker Engine (the specific hosts tested — see
-    # spikes/s4/S4_RESULT.md; this is an observed configuration on
-    # those hosts, not a claimed universal Docker default).
-    # --memory-swap set equal to --memory means "no additional swap
-    # beyond the memory limit," closing that gap for the combined
-    # memory+swap allowance.
-    "--memory-swap",
-    "512m",
-    "--cpus",
-    "1",
-    "--pids-limit",
-    "128",
-    "--user",
-    "1000:1000",
-    "--cap-drop",
-    "ALL",
-    "--security-opt",
-    "no-new-privileges",
-)
+# Slice 3B-4: fixed, documented, per-command bounds and timeouts for
+# every non-streaming Docker control-plane command — never one
+# unexplained arbitrary cap shared across all of them.
+#
+# `docker create`'s own control-plane call is quick (it does not run
+# the container), unlike `docker start --attach`, whose own timeout is
+# the caller-configured verification budget (`self._timeout_seconds`)
+# and stays entirely separate from this fixed control-plane timeout.
+_DOCKER_CONTROL_PLANE_TIMEOUT_SECONDS = 30.0
+# A successful `docker create`'s entire stdout is exactly the created
+# container's full ID (64 lowercase hex characters) plus one trailing
+# LF — 65 bytes, never more.
+_CREATE_ID_MAX_BYTES = 65
+# `docker inspect --format '{{json .State}}'`'s State object is small
+# (Status/ExitCode/OOMKilled plus a handful of timestamps and an
+# optional Health block) but is not itself size-pinned by Docker;
+# bounded generously above any observed real size while still being a
+# hard, documented, non-arbitrary bound, matching this module's own
+# existing `_MAX_STREAM_BYTES` bound for streamed output.
+_INSPECT_STATE_MAX_BYTES = 64 * 1024
+# `docker rm --force`'s own stdout is never read or trusted as proof of
+# removal (see `_cleanup`) — it is normally just the removed
+# name/ID echoed back on one line. Bounded to a small, fixed value
+# purely so an unexpected torrent of output cannot be captured
+# unboundedly; its content is discarded either way.
+_RM_OUTPUT_MAX_BYTES = 4096
+# A full, unfiltered `docker ps -a --no-trunc` listing on a busy host
+# can be large; matches `codeagent.reconciliation`'s own
+# `_DOCKER_OUTPUT_MAX_BYTES` bound for the identical command shape.
+_CLEANUP_LISTING_MAX_BYTES = 1024 * 1024
+
+# A Docker container ID is exactly 64 lowercase hexadecimal ASCII
+# characters — never uppercase, never abbreviated, never anything else.
+_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# Docker's own container-name grammar: an ASCII alphanumeric first
+# character, then any run of ASCII alphanumeric, underscore, period, or
+# hyphen -- never whitespace, CR, NUL, or any non-ASCII character. A
+# cleanup-listing row whose name doesn't match this exactly is refused,
+# never partially trusted as "nonempty is good enough."
+_CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 class _DockerLaunchError(Exception):
     """The `docker` executable itself couldn't be launched (OSError) —
     at *any* stage. Always maps to COMMAND_START_FAILURE, regardless of
     which docker subcommand raised it."""
+
+
+class _DockerControlPlaneFailure(Exception):
+    """A bounded, non-streaming Docker control-plane command
+    (`create`/`inspect`/`rm`/`ps -a`) launched successfully but then
+    failed in some categorical way after launch — a timeout, an
+    output-bound overflow, a monitoring failure, an unconfirmed
+    termination, or an unconfirmed descriptor cleanup — distinct from
+    `_DockerLaunchError` (the executable itself never started). Always
+    classified as ENVIRONMENT_FAILURE by every caller, the same
+    treatment this module already gave an inspect/listing failure
+    before this slice."""
 
 
 class _BoundedCollector:
@@ -150,11 +188,123 @@ def _pump(stream, collector: _BoundedCollector) -> None:
         stream.close()
 
 
-def _run_docker(*args: str) -> subprocess.CompletedProcess[str]:
+def _run_docker(*args: str, limit: int, timeout: float = _DOCKER_CONTROL_PLANE_TIMEOUT_SECONDS):
+    """The single seam for every non-streaming Docker control-plane
+    command (`create`/`inspect`/`rm`/`ps -a`): runs through the shared
+    bounded subprocess runner (`codeagent._bounded_subprocess.
+    run_bounded_stdout`), never a shell. That runner's own monotonic
+    deadline governs monitoring, reading, and waiting only *after* the
+    `docker` process is launched — it cannot and does not bound the
+    synchronous launch call itself. Returns a `BoundedProcessResult`
+    (raw stdout bytes, confirmed exit code) for any exit code,
+    including nonzero — never raises for a nonzero exit. Raises
+    `_DockerLaunchError` for a bare launch failure (unchanged mapping
+    from before this slice); every other categorical failure the
+    shared runner can raise (a monitoring failure, a timeout, an
+    output-bound overflow, an unconfirmed termination, or an
+    unconfirmed descriptor cleanup) becomes `_DockerControlPlaneFailure`
+    uniformly."""
     try:
-        return subprocess.run(["docker", *args], capture_output=True, text=True)
-    except OSError as exc:
-        raise _DockerLaunchError(str(exc)) from exc
+        return run_bounded_stdout(["docker", *args], timeout_seconds=timeout, stdout_limit=limit)
+    except BoundedProcessError as exc:
+        if exc.reason is BoundedProcessFailure.LAUNCH_FAILED:
+            raise _DockerLaunchError(str(exc)) from exc
+        raise _DockerControlPlaneFailure(str(exc)) from exc
+
+
+def _parse_create_id(raw: bytes) -> str | None:
+    """Strict full-container-ID parser for a successful (zero-exit)
+    `docker create`'s stdout. Accepts exactly 64 lowercase hexadecimal
+    ASCII characters followed by exactly one trailing LF (65 bytes
+    total) — nothing else. Rejects empty output, a missing trailing
+    newline, multiple lines, CRLF, uppercase, an abbreviated ID,
+    non-hex characters, embedded NUL, leading/trailing whitespace, and
+    trailing data after the newline. Returns `None` for anything else;
+    the caller must never truncate, guess at, or otherwise trust a
+    partial value. Oversized output never reaches this function at all
+    — `_run_docker`'s own `_CREATE_ID_MAX_BYTES` bound rejects it
+    first, as `_DockerControlPlaneFailure`."""
+    if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        return None
+    candidate_bytes = raw[:-1]
+    try:
+        candidate = candidate_bytes.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if not _CONTAINER_ID_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def _parse_cleanup_listing(raw: bytes) -> tuple[frozenset[str], frozenset[str]] | None:
+    """Strictly parse `docker ps -a --no-trunc --format
+    '{{.ID}}\\t{{.Names}}'`'s stdout: one ID/name record per nonempty
+    line, every ID exactly 64 lowercase hexadecimal characters, every
+    name matching Docker's own container-name grammar exactly
+    (`_CONTAINER_NAME_RE`) -- not merely nonempty. Returns `None` for a
+    decode failure, a malformed row (not exactly two tab-separated
+    fields, a malformed ID, or a name containing whitespace, a carriage
+    return, NUL, non-ASCII characters, or leading punctuation), or a
+    duplicate ID/name (an ambiguous listing is never partially trusted)
+    — the caller treats that identically to a listing failure: cleanup
+    unconfirmed. Returns `(ids, names)` on a fully well-formed listing,
+    empty sets included."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    ids: set[str] = set()
+    names: set[str] = set()
+    for line in text.split("\n"):
+        if line == "":
+            continue
+        parts = line.split("\t")
+        if len(parts) != 2:
+            return None
+        id_field, name_field = parts
+        if not _CONTAINER_ID_RE.fullmatch(id_field):
+            return None
+        if not _CONTAINER_NAME_RE.fullmatch(name_field):
+            return None
+        if id_field in ids or name_field in names:
+            return None
+        ids.add(id_field)
+        names.add(name_field)
+    return frozenset(ids), frozenset(names)
+
+
+_SECURITY_FLAGS: tuple[str, ...] = (
+    "--network",
+    "none",
+    "--read-only",
+    "--tmpfs",
+    "/tmp:rw,size=64m",
+    "--memory",
+    "512m",
+    # Without --memory-swap, --memory alone does not cap the combined
+    # memory+swap allowance: Stage-2 spike S4's retained evidence
+    # observed HostConfig.Memory=512 MiB but
+    # HostConfig.MemorySwap=1024 MiB total (i.e. ~512 MiB of additional
+    # swap on top of the memory limit) on both macOS/Docker Desktop and
+    # native Linux Docker Engine (the specific hosts tested — see
+    # spikes/s4/S4_RESULT.md; this is an observed configuration on
+    # those hosts, not a claimed universal Docker default).
+    # --memory-swap set equal to --memory means "no additional swap
+    # beyond the memory limit," closing that gap for the combined
+    # memory+swap allowance.
+    "--memory-swap",
+    "512m",
+    "--cpus",
+    "1",
+    "--pids-limit",
+    "128",
+    "--user",
+    "1000:1000",
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges",
+)
 
 
 class DockerVerifier:
@@ -220,15 +370,22 @@ class DockerVerifier:
     def _attempt(
         self, name: str, label: str
     ) -> tuple[
-        bool, bool, events.VerificationOutcome, int | None, str, str, OperationalError | None
+        bool,
+        bool,
+        events.VerificationOutcome,
+        int | None,
+        str,
+        str,
+        OperationalError | None,
+        str | None,
     ]:
         """Runs create -> start -> inspect for one container and returns
         (create_attempted, created, outcome, exit_code, stdout, stderr,
-        error) — a provisional result. Never raises: every failure mode
-        here is turned into a returned outcome instead of propagating,
-        so the caller's cleanup step always runs regardless of what
-        happened here, and never has to guess whether a container might
-        exist from inside an exception handler.
+        error, container_id) — a provisional result. Never raises: every
+        failure mode here is turned into a returned outcome instead of
+        propagating, so the caller's cleanup step always runs regardless
+        of what happened here, and never has to guess whether a
+        container might exist from inside an exception handler.
 
         `create_attempted` is set to `True` immediately before the
         `docker create` invocation — including when that invocation
@@ -247,6 +404,14 @@ class DockerVerifier:
         is still verified directly, and `created` — distinct from
         `create_attempted` — for whether a container object might
         actually exist afterward.
+
+        `container_id` is populated only once `docker create` both
+        returns zero *and* its stdout strictly parses as a full,
+        validated container ID (Slice 3B-4, `_parse_create_id`) — never
+        trusted from a nonzero create result, and never a truncated or
+        best-effort value. Every operation after a successful create
+        (`start`/`inspect`) targets that immutable ID, never the
+        mutable generated name.
         """
         create_attempted = False
         try:
@@ -262,6 +427,7 @@ class DockerVerifier:
                 "/workspace",
                 self._image,
                 *self._command,
+                limit=_CREATE_ID_MAX_BYTES,
             )
         except _DockerLaunchError:
             return (
@@ -276,8 +442,9 @@ class DockerVerifier:
                     label,
                     "docker executable could not be launched",
                 ),
+                None,
             )
-        if create_result.returncode != 0:
+        except _DockerControlPlaneFailure:
             return (
                 create_attempted,
                 False,
@@ -290,13 +457,57 @@ class DockerVerifier:
                     label,
                     "failed to create the verification container",
                 ),
+                None,
+            )
+        if create_result.returncode != 0:
+            # Never trust or act on stdout from a nonzero create — even
+            # if it happens to look ID-shaped.
+            return (
+                create_attempted,
+                False,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                None,
+                "",
+                "",
+                self._error(
+                    ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                    label,
+                    "failed to create the verification container",
+                ),
+                None,
+            )
+
+        container_id = _parse_create_id(create_result.stdout)
+        if container_id is None:
+            # Docker committed to creating a container (exit 0), but its
+            # own reported identity cannot be trusted — the container is
+            # never started. Cleanup must still be attempted by the
+            # exact generated name, since a real container may exist.
+            return (
+                create_attempted,
+                True,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                None,
+                "",
+                "",
+                self._error(
+                    ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                    label,
+                    "the verification container's created ID could not be validated",
+                ),
+                None,
             )
 
         try:
             exit_code, status, oom_killed, stdout_text, stderr_text, timed_out = (
-                self._start_and_inspect(name)
+                self._start_and_inspect(container_id)
             )
         except _DockerLaunchError:
+            # `_start_and_inspect` only ever raises this for `docker
+            # start --attach`'s own launch (its inspect step folds a
+            # `_DockerControlPlaneFailure` into a "malformed
+            # inspection" return instead of raising — see its own
+            # docstring), so this is the one exception it can propagate.
             return (
                 create_attempted,
                 True,
@@ -309,6 +520,7 @@ class DockerVerifier:
                     label,
                     "docker executable could not be launched",
                 ),
+                container_id,
             )
 
         if timed_out:
@@ -324,6 +536,7 @@ class DockerVerifier:
                     label,
                     "verification container exceeded its time budget",
                 ),
+                container_id,
             )
         if status != "exited" or exit_code is None or oom_killed is None:
             return (
@@ -338,6 +551,7 @@ class DockerVerifier:
                     label,
                     "failed to inspect the verification container's final state",
                 ),
+                container_id,
             )
         # A confirmed OOM kill takes precedence over both PASSED and
         # TEST_FAILURE: the container was killed by the kernel before
@@ -359,6 +573,7 @@ class DockerVerifier:
                     label,
                     "verification container was killed for exceeding its memory limit",
                 ),
+                container_id,
             )
         if exit_code == 0:
             return (
@@ -369,6 +584,7 @@ class DockerVerifier:
                 stdout_text,
                 stderr_text,
                 None,
+                container_id,
             )
         return (
             create_attempted,
@@ -378,6 +594,7 @@ class DockerVerifier:
             stdout_text,
             stderr_text,
             None,
+            container_id,
         )
 
     @staticmethod
@@ -401,7 +618,7 @@ class DockerVerifier:
         start = self._clock.monotonic()
         name = f"{CONTAINER_NAME_PREFIX}{label}-{uuid4().hex[:12]}"
 
-        create_attempted, _created, outcome, exit_code, stdout_text, stderr_text, error = (
+        create_attempted, _created, outcome, exit_code, stdout_text, stderr_text, error, container_id = (
             self._attempt(name, label)
         )
 
@@ -410,7 +627,7 @@ class DockerVerifier:
         # a launch failure occurred, or the container ran to completion
         # — since any of those can leave a real container object
         # behind. Only a genuine "never attempted" case skips it.
-        confirmed_absent = self._cleanup(name) if create_attempted else True
+        confirmed_absent = self._cleanup(name, container_id) if create_attempted else True
         cleanup_status = self._cleanup_status_for(
             create_attempted=create_attempted, confirmed_absent=confirmed_absent
         )
@@ -447,13 +664,22 @@ class DockerVerifier:
         )
 
     def _start_and_inspect(
-        self, name: str
+        self, container_id: str
     ) -> tuple[int | None, str | None, bool | None, str, str, bool]:
+        """`docker start --attach` and the final-state `docker inspect`
+        both target `container_id` (Slice 3B-4) — the immutable
+        identity Docker itself confirmed at create time, never the
+        mutable generated name. Only `docker start`'s own launch
+        failure (`_DockerLaunchError`) ever propagates out of this
+        method; a `_DockerLaunchError` or `_DockerControlPlaneFailure`
+        from the inspect step is folded into a malformed-inspection
+        return (`None, None, None, ...`) instead, the same treatment a
+        malformed or unparseable inspect payload already gets."""
         stdout_collector = _BoundedCollector(_MAX_STREAM_BYTES)
         stderr_collector = _BoundedCollector(_MAX_STREAM_BYTES)
         try:
             proc = subprocess.Popen(
-                ["docker", "start", "--attach", name],
+                ["docker", "start", "--attach", container_id],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -486,13 +712,20 @@ class DockerVerifier:
             return None, None, None, stdout_text, stderr_text, True
 
         try:
-            inspect_result = _run_docker("inspect", "--format", "{{json .State}}", name)
-        except _DockerLaunchError:
+            inspect_result = _run_docker(
+                "inspect", "--format", "{{json .State}}", container_id, limit=_INSPECT_STATE_MAX_BYTES
+            )
+        except (_DockerLaunchError, _DockerControlPlaneFailure):
             return None, None, None, stdout_text, stderr_text, False
         if inspect_result.returncode != 0:
             return None, None, None, stdout_text, stderr_text, False
 
-        exit_code, status, oom_killed = self._parse_state(inspect_result.stdout)
+        try:
+            inspect_text = inspect_result.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, None, None, stdout_text, stderr_text, False
+
+        exit_code, status, oom_killed = self._parse_state(inspect_text)
         return exit_code, status, oom_killed, stdout_text, stderr_text, False
 
     @staticmethod
@@ -526,32 +759,59 @@ class DockerVerifier:
 
         return exit_code, status, oom_killed
 
-    def _cleanup(self, name: str) -> bool:
+    def _cleanup(self, name: str, container_id: str | None) -> bool:
         """Best-effort removal, followed by a genuine confirmation check
-        via `docker ps -a` — a cleanup *attempt* is not a cleanup
-        *guarantee*. Returns True only if a successful listing
-        afterward shows `name` is genuinely, exactly absent from it.
+        via one fresh, unfiltered, `--no-trunc` `docker ps -a` listing —
+        a cleanup *attempt* is not a cleanup *guarantee*. Returns True
+        only if that listing strictly parses and shows both the exact
+        generated `name` absent and, when `container_id` was validated,
+        that exact ID also absent.
 
-        Deliberately does not use `docker inspect name`'s exit code as
-        the confirmation signal: a nonzero exit there is ambiguous
+        Removal itself targets `container_id` when one is available
+        (Slice 3B-4: the immutable identity Docker itself confirmed at
+        create time) rather than the mutable `name`, so a rename or
+        name-reuse race cannot redirect this mutation to a different
+        container. Before a valid ID exists — a launch failure, a
+        control-plane failure, a nonzero create, or a malformed create
+        ID — removal falls back to the exact generated name, matching
+        this module's existing conservative behavior.
+
+        Deliberately does not use `docker inspect <target>`'s exit code
+        as the confirmation signal: a nonzero exit there is ambiguous
         between "confirmed gone" and "the daemon/client itself is
         broken" — both produce the same exit code, and treating both
         as confirmation risked reporting a successful run whose
-        container secretly still existed. Listing everything and
-        checking for the exact name removes that ambiguity: a failed
+        container secretly still existed. A strictly parsed dual-
+        identity listing removes that ambiguity: a failed, malformed,
         or unparseable listing is always treated as unconfirmed, never
-        as confirmed-absent.
+        as confirmed-absent, and so is a listing in which either the
+        name or the ID (when one was validated) still appears —
+        including the ID appearing live under a different name.
         """
+        rm_target = container_id if container_id is not None else name
         try:
-            _run_docker("rm", "--force", name)
-        except _DockerLaunchError:
+            _run_docker("rm", "--force", rm_target, limit=_RM_OUTPUT_MAX_BYTES)
+        except (_DockerLaunchError, _DockerControlPlaneFailure):
+            # rm's own outcome is never authoritative for removal — the
+            # independent listing below is — so a failure here still
+            # proceeds to that listing rather than short-circuiting.
             pass
 
         try:
-            listing = _run_docker("ps", "-a", "--format", "{{.Names}}")
-        except _DockerLaunchError:
+            listing = _run_docker(
+                "ps", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}", limit=_CLEANUP_LISTING_MAX_BYTES
+            )
+        except (_DockerLaunchError, _DockerControlPlaneFailure):
             return False
         if listing.returncode != 0:
             return False
-        names = {line.strip() for line in listing.stdout.splitlines() if line.strip()}
-        return name not in names
+
+        parsed = _parse_cleanup_listing(listing.stdout)
+        if parsed is None:
+            return False
+        ids, names = parsed
+        if name in names:
+            return False
+        if container_id is not None and container_id in ids:
+            return False
+        return True
