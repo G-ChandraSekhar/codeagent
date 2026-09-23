@@ -673,7 +673,18 @@ Stage 2 (of the four-stage planning process in
   is now recovered automatically before a new run is admitted, but
   nothing yet calls `prepare_lifecycle()` before a real run starts, so
   concurrent-run refusal still depends only on the repository lock's
-  ordinary `BUSY` behavior. Linux CI validation is still pending.
+  ordinary `BUSY` behavior. **GitHub-hosted Linux CI confirmed** (commit
+  `048314e8713777f3401a2e64445e3e8da9507cc1`, run
+  [35814528028](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35814528028),
+  `ubuntu-24.04` x86_64, Python 3.12, success): the dedicated mandatory
+  real-Docker step, 3 passed, 0 skipped; the complete-suite step, 2,246
+  passed, 3 skipped — those 3 skips are exactly the real-Docker tests
+  already exercised for real in the dedicated step immediately before
+  it, not a Docker-unavailability skip; no leftover `codeagent-verify`
+  containers afterward. This is GitHub-hosted `ubuntu-24.04` x86_64
+  evidence specifically, not a general Linux or ARM64 claim, and is
+  implementation/test-suite evidence only — it does not constitute or
+  substitute for a security review.
 - **Milestone 3 Slice 3B-2** (locked, authoritative lifecycle-projection
   writer), per `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
   Amendment 3, **is implemented and locally validated on macOS
@@ -753,7 +764,18 @@ Stage 2 (of the four-stage planning process in
   wiring, resource removal, abandonment — all later Milestone 3 work.
   This slice performs no Docker operations of its own; T-E1's
   mitigation status is unchanged (nothing here is wired into a real
-  run). Linux CI validation is still pending.
+  run). **GitHub-hosted Linux CI confirmed** (commit
+  `0bf66f65b8cbe37ea897af3eb00ca8741522a8da`, run
+  [35826244500](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35826244500),
+  `ubuntu-24.04` x86_64, Python 3.12, success): the dedicated mandatory
+  real-Docker step, 3 passed, 0 skipped; the complete-suite step, 2,296
+  passed, 3 skipped — those 3 skips are exactly the real-Docker tests
+  already exercised for real in the dedicated step immediately before
+  it, not a Docker-unavailability skip; no leftover `codeagent-verify`
+  containers afterward. This is GitHub-hosted `ubuntu-24.04` x86_64
+  evidence specifically, not a general Linux or ARM64 claim, and is
+  implementation/test-suite evidence only — it does not constitute or
+  substitute for a security review.
 - **Milestone 3 Slice 3B-3** (durable checkpoint-ref transition-
   publication seam), per
   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
@@ -824,7 +846,19 @@ Stage 2 (of the four-stage planning process in
   checkpoint-ref transition edge — Amendment 3's tables are unchanged.
   `docs/threat-model.md` is unchanged: nothing here is wired into a
   real run. This slice performs no Docker operations of its own; T-E1's
-  mitigation status is unchanged. Linux CI validation is still pending.
+  mitigation status is unchanged. **GitHub-hosted Linux CI confirmed**
+  (commit `bc8cb770bcfeea9a8161c102536e9b69896f24ef`, run
+  [35889103564](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35889103564),
+  `ubuntu-24.04` x86_64, Python 3.12, success): the pinned verification
+  image was pulled and confirmed `linux/amd64`; the dedicated mandatory
+  real-Docker step, 3 passed, 0 skipped; the complete-suite step, 2,326
+  passed, 3 skipped — those 3 skips are precisely the same real-Docker
+  tests already executed successfully in the dedicated step, not
+  Docker-unavailability skips; no leftover `codeagent-verify`
+  containers afterward. This is GitHub-hosted `ubuntu-24.04` x86_64
+  evidence specifically, not a general Linux or ARM64 claim, and is
+  implementation/test-suite evidence only — it does not constitute or
+  substitute for a security review.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

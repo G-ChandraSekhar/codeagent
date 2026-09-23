@@ -2409,3 +2409,49 @@ for a publisher's `LifecycleStoreError` remains explicitly deferred:
 `RunController` today only catches `CheckpointRefError`/
 `CheckpointSessionError`, and this slice does not claim the seam is
 ready for that integration on its own.
+
+## 2026-09-23: Linux CI evidence reconciliation for Slices 3B-1, 3B-2, 3B-3
+
+Documentation-only. Each slice's own "Linux CI validation is still
+pending" caveat, truthful at the time it was written, is now closed
+prospectively with the corresponding GitHub-hosted Linux CI run,
+independently re-verified via the GitHub API before citing it:
+
+- **Slice 3B-1** (initial-shape automatic reconciliation): commit
+  `048314e8713777f3401a2e64445e3e8da9507cc1`, run
+  [35814528028](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35814528028),
+  `ubuntu-24.04` x86_64, Python 3.12, success. Dedicated mandatory
+  real-Docker step: 3 passed, 0 skipped. Complete-suite step: 2,246
+  passed, 3 skipped — the 3 skips are exactly the real-Docker tests
+  already executed for real in the dedicated step immediately before
+  it, not a Docker-unavailability skip. No leftover `codeagent-verify`
+  containers.
+- **Slice 3B-2** (locked, authoritative lifecycle-projection writer):
+  commit `0bf66f65b8cbe37ea897af3eb00ca8741522a8da`, run
+  [35826244500](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35826244500),
+  `ubuntu-24.04` x86_64, Python 3.12, success. Dedicated mandatory
+  real-Docker step: 3 passed, 0 skipped. Complete-suite step: 2,296
+  passed, 3 skipped — same pattern as above, not a Docker-unavailability
+  skip. No leftover `codeagent-verify` containers.
+- **Slice 3B-3** (durable checkpoint-ref transition-publication seam):
+  commit `bc8cb770bcfeea9a8161c102536e9b69896f24ef`, run
+  [35889103564](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35889103564),
+  `ubuntu-24.04` x86_64, Python 3.12, success. Pinned verification image
+  pulled and confirmed `linux/amd64`. Dedicated mandatory real-Docker
+  step: 3 passed, 0 skipped. Complete-suite step: 2,326 passed, 3
+  skipped — same pattern, not a Docker-unavailability skip. No leftover
+  `codeagent-verify` containers.
+
+This is GitHub-hosted `ubuntu-24.04` x86_64 implementation/test-suite
+evidence specifically, not a general Linux or ARM64 claim, and not a
+security review. No production behavior, transition tables, failure
+semantics, or scope boundary changed by this entry or by the
+corresponding `CLAUDE.md`/ADR 0004 wording updates: `prepare_lifecycle()`
+remains unwired to `RunController`, and T-E1 remains only partially
+mitigated (a dead prior run in the current repository is reconciled
+automatically before a new run is admitted, but concurrent-run refusal
+still depends only on the repository lock's ordinary `BUSY` behavior,
+since nothing yet calls `prepare_lifecycle()` before a real run starts).
+The earlier dated entries for these three slices, which truthfully
+stated Linux CI validation was pending at the time they were written,
+are left unmodified.

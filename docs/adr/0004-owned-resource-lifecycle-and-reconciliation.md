@@ -1531,6 +1531,16 @@ implement and verify every rule above, including real cross-process
 SIGKILL-and-reconcile and real-Docker container/worktree/ref
 inspection; see `ENGINEERING_LOG.md`'s dated entry for exact totals.
 
+Implementation/test evidence (not a security review): confirmed on
+GitHub-hosted Linux CI at commit
+`048314e8713777f3401a2e64445e3e8da9507cc1`, run
+[35814528028](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35814528028)
+(`ubuntu-24.04` x86_64, Python 3.12, success) — the dedicated mandatory
+real-Docker step 3 passed/0 skipped, the complete suite 2,246 passed/3
+skipped (the 3 skips being exactly the real-Docker tests already
+executed in the dedicated step), no leftover `codeagent-verify`
+containers.
+
 ---
 
 ## Amendment 3 (Accepted 2026-09-23): Milestone 3 Slice 3B-2 — locked, authoritative lifecycle-projection writer
@@ -1743,6 +1753,16 @@ run.
 `tests/unit/test_lifecycle_store.py` implement and verify every rule
 above; see `ENGINEERING_LOG.md`'s dated entry for exact totals.
 
+Implementation/test evidence (not a security review): confirmed on
+GitHub-hosted Linux CI at commit
+`0bf66f65b8cbe37ea897af3eb00ca8741522a8da`, run
+[35826244500](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35826244500)
+(`ubuntu-24.04` x86_64, Python 3.12, success) — the dedicated mandatory
+real-Docker step 3 passed/0 skipped, the complete suite 2,296 passed/3
+skipped (the 3 skips being exactly the real-Docker tests already
+executed in the dedicated step), no leftover `codeagent-verify`
+containers.
+
 ---
 
 ## Amendment 4 (Accepted 2026-09-23): Milestone 3 Slice 3B-3 — durable checkpoint-ref transition-publication seam
@@ -1887,3 +1907,14 @@ run, so no threat-model claim becomes true or false by this slice.
 above, including a real end-to-end test proving durable checkpoint-ref
 publication with no mocking of the writer; see `ENGINEERING_LOG.md`'s
 dated entry for exact totals.
+
+Implementation/test evidence (not a security review): confirmed on
+GitHub-hosted Linux CI at commit
+`bc8cb770bcfeea9a8161c102536e9b69896f24ef`, run
+[35889103564](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35889103564)
+(`ubuntu-24.04` x86_64, Python 3.12, success) — the pinned verification
+image confirmed `linux/amd64`, the dedicated mandatory real-Docker step
+3 passed/0 skipped, the complete suite 2,326 passed/3 skipped (the 3
+skips being exactly the real-Docker tests already executed in the
+dedicated step, not Docker-unavailability skips), no leftover
+`codeagent-verify` containers.
