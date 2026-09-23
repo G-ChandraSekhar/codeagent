@@ -1203,12 +1203,19 @@ CI: commit `8aefa5f`, run
 [35794177790](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35794177790)
 (`ubuntu-24.04` x86_64, Python 3.12) concluded success — the dedicated
 mandatory real-Docker step passed 3/3 with no skips, the complete-
-suite step passed 2,177 with 3 skipped (those 3 are exactly the
-real-Docker tests already exercised for real in the dedicated step,
-not a Docker-unavailability skip), and no leftover
-`codeagent-verify` containers remained afterward. This is
-`ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
-ARM64 claim. Slice 3A-2 now implements the lifecycle-lock wrapper and
+suite step passed 2,177 with 3 skipped. **Corrected 2026-09-23**: this
+step also ran with `CODEAGENT_REQUIRE_DOCKER=1` against a ready Docker
+daemon, so those 3 skips were **not** the real-Docker tests, which had
+already passed again within this same step; the narrowest supportable
+claim is three platform/host-specific tests skipped (source inspection,
+not proven from this run's own log, identifies the likely candidates as
+Darwin-only tests in `test_evidence.py`/`test_lifecycle_fs.py` and a
+case-insensitive-filesystem-dependent alias test in
+`test_repo_identity.py` — see `ENGINEERING_LOG.md`'s dated erratum
+entry for detail). No leftover `codeagent-verify` containers remained
+afterward. This is `ubuntu-24.04` x86_64 evidence specifically, not a
+general Linux or ARM64 claim. Slice 3A-2 now implements the
+lifecycle-lock wrapper and
 the `prepare_lifecycle()` composition (see that slice's own
 "Implementation status" note below); the remaining limitation is that
 neither slice is wired into `RunController`, the CLI, or any other
@@ -1347,11 +1354,14 @@ Linux VM. **GitHub-hosted Linux CI is now confirmed**: commit
 (`ubuntu-24.04` x86_64, Python 3.12) concluded success — the pinned
 verification image was pulled and confirmed `linux/amd64`; the
 dedicated mandatory real-Docker step passed 3/3 with no skips; the
-complete-suite step passed 2,177 with 3 skipped (exactly the
-real-Docker tests already exercised for real in the dedicated step
-immediately before it, not a Docker-unavailability skip); no leftover
-`codeagent-verify` containers remained afterward. This is
-`ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+complete-suite step passed 2,177 with 3 skipped. **Corrected
+2026-09-23**: this step also ran with `CODEAGENT_REQUIRE_DOCKER=1`
+against a ready Docker daemon, so those 3 skips were **not** the
+real-Docker tests, which had already passed again within this same
+step; see `ENGINEERING_LOG.md`'s dated erratum entry for the corrected
+explanation. No leftover `codeagent-verify` containers remained
+afterward. This is `ubuntu-24.04` x86_64 evidence specifically, not a
+general Linux or
 ARM64 claim, and it confirms this slice's own composition and test
 suite only — it does not itself mitigate T-E1 or wire `prepare_
 lifecycle()` into `RunController` or the CLI.
@@ -1537,9 +1547,14 @@ GitHub-hosted Linux CI at commit
 [35814528028](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35814528028)
 (`ubuntu-24.04` x86_64, Python 3.12, success) — the dedicated mandatory
 real-Docker step 3 passed/0 skipped, the complete suite 2,246 passed/3
-skipped (the 3 skips being exactly the real-Docker tests already
-executed in the dedicated step), no leftover `codeagent-verify`
-containers.
+skipped. **Corrected 2026-09-23**: this step also ran with
+`CODEAGENT_REQUIRE_DOCKER=1` against a ready Docker daemon, so those 3
+skips were **not** the real-Docker tests, which had already passed
+again within this same step; the narrowest supportable claim is three
+platform/host-specific tests skipped (exact likely identities come
+from source inspection, not this run's own `pytest -q` log — see
+`ENGINEERING_LOG.md`'s dated erratum entry for detail). No leftover
+`codeagent-verify` containers.
 
 ---
 
@@ -1759,9 +1774,14 @@ GitHub-hosted Linux CI at commit
 [35826244500](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35826244500)
 (`ubuntu-24.04` x86_64, Python 3.12, success) — the dedicated mandatory
 real-Docker step 3 passed/0 skipped, the complete suite 2,296 passed/3
-skipped (the 3 skips being exactly the real-Docker tests already
-executed in the dedicated step), no leftover `codeagent-verify`
-containers.
+skipped. **Corrected 2026-09-23**: this step also ran with
+`CODEAGENT_REQUIRE_DOCKER=1` against a ready Docker daemon, so those 3
+skips were **not** the real-Docker tests, which had already passed
+again within this same step; the narrowest supportable claim is three
+platform/host-specific tests skipped (exact likely identities come
+from source inspection, not this run's own `pytest -q` log — see
+`ENGINEERING_LOG.md`'s dated erratum entry for detail). No leftover
+`codeagent-verify` containers.
 
 ---
 
@@ -1914,7 +1934,12 @@ GitHub-hosted Linux CI at commit
 [35889103564](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35889103564)
 (`ubuntu-24.04` x86_64, Python 3.12, success) — the pinned verification
 image confirmed `linux/amd64`, the dedicated mandatory real-Docker step
-3 passed/0 skipped, the complete suite 2,326 passed/3 skipped (the 3
-skips being exactly the real-Docker tests already executed in the
-dedicated step, not Docker-unavailability skips), no leftover
+3 passed/0 skipped, the complete suite 2,326 passed/3 skipped.
+**Corrected 2026-09-23**: this step also ran with
+`CODEAGENT_REQUIRE_DOCKER=1` against a ready Docker daemon, so those 3
+skips were **not** the real-Docker tests, which had already passed
+again within this same step; the narrowest supportable claim is three
+platform/host-specific tests skipped (exact likely identities come
+from source inspection, not this run's own `pytest -q` log — see
+`ENGINEERING_LOG.md`'s dated erratum entry for detail). No leftover
 `codeagent-verify` containers.

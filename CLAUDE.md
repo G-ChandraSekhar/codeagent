@@ -564,13 +564,24 @@ Stage 2 (of the four-stage planning process in
   `ubuntu-24.04` x86_64, Python 3.12): the pinned verification image
   was pulled and confirmed `linux/amd64`; the dedicated mandatory
   real-Docker step, 3 passed, no skips; the complete-suite step, 2,177
-  passed, 3 skipped — those 3 skips are exactly the real-Docker tests
-  already exercised for real in the dedicated step immediately before
-  it, not a Docker-unavailability skip; no leftover
-  `codeagent-verify` containers afterward. This is GitHub-hosted
-  `ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
-  ARM64 claim. A real two-process test confirms both the repository
-  lock and the lifecycle lock are cross-process exclusive, and a real
+  passed, 3 skipped. **Corrected 2026-09-23**: this step also ran with
+  `CODEAGENT_REQUIRE_DOCKER=1` against a ready Docker daemon (confirmed
+  from `.github/workflows/ci.yml`, unmodified since its single
+  introducing commit), so those 3 skips were **not** the real-Docker
+  tests — those had already passed again within this same step. The
+  narrowest claim this run's own log supports is: three platform/host-
+  specific tests skipped; they were not the real-Docker tests. Source
+  inspection (not proven from this run's own log, which does not expose
+  skip names) identifies the likely candidates as three tests that
+  unconditionally skip on a Linux, case-sensitive-filesystem runner:
+  `test_evidence.py`'s Darwin-only ambient-`/tmp`-symlink test,
+  `test_lifecycle_fs.py`'s Darwin-only case-canonicalization test, and
+  `test_repo_identity.py`'s case-insensitive-filesystem-dependent alias
+  test. No leftover `codeagent-verify` containers afterward. This is
+  GitHub-hosted `ubuntu-24.04` x86_64 evidence specifically, not a
+  general Linux or ARM64 claim. A real two-process test confirms both
+  the repository lock and the lifecycle lock are cross-process
+  exclusive, and a real
   SIGKILL test confirms a fresh process can still acquire both locks
   afterward, creating a new, separate lifecycle_id/run directory
   rather than adopting the dead run's own directory. **Not
@@ -678,9 +689,14 @@ Stage 2 (of the four-stage planning process in
   [35814528028](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35814528028),
   `ubuntu-24.04` x86_64, Python 3.12, success): the dedicated mandatory
   real-Docker step, 3 passed, 0 skipped; the complete-suite step, 2,246
-  passed, 3 skipped — those 3 skips are exactly the real-Docker tests
-  already exercised for real in the dedicated step immediately before
-  it, not a Docker-unavailability skip; no leftover `codeagent-verify`
+  passed, 3 skipped. **Corrected 2026-09-23**: this step also ran with
+  `CODEAGENT_REQUIRE_DOCKER=1` against a ready Docker daemon, so those 3
+  skips were **not** the real-Docker tests, which had already passed
+  again within this same step. Narrowest supportable claim: three
+  platform/host-specific tests skipped; they were not the real-Docker
+  tests. Source inspection (not CI-log-proven) identifies the likely
+  candidates as the same three Linux-unconditional skips named in the
+  Slice 3A-1/3A-2 entry above. No leftover `codeagent-verify`
   containers afterward. This is GitHub-hosted `ubuntu-24.04` x86_64
   evidence specifically, not a general Linux or ARM64 claim, and is
   implementation/test-suite evidence only — it does not constitute or
@@ -769,9 +785,14 @@ Stage 2 (of the four-stage planning process in
   [35826244500](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35826244500),
   `ubuntu-24.04` x86_64, Python 3.12, success): the dedicated mandatory
   real-Docker step, 3 passed, 0 skipped; the complete-suite step, 2,296
-  passed, 3 skipped — those 3 skips are exactly the real-Docker tests
-  already exercised for real in the dedicated step immediately before
-  it, not a Docker-unavailability skip; no leftover `codeagent-verify`
+  passed, 3 skipped. **Corrected 2026-09-23**: this step also ran with
+  `CODEAGENT_REQUIRE_DOCKER=1` against a ready Docker daemon, so those 3
+  skips were **not** the real-Docker tests, which had already passed
+  again within this same step. Narrowest supportable claim: three
+  platform/host-specific tests skipped; they were not the real-Docker
+  tests. Source inspection (not CI-log-proven) identifies the likely
+  candidates as the same three Linux-unconditional skips named in the
+  Slice 3A-1/3A-2 entry above. No leftover `codeagent-verify`
   containers afterward. This is GitHub-hosted `ubuntu-24.04` x86_64
   evidence specifically, not a general Linux or ARM64 claim, and is
   implementation/test-suite evidence only — it does not constitute or
@@ -852,9 +873,14 @@ Stage 2 (of the four-stage planning process in
   `ubuntu-24.04` x86_64, Python 3.12, success): the pinned verification
   image was pulled and confirmed `linux/amd64`; the dedicated mandatory
   real-Docker step, 3 passed, 0 skipped; the complete-suite step, 2,326
-  passed, 3 skipped — those 3 skips are precisely the same real-Docker
-  tests already executed successfully in the dedicated step, not
-  Docker-unavailability skips; no leftover `codeagent-verify`
+  passed, 3 skipped. **Corrected 2026-09-23**: this step also ran with
+  `CODEAGENT_REQUIRE_DOCKER=1` against a ready Docker daemon, so those 3
+  skips were **not** the real-Docker tests, which had already passed
+  again within this same step. Narrowest supportable claim: three
+  platform/host-specific tests skipped; they were not the real-Docker
+  tests. Source inspection (not CI-log-proven) identifies the likely
+  candidates as the same three Linux-unconditional skips named in the
+  Slice 3A-1/3A-2 entry above. No leftover `codeagent-verify`
   containers afterward. This is GitHub-hosted `ubuntu-24.04` x86_64
   evidence specifically, not a general Linux or ARM64 claim, and is
   implementation/test-suite evidence only — it does not constitute or
@@ -1035,8 +1061,35 @@ Stage 2 (of the four-stage planning process in
   local suite, 2,434 passed; with `CODEAGENT_REQUIRE_DOCKER=1`, the 3
   dedicated real-Docker tests, 3 passed, 0 skipped, and the complete
   suite, 2,434 passed, 0 skipped; no leftover containers, worktrees,
-  refs, processes, or temp state roots afterward. Linux CI validation
-  is still pending.
+  refs, processes, or temp state roots afterward.
+  **GitHub-hosted Linux CI confirmed** (commit
+  `1a15485575f460b43fa87e7fd159f73c5234fd7e`, run
+  [35920856512](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35920856512),
+  `ubuntu-24.04` x86_64, Python 3.12, success): the pinned verification
+  image was pulled and confirmed `linux/amd64`; the dedicated mandatory
+  real-Docker step, 3 passed, 0 skipped; the complete-suite step, 2,431
+  passed, 3 skipped. This step also ran with `CODEAGENT_REQUIRE_DOCKER=1`
+  against a ready Docker daemon, so those 3 skips were **not** the
+  real-Docker tests, which had already passed again within this same
+  step. Narrowest supportable claim: three platform/host-specific tests
+  skipped; they were not the real-Docker tests. Source inspection (not
+  proven from this run's own log, which uses `pytest -q` and does not
+  expose skip names) identifies the likely candidates as three tests
+  that unconditionally skip on a Linux, case-sensitive-filesystem
+  runner: `test_evidence.py`'s Darwin-only ambient-`/tmp`-symlink test,
+  `test_lifecycle_fs.py`'s Darwin-only case-canonicalization test, and
+  `test_repo_identity.py`'s case-insensitive-filesystem-dependent alias
+  test (`test_discover_repository_identity_case_alias_containment`,
+  which calls `pytest.skip()` at runtime when `os.path.exists()` on a
+  differently-cased alias path returns `False`, as it does on a
+  case-sensitive filesystem). No leftover `codeagent-verify` containers
+  afterward. This is GitHub-hosted `ubuntu-24.04` x86_64 evidence
+  specifically, not a general Linux or ARM64 claim, and is
+  implementation/automated-test evidence only — it does not constitute
+  or substitute for a security review, and this slice adds no lifecycle
+  publisher, lifecycle projection write, ownership label, deterministic
+  lifecycle-derived container name, controller wiring, or crash-
+  reconciliation behavior of any kind.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

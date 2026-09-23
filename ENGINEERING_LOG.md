@@ -2758,3 +2758,109 @@ dedicated real-Docker tests, 3 passed, 0 skipped; the complete suite,
 2,434 passed, 0 skipped; no leftover `codeagent-verify` containers,
 extra worktrees, `refs/codeagent` refs, child processes, or temp state
 roots afterward. `git diff --check` clean.
+
+## 2026-09-23: Erratum — false attribution of every prior complete-suite's 3 Linux CI skips to the real-Docker tests, plus Slice 3B-4's own Linux CI evidence
+
+This is a plain factual error, not time-relative history: `.github/
+workflows/ci.yml` has been committed exactly once (`a845cb3`) and has
+never been modified since, and its "Run complete test suite" step has
+carried `CODEAGENT_REQUIRE_DOCKER: "1"` from that single commit
+onward. That means Docker was required and available for every
+complete-suite step on every Linux CI run this project has ever
+recorded — so the 3 tests that step's own suite reports skipped could
+never have been the 3 real-Docker tests in
+`tests/integration/test_slice_c.py`: those already ran again, for
+real, inside that same step, and this run's own log confirms `3
+passed` in the dedicated step immediately before it, not 3 "already
+covered" skips. Every prior dated entry in this log, and every
+corresponding passage in `CLAUDE.md` and `docs/adr/0004-owned-
+resource-lifecycle-and-reconciliation.md`, that explained a
+complete-suite's 3 skips as "the same real-Docker tests already
+exercised in the dedicated step" was wrong from the moment it was
+written, for every one of these runs:
+
+- commit `8aefa5f`, run
+  [35794177790](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35794177790)
+  (Slice 3A-1/3A-2), complete suite 2,177 passed, 3 skipped;
+- commit `048314e8713777f3401a2e64445e3e8da9507cc1`, run
+  [35814528028](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35814528028)
+  (Slice 3B-1), complete suite 2,246 passed, 3 skipped;
+- commit `0bf66f65b8cbe37ea897af3eb00ca8741522a8da`, run
+  [35826244500](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35826244500)
+  (Slice 3B-2), complete suite 2,296 passed, 3 skipped;
+- commit `bc8cb770bcfeea9a8161c102536e9b69896f24ef`, run
+  [35889103564](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35889103564)
+  (Slice 3B-3), complete suite 2,326 passed, 3 skipped.
+
+Following this repository's own documentation-ladder convention for a
+historical record (unlike `CLAUDE.md`, a living current-status
+document whose four corresponding passages this same session's edits
+correct in place), this log's own prior entries above are **not**
+rewritten — this erratum supersedes their specific "same real-Docker
+tests" explanation without altering their surrounding prose, exact
+totals, run IDs, commit SHAs, platform-scope claims, or any other
+evidence, all of which remain accurate.
+
+The correct explanation, which none of the cited runs' own logs prove
+directly (`python -m pytest -q` does not report skip names or
+reasons): the narrowest claim every one of these runs' logs actually
+supports is **three platform/host-specific tests skipped; they were
+not the real-Docker tests**. Source inspection of this repository's own
+skip conditions (not CI-log evidence) identifies exactly three
+sites that unconditionally skip on a Linux, case-sensitive-filesystem
+runner, and no others found by a full-repository search for every
+`pytest.skip`/`skipif` call:
+
+- `tests/unit/test_evidence.py`: `@pytest.mark.skipif(sys.platform !=
+  "darwin", ...)` on the real, unmocked `/tmp` ambient-symlink test;
+- `tests/unit/test_lifecycle_fs.py`: `@pytest.mark.skipif(platform.
+  system() != "Darwin", ...)` on the macOS case-canonicalization test;
+- `tests/unit/test_repo_identity.py`:
+  `test_discover_repository_identity_case_alias_containment` calls
+  `pytest.skip()` at runtime when a differently-cased alias path does
+  not resolve via `os.path.exists()` — true on any case-sensitive
+  filesystem, which is the Linux/ext4 default.
+
+Every other conditional skip found in the repository (git-version-
+dependent ones, e.g. `--object-format=sha256` or
+`--ref-format=reftable` support in `test_checkpoint_ref.py`,
+`test_git_safety.py`, `test_lifecycle_store.py`,
+`test_repo_identity.py`) depends on the installed `git` version, which
+this session did not independently confirm for any of these runner
+images — so those are not ruled in or out with certainty, and the
+three named above are presented as the most plausible source-based
+candidates, not a CI-log-proven identity.
+
+**Slice 3B-4's own Linux CI evidence** (commit
+`1a15485575f460b43fa87e7fd159f73c5234fd7e`, run
+[35920856512](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35920856512),
+`ubuntu-24.04` x86_64, Python 3.12, success — independently
+re-verified via the GitHub API and log before citing it): the pinned
+verification image was pulled and confirmed `linux/amd64`; the
+dedicated mandatory real-Docker step, 3 passed, 0 skipped (confirmed
+directly in the log, and confirmed that step's own env carries
+`CODEAGENT_REQUIRE_DOCKER: 1`); the complete-suite step (same env
+variable confirmed present), 2,431 passed, 3 skipped — per the
+corrected explanation above, three platform/host-specific tests, not
+the real-Docker tests; no leftover `codeagent-verify` containers
+(the check step itself concluded `success` with an empty result). This
+is GitHub-hosted `ubuntu-24.04` x86_64 implementation/automated-test
+evidence specifically — not a general Linux claim, not ARM64 evidence,
+and not a security review. Slice 3B-4 adds no lifecycle publisher, no
+lifecycle projection write, no ownership label, no deterministic
+lifecycle-derived container name, no controller wiring, and no crash-
+reconciliation behavior — none of that was in this slice's scope.
+
+`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s five
+occurrences of the same false attribution are corrected in place
+alongside this entry, since those passages describe verification
+evidence, not the ADR's own accepted design, transition tables, or
+scope boundaries: two for run `35794177790`, both within Amendment 1
+(its own "Implementation status (Slice 3A-1, ...)" and "Implementation
+status (Slice 3A-2, ...)" subsections — Slice 3A-2 has no separate
+Amendment of its own), and one each for run `35814528028` (Amendment
+2's evidence section), run `35826244500` (Amendment 3's evidence
+section), and run `35889103564` (Amendment 4's evidence section).
+`docs/threat-model.md` was inspected and contains no occurrence of
+this specific false attribution and no stale Slice 3B-4
+Linux-CI-pending statement to update — left unchanged.
