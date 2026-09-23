@@ -134,7 +134,7 @@ def _read_projection_dict(run_dir):
 
 def test_is_absent_shape_true_for_initial_projection(harness):
     projection = _initial_projection(harness, "a" * 32)
-    assert rc._is_absent_shape(projection)
+    assert ls.is_projection_fully_absent_shape(projection)
 
 
 def test_is_absent_shape_false_when_container_non_absent(harness):
@@ -142,13 +142,13 @@ def test_is_absent_shape_false_when_container_non_absent(harness):
     tampered = dataclasses.replace(
         projection, baseline=dataclasses.replace(projection.baseline, intent=ls.ContainerIntent.PRESENT, id="x" * 64)
     )
-    assert not rc._is_absent_shape(tampered)
+    assert not ls.is_projection_fully_absent_shape(tampered)
 
 
 def test_is_absent_shape_false_when_failure_populated(harness):
     projection = _initial_projection(harness, "a" * 32)
     tampered = dataclasses.replace(projection, failure=ls.FailureDetail(phase="p", detail="d"))
-    assert not rc._is_absent_shape(tampered)
+    assert not ls.is_projection_fully_absent_shape(tampered)
 
 
 # ---------------------------------------------------------------------------

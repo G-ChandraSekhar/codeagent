@@ -1530,3 +1530,215 @@ later Milestone 3 work, unchanged in scope by this amendment.
 implement and verify every rule above, including real cross-process
 SIGKILL-and-reconcile and real-Docker container/worktree/ref
 inspection; see `ENGINEERING_LOG.md`'s dated entry for exact totals.
+
+---
+
+## Amendment 3 (Accepted 2026-09-23): Milestone 3 Slice 3B-2 — locked, authoritative lifecycle-projection writer
+
+Implementation status: **implemented.** Fills in the durable write-side
+API and exact transition rules this ADR's §5/§7 tables imply but never
+themselves specified as a callable contract. Reverses no earlier
+decision.
+
+### 1. Writer boundary and API
+
+`LifecycleLease.open_projection_writer() -> (writer, current)` is the
+only sanctioned way to obtain a `_LifecycleProjectionWriter`. It
+refuses categorically — before any raw `TypeError`/`AttributeError`/
+invalid-descriptor error can escape — an incomplete lease
+(`run_dir_fd`/`object_format`/`state_root` unset), then performs the
+exact same complete lock-scope validation every write method uses
+(held, `LIFECYCLE`-kind, exact `repo_key`/`lifecycle_id` match — which
+also transitively refuses an already-`close()`d lease, since
+`release()` clears `is_held`), then performs exactly one authoritative
+read and returns it as the caller's first `expected`. The writer is
+never constructed directly.
+
+`LifecycleLease` gained `object_format` (the trusted `"sha1"`/`"sha256"`
+value from `RepositoryIdentity.object_format`, set once in
+`prepare_lifecycle()`) — never inferred from a caller-supplied SHA or
+untrusted projection content.
+
+The writer never performs a Docker or Git call, never inspects an
+external resource, and never claims to have done so — every precondition
+named below ("caller-confirmed absence," "confirmed applied") is the
+future resource-owning caller's own responsibility.
+
+### 2. Authoritative-read and stale-expectation behavior
+
+Every write method: verify lock scope → load and fully validate the
+currently installed authoritative projection fresh (a corrupt or
+identity-mismatched file is refused exactly as `load_lifecycle_
+projection` already refused it — `SCHEMA_INVALID`/`SUBSTRATE_UNAVAILABLE`
+— and is never overwritten) → compare against the caller's `expected`
+→ refuse a mismatch (`STALE_EXPECTED_PROJECTION`) before any
+publication I/O → derive the candidate only from the freshly validated,
+currently installed projection. A successful read here validates that
+installed content; it cannot retroactively prove a prior failed
+directory-`fsync` durable — no power-loss durability claim is made.
+
+`STALE_EXPECTED_PROJECTION` is deliberately distinct from
+`ILLEGAL_TRANSITION`: the former means the requested edge may be
+perfectly legal from the *actual* current state — the caller's belief
+is simply out of date (a compare-and-swap rejection); the latter means
+the edge is not legal from *any* state. A refusal at this stage still
+performed one authoritative *read* — described as "zero publication/
+write I/O," never "zero I/O."
+
+### 3. Lock enforcement
+
+`_require_lease_lock_held()`: the lease's `lifecycle_lock` must be
+non-null, held, and its `scope` must exactly equal
+`LockScope(kind=LIFECYCLE, repo_key=lease.repo_key,
+lifecycle_id=lease.lifecycle_id)` — never merely `is_held`. A
+repository-kind lock, a mismatched `repo_key`/`lifecycle_id`, or an
+incomplete lease's `None` identity fields are all refused
+categorically (`WRONG_LOCK_SCOPE`) without ever constructing an invalid
+`LockScope`.
+
+### 4. Publication outcomes and recovery
+
+- **Pre-installation failure** (`PROJECTION_PUBLICATION_FAILED`):
+  nothing installed; the durable projection is confirmed still equal to
+  the pre-call `expected`; retrying the same call with the same
+  `expected` is accepted, not stale.
+- **Installed, durability unconfirmed** (`PROJECTION_DURABILITY_UNCONFIRMED`):
+  the new complete projection is currently installed (`os.replace`
+  already confirmed it), but its directory-entry durability was not
+  confirmed by this process — no power-loss durability claim is made
+  either way. The caller's old `expected` is now stale.
+  `writer.refresh()` performs one authoritative read (zero publication/
+  write I/O) and returns the currently installed, fully validated
+  projection for reconsideration; nothing retries automatically. A
+  caller who ignores this and retries with the stale `expected` anyway
+  is caught by `STALE_EXPECTED_PROJECTION`.
+- **Temporary-publication cleanup unconfirmed** (`CLEANUP_UNCONFIRMED`):
+  preserved as its own distinct, fail-closed reason — never silently
+  treated as an ordinary retryable pre-installation failure.
+- **Confirmed success**: the newly published projection is returned;
+  callers thread it forward as their next `expected`.
+
+### 5. Exact transition tables
+
+**Owner lifecycle state** (`advance_lifecycle_state`):
+`PREPARING→ACTIVE`, `ACTIVE→CLEANING`, `CLEANING→COMPLETE` (only with
+the complete clean-final absent shape — both containers absent, worktree
+absent, `checkpoint_ref == ABSENT_TRANSITION`, `failure` null — the
+shared `is_projection_fully_absent_shape()` predicate, ADR's clean-final
+rule and I15), plus exact same-state no-op *only* among these four
+states. `RECONCILING`/`RECONCILED`/`RECONCILIATION_FAILED` are refused
+unconditionally by this API, including an identical-state request —
+those remain `reconciliation.py`'s own private, reconciler-owned write
+path (`_publish_projection_state`), untouched by this amendment.
+
+**Container** (`record_container_transition`, per role independently):
+`(absent,null)→(creating,null)`, `(creating,null)→(present,<set>)`,
+`(creating,null)→(absent,null)` (failed-create recovery — see below),
+`(present,X)→(removing,X)`, `(removing,X)→(absent,null)`, plus exact
+tuple no-op. Every other combination, including `(present,X)→(present,Y)`
+for `Y≠X`, is `ILLEGAL_TRANSITION`.
+
+`(creating,null)→(absent,null)` is an explicit clarification of the
+accepted write-ahead/reuse rule, not an assumed analogy to
+checkpoint-ref: legal only when the caller has independently confirmed,
+by real Docker inspection outside this writer, that no container was
+ever created for the attempt — enabling the role name to be safely
+reused. This writer never performs that inspection itself.
+
+**Checkpoint-ref** (`record_checkpoint_ref_transition`): the writer
+never re-derives an outcome — `transition` is trusted to already be the
+decided output of `checkpoint_session.CheckpointSession`'s own collapse
+logic. Beyond `CheckpointTransition.__post_init__`'s existing per-record
+shape validation, this amendment adds cross-transition SHA continuity:
+
+| Edge | Continuity requirement |
+|---|---|
+| `absent→creating` | target's own shape only (schema-valid proposed SHA) |
+| `creating→present` | target `accepted_sha == current.proposed_new_sha` |
+| `creating→absent` | confirmed-unchanged create-failure recovery |
+| `present→advancing` | target `accepted_sha == expected_old_sha == current.accepted_sha` |
+| `advancing→present` | target `accepted_sha ∈ {current.accepted_sha, current.proposed_new_sha}` |
+| `present→removing` | target `accepted_sha == expected_old_sha == current.accepted_sha` |
+| `removing→absent` | confirmed-removal collapse |
+| any, exact full-record equality | no-op |
+| every other edge or SHA discontinuity | `ILLEGAL_TRANSITION` |
+
+Every non-null SHA is additionally validated against the lease's
+trusted `object_format` (never inferred from the SHA's own length).
+
+Both resource methods share a uniform call order, applied strictly
+before their own request validation: verify exact lock scope → load and
+validate the authoritative projection → refuse a stale `expected` → only
+then validate the requested role/shape/edge, so a wrong lock scope or a
+stale `expected` can never be masked by an invalid request argument
+being checked first.
+
+### 5a. Resource-transition state gate (correction, 2026-09-23)
+
+Both `record_container_transition()` and `record_checkpoint_ref_transition()`
+additionally require, immediately after the mandatory lock verification
+and authoritative load/stale comparison and *before* their own exact-
+no-op handling, that the authoritative lifecycle state be
+owner-controlled and nonterminal: `PREPARING`, `ACTIVE`, or `CLEANING`.
+`COMPLETE`, `RECONCILING`, `RECONCILED`, and `RECONCILIATION_FAILED` are
+all refused (`ILLEGAL_TRANSITION`) — including an exact resource
+no-op — since none of those projections may ever be mutated again by
+this live-owner writer boundary. This enforces the already-accepted
+clean-final rule and I11/I15; it is not a new lifecycle state graph, and
+it does not change the owner state graph in section 5 above.
+
+`record_checkpoint_ref_transition()` also sanitizes its `transition`
+argument's type immediately after this gate, before any field access:
+a non-`CheckpointTransition` value (including `None`) is refused as
+`ILLEGAL_TRANSITION` with fixed categorical text, never a raw
+`AttributeError`/`TypeError`/`ValueError`.
+
+### 6. `CheckpointSession` boundary — Option A
+
+`CheckpointSession.establish()`/`advance()`/`delete()` set their
+transitional intent and call the corresponding `CheckpointRef` method
+on the very next line, with no seam between them — confirmed by direct
+inspection before this amendment was written. **This writer's
+`record_checkpoint_ref_transition` is therefore not yet a usable durable
+write-ahead boundary in production**: it correctly persists whatever
+transition it is given, at whatever moment it is called, but nothing
+in production can call it at the ADR-required moment (before the Git
+mutation) for a real checkpoint-ref operation today. `checkpoint_session.py`
+is untouched by this slice — the smaller option, since that module is
+already a live production collaborator (`RunController` requires it),
+and adding a seam nothing yet uses would grow this slice's blast radius
+onto currently-live behavior. A later slice must inject or refactor a
+persistence seam into `CheckpointSession` before durable checkpoint-ref
+write-ahead exists.
+
+### 7. Deferrals unchanged
+
+Populated `failure` writing and non-absent worktree writing remain
+deferred, exactly as Slice 3A-2 and 3B-1 already narrowed them — no new
+policy invented for either. Both remain refused at the schema-validation
+layer (`SCHEMA_INVALID`) before this slice's own transition-edge logic
+would ever see them.
+
+### 8. Shared predicate
+
+`is_projection_fully_absent_shape()` now lives in `lifecycle_store.py`
+(previously a private `reconciliation.py`-only helper) and is imported
+explicitly by `reconciliation.py` for its own terminal/nonterminal
+recognition — the one predicate this ADR's clean-final rule and I15
+require, used identically by both this writer's `CLEANING→COMPLETE`
+guard and reconciliation's `SKIPPED_TERMINAL` recognition.
+
+### Milestone boundary
+
+Slice 3B-2 owns exactly the above: the projection-transition writer
+substrate. No Docker or Git call, no `workspace.py`/`executor.py`
+change, no controller or CLI wiring, no resource removal, no
+abandonment, and no `checkpoint_session.py` change. T-E1's mitigation
+status is unchanged by this slice — nothing here is wired into a real
+run.
+
+### Evidence
+
+`src/codeagent/lifecycle_store.py` and
+`tests/unit/test_lifecycle_store.py` implement and verify every rule
+above; see `ENGINEERING_LOG.md`'s dated entry for exact totals.

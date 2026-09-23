@@ -2110,3 +2110,206 @@ refs, child processes, or temp state roots afterward. `git diff
 3B-1 boundary, outcome vocabulary, clean-final invariant, attempt-
 counting semantics, lock ordering, and no-removal boundary are all
 unchanged.
+
+## 2026-09-23: Milestone 3 Slice 3B-2 — locked, authoritative lifecycle-projection writer
+
+Implemented per ADR 0004 Amendment 3, after a three-round planning-only
+review pass (an initial writer-signature proposal was corrected for
+stale-write prevention, lock enforcement, and object-format sourcing;
+a second pass corrected factory-validation completeness, checkpoint SHA
+continuity, publication-recovery precision, transition-edge exactness,
+owner-state no-op scope, and the shared-predicate export) before any
+code was written.
+
+`LifecycleLease` gained `object_format` (from `RepositoryIdentity.
+object_format`, set once in `prepare_lifecycle()`, never inferred from
+a caller-supplied SHA) and `open_projection_writer()` — the only
+sanctioned way to obtain a `_LifecycleProjectionWriter`. The factory
+refuses an incomplete lease (`run_dir_fd`/`object_format`/`state_root`
+unset) before any raw `TypeError`/`AttributeError`/invalid-descriptor
+error can escape, then calls the writer's own `_require_lease_lock_held()`
+— the exact same complete scope check (held, `LIFECYCLE`-kind, exact
+`repo_key`/`lifecycle_id` match, never merely `is_held`) every write
+method uses — so an already-`close()`d lease (whose `release()` already
+cleared `is_held`) is refused identically to a never-fully-prepared one,
+not by a separate, potentially-divergent check.
+
+Every write method's shared flow (`_require_current`): verify lock scope
+→ load and fully validate the currently installed authoritative
+projection fresh (reusing `load_lifecycle_projection` unchanged — a
+corrupt or identity-mismatched file is refused exactly as before, never
+overwritten) → refuse a stale caller-supplied `expected` before any
+publication I/O.
+`STALE_EXPECTED_PROJECTION` is a new, deliberately distinct reason from
+`ILLEGAL_TRANSITION`: the former means the target may be legal from the
+*real* current state but the caller's belief is out of date (caught,
+for example, by a caller who skips the mandated `refresh()` step after
+a `PROJECTION_DURABILITY_UNCONFIRMED` result and blindly retries); the
+latter means the target is illegal from any state. `refresh()` is the
+explicit, read-only recovery operation for the former case — one
+authoritative read, zero publication/write I/O, never invoked
+automatically.
+
+Three new writer methods, each reusing the existing atomic-publish
+primitive and `_classify_publication_failure` unchanged:
+`advance_lifecycle_state()` (the owner state graph `PREPARING→ACTIVE→
+CLEANING→COMPLETE`, the last edge gated by the clean-final absent-shape
+predicate; `RECONCILING`/`RECONCILED`/`RECONCILIATION_FAILED` refused
+unconditionally, including an identical-state request, keeping
+reconciler-owned transitions structurally separate from this owner-
+facing API); `record_container_transition()` (ADR 0004 §7's table per
+role, plus the Amendment 3 clarification that
+`(creating,null)→(absent,null)` — a failed-but-confirmed create — is
+legal only when the caller has independently confirmed, by real Docker
+inspection this writer never performs, that nothing was ever created);
+`record_checkpoint_ref_transition()` (ADR 0004 §5's table with full
+cross-transition SHA continuity — not merely per-record shape, which
+`CheckpointTransition.__post_init__` already guaranteed in isolation —
+so e.g. `advancing→present` must land on either the prior or the
+proposed SHA, never a third value; `transition` is trusted as the
+already-decided output of `checkpoint_session.CheckpointSession`'s own
+collapse logic, never re-derived here).
+
+**`checkpoint_session.py` is deliberately untouched.** Direct inspection
+of `establish()`/`advance()`/`delete()` before this slice's design was
+finalized confirmed each sets its transitional intent and calls the
+corresponding `CheckpointRef` method on the very next line, with no
+seam between them. The reviewed plan considered adding a narrow
+optional transition-publisher callback there (invoked between the
+in-memory intent change and the Git call) but selected the smaller
+option: `checkpoint_session.py` is already a live production
+collaborator (`RunController` requires it for every real checkpoint
+commit), and adding an unused seam would grow this slice's blast radius
+onto currently-live behavior for infrastructure nothing yet calls.
+Consequence, stated plainly rather than implied: `record_checkpoint_ref_
+transition()` is fully correct and tested standalone, but is **not yet
+a usable durable write-ahead boundary in production** — nothing can
+call it at the ADR-required moment for a real checkpoint-ref mutation
+today.
+
+`is_projection_fully_absent_shape()` moved from a private
+`reconciliation.py`-only helper (`_is_absent_shape`) to a deliberately
+public, explicitly-named predicate in `lifecycle_store.py`, imported
+explicitly by `reconciliation.py` (four call sites updated) rather than
+preserved as an accidental private re-export. `tests/unit/
+test_reconciliation.py`'s three direct references were updated to
+`ls.is_projection_fully_absent_shape(...)`, referencing the owning
+module.
+
+Populated `failure` and non-absent worktree writing remain deferred,
+unchanged from Slice 3A-2/3B-1's own narrowing — both are still refused
+at the schema-validation layer (`SCHEMA_INVALID`) before this slice's
+own transition-edge logic would ever see them; two tests
+(`test_cleaning_to_complete_worktree_dirty_shape_is_unloadable`,
+`test_cleaning_to_complete_populated_failure_shape_is_unloadable`)
+document this precisely: the `CLEANING→COMPLETE` clean-final guard's
+worktree/failure checks are correct but currently unreachable in
+practice, intercepted earlier by the loader's own existing narrowing.
+
+**Verified**: `py_compile` clean on all four changed/new files.
+`test_lifecycle_store.py`/`test_reconciliation.py` together: 193
+passed. The eight-file focused set collected and passed together, 651
+passed, in both forward and reverse file order. Full local suite:
+2,284 passed. Docker Desktop was confirmed down at the start of
+verification (`docker info` failing) and was started and waited on
+until genuinely ready before any Docker-dependent test ran — the
+initial failures this produced in the ordinary (non-`CODEAGENT_
+REQUIRE_DOCKER`) run were purely environmental, not a code regression,
+confirmed by rerunning identically once Docker was ready. With
+`CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a failure): the
+dedicated real-Docker step (`tests/integration/test_slice_c.py`), 3
+passed, 0 skipped; the complete suite, 2,284 passed, 0 skipped; no
+leftover `codeagent` containers, extra worktrees, `refs/codeagent`
+refs, child processes, or temp state roots afterward — this slice
+itself performs no Docker or Git operation of any kind; the mandatory
+verification exercised the *existing* real-Docker tests unaffected by
+it. `git diff --check` clean.
+
+No architectural or scope change beyond what Amendment 3 records: no
+`workspace.py`/`executor.py` change, no controller/CLI wiring, no
+resource removal, no abandonment, and (per the boundary decision above)
+no `checkpoint_session.py` change. T-E1's mitigation status is
+unchanged — nothing from this slice is wired into a real run.
+
+## 2026-09-23: Slice 3B-2 correction pass — resource state gate, writer-call ordering, sanitized checkpoint input, durability wording
+
+A focused review of the just-landed Slice 3B-2 writer found four real
+defects and one imprecise-wording issue, all independently verified
+against the code before being fixed (the accepted writer architecture,
+API shapes, and transition tables were not revisited):
+
+1. **Missing resource state gate.** Neither `record_container_
+   transition()` nor `record_checkpoint_ref_transition()` checked the
+   authoritative lifecycle state at all — a `COMPLETE` or reconciler-
+   owned (`RECONCILING`/`RECONCILED`/`RECONCILIATION_FAILED`) projection
+   could still be dirtied by a resource transition, including an exact
+   no-op, violating the clean-final rule and I11/I15 ("clean-final and
+   abandoned entries are never locked, inspected, or mutated again").
+   Fixed: a new shared `_require_resource_writable_state()` check
+   (`PREPARING`/`ACTIVE`/`CLEANING` only) runs immediately after the
+   lock/authoritative-read/stale checks and before any no-op or edge
+   logic in both methods. This enforces an already-accepted rule; it is
+   not a new lifecycle state graph (ADR 0004 Amendment 3 §5a).
+2. **Non-uniform writer-call ordering.** `record_container_transition()`
+   validated `role`/`intent`/`id` shape *before* calling
+   `_require_current()`, unlike `advance_lifecycle_state()` and
+   `record_checkpoint_ref_transition()` — an invalid `role` could mask
+   a wrong lock scope or a stale `expected` never actually being
+   checked. Fixed: call order is now uniform across all three write
+   methods (lock scope → authoritative read/stale comparison → state
+   gate → request-shape validation → edge validation → publish).
+3. **Unsanitized checkpoint-transition input.** `record_checkpoint_ref_
+   transition()` accessed `transition.accepted_sha`/etc. directly with
+   no type check — `None` or any non-`CheckpointTransition` value
+   raised a raw `AttributeError`, not a sanitized `LifecycleStoreError`.
+   Fixed: `isinstance(transition, CheckpointTransition)` is now checked
+   immediately after the state gate, before any field access, refusing
+   with `ILLEGAL_TRANSITION` and fixed categorical text.
+4. **Imprecise durability wording.** `refresh()`'s docstring and ADR
+   0004 Amendment 3 §4 both said the new content was "very likely
+   durably installed but not confirmed" after
+   `PROJECTION_DURABILITY_UNCONFIRMED` — conflating "installed"
+   (which `os.replace` genuinely confirmed) with "durable" (which was
+   explicitly *not* confirmed). Corrected to: the new complete
+   projection is currently installed; its directory-entry durability
+   was not confirmed; no power-loss durability claim is made either
+   way. Corrected in `lifecycle_store.py`, the one affected test
+   comment, and ADR 0004 Amendment 3. `CLAUDE.md` and the prior
+   `ENGINEERING_LOG.md` entry were checked and found already precise —
+   no change needed there, and no truthful historical entry was
+   rewritten.
+5. **Leaking corruption-test descriptor.** `test_write_refuses_corrupt_
+   projection_without_overwriting` never closed the `os.open()`
+   descriptor it corrupted the fixture through, and wrote without
+   `O_TRUNC`, leaving a non-deterministic fixture (corrupt prefix plus
+   leftover original-content tail bytes, dependent on exact original
+   length). Fixed: the descriptor is retained, written with `O_TRUNC`
+   for a deterministic all-corrupt fixture, and closed in `finally`;
+   the test now also asserts the corrupt bytes remain byte-for-byte
+   unchanged after the write is refused.
+
+**Verified**: `py_compile` clean on all four changed files.
+`test_lifecycle_store.py` + `test_reconciliation.py`: 208 passed (up
+from 193; 15 new tests covering every finding above — refusal from
+`COMPLETE` for both resource methods including exact no-ops, refusal
+from each of the three reconciler-owned states for both methods
+including exact no-ops, confirmation that legal edges still work in
+`ACTIVE`/`CLEANING`, the released-lock-plus-invalid-request ordering
+proof for both methods, and `None`/wrong-type checkpoint-transition
+sanitization). No regression in the full existing test_lifecycle_
+store.py suite (123 passed before the 15 additions, unchanged). The
+eight-file focused set collected and passed together, 666 passed, in
+both forward and reverse file order. Full local suite: 2,299 passed.
+Docker was already running at verification start (confirmed via
+`docker info`, no start needed this pass). With
+`CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a failure): the
+dedicated real-Docker step, 3 passed, 0 skipped; the complete suite,
+2,299 passed, 0 skipped; no leftover `codeagent` containers, extra
+worktrees, `refs/codeagent` refs, child processes, or temp state roots
+afterward. `git diff --check` clean.
+
+No architectural or scope change: the accepted writer boundary, API
+shapes, transition tables, and lock/stale-write/publication semantics
+are all unchanged — this pass added a missing invariant check,
+corrected call ordering, sanitized one input, fixed wording, and fixed
+one test's own descriptor hygiene.

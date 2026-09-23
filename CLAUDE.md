@@ -674,6 +674,86 @@ Stage 2 (of the four-stage planning process in
   nothing yet calls `prepare_lifecycle()` before a real run starts, so
   concurrent-run refusal still depends only on the repository lock's
   ordinary `BUSY` behavior. Linux CI validation is still pending.
+- **Milestone 3 Slice 3B-2** (locked, authoritative lifecycle-projection
+  writer), per `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  Amendment 3, **is implemented and locally validated on macOS
+  (2026-09-23)**. `LifecycleLease` gained a trusted `object_format`
+  field (from `RepositoryIdentity.object_format`, set once in
+  `prepare_lifecycle()`) and `open_projection_writer()`, the only
+  sanctioned way to obtain a `_LifecycleProjectionWriter` — it refuses
+  an incomplete or already-`close()`d lease categorically (no raw
+  `TypeError`/`AttributeError`/invalid-descriptor error escapes) and
+  performs the same complete lock-scope check (held, `LIFECYCLE`-kind,
+  exact `repo_key`/`lifecycle_id` match) every write method uses before
+  the caller ever gets a writer. Every write method loads and fully
+  validates the currently installed authoritative projection fresh,
+  refuses a stale caller-supplied `expected` before any publication I/O
+  (`STALE_EXPECTED_PROJECTION`, deliberately distinct from
+  `ILLEGAL_TRANSITION`), and never overwrites a corrupt or identity-
+  mismatched file. `advance_lifecycle_state()` implements the owner
+  state graph (`PREPARING→ACTIVE→CLEANING→COMPLETE`, the last edge
+  gated by the shared `is_projection_fully_absent_shape()` clean-final
+  predicate — moved from `reconciliation.py`, now public in
+  `lifecycle_store.py` and imported explicitly, not accidentally
+  re-exported); `RECONCILING`/`RECONCILED`/`RECONCILIATION_FAILED`
+  remain refused unconditionally, including identical-state requests,
+  since those stay `reconciliation.py`'s own private write path.
+  `record_container_transition()` implements ADR 0004 §7's persisted-
+  combination table per role, including the Amendment 3 clarification
+  that `(creating,null)→(absent,null)` is legal only when the caller
+  has independently confirmed, by real Docker inspection this writer
+  never performs itself, that no container was ever created.
+  `record_checkpoint_ref_transition()` adds full cross-transition SHA
+  continuity beyond `CheckpointTransition`'s own per-record shape
+  validation (e.g. `advancing→present` must land on either the prior
+  or the proposed SHA, never an arbitrary third value), trusting
+  `transition` as the already-decided output of `checkpoint_session.
+  CheckpointSession`'s own collapse logic. `PROJECTION_DURABILITY_UNCONFIRMED`
+  requires the new explicit `refresh()` recovery read before any
+  further write — the writer never blindly retries a stale `expected`
+  itself. **`checkpoint_session.py` is deliberately untouched**:
+  direct inspection confirmed `establish()`/`advance()`/`delete()` set
+  their transitional intent and call `CheckpointRef` on the very next
+  line with no seam between them, so this writer's checkpoint-ref
+  method, while fully correct and tested standalone, is **not yet a
+  usable durable write-ahead boundary in production** — nothing can
+  call it at the ADR-required moment for a real checkpoint-ref
+  mutation today; that seam is later Milestone 3 work. Populated
+  `failure` and non-absent worktree writing remain deferred, unchanged
+  from Slice 3A-2/3B-1's own narrowing (both still refused at the
+  schema-validation layer before this slice's transition logic would
+  ever see them). A correction pass (2026-09-23) fixed three real gaps
+  found by review before this slice was considered final: neither
+  resource-transition method gated on the authoritative lifecycle
+  state, so a `COMPLETE` or reconciler-owned (`RECONCILING`/
+  `RECONCILED`/`RECONCILIATION_FAILED`) projection could still be
+  dirtied by a container or checkpoint-ref transition — including an
+  exact no-op — violating the clean-final rule and I11/I15; both
+  methods now require `PREPARING`/`ACTIVE`/`CLEANING` immediately after
+  the lock/stale checks and before any resource-shape or no-op logic.
+  `record_container_transition()`'s request-shape validation ran before
+  `_require_current()`, so an invalid `role` could mask a wrong lock
+  scope or a stale `expected`; call order is now uniform across all
+  three write methods (lock → authoritative read/stale check → state
+  gate → request validation → edge → publish).
+  `record_checkpoint_ref_transition()` accessed `transition`'s fields
+  without a type check, so `None` or a wrong type raised a raw
+  `AttributeError` instead of a sanitized `LifecycleStoreError`; now
+  sanitized (`ILLEGAL_TRANSITION`) immediately after the state gate.
+  Verified (post-correction-pass totals): the eight-file focused set
+  collected and passed together, 666 passed, in both forward and
+  reverse file order; the full local suite (macOS), with a real Docker
+  daemon and `CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a
+  failure): the 3 dedicated real-Docker tests, 3 passed, 0 skipped; the
+  complete suite, 2,299 passed, 0 skipped; no leftover
+  `codeagent-verify` containers,
+  extra worktrees, `refs/codeagent` refs, child processes, or temp
+  state roots afterward. **Not implemented**: any Docker/Git call of
+  any kind, `workspace.py`/`executor.py` changes, controller/CLI
+  wiring, resource removal, abandonment — all later Milestone 3 work.
+  This slice performs no Docker operations of its own; T-E1's
+  mitigation status is unchanged (nothing here is wired into a real
+  run). Linux CI validation is still pending.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

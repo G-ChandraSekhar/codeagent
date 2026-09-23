@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import multiprocessing
 import os
 import signal
@@ -1287,3 +1288,915 @@ def test_real_lifecycle_lock_cross_process_exclusion(tmp_path):
         del os.environ["CODEAGENT_STATE_DIR"]
         release_evt.set()
         proc.join(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# Slice 3B-2: locked, authoritative lifecycle-projection writer
+# ---------------------------------------------------------------------------
+
+
+def _prepared_lease(tmp_path, monkeypatch, *, name="repo"):
+    repo = _make_repo(tmp_path, name=name)
+    _set_state_dir(monkeypatch, tmp_path)
+    return ls.prepare_lifecycle(str(repo), run_id="writer-run")
+
+
+# --- Factory validation ---
+
+
+def test_open_projection_writer_succeeds_and_returns_initial_projection(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        assert isinstance(writer, ls._LifecycleProjectionWriter)
+        assert current.state == ls.LifecycleState.PREPARING
+        assert current.lifecycle_id == lease.lifecycle_id
+    finally:
+        lease.close()
+
+
+def test_open_projection_writer_refuses_after_close(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    lease.close()
+    with pytest.raises(ls.LifecycleStoreError) as excinfo:
+        lease.open_projection_writer()
+    assert excinfo.value.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+
+
+def test_open_projection_writer_refuses_repository_kind_lock_substituted(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        # Substitute a repository-kind lock in place of the lifecycle
+        # lock -- never a legal scope for a projection write.
+        fake_lock = object.__new__(sl.LockHandle)
+        fake_lock._fd = -1
+        fake_lock.scope = sl.LockScope(kind=sl.LockKind.REPOSITORY, repo_key=lease.repo_key)
+        fake_lock._held = True
+        fake_lock.diagnostic_path = "<fake>"
+        real_lock = lease.lifecycle_lock
+        lease.lifecycle_lock = fake_lock
+        try:
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                lease.open_projection_writer()
+            assert excinfo.value.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+        finally:
+            lease.lifecycle_lock = real_lock
+    finally:
+        lease.close()
+
+
+def test_open_projection_writer_refuses_mismatched_lifecycle_id_scope(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        fake_lock = object.__new__(sl.LockHandle)
+        fake_lock._fd = -1
+        fake_lock.scope = sl.LockScope(kind=sl.LockKind.LIFECYCLE, repo_key=lease.repo_key, lifecycle_id="f" * 32)
+        fake_lock._held = True
+        fake_lock.diagnostic_path = "<fake>"
+        real_lock = lease.lifecycle_lock
+        lease.lifecycle_lock = fake_lock
+        try:
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                lease.open_projection_writer()
+            assert excinfo.value.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+        finally:
+            lease.lifecycle_lock = real_lock
+    finally:
+        lease.close()
+
+
+def test_open_projection_writer_refuses_incomplete_lease_no_raw_error():
+    bare = ls.LifecycleLease()
+    with pytest.raises(ls.LifecycleStoreError) as excinfo:
+        bare.open_projection_writer()
+    assert excinfo.value.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+
+
+# --- Authoritative read / stale-expectation prevention ---
+
+
+def test_write_refuses_stale_expected_projection(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, initial = lease.open_projection_writer()
+        writer.advance_lifecycle_state(expected=initial, state=ls.LifecycleState.ACTIVE)
+        # `initial` is now stale -- the durable state has moved on.
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.advance_lifecycle_state(expected=initial, state=ls.LifecycleState.ACTIVE)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.STALE_EXPECTED_PROJECTION
+    finally:
+        lease.close()
+
+
+def test_write_refuses_corrupt_projection_without_overwriting(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, initial = lease.open_projection_writer()
+
+        corrupt_bytes = b"not json at all"
+        fd = os.open(ls.LIFECYCLE_JSON_FILENAME, os.O_WRONLY | os.O_TRUNC, dir_fd=lease.run_dir_fd)
+        try:
+            os.write(fd, corrupt_bytes)
+        finally:
+            os.close(fd)
+
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.advance_lifecycle_state(expected=initial, state=ls.LifecycleState.ACTIVE)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.SCHEMA_INVALID
+
+        # Never overwritten: the corrupt bytes are exactly unchanged.
+        fd = os.open(ls.LIFECYCLE_JSON_FILENAME, os.O_RDONLY, dir_fd=lease.run_dir_fd)
+        try:
+            assert os.read(fd, 65536) == corrupt_bytes
+        finally:
+            os.close(fd)
+    finally:
+        lease.close()
+
+
+# --- Publication outcomes ---
+
+
+def test_publication_pre_install_failure_leaves_old_expected_valid(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, initial = lease.open_projection_writer()
+
+        def _boom(fd, data):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.IO_FAILED, "forced")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "write_all_eintr_safe", _boom)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                writer.advance_lifecycle_state(expected=initial, state=ls.LifecycleState.ACTIVE)
+            assert excinfo.value.reason is ls.LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED
+
+        # Nothing installed: `initial` is still authoritative, and a
+        # retry with the same `expected` is accepted (not stale).
+        result = writer.advance_lifecycle_state(expected=initial, state=ls.LifecycleState.ACTIVE)
+        assert result.state == ls.LifecycleState.ACTIVE
+    finally:
+        lease.close()
+
+
+def test_publication_durability_unconfirmed_requires_refresh(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, initial = lease.open_projection_writer()
+
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_last_fsync(fd):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced directory fsync failure")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                writer.advance_lifecycle_state(expected=initial, state=ls.LifecycleState.ACTIVE)
+            assert excinfo.value.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+
+        # The old `expected` (PREPARING) is now stale: the new content
+        # (ACTIVE) is currently installed, but its directory-entry
+        # durability was not confirmed by this process.
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.advance_lifecycle_state(expected=initial, state=ls.LifecycleState.ACTIVE)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.STALE_EXPECTED_PROJECTION
+
+        # The mandated recovery path: refresh() reads the authoritative
+        # installed value, which the caller then reconsiders.
+        current = writer.refresh()
+        assert current.state == ls.LifecycleState.ACTIVE
+        result = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+        assert result.state == ls.LifecycleState.CLEANING
+    finally:
+        lease.close()
+
+
+def test_publication_cleanup_unconfirmed_is_distinct_and_fails_closed(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, initial = lease.open_projection_writer()
+
+        def _fail_write(fd, data):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.IO_FAILED, "forced write failure")
+
+        def _fail_unlink(path, *, dir_fd):
+            raise OSError("forced temp-cleanup failure")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "write_all_eintr_safe", _fail_write)
+            scoped.setattr(lf.os, "unlink", _fail_unlink)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                writer.advance_lifecycle_state(expected=initial, state=ls.LifecycleState.ACTIVE)
+            assert excinfo.value.reason is ls.LifecycleStoreFailure.CLEANUP_UNCONFIRMED
+    finally:
+        lease.close()
+
+
+def test_publication_success_returns_newly_confirmed_projection(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, initial = lease.open_projection_writer()
+        result = writer.advance_lifecycle_state(expected=initial, state=ls.LifecycleState.ACTIVE)
+        assert result.state == ls.LifecycleState.ACTIVE
+        on_disk = _read_lifecycle_json(lease)
+        assert on_disk["state"] == "ACTIVE"
+    finally:
+        lease.close()
+
+
+def _read_lifecycle_json(lease):
+    fd = os.open(ls.LIFECYCLE_JSON_FILENAME, os.O_RDONLY, dir_fd=lease.run_dir_fd)
+    try:
+        data = os.read(fd, 65536)
+    finally:
+        os.close(fd)
+    return lf.canonical_json_loads_strict(data, max_bytes=ls.LIFECYCLE_JSON_MAX_BYTES)
+
+
+# --- Owner lifecycle-state edges ---
+
+
+def test_owner_state_happy_path_to_complete(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.ACTIVE)
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.COMPLETE)
+        assert current.state == ls.LifecycleState.COMPLETE
+    finally:
+        lease.close()
+
+
+def test_owner_state_same_state_no_op_zero_publication_io(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+
+        def _boom(*a, **k):
+            raise AssertionError("must not publish for a no-op")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ls, "publish_private_file_atomically_at", _boom)
+            result = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.PREPARING)
+        assert result == current
+    finally:
+        lease.close()
+
+
+def test_owner_state_skips_are_refused(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_owner_state_refuses_reconciler_state_even_if_identical(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, initial = lease.open_projection_writer()
+        reconciling = dataclasses.replace(
+            initial,
+            state=ls.LifecycleState.RECONCILING,
+            reconciliation=dataclasses.replace(initial.reconciliation, attempts_total=1),
+        )
+        data = lf.canonical_json_dumps(ls.projection_to_dict(reconciling))
+        ls.publish_private_file_atomically_at(lease.run_dir_fd, ls.LIFECYCLE_JSON_FILENAME, data, mode=0o600)
+
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.advance_lifecycle_state(expected=reconciling, state=ls.LifecycleState.RECONCILING)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_cleaning_to_complete_refused_with_genuinely_dirty_container(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.ACTIVE)
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+        # Genuinely dirty the durable projection via the writer's own
+        # container API -- not a fabricated in-memory belief -- so the
+        # guard is exercised against the real authoritative state.
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.CREATING, id=None
+        )
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.PRESENT, id="a" * 64
+        )
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.COMPLETE)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def _publish_raw(lease, projection: ls.LifecycleProjection) -> None:
+    data = lf.canonical_json_dumps(ls.projection_to_dict(projection))
+    ls.publish_private_file_atomically_at(lease.run_dir_fd, ls.LIFECYCLE_JSON_FILENAME, data, mode=0o600)
+
+
+def test_cleaning_to_complete_worktree_dirty_shape_is_unloadable(tmp_path, monkeypatch):
+    """Non-absent worktree writing is deferred (Slice 3A-2's own
+    narrowing, unchanged): `validate_lifecycle_json_schema` refuses to
+    load a non-absent worktree shape at all, so the durable projection
+    can never become "authoritative and worktree-dirty" through the
+    normal read path in the first place -- the CLEANING->COMPLETE
+    guard's worktree check is correct but currently unreachable in
+    practice, intercepted earlier by the loader's own existing
+    narrowing (SCHEMA_INVALID), not by ILLEGAL_TRANSITION."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.ACTIVE)
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+        dirty = dataclasses.replace(current, worktree=ls.WorktreeAttribution(intent=ls.WorktreeIntent.PRESENT, expected_head=None))
+        _publish_raw(lease, dirty)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.advance_lifecycle_state(expected=dirty, state=ls.LifecycleState.COMPLETE)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.SCHEMA_INVALID
+    finally:
+        lease.close()
+
+
+def test_cleaning_to_complete_populated_failure_shape_is_unloadable(tmp_path, monkeypatch):
+    """Populated `failure` writing is deferred, same narrowing as
+    above: the schema validator refuses to load it at all, so this is
+    also SCHEMA_INVALID, not ILLEGAL_TRANSITION -- see the worktree
+    test's docstring for the full explanation."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.ACTIVE)
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+        dirty = dataclasses.replace(current, failure=ls.FailureDetail(phase="p", detail="d"))
+        _publish_raw(lease, dirty)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.advance_lifecycle_state(expected=dirty, state=ls.LifecycleState.COMPLETE)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.SCHEMA_INVALID
+    finally:
+        lease.close()
+
+
+def test_cleaning_to_complete_succeeds_when_genuinely_clean(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.ACTIVE)
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+        result = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.COMPLETE)
+        assert result.state == ls.LifecycleState.COMPLETE
+    finally:
+        lease.close()
+
+
+# --- Container transition edges ---
+
+
+def test_container_full_happy_path_round_trip(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.CREATING, id=None
+        )
+        assert current.baseline.intent is ls.ContainerIntent.CREATING
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.PRESENT, id="c" * 64
+        )
+        assert current.baseline.id == "c" * 64
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.REMOVING, id="c" * 64
+        )
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None
+        )
+        assert current.baseline.intent is ls.ContainerIntent.ABSENT
+    finally:
+        lease.close()
+
+
+def test_container_failed_create_recovery_edge(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.record_container_transition(
+            expected=current, role="verification", intent=ls.ContainerIntent.CREATING, id=None
+        )
+        current = writer.record_container_transition(
+            expected=current, role="verification", intent=ls.ContainerIntent.ABSENT, id=None
+        )
+        assert current.verification.intent is ls.ContainerIntent.ABSENT
+    finally:
+        lease.close()
+
+
+def test_container_exact_tuple_no_op_zero_publication_io(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+
+        def _boom(*a, **k):
+            raise AssertionError("must not publish for a no-op")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ls, "publish_private_file_atomically_at", _boom)
+            result = writer.record_container_transition(
+                expected=current, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None
+            )
+        assert result == current
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize(
+    "from_intent,from_id,to_intent,to_id",
+    [
+        (ls.ContainerIntent.ABSENT, None, ls.ContainerIntent.PRESENT, "a" * 64),
+        (ls.ContainerIntent.ABSENT, None, ls.ContainerIntent.REMOVING, "a" * 64),
+    ],
+)
+def test_container_illegal_edges_from_absent(tmp_path, monkeypatch, from_intent, from_id, to_intent, to_id):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_container_transition(expected=current, role="baseline", intent=to_intent, id=to_id)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_container_present_to_present_different_id_is_illegal(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.CREATING, id=None
+        )
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.PRESENT, id="a" * 64
+        )
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_container_transition(
+                expected=current, role="baseline", intent=ls.ContainerIntent.PRESENT, id="b" * 64
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_container_removing_with_different_id_is_illegal(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.CREATING, id=None
+        )
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.PRESENT, id="a" * 64
+        )
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_container_transition(
+                expected=current, role="baseline", intent=ls.ContainerIntent.REMOVING, id="b" * 64
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_container_shape_guard_absent_with_id_refused(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_container_transition(
+                expected=current, role="baseline", intent=ls.ContainerIntent.CREATING, id="a" * 64
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_container_shape_guard_present_without_id_refused(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_container_transition(
+                expected=current, role="baseline", intent=ls.ContainerIntent.PRESENT, id=None
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_container_role_isolated(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.CREATING, id=None
+        )
+        assert current.verification.intent is ls.ContainerIntent.ABSENT
+    finally:
+        lease.close()
+
+
+# --- Checkpoint-ref transition edges (SHA continuity) ---
+
+
+def _sha(seed: str) -> str:
+    return (seed * 40)[:40]
+
+
+def test_checkpoint_ref_full_happy_path_round_trip(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        initial_sha = _sha("1")
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=initial_sha),
+        )
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=initial_sha),
+        )
+        assert current.checkpoint_ref.accepted_sha == initial_sha
+
+        new_sha = _sha("2")
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(
+                intent=cs.CheckpointIntent.ADVANCING,
+                accepted_sha=initial_sha,
+                expected_old_sha=initial_sha,
+                proposed_new_sha=new_sha,
+            ),
+        )
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=new_sha),
+        )
+        assert current.checkpoint_ref.accepted_sha == new_sha
+
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(
+                intent=cs.CheckpointIntent.REMOVING, accepted_sha=new_sha, expected_old_sha=new_sha
+            ),
+        )
+        current = writer.record_checkpoint_ref_transition(
+            expected=current, transition=cs.ABSENT_TRANSITION
+        )
+        assert current.checkpoint_ref == cs.ABSENT_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_checkpoint_ref_create_failure_recovery(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1")),
+        )
+        current = writer.record_checkpoint_ref_transition(expected=current, transition=cs.ABSENT_TRANSITION)
+        assert current.checkpoint_ref == cs.ABSENT_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_checkpoint_ref_advance_collapse_to_old_sha_on_failure(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        initial_sha = _sha("1")
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=initial_sha),
+        )
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=initial_sha),
+        )
+        new_sha = _sha("2")
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(
+                intent=cs.CheckpointIntent.ADVANCING,
+                accepted_sha=initial_sha,
+                expected_old_sha=initial_sha,
+                proposed_new_sha=new_sha,
+            ),
+        )
+        # Failed advance, confirmed still at the old SHA.
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=initial_sha),
+        )
+        assert current.checkpoint_ref.accepted_sha == initial_sha
+    finally:
+        lease.close()
+
+
+def test_checkpoint_ref_discontinuous_sha_is_illegal(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        initial_sha = _sha("1")
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=initial_sha),
+        )
+        # creating -> present must confirm the *same* proposed SHA.
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_checkpoint_ref_transition(
+                expected=current,
+                transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=_sha("9")),
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=initial_sha),
+        )
+        # advancing -> present with a totally unrelated third SHA.
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(
+                intent=cs.CheckpointIntent.ADVANCING,
+                accepted_sha=initial_sha,
+                expected_old_sha=initial_sha,
+                proposed_new_sha=_sha("2"),
+            ),
+        )
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_checkpoint_ref_transition(
+                expected=current,
+                transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=_sha("9")),
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_checkpoint_ref_wrong_object_format_length_is_illegal(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        assert lease.object_format == "sha1"
+        sha256_looking = ("a" * 64)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_checkpoint_ref_transition(
+                expected=current,
+                transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=sha256_looking),
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_checkpoint_ref_exact_no_op_zero_publication_io(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+
+        def _boom(*a, **k):
+            raise AssertionError("must not publish for a no-op")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ls, "publish_private_file_atomically_at", _boom)
+            result = writer.record_checkpoint_ref_transition(expected=current, transition=cs.ABSENT_TRANSITION)
+        assert result == current
+    finally:
+        lease.close()
+
+
+# ---------------------------------------------------------------------------
+# Correction pass: resource transitions refused outside owner-controlled
+# nonterminal states (COMPLETE / reconciler-owned)
+# ---------------------------------------------------------------------------
+
+
+def _drive_to_complete(writer, current):
+    current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.ACTIVE)
+    current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+    return writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.COMPLETE)
+
+
+def test_container_absent_to_creating_refused_from_complete(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = _drive_to_complete(writer, current)
+        assert current.state == ls.LifecycleState.COMPLETE
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_container_transition(
+                expected=current, role="baseline", intent=ls.ContainerIntent.CREATING, id=None
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_checkpoint_ref_absent_to_creating_refused_from_complete(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = _drive_to_complete(writer, current)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_checkpoint_ref_transition(
+                expected=current,
+                transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1")),
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_container_exact_no_op_refused_from_complete(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = _drive_to_complete(writer, current)
+
+        def _boom(*a, **k):
+            raise AssertionError("must not even be reached for a COMPLETE projection")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ls, "publish_private_file_atomically_at", _boom)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                writer.record_container_transition(
+                    expected=current, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None
+                )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_checkpoint_ref_exact_no_op_refused_from_complete(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = _drive_to_complete(writer, current)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_checkpoint_ref_transition(expected=current, transition=cs.ABSENT_TRANSITION)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize(
+    "reconciler_state",
+    [ls.LifecycleState.RECONCILING, ls.LifecycleState.RECONCILED, ls.LifecycleState.RECONCILIATION_FAILED],
+)
+def test_container_transition_refused_from_reconciler_owned_states(tmp_path, monkeypatch, reconciler_state):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, initial = lease.open_projection_writer()
+        reconciler_owned = dataclasses.replace(initial, state=reconciler_state)
+        _publish_raw(lease, reconciler_owned)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_container_transition(
+                expected=reconciler_owned, role="baseline", intent=ls.ContainerIntent.CREATING, id=None
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+        # Even an exact no-op is refused.
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_container_transition(
+                expected=reconciler_owned, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize(
+    "reconciler_state",
+    [ls.LifecycleState.RECONCILING, ls.LifecycleState.RECONCILED, ls.LifecycleState.RECONCILIATION_FAILED],
+)
+def test_checkpoint_ref_transition_refused_from_reconciler_owned_states(tmp_path, monkeypatch, reconciler_state):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, initial = lease.open_projection_writer()
+        reconciler_owned = dataclasses.replace(initial, state=reconciler_state)
+        _publish_raw(lease, reconciler_owned)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_checkpoint_ref_transition(
+                expected=reconciler_owned,
+                transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1")),
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+        # Even an exact no-op is refused.
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_checkpoint_ref_transition(expected=reconciler_owned, transition=cs.ABSENT_TRANSITION)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_container_and_checkpoint_ref_transitions_still_legal_in_active_and_cleaning(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.ACTIVE)
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.CREATING, id=None
+        )
+        current = writer.record_checkpoint_ref_transition(
+            expected=current,
+            transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1")),
+        )
+        current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None
+        )
+        current = writer.record_checkpoint_ref_transition(expected=current, transition=cs.ABSENT_TRANSITION)
+
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+        current = writer.record_container_transition(
+            expected=current, role="verification", intent=ls.ContainerIntent.CREATING, id=None
+        )
+        current = writer.record_container_transition(
+            expected=current, role="verification", intent=ls.ContainerIntent.ABSENT, id=None
+        )
+        assert current.state == ls.LifecycleState.CLEANING
+        assert current.verification.intent is ls.ContainerIntent.ABSENT
+    finally:
+        lease.close()
+
+
+# ---------------------------------------------------------------------------
+# Correction pass: uniform writer-call ordering (lock check first)
+# ---------------------------------------------------------------------------
+
+
+def test_container_transition_invalid_role_on_released_lock_gives_wrong_lock_scope(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    writer, current = lease.open_projection_writer()
+    lease.close()
+    with pytest.raises(ls.LifecycleStoreError) as excinfo:
+        writer.record_container_transition(
+            expected=current, role="not-a-real-role", intent=ls.ContainerIntent.CREATING, id=None
+        )
+    assert excinfo.value.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+
+
+def test_checkpoint_ref_transition_invalid_type_on_released_lock_gives_wrong_lock_scope(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    writer, current = lease.open_projection_writer()
+    lease.close()
+    with pytest.raises(ls.LifecycleStoreError) as excinfo:
+        writer.record_checkpoint_ref_transition(expected=current, transition="not-a-transition")
+    assert excinfo.value.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# Correction pass: sanitized invalid checkpoint-transition inputs
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_ref_transition_none_is_illegal_not_raw_error(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+
+        def _boom(*a, **k):
+            raise AssertionError("must not publish for an invalid transition")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ls, "publish_private_file_atomically_at", _boom)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                writer.record_checkpoint_ref_transition(expected=current, transition=None)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_checkpoint_ref_transition_wrong_type_is_illegal_not_raw_error(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+
+        def _boom(*a, **k):
+            raise AssertionError("must not publish for an invalid transition")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ls, "publish_private_file_atomically_at", _boom)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                writer.record_checkpoint_ref_transition(expected=current, transition={"intent": "absent"})
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()

@@ -59,18 +59,16 @@ from ._lifecycle_fs import (
     write_all_eintr_safe,
 )
 from .checkpoint_ref import LIFECYCLE_ID_RE, CheckpointRef, CheckpointRefError
-from .checkpoint_session import ABSENT_TRANSITION
 from .lifecycle_store import (
     LIFECYCLE_JSON_FILENAME,
     RUN_ID_MAX_ENCODED_BYTES,
     RUNS_DIRNAME,
-    ContainerIntent,
     LifecycleProjection,
     LifecycleState,
     LifecycleStoreError,
     LifecycleStoreFailure,
-    WorktreeIntent,
     _publish_projection_state,
+    is_projection_fully_absent_shape,
     load_lifecycle_projection,
 )
 from .repo_identity import RepositoryIdentity, TrustedRepositoryContext
@@ -159,19 +157,6 @@ class ReconciliationError(Exception):
         super().__init__(message)
         self.reason = reason
         self.message = message
-
-
-def _is_absent_shape(projection: LifecycleProjection) -> bool:
-    return (
-        projection.baseline.intent is ContainerIntent.ABSENT
-        and projection.baseline.id is None
-        and projection.verification.intent is ContainerIntent.ABSENT
-        and projection.verification.id is None
-        and projection.worktree.intent is WorktreeIntent.ABSENT
-        and projection.worktree.expected_head is None
-        and projection.checkpoint_ref == ABSENT_TRANSITION
-        and projection.failure is None
-    )
 
 
 def _require_repository_lock_scope(repository_lock: LockHandle, repo_key: str) -> None:
@@ -486,7 +471,7 @@ def _reconcile_locked_entry(
             "lifecycle.json could not be loaded after acquiring the lifecycle lock",
         )
 
-    if projection.state not in (LifecycleState.PREPARING, LifecycleState.RECONCILING) or not _is_absent_shape(
+    if projection.state not in (LifecycleState.PREPARING, LifecycleState.RECONCILING) or not is_projection_fully_absent_shape(
         projection
     ):
         return ReconciliationEntryResult(
@@ -678,7 +663,7 @@ def _process_open_entry_body(
         )
 
     if peek.state in (LifecycleState.COMPLETE, LifecycleState.RECONCILED):
-        if _is_absent_shape(peek):
+        if is_projection_fully_absent_shape(peek):
             return ReconciliationEntryResult(
                 lifecycle_id,
                 ReconciliationEntryOutcome.SKIPPED_TERMINAL,
@@ -694,7 +679,7 @@ def _process_open_entry_body(
             attempt_number=peek.reconciliation.attempts_total,
         )
 
-    if peek.state not in (LifecycleState.PREPARING, LifecycleState.RECONCILING) or not _is_absent_shape(peek):
+    if peek.state not in (LifecycleState.PREPARING, LifecycleState.RECONCILING) or not is_projection_fully_absent_shape(peek):
         return ReconciliationEntryResult(
             lifecycle_id,
             ReconciliationEntryOutcome.REFUSED,

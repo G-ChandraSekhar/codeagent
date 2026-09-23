@@ -74,7 +74,7 @@ from ._lifecycle_fs import (
 from .checkpoint_ref import new_lifecycle_id
 from .checkpoint_session import ABSENT_TRANSITION, CheckpointIntent, CheckpointTransition
 from .repo_identity import discover_repository_identity_and_context, load_or_create_repo_json
-from .state_locks import LockError, acquire_lifecycle_lock, acquire_repository_lock
+from .state_locks import LockError, LockKind, LockScope, acquire_lifecycle_lock, acquire_repository_lock
 from .state_root import init_state_root, open_or_create_canonical_root, validate_state_root_containment
 
 LIFECYCLE_JSON_FILENAME = "lifecycle.json"
@@ -204,6 +204,23 @@ class LifecycleStoreFailure(str, Enum):
     # reconciliation pass found at least one unresolved entry and
     # refused to mint a new lifecycle_id or create a new run directory.
     RECONCILIATION_BLOCKED = "reconciliation_blocked"
+    # Slice 3B-2 (ADR 0004 Amendment 3): a projection write was
+    # attempted without the exact matching lifecycle lock held (never
+    # a repository lock, never a mismatched repo_key/lifecycle_id, and
+    # never an incomplete/closed lease).
+    WRONG_LOCK_SCOPE = "wrong_lock_scope"
+    # Slice 3B-2: the caller's `expected` projection no longer matches
+    # the currently installed authoritative projection. Distinct
+    # from ILLEGAL_TRANSITION: the requested target may be perfectly
+    # legal from the *actual* current state — the caller's belief about
+    # that state is simply out of date (a compare-and-swap rejection,
+    # not a graph violation).
+    STALE_EXPECTED_PROJECTION = "stale_expected_projection"
+    # Slice 3B-2: the requested target is not a legal edge from the
+    # authoritative current state — covers the owner state graph, the
+    # container and checkpoint-ref transition tables (including SHA
+    # continuity), and the CLEANING->COMPLETE clean-final guard.
+    ILLEGAL_TRANSITION = "illegal_transition"
 
 
 class LifecycleStoreError(Exception):
@@ -243,6 +260,27 @@ def build_initial_preparing_projection(
         checkpoint_ref=ABSENT_TRANSITION,
         failure=None,
         reconciliation=ReconciliationSummary(attempts_total=0, recent_failures=()),
+    )
+
+
+def is_projection_fully_absent_shape(projection: LifecycleProjection) -> bool:
+    """True only when both containers, the worktree, and the checkpoint
+    ref are all at their initial absent shape and `failure` is null.
+
+    Shared, deliberately public predicate: reconciliation.py's
+    terminal/nonterminal recognition and this module's own
+    `CLEANING -> COMPLETE` clean-final guard (Slice 3B-2, ADR 0004
+    Amendment 3) both depend on the identical check — the one
+    predicate ADR 0004's clean-final rule and I15 require."""
+    return (
+        projection.baseline.intent is ContainerIntent.ABSENT
+        and projection.baseline.id is None
+        and projection.verification.intent is ContainerIntent.ABSENT
+        and projection.verification.id is None
+        and projection.worktree.intent is WorktreeIntent.ABSENT
+        and projection.worktree.expected_head is None
+        and projection.checkpoint_ref == ABSENT_TRANSITION
+        and projection.failure is None
     )
 
 
@@ -805,6 +843,7 @@ class LifecycleLease:
         lifecycle_id: str | None = None,
         repo_key: str | None = None,
         run_dir_path: str | None = None,
+        object_format: str | None = None,
     ) -> None:
         self.state_root = state_root
         self.run_dir_fd = run_dir_fd
@@ -813,6 +852,11 @@ class LifecycleLease:
         self.lifecycle_id = lifecycle_id
         self.repo_key = repo_key
         self.run_dir_path = run_dir_path
+        # The trusted repository object format ("sha1"/"sha256"),
+        # discovered once via `RepositoryIdentity.object_format`
+        # (Slice 3B-2, ADR 0004 Amendment 3) — never inferred from a
+        # caller-supplied SHA or from untrusted projection content.
+        self.object_format = object_format
         self._closed = False
 
     def __enter__(self) -> "LifecycleLease":
@@ -869,6 +913,331 @@ class LifecycleLease:
                 "one or more lifecycle-lease resources could not be confirmed released: "
                 + ", ".join(failed_stages),
             ) from first_failure
+
+    def open_projection_writer(self) -> tuple["_LifecycleProjectionWriter", LifecycleProjection]:
+        """The only sanctioned way to obtain a projection writer bound
+        to this lease (Slice 3B-2, ADR 0004 Amendment 3). Refuses
+        categorically, before any write is possible or any raw
+        `TypeError`/`AttributeError`/invalid-descriptor error can
+        escape, if the lease is not fully prepared: `run_dir_fd`,
+        `object_format`, or `state_root` is unset (an incomplete or
+        never-completed construction). Then performs the exact same
+        complete lock-scope validation every write method uses —
+        held, `LIFECYCLE`-kind, exact `repo_key`/`lifecycle_id` match —
+        which also transitively refuses an already-`close()`d lease
+        (`release()` clears `is_held`). Performs exactly one
+        authoritative read and returns it as the caller's first
+        `expected` — the single source of truth for "what is current,"
+        never a separately cached in-memory value.
+        """
+        if self.run_dir_fd is None or self.object_format is None or self.state_root is None:
+            raise LifecycleStoreError(
+                LifecycleStoreFailure.WRONG_LOCK_SCOPE,
+                "a projection writer requires a fully prepared lease",
+            )
+        writer = _LifecycleProjectionWriter(self)
+        writer._require_lease_lock_held()
+        current = writer._load_authoritative()
+        return writer, current
+
+
+_OWNER_STATES = (LifecycleState.PREPARING, LifecycleState.ACTIVE, LifecycleState.CLEANING, LifecycleState.COMPLETE)
+_OWNER_STATE_EDGES: dict[LifecycleState, LifecycleState] = {
+    LifecycleState.PREPARING: LifecycleState.ACTIVE,
+    LifecycleState.ACTIVE: LifecycleState.CLEANING,
+    LifecycleState.CLEANING: LifecycleState.COMPLETE,
+}
+
+# The lifecycle states in which a resource (container or checkpoint-ref)
+# transition is ever legal -- ADR 0004 Amendment 3 §1's state gate.
+# `COMPLETE` is clean-final (I15) and `RECONCILING`/`RECONCILED`/
+# `RECONCILIATION_FAILED` are reconciler-owned (I11): none of those
+# projections may ever be mutated again, resource transitions included,
+# not even an exact no-op. This enforces the already-accepted clean-
+# final/I11/I15 rules -- it is not a new lifecycle state graph.
+_RESOURCE_WRITABLE_STATES = (LifecycleState.PREPARING, LifecycleState.ACTIVE, LifecycleState.CLEANING)
+
+_CONTAINER_TRANSITION_EDGES: frozenset[tuple[ContainerIntent, ContainerIntent]] = frozenset(
+    {
+        (ContainerIntent.ABSENT, ContainerIntent.CREATING),
+        (ContainerIntent.CREATING, ContainerIntent.PRESENT),
+        # ADR 0004 Amendment 3 clarification: a failed-but-confirmed
+        # create may return to absent, enabling the role name to be
+        # safely reused for a later attempt. This writer never
+        # inspects Docker itself; the caller is solely responsible for
+        # having confirmed, by real Docker inspection, that no
+        # container was ever created for this attempt before invoking
+        # this edge.
+        (ContainerIntent.CREATING, ContainerIntent.ABSENT),
+        (ContainerIntent.PRESENT, ContainerIntent.REMOVING),
+        (ContainerIntent.REMOVING, ContainerIntent.ABSENT),
+    }
+)
+
+
+def _validate_checkpoint_ref_edge(current: CheckpointTransition, target: CheckpointTransition) -> None:
+    """Cross-transition SHA continuity (ADR 0004 section 5's write-
+    ahead and operation-specific recovery prose), not merely intent-
+    pair adjacency or per-record shape -- `CheckpointTransition.
+    __post_init__` and `_is_valid_oid_for_format` already guarantee a
+    single record's own internal shape; this checks that the *target*
+    record is a truthful continuation of the *current* one. The caller
+    never re-derives an outcome here -- `target` is trusted to already
+    be the decided output of `checkpoint_session.CheckpointSession`'s
+    own collapse logic."""
+    c, t = current.intent, target.intent
+
+    if c is CheckpointIntent.ABSENT and t is CheckpointIntent.CREATING:
+        return
+    if c is CheckpointIntent.CREATING and t is CheckpointIntent.PRESENT:
+        if target.accepted_sha == current.proposed_new_sha:
+            return
+        raise _illegal_transition("creating->present must confirm the record's own proposed SHA")
+    if c is CheckpointIntent.CREATING and t is CheckpointIntent.ABSENT:
+        return  # confirmed-unchanged create-failure recovery (ADR 0004 section 5, explicit)
+    if c is CheckpointIntent.PRESENT and t is CheckpointIntent.ADVANCING:
+        if target.accepted_sha == current.accepted_sha and target.expected_old_sha == current.accepted_sha:
+            return
+        raise _illegal_transition("advancing must continue from the current accepted SHA")
+    if c is CheckpointIntent.ADVANCING and t is CheckpointIntent.PRESENT:
+        if target.accepted_sha in (current.accepted_sha, current.proposed_new_sha):
+            return
+        raise _illegal_transition("an advance collapse must match either the old or the proposed SHA")
+    if c is CheckpointIntent.PRESENT and t is CheckpointIntent.REMOVING:
+        if target.accepted_sha == current.accepted_sha and target.expected_old_sha == current.accepted_sha:
+            return
+        raise _illegal_transition("removing must match the current accepted SHA")
+    if c is CheckpointIntent.REMOVING and t is CheckpointIntent.ABSENT:
+        return  # confirmed-removal collapse
+    raise _illegal_transition("not a legal checkpoint-ref transition edge")
+
+
+def _illegal_transition(message: str) -> LifecycleStoreError:
+    return LifecycleStoreError(LifecycleStoreFailure.ILLEGAL_TRANSITION, message)
+
+
+class _LifecycleProjectionWriter:
+    """Locked, authoritative lifecycle-projection writer (Slice 3B-2,
+    ADR 0004 Amendment 3). Never constructed directly -- obtained only
+    via `LifecycleLease.open_projection_writer()`. Every method
+    re-verifies the lease's lifecycle lock at call time (never trusted
+    from construction) and loads the currently installed authoritative
+    projection fresh before any transition decision, refusing a stale
+    caller-supplied `expected` before any publication I/O. Publishes
+    only via the existing atomic-publish primitive, unchanged.
+
+    Never writes a populated `failure` or a non-absent worktree shape
+    (both deliberately deferred, matching Slice 3A-2/3B-1's own
+    narrowing), never performs a Docker or Git call of any kind, and
+    never writes `RECONCILING`/`RECONCILED`/`RECONCILIATION_FAILED` --
+    those remain `reconciliation.py`'s own private, reconciler-owned
+    write path, structurally unreachable through this owner-facing
+    API even when the requested state is already identical.
+    """
+
+    def __init__(self, lease: LifecycleLease) -> None:
+        self._lease = lease
+
+    def _require_lease_lock_held(self) -> None:
+        lock = self._lease.lifecycle_lock
+        repo_key = self._lease.repo_key
+        lifecycle_id = self._lease.lifecycle_id
+        if lock is None or not lock.is_held or repo_key is None or lifecycle_id is None:
+            raise LifecycleStoreError(
+                LifecycleStoreFailure.WRONG_LOCK_SCOPE,
+                "a projection write requires an already-held lifecycle lock on a fully identified lease",
+            )
+        try:
+            expected_scope = LockScope(kind=LockKind.LIFECYCLE, repo_key=repo_key, lifecycle_id=lifecycle_id)
+        except LifecycleFsError as exc:
+            raise LifecycleStoreError(
+                LifecycleStoreFailure.WRONG_LOCK_SCOPE,
+                "the lease's own identity is not a valid lock scope",
+            ) from exc
+        if lock.scope != expected_scope:
+            raise LifecycleStoreError(
+                LifecycleStoreFailure.WRONG_LOCK_SCOPE,
+                "the held lock's scope does not match this lease (not a lifecycle lock, or a different repo_key/lifecycle_id)",
+            )
+
+    def _load_authoritative(self) -> LifecycleProjection:
+        return load_lifecycle_projection(
+            self._lease.run_dir_fd,
+            object_format=self._lease.object_format,
+            expected_lifecycle_id=self._lease.lifecycle_id,
+            expected_repo_key=self._lease.repo_key,
+            expected_state_root_id=self._lease.state_root.state_root_id,
+        )
+
+    def _require_current(self, expected: LifecycleProjection) -> LifecycleProjection:
+        """The authoritative-read/stale-write-prevention flow: verify
+        lock scope, load and fully validate the currently installed
+        authoritative projection fresh (a corrupt or identity-mismatched
+        file is refused here, unchanged, and never overwritten), then
+        refuse a stale `expected` before any publication I/O. A
+        successful read here validates the currently installed content
+        -- it cannot retroactively prove a prior failed directory-
+        `fsync` durable; no power-loss durability claim is made. Note
+        this performs one authoritative *read* -- callers should never
+        describe a refusal here as "zero I/O"; it is "zero publication/
+        write I/O"."""
+        self._require_lease_lock_held()
+        current = self._load_authoritative()
+        if current != expected:
+            raise LifecycleStoreError(
+                LifecycleStoreFailure.STALE_EXPECTED_PROJECTION,
+                "the caller's expected projection no longer matches the currently installed authoritative projection",
+            )
+        return current
+
+    def refresh(self) -> LifecycleProjection:
+        """Explicit read-only recovery operation. Call this after a
+        `PROJECTION_DURABILITY_UNCONFIRMED` publication result -- never
+        blindly retry with the old `expected`. That result means the
+        new complete projection is currently installed (`os.replace`
+        already confirmed it), but its directory-entry durability was
+        not confirmed by this process -- no power-loss durability claim
+        is made either way. This method returns the currently
+        installed, fully validated projection for reconsideration.
+        Performs one authoritative read -- zero publication/write I/O
+        -- and requires the lifecycle lock still be held. Never invoked
+        automatically by any write method."""
+        self._require_lease_lock_held()
+        return self._load_authoritative()
+
+    def _publish(self, updated: LifecycleProjection) -> LifecycleProjection:
+        data = _encode_and_bound_projection(updated)
+        try:
+            publish_private_file_atomically_at(self._lease.run_dir_fd, LIFECYCLE_JSON_FILENAME, data, mode=0o600)
+        except LifecycleFsError as exc:
+            raise _classify_publication_failure(exc) from exc
+        return updated
+
+    def advance_lifecycle_state(self, *, expected: LifecycleProjection, state: LifecycleState) -> LifecycleProjection:
+        """Owner-facing state-graph transitions only:
+        `PREPARING->ACTIVE->CLEANING->COMPLETE`. `RECONCILING`,
+        `RECONCILED`, and `RECONCILIATION_FAILED` are refused
+        unconditionally -- including when `state` already equals the
+        (reconciler-owned) current state -- since those remain
+        `reconciliation.py`'s own private write path. Exact no-op
+        (zero publication/write I/O beyond the mandatory authoritative
+        read) is permitted only among the four owner states themselves.
+        `CLEANING->COMPLETE` additionally requires the complete
+        clean-final absent shape (ADR 0004's clean-final rule, I15)."""
+        current = self._require_current(expected)
+        if state not in _OWNER_STATES or current.state not in _OWNER_STATES:
+            raise _illegal_transition("RECONCILING/RECONCILED/RECONCILIATION_FAILED are reconciler-owned and refused here")
+        if state == current.state:
+            return current
+        if _OWNER_STATE_EDGES.get(current.state) != state:
+            raise _illegal_transition("not a legal owner lifecycle-state edge")
+        if state is LifecycleState.COMPLETE and not is_projection_fully_absent_shape(current):
+            raise _illegal_transition("CLEANING->COMPLETE requires the complete clean-final absent shape")
+        return self._publish(replace(current, state=state))
+
+    def _require_resource_writable_state(self, current_projection: LifecycleProjection) -> None:
+        """ADR 0004 Amendment 3 §1's state gate, shared by both
+        resource-transition methods: a resource transition -- even an
+        exact no-op -- is legal only while the authoritative lifecycle
+        state is owner-controlled and nonterminal (`PREPARING`/
+        `ACTIVE`/`CLEANING`). `COMPLETE` is clean-final (I15);
+        `RECONCILING`/`RECONCILED`/`RECONCILIATION_FAILED` are
+        reconciler-owned (I11) -- neither may ever be mutated again by
+        this live-owner resource-writer boundary."""
+        if current_projection.state not in _RESOURCE_WRITABLE_STATES:
+            raise _illegal_transition(
+                "resource transitions require an owner-controlled nonterminal state "
+                "(PREPARING/ACTIVE/CLEANING) -- refused for COMPLETE or any reconciler-owned state"
+            )
+
+    def record_container_transition(
+        self,
+        *,
+        expected: LifecycleProjection,
+        role: str,
+        intent: ContainerIntent,
+        id: str | None,
+    ) -> LifecycleProjection:
+        """ADR 0004 section 7's persisted-combination table and write-
+        ahead edges, per role, independently. This writer never
+        inspects Docker; every precondition (that a container was
+        actually created/started/removed, or confirmed never created)
+        is the caller's own responsibility to have confirmed before
+        invoking the corresponding edge.
+
+        Uniform writer-call ordering: lock scope and authoritative
+        read/stale comparison happen first (`_require_current`), then
+        the state gate, then request-shape validation -- so a wrong
+        lock scope or a stale `expected` is never masked by an invalid
+        `role`/`intent`/`id` argument being checked first."""
+        current_projection = self._require_current(expected)
+        self._require_resource_writable_state(current_projection)
+
+        if role not in ("baseline", "verification"):
+            raise _illegal_transition("role must be exactly 'baseline' or 'verification'")
+        if intent in (ContainerIntent.ABSENT, ContainerIntent.CREATING):
+            if id is not None:
+                raise _illegal_transition("absent/creating must carry no id")
+        else:
+            if not isinstance(id, str) or not id:
+                raise _illegal_transition("present/removing requires a nonempty id")
+
+        current_attr = current_projection.baseline if role == "baseline" else current_projection.verification
+        target_attr = ContainerAttribution(intent=intent, id=id)
+
+        if current_attr == target_attr:
+            return current_projection
+
+        if (current_attr.intent, intent) not in _CONTAINER_TRANSITION_EDGES:
+            raise _illegal_transition("not a legal container transition edge")
+        if current_attr.intent is ContainerIntent.PRESENT and intent is ContainerIntent.REMOVING and id != current_attr.id:
+            raise _illegal_transition("present->removing must retain the exact same id")
+
+        if role == "baseline":
+            updated = replace(current_projection, baseline=target_attr)
+        else:
+            updated = replace(current_projection, verification=target_attr)
+        return self._publish(updated)
+
+    def record_checkpoint_ref_transition(
+        self, *, expected: LifecycleProjection, transition: CheckpointTransition
+    ) -> LifecycleProjection:
+        """ADR 0004 section 5's write-ahead and operation-specific
+        recovery edges, with full cross-transition SHA continuity
+        (`_validate_checkpoint_ref_edge`), not merely per-record shape.
+        `transition` is trusted to already be the decided output of
+        `checkpoint_session.CheckpointSession`'s own collapse logic --
+        this method never re-derives an outcome. `CheckpointSession`
+        has no seam today to call this at the ADR-required moment (see
+        ADR 0004 Amendment 3) -- this method is correctness-tested
+        standalone, not yet durably wired to a real checkpoint-ref
+        mutation.
+
+        Uniform writer-call ordering: lock scope and authoritative
+        read/stale comparison happen first, then the state gate, then
+        `transition`'s own type is sanitized before any field access --
+        a raw `None` or wrong-type `transition` never reaches an
+        unguarded attribute lookup."""
+        current_projection = self._require_current(expected)
+        self._require_resource_writable_state(current_projection)
+
+        if not isinstance(transition, CheckpointTransition):
+            raise _illegal_transition("transition must be a CheckpointTransition")
+
+        current_transition = current_projection.checkpoint_ref
+
+        if current_transition == transition:
+            return current_projection
+
+        object_format = ObjectFormat(self._lease.object_format)
+        for value in (transition.accepted_sha, transition.expected_old_sha, transition.proposed_new_sha):
+            if value is not None and not _is_valid_oid_for_format(value, object_format=object_format):
+                raise _illegal_transition("a checkpoint-ref SHA does not match the repository's object format")
+
+        _validate_checkpoint_ref_edge(current_transition, transition)
+
+        updated = replace(current_projection, checkpoint_ref=transition)
+        return self._publish(updated)
 
 
 def prepare_lifecycle(source_repo_path: Path | str, *, run_id: str) -> LifecycleLease:
@@ -930,6 +1299,7 @@ def prepare_lifecycle(source_repo_path: Path | str, *, run_id: str) -> Lifecycle
         lease.repository_lock = repository_lock
 
         validated_identity = load_or_create_repo_json(state_root, identity, repository_lock)
+        lease.object_format = validated_identity.object_format
 
         # Automatic pre-run reconciliation (ADR 0004 Amendment 1
         # section 10, Amendment 2 — Milestone 3 Slice 3B-1): after
