@@ -1240,6 +1240,54 @@ class _LifecycleProjectionWriter:
         return self._publish(updated)
 
 
+class LifecycleCheckpointRefPublisher:
+    """Adapts a `_LifecycleProjectionWriter` to `checkpoint_session.
+    CheckpointTransitionPublisher`'s structural `publish(transition)`
+    boundary (Slice 3B-3, ADR 0004 Amendment 4).
+
+    Retains the writer and its own `current` expected `LifecycleProjection`
+    across calls, so `checkpoint_session.CheckpointSession` never needs
+    to know anything about `LifecycleProjection`. `publish()` does not
+    catch or translate anything: `record_checkpoint_ref_transition()`
+    both loads the currently installed authoritative projection fresh
+    (which can itself fail, e.g. `SCHEMA_INVALID` or
+    `SUBSTRATE_UNAVAILABLE`) and performs the write, so `publish()` lets
+    every `LifecycleStoreError` it raises propagate unchanged, including
+    but not limited to a stale expectation, a wrong lock scope, an
+    illegal transition, and a pre-installation, cleanup-unconfirmed, or
+    durability-unconfirmed publication failure. `current` replaces the
+    stored value only after that call returns normally (a confirmed
+    publication) — it never retries automatically, and it never treats
+    `PROJECTION_DURABILITY_UNCONFIRMED` as success. On any failure,
+    `current` is left exactly as it was before the failed call.
+
+    Call `refresh()` explicitly to recover after
+    `PROJECTION_DURABILITY_UNCONFIRMED` — it is never invoked
+    automatically by `publish()`. A future integration owner (not this
+    slice) decides when to call it.
+    """
+
+    def __init__(self, writer: "_LifecycleProjectionWriter", initial_projection: LifecycleProjection) -> None:
+        self._writer = writer
+        self._current = initial_projection
+
+    @property
+    def current(self) -> LifecycleProjection:
+        return self._current
+
+    def publish(self, transition: CheckpointTransition) -> None:
+        updated = self._writer.record_checkpoint_ref_transition(expected=self._current, transition=transition)
+        self._current = updated
+
+    def refresh(self) -> LifecycleProjection:
+        """Explicit recovery operation: re-reads the currently installed
+        authoritative projection via the writer's own `refresh()` and
+        updates this adapter's stored `current` to match it. Never
+        invoked automatically."""
+        self._current = self._writer.refresh()
+        return self._current
+
+
 def prepare_lifecycle(source_repo_path: Path | str, *, run_id: str) -> LifecycleLease:
     """The exact accepted Slice 3A-2 composition (ADR 0004 Amendment 1
     section 16): Git preflight, repository discovery, trusted state

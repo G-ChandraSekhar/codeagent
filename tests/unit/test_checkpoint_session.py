@@ -779,7 +779,10 @@ def test_module_imports_nothing_beyond_its_narrow_dependencies() -> None:
     """Structural proof of the unwired boundary: no events, errors,
     controller, workspace, executor, patch, subprocess, os, pathlib,
     json, fcntl or tempfile — no persistence, locks, or Git of its
-    own."""
+    own. `typing` (Slice 3B-3) is a deliberate, narrow addition: it
+    supplies only the structural `CheckpointTransitionPublisher`
+    `Protocol` -- a static-typing construct, not a new runtime
+    dependency -- and does not weaken this boundary."""
     source = Path(checkpoint_session_module.__file__).read_text()
     tree = ast.parse(source)
     imported: set[str] = set()
@@ -788,7 +791,7 @@ def test_module_imports_nothing_beyond_its_narrow_dependencies() -> None:
             imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             imported.add(node.module or "")
-    assert imported == {"__future__", "re", "dataclasses", "enum", "codeagent.checkpoint_ref"}
+    assert imported == {"__future__", "re", "dataclasses", "enum", "typing", "codeagent.checkpoint_ref"}
 
 
 def test_session_creates_no_filesystem_state_and_no_other_refs(repo: Path, tmp_path: Path) -> None:
@@ -850,3 +853,374 @@ def test_session_public_surface_is_narrow() -> None:
         "lifecycle_id",
         "ref_name",
     }
+
+
+# ---------------------------------------------------------------------------
+# Slice 3B-3: optional transition-publication seam
+# ---------------------------------------------------------------------------
+
+
+class _EventOrderedRef(_RecordingRef):
+    """Like `_RecordingRef`, but also appends a `"git:<op>"` marker to a
+    shared `events` list -- lets a test assert the exact interleaving
+    of publish calls and Git calls, not just that both happened."""
+
+    def __init__(self, events: list[str], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._events = events
+
+    def create(self, new_oid: str) -> None:
+        self._events.append("git:create")
+        super().create(new_oid)
+
+    def advance(self, *, expected_old_oid: str, new_oid: str) -> None:
+        self._events.append("git:advance")
+        super().advance(expected_old_oid=expected_old_oid, new_oid=new_oid)
+
+    def delete(self, *, expected_oid: str) -> None:
+        self._events.append("git:delete")
+        super().delete(expected_oid=expected_oid)
+
+
+class _RecordingPublisher:
+    """A `CheckpointTransitionPublisher` double: records every
+    transition it is asked to publish, and optionally raises a scripted
+    exception on the Nth call (1-indexed). Also appends a
+    `"publish:<intent>"` marker to a shared `events` list when supplied,
+    for exact call-order assertions against `_EventOrderedRef`."""
+
+    def __init__(
+        self,
+        *,
+        failure: Exception | None = None,
+        fail_on_call: int | None = None,
+        events: list[str] | None = None,
+    ) -> None:
+        self.calls: list[CheckpointTransition] = []
+        self._failure = failure
+        self._fail_on_call = fail_on_call
+        self._events = events
+
+    def publish(self, transition: CheckpointTransition) -> None:
+        self.calls.append(transition)
+        if self._events is not None:
+            self._events.append(f"publish:{transition.intent.value}")
+        if self._failure is not None and (self._fail_on_call is None or len(self.calls) == self._fail_on_call):
+            raise self._failure
+
+
+def test_no_publisher_behavior_is_unchanged() -> None:
+    """The default (`transition_publisher=None`) is indistinguishable
+    from every pre-3B-3 test above: no publish call ever happens, and
+    nothing about establish/advance/delete's own behavior changes."""
+    ref = _RecordingRef()
+    session = CheckpointSession(ref)
+    session.establish(A)
+    session.advance(B)
+    session.delete()
+    assert ref.calls == [("create", A), ("advance", A, B), ("delete", B)]
+    assert session.transition == ABSENT_TRANSITION
+
+
+def test_establish_publishes_transitional_before_git_and_collapse_after() -> None:
+    events: list[str] = []
+    ref = _EventOrderedRef(events)
+    publisher = _RecordingPublisher(events=events)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    session.establish(A)
+
+    assert events == ["publish:creating", "git:create", "publish:present"]
+    assert publisher.calls == [
+        CheckpointTransition(intent=CheckpointIntent.CREATING, proposed_new_sha=A),
+        CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=A),
+    ]
+
+
+def test_advance_publishes_transitional_before_git_and_collapse_after() -> None:
+    events: list[str] = []
+    ref = _EventOrderedRef(events)
+    publisher = _RecordingPublisher(events=events)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+    session.establish(A)
+    events.clear()
+    publisher.calls.clear()
+
+    session.advance(B)
+
+    assert events == ["publish:advancing", "git:advance", "publish:present"]
+    assert publisher.calls == [
+        CheckpointTransition(intent=CheckpointIntent.ADVANCING, accepted_sha=A, expected_old_sha=A, proposed_new_sha=B),
+        CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=B),
+    ]
+
+
+def test_delete_publishes_transitional_before_git_and_collapse_after() -> None:
+    events: list[str] = []
+    ref = _EventOrderedRef(events)
+    publisher = _RecordingPublisher(events=events)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+    session.establish(A)
+    events.clear()
+    publisher.calls.clear()
+
+    session.delete()
+
+    assert events == ["publish:removing", "git:delete", "publish:absent"]
+    assert publisher.calls == [
+        CheckpointTransition(intent=CheckpointIntent.REMOVING, accepted_sha=A, expected_old_sha=A),
+        ABSENT_TRANSITION,
+    ]
+
+
+def test_delete_from_absent_publishes_nothing_and_makes_no_git_call() -> None:
+    ref = _RecordingRef()
+    publisher = _RecordingPublisher()
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    session.delete()
+
+    assert ref.calls == []
+    assert publisher.calls == []
+
+
+class _Boom(Exception):
+    """A distinguishable exception type used across the publisher-
+    failure tests below, so a propagated exception can be checked by
+    identity (`is`), not merely by class, proving it is the exact
+    instance the publisher raised -- never wrapped, translated, or
+    replaced."""
+
+
+def test_establish_pre_mutation_publisher_failure_prevents_git_call() -> None:
+    boom = _Boom("forced")
+    ref = _RecordingRef()
+    publisher = _RecordingPublisher(failure=boom, fail_on_call=1)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    with pytest.raises(_Boom) as excinfo:
+        session.establish(A)
+
+    assert excinfo.value is boom  # the exact publisher exception instance, unchanged.
+    assert ref.calls == []  # Git was never called.
+    assert session.transition == CheckpointTransition(intent=CheckpointIntent.CREATING, proposed_new_sha=A)
+
+
+def test_delete_pre_mutation_publisher_failure_prevents_git_call() -> None:
+    boom = _Boom("forced")
+    ref = _RecordingRef()
+    session = CheckpointSession(ref)
+    session.establish(A)
+    ref.calls.clear()
+    publisher = _RecordingPublisher(failure=boom, fail_on_call=1)
+    session._transition_publisher = publisher  # noqa: SLF001 - inject after setup, before the call under test
+
+    with pytest.raises(_Boom) as excinfo:
+        session.delete()
+
+    assert excinfo.value is boom
+    assert ref.calls == []  # Git was never called.
+    assert session.transition == CheckpointTransition(intent=CheckpointIntent.REMOVING, accepted_sha=A, expected_old_sha=A)
+
+
+def test_advance_pre_mutation_publisher_failure_prevents_git_call() -> None:
+    boom = _Boom("forced")
+    ref = _RecordingRef()
+    session = CheckpointSession(ref)
+    session.establish(A)
+    ref.calls.clear()
+    publisher = _RecordingPublisher(failure=boom, fail_on_call=1)
+    session._transition_publisher = publisher  # noqa: SLF001 - inject after setup, before the call under test
+
+    with pytest.raises(_Boom) as excinfo:
+        session.advance(B)
+
+    assert excinfo.value is boom
+    assert ref.calls == []
+    assert session.transition == CheckpointTransition(
+        intent=CheckpointIntent.ADVANCING, accepted_sha=A, expected_old_sha=A, proposed_new_sha=B
+    )
+
+
+def test_establish_post_collapse_publisher_failure_propagates_after_git_call() -> None:
+    boom = _Boom("forced")
+    ref = _RecordingRef()
+    publisher = _RecordingPublisher(failure=boom, fail_on_call=2)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    with pytest.raises(_Boom) as excinfo:
+        session.establish(A)
+
+    assert excinfo.value is boom
+    assert ref.calls == [("create", A)]  # Git was called; its result is not undone.
+    assert session.transition == CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=A)
+
+
+def test_advance_post_collapse_publisher_failure_propagates_after_git_call() -> None:
+    boom = _Boom("forced")
+    ref = _RecordingRef()
+    session = CheckpointSession(ref)
+    session.establish(A)
+    ref.calls.clear()
+    publisher = _RecordingPublisher(failure=boom, fail_on_call=2)
+    session._transition_publisher = publisher  # noqa: SLF001
+
+    with pytest.raises(_Boom) as excinfo:
+        session.advance(B)
+
+    assert excinfo.value is boom
+    assert ref.calls == [("advance", A, B)]
+    assert session.transition == CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=B)
+
+
+def test_delete_post_collapse_publisher_failure_propagates_after_git_call() -> None:
+    boom = _Boom("forced")
+    ref = _RecordingRef()
+    session = CheckpointSession(ref)
+    session.establish(A)
+    ref.calls.clear()
+    publisher = _RecordingPublisher(failure=boom, fail_on_call=2)
+    session._transition_publisher = publisher  # noqa: SLF001
+
+    with pytest.raises(_Boom) as excinfo:
+        session.delete()
+
+    assert excinfo.value is boom
+    assert ref.calls == [("delete", A)]
+    assert session.transition == ABSENT_TRANSITION
+
+
+def test_establish_unchanged_recovery_publishes_before_reraising_original_error() -> None:
+    """Proves the exact interleaving: transitional publish, then the
+    Git attempt, then -- only after Git confirms UNCHANGED -- the
+    recovery-collapse publish, and only after that succeeds is the
+    original error re-raised."""
+    original = _error(CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED, MutationOutcome.UNCHANGED)
+    events: list[str] = []
+    ref = _EventOrderedRef(events, failure=original)
+    publisher = _RecordingPublisher(events=events)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        session.establish(A)
+
+    assert events == ["publish:creating", "git:create", "publish:absent"]
+    assert excinfo.value is original  # the original error, unchanged
+    assert publisher.calls == [
+        CheckpointTransition(intent=CheckpointIntent.CREATING, proposed_new_sha=A),
+        ABSENT_TRANSITION,
+    ]
+    assert session.transition == ABSENT_TRANSITION
+
+
+def test_establish_unchanged_recovery_publish_failure_chains_from_original_error() -> None:
+    boom = _Boom("forced")
+    original = _error(CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED, MutationOutcome.UNCHANGED)
+    ref = _RecordingRef(failure=original)
+    publisher = _RecordingPublisher(failure=boom, fail_on_call=2)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    with pytest.raises(_Boom) as excinfo:
+        session.establish(A)
+
+    # The exact publisher exception instance propagates as the primary
+    # exception, deliberately chained (`raise ... from ...`, not merely
+    # incidental __context__) from the exact original error instance.
+    assert excinfo.value is boom
+    assert excinfo.value.__cause__ is original
+    assert session.transition == ABSENT_TRANSITION
+
+
+def test_advance_unchanged_recovery_publishes_before_reraising_original_error() -> None:
+    """Proves the exact interleaving for advance(): transitional
+    publish, Git attempt, recovery-collapse publish only after a
+    confirmed UNCHANGED outcome, original error re-raised only after
+    that publish succeeds."""
+    events: list[str] = []
+    ref = _EventOrderedRef(events)
+    session = CheckpointSession(ref)
+    session.establish(A)
+    events.clear()
+    original = _error(CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED, MutationOutcome.UNCHANGED)
+    ref._failure = original
+    publisher = _RecordingPublisher(events=events)
+    session._transition_publisher = publisher  # noqa: SLF001
+
+    with pytest.raises(CheckpointRefError) as excinfo:
+        session.advance(B)
+
+    assert events == ["publish:advancing", "git:advance", "publish:present"]
+    assert excinfo.value is original
+    assert publisher.calls[-1] == CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=A)
+    assert session.transition == CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=A)
+
+
+def test_advance_unchanged_recovery_publish_failure_chains_from_original_error() -> None:
+    boom = _Boom("forced")
+    ref = _RecordingRef()
+    session = CheckpointSession(ref)
+    session.establish(A)
+    original = _error(CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED, MutationOutcome.UNCHANGED)
+    ref._failure = original
+    # call #1 is advance()'s own pre-mutation "advancing" publish
+    # (must succeed); call #2 is the recovery-collapse publish this
+    # test is targeting.
+    publisher = _RecordingPublisher(failure=boom, fail_on_call=2)
+    session._transition_publisher = publisher  # noqa: SLF001
+
+    with pytest.raises(_Boom) as excinfo:
+        session.advance(B)
+
+    assert excinfo.value is boom
+    assert excinfo.value.__cause__ is original
+    assert session.transition == CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=A)
+
+
+@pytest.mark.parametrize("outcome", _NON_COLLAPSING)
+def test_unconfirmed_establish_outcomes_do_not_invent_a_collapse_publication(outcome: MutationOutcome) -> None:
+    """UNEXPECTED/SYMBOLIC/UNKNOWN leave the record `creating` -- no
+    second publish call is ever made for a non-collapsing outcome."""
+    ref = _RecordingRef(failure=_error(CheckpointRefFailure.UNEXPECTED_VALUE, outcome))
+    publisher = _RecordingPublisher()
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    with pytest.raises(CheckpointRefError):
+        session.establish(A)
+
+    assert publisher.calls == [CheckpointTransition(intent=CheckpointIntent.CREATING, proposed_new_sha=A)]
+    assert session.transition.intent is CheckpointIntent.CREATING
+
+
+@pytest.mark.parametrize("outcome", _NON_COLLAPSING)
+def test_unconfirmed_advance_outcomes_do_not_invent_a_collapse_publication(outcome: MutationOutcome) -> None:
+    ref = _RecordingRef()
+    session = CheckpointSession(ref)
+    session.establish(A)
+    ref._failure = _error(CheckpointRefFailure.UNEXPECTED_VALUE, outcome)
+    publisher = _RecordingPublisher()
+    session._transition_publisher = publisher  # noqa: SLF001
+
+    with pytest.raises(CheckpointRefError):
+        session.advance(B)
+
+    assert publisher.calls == [
+        CheckpointTransition(intent=CheckpointIntent.ADVANCING, accepted_sha=A, expected_old_sha=A, proposed_new_sha=B)
+    ]
+    assert session.transition.intent is CheckpointIntent.ADVANCING
+
+
+def test_unconfirmed_delete_outcome_does_not_invent_a_collapse_publication() -> None:
+    ref = _RecordingRef()
+    session = CheckpointSession(ref)
+    session.establish(A)
+    ref._failure = _error(CheckpointRefFailure.UNEXPECTED_VALUE, MutationOutcome.UNEXPECTED)
+    publisher = _RecordingPublisher()
+    session._transition_publisher = publisher  # noqa: SLF001
+
+    with pytest.raises(CheckpointRefError):
+        session.delete()
+
+    assert publisher.calls == [
+        CheckpointTransition(intent=CheckpointIntent.REMOVING, accepted_sha=A, expected_old_sha=A)
+    ]
+    assert session.transition.intent is CheckpointIntent.REMOVING

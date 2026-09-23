@@ -13,6 +13,7 @@ import pytest
 
 from codeagent import _git_safety as gs
 from codeagent import _lifecycle_fs as lf
+from codeagent import checkpoint_ref as cr
 from codeagent import checkpoint_session as cs
 from codeagent import lifecycle_store as ls
 from codeagent import repo_identity as ri
@@ -2200,3 +2201,220 @@ def test_checkpoint_ref_transition_wrong_type_is_illegal_not_raw_error(tmp_path,
         assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
     finally:
         lease.close()
+
+
+# ---------------------------------------------------------------------------
+# Slice 3B-3: LifecycleCheckpointRefPublisher adapter
+# ---------------------------------------------------------------------------
+
+
+def test_publisher_adapter_success_threads_returned_projection_forward(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleCheckpointRefPublisher(writer, current)
+
+        publisher.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1")))
+
+        assert publisher.current.checkpoint_ref.intent is cs.CheckpointIntent.CREATING
+        assert publisher.current != current  # the stored projection advanced
+    finally:
+        lease.close()
+
+
+def test_publisher_adapter_repeated_legal_transitions_use_updated_expected(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleCheckpointRefPublisher(writer, current)
+
+        initial_sha = _sha("1")
+        publisher.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=initial_sha))
+        publisher.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=initial_sha))
+
+        assert publisher.current.checkpoint_ref.accepted_sha == initial_sha
+
+        new_sha = _sha("2")
+        publisher.publish(
+            cs.CheckpointTransition(
+                intent=cs.CheckpointIntent.ADVANCING,
+                accepted_sha=initial_sha,
+                expected_old_sha=initial_sha,
+                proposed_new_sha=new_sha,
+            )
+        )
+        publisher.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=new_sha))
+        assert publisher.current.checkpoint_ref.accepted_sha == new_sha
+    finally:
+        lease.close()
+
+
+def test_publisher_adapter_does_not_hide_stale_expectation(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleCheckpointRefPublisher(writer, current)
+        # A second, independent writer publishes behind the adapter's back.
+        real_current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.CREATING, id=None
+        )
+        assert real_current != current
+
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            publisher.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1")))
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.STALE_EXPECTED_PROJECTION
+        # The adapter's own belief is untouched by the failed call.
+        assert publisher.current == current
+    finally:
+        lease.close()
+
+
+def test_publisher_adapter_pre_installation_failure_leaves_expected_unchanged(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleCheckpointRefPublisher(writer, current)
+
+        def _boom(fd, data):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.IO_FAILED, "forced")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "write_all_eintr_safe", _boom)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                publisher.publish(
+                    cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1"))
+                )
+            assert excinfo.value.reason is ls.LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED
+        assert publisher.current == current
+    finally:
+        lease.close()
+
+
+def test_publisher_adapter_durability_unconfirmed_does_not_silently_update_and_refresh_recovers(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleCheckpointRefPublisher(writer, current)
+
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_last_fsync(fd):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced directory fsync failure")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                publisher.publish(
+                    cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1"))
+                )
+            assert excinfo.value.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+
+        # Never silently treated as success: the adapter's own belief
+        # is unchanged.
+        assert publisher.current == current
+
+        # Explicit refresh() recovers: currently installed content is
+        # returned and becomes the new expectation.
+        refreshed = publisher.refresh()
+        assert refreshed.checkpoint_ref.intent is cs.CheckpointIntent.CREATING
+        assert publisher.current is refreshed
+
+        # The now-correct expectation lets a further legal transition
+        # succeed.
+        publisher.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=_sha("1")))
+        assert publisher.current.checkpoint_ref.accepted_sha == _sha("1")
+    finally:
+        lease.close()
+
+
+def test_publisher_adapter_cleanup_unconfirmed_remains_distinct_and_propagates(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleCheckpointRefPublisher(writer, current)
+
+        def _fail_write(fd, data):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.IO_FAILED, "forced write failure")
+
+        def _fail_unlink(path, *, dir_fd):
+            raise OSError("forced temp-cleanup failure")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "write_all_eintr_safe", _fail_write)
+            scoped.setattr(lf.os, "unlink", _fail_unlink)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                publisher.publish(
+                    cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1"))
+                )
+            assert excinfo.value.reason is ls.LifecycleStoreFailure.CLEANUP_UNCONFIRMED
+        assert publisher.current == current
+    finally:
+        lease.close()
+
+
+def test_publisher_adapter_wrong_lock_scope_propagates_unchanged(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    writer, current = lease.open_projection_writer()
+    lease.close()
+    publisher = ls.LifecycleCheckpointRefPublisher(writer, current)
+
+    with pytest.raises(ls.LifecycleStoreError) as excinfo:
+        publisher.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1")))
+    assert excinfo.value.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+    assert publisher.current == current
+
+
+# ---------------------------------------------------------------------------
+# Slice 3B-3: real production-shaped integration -- no mocking of the
+# durable writer, real repo, real CheckpointRef, real CheckpointSession
+# ---------------------------------------------------------------------------
+
+
+def test_real_checkpoint_session_durably_publishes_through_the_real_writer(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    _set_state_dir(monkeypatch, tmp_path)
+    lease = ls.prepare_lifecycle(str(repo), run_id="publisher-integration")
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleCheckpointRefPublisher(writer, current)
+
+        checkpoint_ref = cr.CheckpointRef(str(repo), lease.lifecycle_id)
+        session = cs.CheckpointSession(checkpoint_ref, transition_publisher=publisher)
+
+        first_sha = _head(repo)
+
+        session.establish(first_sha)
+        on_disk = _read_lifecycle_json(lease)
+        assert on_disk["checkpoint_ref"]["intent"] == "present"
+        assert on_disk["checkpoint_ref"]["accepted_sha"] == first_sha
+        assert checkpoint_ref.observe() == cr.RefObservation(present=True, oid=first_sha)
+
+        (repo / "f.txt").write_text("y")
+        _run("git", "-C", str(repo), "add", ".")
+        _run("git", "-C", str(repo), "commit", "-qm", "second")
+        second_sha = _head(repo)
+
+        session.advance(second_sha)
+        on_disk = _read_lifecycle_json(lease)
+        assert on_disk["checkpoint_ref"]["intent"] == "present"
+        assert on_disk["checkpoint_ref"]["accepted_sha"] == second_sha
+        assert checkpoint_ref.observe() == cr.RefObservation(present=True, oid=second_sha)
+
+        session.delete()
+        on_disk = _read_lifecycle_json(lease)
+        assert on_disk["checkpoint_ref"]["intent"] == "absent"
+        assert checkpoint_ref.observe() == cr.RefObservation(present=False, oid=None)
+
+        # No leaked worktrees or extra refs after delete().
+        assert _run("git", "-C", str(repo), "worktree", "list", "--porcelain").stdout.count("worktree ") == 1
+        assert "refs/codeagent/" not in _run("git", "-C", str(repo), "for-each-ref").stdout
+    finally:
+        lease.close()
+
+
+def _head(repo) -> str:
+    return _run("git", "-C", str(repo), "rev-parse", "HEAD").stdout.strip()

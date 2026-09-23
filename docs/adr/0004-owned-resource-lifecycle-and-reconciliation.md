@@ -1742,3 +1742,148 @@ run.
 `src/codeagent/lifecycle_store.py` and
 `tests/unit/test_lifecycle_store.py` implement and verify every rule
 above; see `ENGINEERING_LOG.md`'s dated entry for exact totals.
+
+---
+
+## Amendment 4 (Accepted 2026-09-23): Milestone 3 Slice 3B-3 — durable checkpoint-ref transition-publication seam
+
+Implementation status: **implemented.** Adds the one call-ordering
+mechanism that lets Slice 3B-2's already-accepted
+`record_checkpoint_ref_transition()` become genuinely usable — nothing
+in Amendment 3's transition/edge tables changes; no new legal
+checkpoint-ref transition edge is added here.
+
+### 1. Protocol and adapter boundary
+
+`checkpoint_session.py` gains a structural `CheckpointTransitionPublisher`
+Protocol (`publish(transition: CheckpointTransition) -> None`) and an
+optional, keyword-only `transition_publisher` constructor parameter on
+`CheckpointSession`, defaulting to `None`. `checkpoint_session.py`
+imports nothing new beyond `typing` (for the `Protocol` itself) — it
+still knows nothing about `LifecycleProjection`, `LifecycleLease`, or
+any filesystem/lock primitive.
+
+`lifecycle_store.py` gains `LifecycleCheckpointRefPublisher`, the one
+concrete implementation Milestone 3 provides: it wraps a
+`_LifecycleProjectionWriter` and tracks its own `current` expected
+`LifecycleProjection` across calls, so `CheckpointSession` never needs
+to construct or thread a `LifecycleProjection` itself.
+
+### 2. Exact pre-mutation and post-outcome ordering
+
+Every `self._transition` reassignment in `establish()`/`advance()`/
+`delete()` is immediately followed by a publish attempt, in this exact
+sequence:
+
+1. Assign the new transitional intent to `self._transition`.
+2. Publish it (a no-op if no publisher is configured).
+3. Only after step 2 succeeds does the corresponding `CheckpointRef`
+   mutation (`create`/`advance`/`delete`) run.
+4. After a confirmed Git outcome, assign the collapse and publish it.
+
+`delete()`'s `ABSENT`-no-op early return publishes nothing and makes no
+Git call — nothing changed, so nothing is recorded.
+
+### 3. Assignment-first in-memory behavior when publication fails
+
+If the **pre-mutation** publish (step 2) raises: the Git mutation is
+never reached, the publication exception propagates unchanged, and
+`self._transition` remains exactly the transitional intent just
+assigned — no rollback, no retry, no reinterpretation.
+
+If the **post-outcome** publish (step 4, or the confirmed-`UNCHANGED`
+recovery collapse below) raises: the Git result already happened and
+is never undone; the publication exception propagates; `self._transition`
+remains the decided collapsed value regardless of whether it could be
+durably recorded.
+
+### 4. Projection-consistency failure dominance during `UNCHANGED` recovery
+
+For `establish()`/`advance()`'s confirmed-`UNCHANGED` recovery path:
+the original `CheckpointRefError` is retained, the recovery collapse is
+assigned, and its publication is attempted. If that publication
+succeeds, the original `CheckpointRefError` is re-raised unchanged. If
+it fails, the publication exception is raised **explicitly** `from` the
+original `CheckpointRefError` (`raise publish_exc from exc`) — a
+deliberate chain, not incidental Python `__context__`. This is named
+**projection-consistency failure dominance**, a distinct rule from this
+repository's existing cleanup-dominance convention (release-order
+resource cleanup): here, an already-decided in-memory collapse could
+not be durably confirmed, which is a different failure class from an
+unconfirmed release of an acquired resource.
+
+Every other non-collapsing outcome (`UNEXPECTED`/`SYMBOLIC`/`UNKNOWN`)
+leaves the record transitional and makes **no** publish call beyond the
+original pre-mutation one — no collapse is invented to publish when
+none was decided.
+
+### 5. Adapter expected-projection tracking and `refresh()`
+
+`LifecycleCheckpointRefPublisher.publish()` calls `writer.
+record_checkpoint_ref_transition(expected=self._current,
+transition=...)` and replaces `self._current` **only** after that call
+returns normally. `publish()` does not catch or translate anything:
+`record_checkpoint_ref_transition()` both freshly loads the currently
+installed authoritative projection and performs the write, so every
+`LifecycleStoreError` it can raise propagates unchanged — including but
+not limited to `STALE_EXPECTED_PROJECTION`, `WRONG_LOCK_SCOPE`,
+`ILLEGAL_TRANSITION`, `PROJECTION_PUBLICATION_FAILED`,
+`PROJECTION_DURABILITY_UNCONFIRMED`, `CLEANUP_UNCONFIRMED`, and the
+authoritative-load failures `SCHEMA_INVALID`/`SUBSTRATE_UNAVAILABLE`.
+`current` is left exactly as it was before the failed call —
+`PROJECTION_DURABILITY_UNCONFIRMED` is never silently treated as
+success.
+
+`refresh()` is an explicit, separate method: it calls the writer's own
+`refresh()`, updates `current` to the currently installed authoritative
+projection, and returns it. It is **never invoked automatically** by
+`publish()`. A future integration owner decides when to call it — this
+slice only provides the operation.
+
+### 6. No automatic retry
+
+Neither `CheckpointSession`'s publish calls nor
+`LifecycleCheckpointRefPublisher.publish()`/`refresh()` retry anything
+automatically. Every failure propagates to the caller, once.
+
+### 7. Default-`None` backward compatibility
+
+Every existing `CheckpointSession` caller remains source-compatible and
+behaviorally unchanged when the publisher is omitted:
+`transition_publisher` defaults to `None`, and `_publish()` no-ops when
+unset. The pre-existing behavioral tests in `test_checkpoint_session.py`
+continue to pass unmodified; the file's own static import-boundary
+assertion was deliberately updated to admit the new `typing` import (see
+Evidence below).
+
+### 8. Controller error translation remains deferred
+
+This seam is real and production-shaped — proven by a real end-to-end
+test (real repo, real `prepare_lifecycle()`, real `_LifecycleProjectionWriter`,
+real `LifecycleCheckpointRefPublisher`, real `CheckpointRef`, real
+`CheckpointSession`) — but it is **not** itself controller-ready.
+`RunController` today catches only `CheckpointRefError`/
+`CheckpointSessionError` (`_map_checkpoint_error`); a publisher
+exception (a `LifecycleStoreError`) is a new exception family that
+future controller wiring must explicitly translate. This slice does
+not add that translation and does not claim the seam is ready for
+`RunController` integration on its own.
+
+### Milestone boundary
+
+Slice 3B-3 owns exactly the above: the publication seam in
+`checkpoint_session.py` and its one adapter in `lifecycle_store.py`. No
+`RunController`, `executor.py`, `workspace.py`, CLI, container/worktree
+handling, abandonment, reconciliation, signal handling, model
+integration, or UI change. No new legal checkpoint-ref transition edge.
+No change to `docs/threat-model.md` — nothing here is wired into a real
+run, so no threat-model claim becomes true or false by this slice.
+
+### Evidence
+
+`src/codeagent/checkpoint_session.py`, `src/codeagent/lifecycle_store.py`,
+`tests/unit/test_checkpoint_session.py`, and
+`tests/unit/test_lifecycle_store.py` implement and verify every rule
+above, including a real end-to-end test proving durable checkpoint-ref
+publication with no mocking of the writer; see `ENGINEERING_LOG.md`'s
+dated entry for exact totals.

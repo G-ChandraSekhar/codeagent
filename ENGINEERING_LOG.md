@@ -2313,3 +2313,99 @@ shapes, transition tables, and lock/stale-write/publication semantics
 are all unchanged — this pass added a missing invariant check,
 corrected call ordering, sanitized one input, fixed wording, and fixed
 one test's own descriptor hygiene.
+
+## 2026-09-23: Milestone 3 Slice 3B-3 — durable checkpoint-ref transition-publication seam
+
+Implemented per ADR 0004 Amendment 4. Planning identified this as the
+smallest dependency-correct next slice: Slice 3B-2's
+`record_checkpoint_ref_transition()` was already fully accepted and
+tested, but nothing could ever call it at the ADR-required moment,
+since `CheckpointSession.establish()`/`advance()`/`delete()` set their
+transitional intent and call the corresponding `CheckpointRef` method
+on the very next statement, with no seam between them — confirmed by
+direct inspection before any code was written, per the accepted plan.
+
+`checkpoint_session.py` gained a structural `CheckpointTransitionPublisher`
+Protocol and an optional, keyword-only `transition_publisher`
+constructor parameter, defaulting to `None`. The module's own
+import-boundary test (`test_module_imports_nothing_beyond_its_narrow_
+dependencies`) needed one deliberate addition — `typing`, for the
+`Protocol` itself — updated with an explanatory comment rather than
+silently loosened.
+
+Every `self._transition` reassignment across `establish`/`advance`/
+`delete` is now immediately followed by a publish attempt, preserving
+assignment-first ordering deliberately: the transitional intent is
+published *before* the corresponding Git mutation, so a publish failure
+there means Git is never called at all (fail-closed by ordering alone,
+no extra branching needed); the collapse is published *after* a
+confirmed Git outcome, so a publish failure there never undoes the
+already-happened mutation. For `establish()`/`advance()`'s confirmed-
+`UNCHANGED` recovery path, the recovery collapse is published before
+the original `CheckpointRefError` is re-raised; if that publication
+itself fails, its exception is raised explicitly `from` the original
+error — deliberate chaining, not left to incidental `__context__` —
+named **projection-consistency failure dominance** in the ADR, a
+distinct rule from this repository's existing cleanup-dominance
+convention (an already-decided in-memory collapse that could not be
+durably confirmed is a different failure class from an unconfirmed
+resource-release). No new `CheckpointSessionFailure` was added to wrap
+publisher exceptions — they propagate as their own original type,
+unchanged.
+
+`lifecycle_store.py` gained `LifecycleCheckpointRefPublisher`, the one
+concrete adapter: it wraps a `_LifecycleProjectionWriter` and tracks
+its own `current` expected `LifecycleProjection` across calls, so
+`checkpoint_session.py` never needs to know anything about
+`LifecycleProjection`. `publish()` replaces `current` only after
+`record_checkpoint_ref_transition()` returns normally — every
+`LifecycleStoreError` propagates unchanged and leaves `current`
+untouched, and `PROJECTION_DURABILITY_UNCONFIRMED` is never silently
+treated as success. A separate, explicit `refresh()` method (never
+invoked automatically by `publish()`) recovers the currently installed
+authoritative projection after that result, matching the recovery
+discipline Slice 3B-2 already established for the writer itself.
+
+**Verified**: `py_compile` clean on all four changed files. One test
+bug found and fixed during verification, not a production defect: an
+`UNCHANGED`-recovery chaining test for `advance()` scripted its fake
+publisher to fail on call #1 (the pre-mutation "advancing" publish)
+instead of call #2 (the recovery-collapse publish it was meant to
+target) — corrected with an explanatory comment; the production
+ordering was correct throughout. `test_checkpoint_session.py` alone:
+133 passed (up from 111; 22 new tests covering default-unchanged
+behavior, exact publish/Git call ordering for all three operations,
+delete-from-absent publishing nothing, pre-mutation and post-collapse
+publisher failures for all three operations, `UNCHANGED`-recovery
+publication and its explicit-chaining failure mode for both
+`establish`/`advance`, and non-collapsing outcomes never inventing a
+publish call). `test_lifecycle_store.py`'s new adapter section: 8
+passed, including the real end-to-end integration test (real repo,
+real `prepare_lifecycle()`, real lease/writer/adapter, real
+`CheckpointRef`, real `CheckpointSession` — `establish`/`advance`/
+`delete` each durably publish, with `lifecycle.json` reloaded and
+compared against the real ref's actual state after every call, no
+mocking of the writer). The three directly affected files together:
+349 passed. The eight-file focused set collected and passed together,
+696 passed, in both forward and reverse file order. Full local suite:
+2,329 passed. Docker Desktop was found down at verification start
+(`docker info` failing — the same environmental state, not a
+regression, that produced identical-looking failures in the prior
+slice's verification); started and waited on until genuinely ready
+before any Docker-dependent test ran. With `CODEAGENT_REQUIRE_DOCKER=1`
+(a skip treated as a failure): the dedicated real-Docker step
+(`tests/integration/test_slice_c.py`), 3 passed, 0 skipped; the
+complete suite, 2,329 passed, 0 skipped; no leftover `codeagent`
+containers, extra worktrees, `refs/codeagent` refs, child processes, or
+temp state roots afterward. `git diff --check` clean.
+
+No architectural or scope change beyond what Amendment 4 records: no
+`RunController`/`executor.py`/`workspace.py` change, no CLI, no
+container/worktree writing, no resource removal, no abandonment, no
+new legal checkpoint-ref transition edge. `docs/threat-model.md`
+unchanged — nothing here is wired into a real run, so no threat-model
+claim becomes true or false by this slice. Controller error translation
+for a publisher's `LifecycleStoreError` remains explicitly deferred:
+`RunController` today only catches `CheckpointRefError`/
+`CheckpointSessionError`, and this slice does not claim the seam is
+ready for that integration on its own.

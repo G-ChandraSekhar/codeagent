@@ -754,6 +754,77 @@ Stage 2 (of the four-stage planning process in
   This slice performs no Docker operations of its own; T-E1's
   mitigation status is unchanged (nothing here is wired into a real
   run). Linux CI validation is still pending.
+- **Milestone 3 Slice 3B-3** (durable checkpoint-ref transition-
+  publication seam), per
+  `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  Amendment 4, **is implemented and locally validated on macOS
+  (2026-09-23)**. `checkpoint_session.py` gains a structural
+  `CheckpointTransitionPublisher` Protocol (`publish(transition) ->
+  None`) and an optional, keyword-only `transition_publisher`
+  constructor parameter on `CheckpointSession`, defaulting to `None` —
+  every existing caller remains source-compatible and behaviorally
+  unchanged when the publisher is omitted, and the pre-existing
+  behavioral tests in `test_checkpoint_session.py` continue to pass
+  (the file's own static import-boundary assertion was deliberately
+  updated to admit the new `typing` import).
+  Assignment-first ordering is preserved deliberately: each
+  `establish()`/`advance()`/`delete()` transitional intent is assigned
+  to `self._transition` and published *before* the corresponding
+  `CheckpointRef` mutation runs — if publication raises there, the Git
+  call is never reached, the exception propagates unchanged, and the
+  in-memory transition stays exactly the transitional value just
+  assigned. After a confirmed Git outcome, the collapse is assigned and
+  published; a failure there doesn't undo the Git result, and the
+  in-memory transition stays the decided collapse regardless. For
+  `establish()`/`advance()`'s confirmed-`UNCHANGED` recovery path, the
+  recovery collapse is published before the original `CheckpointRefError`
+  is re-raised; if that publication itself fails, its exception is
+  raised **explicitly** `from` the original error (deliberate chaining,
+  not incidental `__context__`) — named **projection-consistency
+  failure dominance**, a distinct rule from this repository's existing
+  cleanup-dominance convention. `lifecycle_store.py` gains
+  `LifecycleCheckpointRefPublisher`, wrapping a
+  `_LifecycleProjectionWriter` and tracking its own `current` expected
+  `LifecycleProjection`: `publish()` does not catch or translate
+  anything, so `current` replaces its stored value only after a
+  confirmed successful write and every `LifecycleStoreError` the writer
+  or its fresh authoritative-projection load can raise — including but
+  not limited to `STALE_EXPECTED_PROJECTION`, `WRONG_LOCK_SCOPE`,
+  `ILLEGAL_TRANSITION`, both publication-failure reasons,
+  `CLEANUP_UNCONFIRMED`, `SCHEMA_INVALID`, and `SUBSTRATE_UNAVAILABLE` —
+  propagates unchanged with `current` left untouched,
+  `PROJECTION_DURABILITY_UNCONFIRMED` never silently treated as
+  success; an explicit `refresh()` method
+  (never called automatically) recovers the currently installed
+  authoritative projection after a durability-unconfirmed result.
+  Neither side retries anything automatically. Proven real: a full
+  end-to-end integration test uses a real temporary repo, real
+  `prepare_lifecycle()`, a real lease/writer/adapter, a real
+  `CheckpointRef`, and a real `CheckpointSession` — `establish()`/
+  `advance()`/`delete()` each durably publish, and the durable
+  `lifecycle.json` is reloaded and compared against the real ref's
+  actual state after each call, with no mocking of the writer anywhere
+  in that test. Verified: `test_checkpoint_session.py` alone, 133
+  passed (up from 111); `test_lifecycle_store.py` +
+  `test_checkpoint_session.py` + `test_reconciliation.py` together, 349
+  passed; the eight-file focused set collected and passed together,
+  696 passed, in both forward and reverse file order; the full local
+  suite (macOS), with a real Docker daemon and
+  `CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a failure): the 3
+  dedicated real-Docker tests, 3 passed, 0 skipped; the complete suite,
+  2,329 passed, 0 skipped; no leftover `codeagent-verify` containers,
+  extra worktrees, `refs/codeagent` refs, child processes, or temp
+  state roots afterward. **Not implemented**: any `RunController`
+  wiring or error translation (the controller today catches only
+  `CheckpointRefError`/`CheckpointSessionError`; a publisher's
+  `LifecycleStoreError` is a new family future wiring must explicitly
+  translate — this slice does not claim readiness for that
+  integration), `executor.py`/`workspace.py` changes, container/
+  worktree writing, resource removal, abandonment, CLI. No new legal
+  checkpoint-ref transition edge — Amendment 3's tables are unchanged.
+  `docs/threat-model.md` is unchanged: nothing here is wired into a
+  real run. This slice performs no Docker operations of its own; T-E1's
+  mitigation status is unchanged. Linux CI validation is still pending.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

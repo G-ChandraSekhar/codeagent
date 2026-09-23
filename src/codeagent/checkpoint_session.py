@@ -93,6 +93,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum, unique
+from typing import Protocol
 
 from codeagent.checkpoint_ref import (
     CheckpointRef,
@@ -173,7 +174,9 @@ def _require_oid_shape(name: str, value: str) -> None:
 @dataclass(frozen=True)
 class CheckpointTransition:
     """One write-ahead checkpoint-ref transition record (ADR 0004
-    section 5), held in memory only.
+    section 5). `CheckpointSession` always holds it in memory; when
+    configured with a `CheckpointTransitionPublisher` (Slice 3B-3), it
+    is also synchronously offered to that publication boundary.
 
     Field names are ADR 0004's verbatim, so Milestone 3's durable
     lifecycle store serializes this object rather than translating it.
@@ -249,9 +252,34 @@ _REQUIRED_FIELD_PRESENCE: dict[CheckpointIntent, tuple[bool, bool, bool]] = {
 ABSENT_TRANSITION = CheckpointTransition(intent=CheckpointIntent.ABSENT)
 
 
+class CheckpointTransitionPublisher(Protocol):
+    """Optional structural seam (Milestone 3 Slice 3B-3, ADR 0004
+    Amendment 4): anything with a `publish(transition)` method. This
+    module never imports a concrete implementation -- `lifecycle_store.
+    LifecycleCheckpointRefPublisher` is the one Milestone 3 provides,
+    constructed and injected by whichever later slice wires a real
+    `LifecycleLease` in. `publish()` is called synchronously, in the
+    exact places `self._transition` itself changes. A raised exception
+    is never wrapped, translated, or swallowed by this module. The one
+    exception is during confirmed-`UNCHANGED` recovery: this module
+    deliberately catches a publisher exception there solely to raise
+    that same exception instance explicitly `from` the existing
+    `CheckpointRefError`, establishing projection-consistency failure
+    dominance without changing the publisher exception's type or
+    identity -- see `establish`/`advance`/`delete` for the precise
+    ordering and failure semantics.
+    """
+
+    def publish(self, transition: CheckpointTransition) -> None: ...
+
+
 class CheckpointSession:
     """Drives one lifecycle's checkpoint ref through write-ahead
-    intent, holding the transition record **in memory only**.
+    intent. The transition record is always held in memory; without a
+    configured `transition_publisher` it remains memory-only, and with
+    one, every change is also synchronously offered to the configured
+    publication boundary at the documented write-ahead/collapse
+    moments.
 
     Each operation records its intent first, calls the wrapped
     `CheckpointRef` exactly once, then collapses the record according to
@@ -259,11 +287,29 @@ class CheckpointSession:
     (or deliberately left transitional) and the original
     `CheckpointRefError` is re-raised unchanged, so the caller can
     translate that single occurrence into a single `OperationalError`.
+
+    An optional `transition_publisher` (Slice 3B-3) is called every time
+    `self._transition` changes -- before the corresponding Git mutation
+    for a fresh transitional intent, and again after a confirmed
+    collapse -- so a caller with one configured gets a durable write-
+    ahead record for free, at exactly the ADR 0004 section 5 moments
+    that record requires. Defaulting to `None` preserves every existing
+    caller's behavior exactly: `_publish` no-ops when unset.
     """
 
-    def __init__(self, checkpoint_ref: CheckpointRef) -> None:
+    def __init__(
+        self,
+        checkpoint_ref: CheckpointRef,
+        *,
+        transition_publisher: CheckpointTransitionPublisher | None = None,
+    ) -> None:
         self._ref = checkpoint_ref
         self._transition = ABSENT_TRANSITION
+        self._transition_publisher = transition_publisher
+
+    def _publish(self, transition: CheckpointTransition) -> None:
+        if self._transition_publisher is not None:
+            self._transition_publisher.publish(transition)
 
     @property
     def transition(self) -> CheckpointTransition:
@@ -293,31 +339,59 @@ class CheckpointSession:
 
     def establish(self, initial_sha: str) -> None:
         """Create the ref at the starting commit (ADR 0003 Amendment 1
-        point 4's "establish, then rely"). Legal only from `absent`."""
+        point 4's "establish, then rely"). Legal only from `absent`.
+
+        Assignment-first ordering (Slice 3B-3): the transitional intent
+        is assigned to `self._transition` and published *before*
+        `self._ref.create()` is ever called. If publication raises,
+        `create()` is never reached, the publication exception
+        propagates unchanged, and `self._transition` remains the
+        transitional intent just assigned -- no rollback, no retry.
+        """
         self._require_intent(
             CheckpointIntent.ABSENT,
             operation="establish",
         )
         self._validate_against_repository("initial_sha", initial_sha)
 
-        self._transition = CheckpointTransition(
+        transitional = CheckpointTransition(
             intent=CheckpointIntent.CREATING, proposed_new_sha=initial_sha
         )
+        self._transition = transitional
+        self._publish(transitional)
+
         try:
             self._ref.create(initial_sha)
         except CheckpointRefError as exc:
             if self._effective_outcome(exc) is MutationOutcome.UNCHANGED:
                 # Confirmed still absent: nothing was created.
-                self._transition = ABSENT_TRANSITION
+                recovery = ABSENT_TRANSITION
+                self._transition = recovery
+                try:
+                    self._publish(recovery)
+                except Exception as publish_exc:
+                    # Projection-consistency failure dominance (distinct
+                    # from the repository's cleanup-dominance rule):
+                    # this durable-record failure, not the original Git
+                    # error, is what the caller must react to.
+                    # Deliberately chained, not left to incidental
+                    # `__context__`.
+                    raise publish_exc from exc
             raise
-        self._transition = CheckpointTransition(
+        collapse = CheckpointTransition(
             intent=CheckpointIntent.PRESENT, accepted_sha=initial_sha
         )
+        self._transition = collapse
+        self._publish(collapse)
 
     def advance(self, new_sha: str) -> None:
         """Move the ref to a newly accepted checkpoint by compare-and-
         swap against the currently accepted one. Legal only from
-        `present`."""
+        `present`.
+
+        Assignment-first ordering identical to `establish()`: see that
+        method's docstring for the exact publication-failure semantics.
+        """
         self._require_intent(CheckpointIntent.PRESENT, operation="advance")
         self._validate_against_repository("new_sha", new_sha)
 
@@ -329,31 +403,41 @@ class CheckpointSession:
                 "advance requires a new_sha that differs from the accepted checkpoint",
             )
 
-        self._transition = CheckpointTransition(
+        transitional = CheckpointTransition(
             intent=CheckpointIntent.ADVANCING,
             accepted_sha=accepted,
             expected_old_sha=accepted,
             proposed_new_sha=new_sha,
         )
+        self._transition = transitional
+        self._publish(transitional)
+
         try:
             self._ref.advance(expected_old_oid=accepted, new_oid=new_sha)
         except CheckpointRefError as exc:
             if self._effective_outcome(exc) is MutationOutcome.UNCHANGED:
                 # Confirmed still at the old value: the commit is
                 # unaccepted, and the previous checkpoint still stands.
-                self._transition = CheckpointTransition(
+                recovery = CheckpointTransition(
                     intent=CheckpointIntent.PRESENT, accepted_sha=accepted
                 )
+                self._transition = recovery
+                try:
+                    self._publish(recovery)
+                except Exception as publish_exc:
+                    raise publish_exc from exc
             raise
-        self._transition = CheckpointTransition(
+        collapse = CheckpointTransition(
             intent=CheckpointIntent.PRESENT, accepted_sha=new_sha
         )
+        self._transition = collapse
+        self._publish(collapse)
 
     def delete(self) -> None:
         """Delete the ref by compare-and-swap against the accepted
         checkpoint. Legal only from `present`; a no-op from `absent`
-        (nothing was ever created, so there is nothing to confirm and
-        no Git call is made).
+        (nothing was ever created, so there is nothing to confirm, no
+        Git call is made, and nothing is published).
 
         Refused from every transitional state, `removing` included.
         Retrying a delete from `removing` looks harmless — same
@@ -364,6 +448,15 @@ class CheckpointSession:
         blindly. Distinguishing them requires a fresh inspection of the
         live ref, which is ADR 0004 section 8 dead-run reconciliation —
         Milestone 3 work, and the owner of any later deletion retry.
+
+        Assignment-first ordering identical to `establish()`: the
+        `removing` transitional intent is published before
+        `self._ref.delete()` is called. Unlike `establish()`/
+        `advance()`, there is no recovery-collapse branch on failure —
+        any failure here leaves the record in `removing` (already
+        published) for terminal cleanup-unconfirmed handling, and the
+        original error propagates unchanged with no further publish
+        attempt.
         """
         if self._transition.intent is CheckpointIntent.ABSENT:
             return
@@ -371,16 +464,21 @@ class CheckpointSession:
 
         accepted = self._transition.accepted_sha
         assert accepted is not None  # guaranteed by the `present` record shape
-        self._transition = CheckpointTransition(
+        transitional = CheckpointTransition(
             intent=CheckpointIntent.REMOVING,
             accepted_sha=accepted,
             expected_old_sha=accepted,
         )
+        self._transition = transitional
+        self._publish(transitional)
+
         self._ref.delete(expected_oid=accepted)
         # Only a normal return means APPLIED (confirmed absent). Any
         # failure leaves the record in `removing` for terminal
         # cleanup-unconfirmed handling, and propagates unchanged.
-        self._transition = ABSENT_TRANSITION
+        collapse = ABSENT_TRANSITION
+        self._transition = collapse
+        self._publish(collapse)
 
     def _require_intent(self, expected: CheckpointIntent, *, operation: str) -> None:
         if self._transition.intent is not expected:
