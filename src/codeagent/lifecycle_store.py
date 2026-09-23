@@ -27,22 +27,29 @@ attempted regardless of an earlier step's outcome, with a cleanup
 failure dominating and chaining from whatever failure was already
 active.
 
-Not implemented here (later Milestone 3 slices): automatic
-reconciliation (to be inserted after repository-lock acquisition and
-repository-identity validation but before lifecycle-ID generation),
-abandonment, the maintenance trace, container/worktree/checkpoint-ref
-attribution or mutation of any kind, and any `RunController`/CLI
-wiring. This module is deliberately unwired. T-E1 (concurrent runs
-against the same repository) is therefore **not** mitigated by this
-slice alone: nothing yet calls this composition before a real run
-starts.
+Slice 3B-1 (ADR 0004 Amendment 2, `reconciliation.py`) now also wires
+automatic pre-run reconciliation in, immediately after
+`load_or_create_repo_json` and before a lifecycle_id is ever minted —
+recognizing and reconciling only the initial all-absent
+`PREPARING`/`RECONCILING` shape; it never removes an external resource.
+
+Not implemented here (later Milestone 3 slices): abandonment, the
+maintenance trace's `explicit` trigger and CLI, container/worktree/
+checkpoint-ref attribution or *removal* of any kind, and any
+`RunController`/CLI wiring. This module is deliberately unwired. T-E1
+(concurrent runs against the same repository) is therefore **still not
+fully mitigated**: nothing yet calls this composition before a real run
+starts, though a call that does happen now also reconciles a dead
+prior run first.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import re
-from dataclasses import dataclass
+import stat
+from dataclasses import dataclass, replace
 from enum import Enum, unique
 from pathlib import Path
 
@@ -51,11 +58,16 @@ from ._lifecycle_fs import (
     STORED_PATH_MAX_FS_BYTES,
     LifecycleFsError,
     LifecycleFsFailure,
+    _assert_cloexec,
+    _cloexec_flag,
+    _nofollow_flag,
     canonical_json_dumps,
+    canonical_json_loads_strict,
     close_confirmed,
     create_exclusive_directory_at,
     open_managed_directory_chain,
     publish_private_file_atomically_at,
+    read_all_eintr_safe,
     resolve_state_root_path,
     validate_hex32,
 )
@@ -188,6 +200,10 @@ class LifecycleStoreFailure(str, Enum):
     # durability confirmation failed. lifecycle.json is never deleted
     # or reverted for this reason.
     PROJECTION_DURABILITY_UNCONFIRMED = "projection_durability_unconfirmed"
+    # Slice 3B-1 (ADR 0004 Amendment 2): the automatic pre-run
+    # reconciliation pass found at least one unresolved entry and
+    # refused to mint a new lifecycle_id or create a new run directory.
+    RECONCILIATION_BLOCKED = "reconciliation_blocked"
 
 
 class LifecycleStoreError(Exception):
@@ -518,6 +534,206 @@ def _encode_and_bound_projection(projection: LifecycleProjection) -> bytes:
     return data
 
 
+def _projection_from_dict(payload: dict) -> LifecycleProjection:
+    """Inverse of `projection_to_dict`. Called only after
+    `validate_lifecycle_json_schema` has already accepted `payload` —
+    every field access below is therefore known-shape."""
+    containers = payload["containers"]
+    baseline = containers["baseline"]
+    verification = containers["verification"]
+    worktree = payload["worktree"]
+    ref = payload["checkpoint_ref"]
+    failure = payload["failure"]
+    reconciliation = payload["reconciliation"]
+    return LifecycleProjection(
+        schema_version=payload["schema_version"],
+        lifecycle_id=payload["lifecycle_id"],
+        state_root_id=payload["state_root_id"],
+        repo_key=payload["repo_key"],
+        run_id=payload["run_id"],
+        source_repo_path=payload["source_repo_path"],
+        state=LifecycleState(payload["state"]),
+        baseline=ContainerAttribution(intent=ContainerIntent(baseline["intent"]), id=baseline["id"]),
+        verification=ContainerAttribution(intent=ContainerIntent(verification["intent"]), id=verification["id"]),
+        worktree=WorktreeAttribution(
+            intent=WorktreeIntent(worktree["intent"]), expected_head=worktree["expected_head"]
+        ),
+        checkpoint_ref=CheckpointTransition(
+            intent=CheckpointIntent(ref["intent"]),
+            accepted_sha=ref["accepted_sha"],
+            expected_old_sha=ref["expected_old_sha"],
+            proposed_new_sha=ref["proposed_new_sha"],
+        ),
+        failure=FailureDetail(phase=failure["phase"], detail=failure["detail"]) if failure is not None else None,
+        reconciliation=ReconciliationSummary(
+            attempts_total=reconciliation["attempts_total"],
+            recent_failures=tuple(reconciliation["recent_failures"]),
+        ),
+    )
+
+
+def load_lifecycle_projection(
+    run_dir_fd: int,
+    *,
+    object_format: str,
+    expected_lifecycle_id: str,
+    expected_repo_key: str,
+    expected_state_root_id: str,
+) -> LifecycleProjection:
+    """Read and fully validate `lifecycle.json` beneath the caller's own
+    open `run_dir_fd` (Milestone 3 Slice 3B-1, ADR 0004 Amendment 2).
+
+    Fixed-name, fd-relative, `O_NOFOLLOW` open — never a fresh
+    full-pathname lookup. The opened descriptor is authoritative: every
+    check below (`fstat`, size, ownership, permissions, link count) is
+    performed on the open file descriptor itself, never re-derived from
+    a separate path-based check. A missing file, a symlink, a
+    hard-linked file (`st_nlink != 1`), unsafe ownership or permissions,
+    an oversized file, malformed or duplicate-keyed JSON, a
+    schema-invalid payload, or a mismatch against the separately
+    supplied trusted `expected_lifecycle_id`/`expected_repo_key`/
+    `expected_state_root_id` are all `LifecycleStoreError(SCHEMA_INVALID)`
+    — a run directory without a valid, identity-matched projection is
+    never distinguished from one that is merely corrupt, and is never
+    repaired, deleted, or adopted automatically (ADR 0004 Amendment 2
+    section 7 — future abandonment is the designed recovery path). A
+    genuine I/O failure (not "the file doesn't exist") is
+    `LifecycleStoreError(SUBSTRATE_UNAVAILABLE)`.
+    """
+    try:
+        fd = os.open(
+            LIFECYCLE_JSON_FILENAME,
+            os.O_RDONLY | _nofollow_flag() | _cloexec_flag(),
+            dir_fd=run_dir_fd,
+        )
+    except OSError as exc:
+        # A positively observed wrong state -- the file is genuinely
+        # absent, or O_NOFOLLOW positively refused a symlink at that
+        # name -- is REFUSED (SCHEMA_INVALID): never distinguished from
+        # "the projection is corrupt," per this function's own accepted
+        # contract. Any other open failure (permission truly denied at
+        # the OS level, a resource-exhaustion error, an I/O error) is a
+        # genuine inability to inspect, not an observed bad shape, and
+        # must not be conflated with it.
+        if exc.errno in (errno.ENOENT, errno.ELOOP):
+            raise LifecycleStoreError(
+                LifecycleStoreFailure.SCHEMA_INVALID,
+                "lifecycle.json is missing or a symlink",
+            ) from None
+        raise LifecycleStoreError(
+            LifecycleStoreFailure.SUBSTRATE_UNAVAILABLE,
+            "lifecycle.json could not be opened",
+        ) from exc
+
+    try:
+        payload = _read_and_validate_lifecycle_fd(
+            fd,
+            object_format=object_format,
+            expected_lifecycle_id=expected_lifecycle_id,
+            expected_repo_key=expected_repo_key,
+            expected_state_root_id=expected_state_root_id,
+        )
+    except BaseException as exc:
+        _close_or_chain([fd], exc)
+        raise
+    else:
+        _close_or_chain([fd], None)
+
+    return _projection_from_dict(payload)
+
+
+def _read_and_validate_lifecycle_fd(
+    fd: int,
+    *,
+    object_format: str,
+    expected_lifecycle_id: str,
+    expected_repo_key: str,
+    expected_state_root_id: str,
+) -> dict:
+    try:
+        _assert_cloexec(fd)
+    except LifecycleFsError as exc:
+        raise LifecycleStoreError(
+            LifecycleStoreFailure.SUBSTRATE_UNAVAILABLE,
+            "lifecycle.json's descriptor is not non-inheritable",
+        ) from exc
+
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        raise LifecycleStoreError(
+            LifecycleStoreFailure.SUBSTRATE_UNAVAILABLE, "lifecycle.json could not be inspected"
+        ) from None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise LifecycleStoreError(LifecycleStoreFailure.SCHEMA_INVALID, "lifecycle.json is not a regular file")
+    if st.st_nlink != 1:
+        raise LifecycleStoreError(LifecycleStoreFailure.SCHEMA_INVALID, "lifecycle.json is unexpectedly hard-linked")
+    if st.st_uid != os.getuid():
+        raise LifecycleStoreError(
+            LifecycleStoreFailure.SCHEMA_INVALID, "lifecycle.json is not owned by the current user"
+        )
+    if st.st_mode & 0o077:
+        raise LifecycleStoreError(LifecycleStoreFailure.SCHEMA_INVALID, "lifecycle.json has unsafe permissions")
+    if st.st_size > LIFECYCLE_JSON_MAX_BYTES:
+        raise LifecycleStoreError(LifecycleStoreFailure.SCHEMA_INVALID, "lifecycle.json exceeds its size bound")
+
+    try:
+        data = read_all_eintr_safe(fd, LIFECYCLE_JSON_MAX_BYTES)
+    except LifecycleFsError as exc:
+        raise LifecycleStoreError(LifecycleStoreFailure.SUBSTRATE_UNAVAILABLE, "lifecycle.json could not be read") from exc
+
+    try:
+        payload = canonical_json_loads_strict(data, max_bytes=LIFECYCLE_JSON_MAX_BYTES)
+    except LifecycleFsError:
+        raise LifecycleStoreError(
+            LifecycleStoreFailure.SCHEMA_INVALID, "lifecycle.json is corrupt and is never regenerated"
+        ) from None
+
+    payload = validate_lifecycle_json_schema(payload, object_format=object_format)
+
+    if (
+        payload["lifecycle_id"] != expected_lifecycle_id
+        or payload["repo_key"] != expected_repo_key
+        or payload["state_root_id"] != expected_state_root_id
+    ):
+        raise LifecycleStoreError(
+            LifecycleStoreFailure.SCHEMA_INVALID,
+            "lifecycle.json's recorded identity does not match its trusted expected identity",
+        )
+
+    return payload
+
+
+def _publish_projection_state(
+    run_dir_fd: int,
+    projection: LifecycleProjection,
+    *,
+    state: LifecycleState,
+    attempts_total: int,
+) -> LifecycleProjection:
+    """Publish `projection` with `state` and
+    `reconciliation.attempts_total` replaced, reusing the exact same
+    atomic-publish primitive and size bounds as the initial `PREPARING`
+    write (Milestone 3 Slice 3B-1). Every other field is unchanged.
+    Raises `LifecycleStoreError` classified by
+    `_classify_publication_failure` on any publication failure —
+    `PROJECTION_PUBLICATION_FAILED` (nothing installed) or
+    `PROJECTION_DURABILITY_UNCONFIRMED` (installed, directory-fsync
+    unconfirmed) — never conflated. Returns the updated in-memory
+    projection only on confirmed success."""
+    updated = replace(
+        projection,
+        state=state,
+        reconciliation=replace(projection.reconciliation, attempts_total=attempts_total),
+    )
+    data = _encode_and_bound_projection(updated)
+    try:
+        publish_private_file_atomically_at(run_dir_fd, LIFECYCLE_JSON_FILENAME, data, mode=0o600)
+    except LifecycleFsError as exc:
+        raise _classify_publication_failure(exc) from exc
+    return updated
+
+
 def _close_or_chain(fds: list[int], primary: BaseException | None) -> None:
     """This module's own copy of the established close-confirmed-or-
     chain pattern (`_lifecycle_fs.py`, `state_root.py`, and
@@ -665,16 +881,20 @@ def prepare_lifecycle(source_repo_path: Path | str, *, run_id: str) -> Lifecycle
     Returns an owned `LifecycleLease`; the caller is responsible for
     eventually calling `close()` (or using it as a context manager).
 
-    Deliberately not implemented here: automatic reconciliation (to be
-    inserted after repository-lock acquisition and repository-identity
-    validation, but before `new_lifecycle_id()` — i.e. exactly where
-    this function currently proceeds straight from `load_or_create_
-    repo_json` to minting a lifecycle id), abandonment, the maintenance
-    trace, and any container/worktree/checkpoint-ref mutation. This
-    function alone does **not** mitigate T-E1: nothing here refuses a
-    second concurrent run beyond the repository lock's own ordinary
-    non-blocking `BUSY` refusal, which is `acquire_repository_lock`'s
-    existing 3A-1 behavior, not a new guarantee this slice adds.
+    Now also runs automatic pre-run reconciliation (`reconciliation.
+    reconcile_repository`, Slice 3B-1) immediately after
+    `load_or_create_repo_json` and before `new_lifecycle_id()` — the
+    exact ADR 0004 section 16 insertion point. A blocked reconciliation
+    pass raises `LifecycleStoreError(RECONCILIATION_BLOCKED)` before a
+    lifecycle_id is minted or a run directory is created.
+
+    Deliberately not implemented here: abandonment, the maintenance
+    trace's `explicit` trigger, and any container/worktree/
+    checkpoint-ref *removal*. This function alone does **not** fully
+    mitigate T-E1: nothing here refuses a second *concurrent* run
+    beyond the repository lock's own ordinary non-blocking `BUSY`
+    refusal, which is `acquire_repository_lock`'s existing 3A-1
+    behavior — reconciliation only recovers a *dead* prior run.
     """
     if not isinstance(run_id, str) or not run_id:
         raise LifecycleStoreError(LifecycleStoreFailure.OVERSIZED, "run_id must be a nonempty string")
@@ -711,11 +931,31 @@ def prepare_lifecycle(source_repo_path: Path | str, *, run_id: str) -> Lifecycle
 
         validated_identity = load_or_create_repo_json(state_root, identity, repository_lock)
 
-        # --- Automatic pre-run reconciliation (ADR 0004 Amendment 1
-        # section 10) belongs exactly here in a later Milestone 3
-        # slice: after repository-lock acquisition and repository-
-        # identity validation, but before a new lifecycle_id is ever
-        # minted. Not implemented in this slice. ---
+        # Automatic pre-run reconciliation (ADR 0004 Amendment 1
+        # section 10, Amendment 2 — Milestone 3 Slice 3B-1): after
+        # repository-lock acquisition and repository-identity
+        # validation, but before a new lifecycle_id is ever minted.
+        # Imported lazily to avoid a module import cycle
+        # (reconciliation.py imports several names from this module).
+        from .reconciliation import ReconciliationError, reconcile_repository
+
+        try:
+            reconciliation_result = reconcile_repository(
+                state_root=state_root,
+                identity=validated_identity,
+                context=context,
+                repository_lock=repository_lock,
+            )
+        except ReconciliationError as exc:
+            raise LifecycleStoreError(
+                LifecycleStoreFailure.RECONCILIATION_BLOCKED,
+                "automatic pre-run reconciliation could not complete and blocked this run",
+            ) from exc
+        if reconciliation_result.blocked:
+            raise LifecycleStoreError(
+                LifecycleStoreFailure.RECONCILIATION_BLOCKED,
+                "automatic pre-run reconciliation found an unresolved entry and blocked this run",
+            )
 
         lifecycle_id = new_lifecycle_id()
 

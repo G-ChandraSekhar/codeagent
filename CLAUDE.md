@@ -573,14 +573,107 @@ Stage 2 (of the four-stage planning process in
   lock and the lifecycle lock are cross-process exclusive, and a real
   SIGKILL test confirms a fresh process can still acquire both locks
   afterward, creating a new, separate lifecycle_id/run directory
-  rather than adopting the dead run's own directory. **Unwired**: no
-  `RunController` or CLI integration exists yet. **Not implemented**:
-  automatic pre-run reconciliation, abandonment, the maintenance
-  trace, and any container/worktree/checkpoint-ref attribution or
-  mutation (a static AST-based test confirms none is reachable from
-  this module) — all later Milestone 3 work. **T-E1 is not mitigated
-  by this slice alone** (`docs/threat-model.md`): nothing yet calls
-  `prepare_lifecycle()` before a real run starts.
+  rather than adopting the dead run's own directory. **Not
+  implemented** (at the time this bullet was written; see the 3B-1
+  bullet below for what has since been added): automatic pre-run
+  reconciliation, abandonment, the maintenance trace, and any
+  container/worktree/checkpoint-ref attribution or mutation (a static
+  AST-based test confirms none is reachable from this module).
+- **Milestone 3 Slice 3B-1** (initial-shape automatic reconciliation),
+  per `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  Amendment 2, **is implemented and locally validated on macOS
+  (2026-09-22)**. `src/codeagent/reconciliation.py` implements
+  `reconcile_repository()`, wired into `lifecycle_store.
+  prepare_lifecycle()` at the exact documented insertion point — after
+  `load_or_create_repo_json()`, before a new `lifecycle_id` is ever
+  minted — while the repository lock is already held. It recognizes
+  and reconciles only entries whose durable state is `PREPARING` or
+  `RECONCILING` with the complete initial all-absent attribution shape
+  (both containers, worktree, and `checkpoint_ref` all `absent`,
+  `failure=null`): after a real, freshly performed `docker ps -a`
+  listing, a real `git worktree list --porcelain` listing, and a real
+  `CheckpointRef.observe()` all confirm absence, it writes
+  `RECONCILING → RECONCILED`. It **never removes or mutates** a
+  container, worktree, or checkpoint ref, and it never writes
+  `LifecycleState.RECONCILIATION_FAILED` (reserved for a later slice
+  with a real external mutation to give up on). A positively observed
+  wrong state (malformed name, symlink, wrong type/owner/permissions,
+  an unrecognized inner entry, a non-absent or corrupt/identity-
+  mismatched projection, or a resource actually found present) is
+  `REFUSED`; a genuine inspection or infrastructure failure is
+  `SUBSTRATE_UNAVAILABLE`; a busy lifecycle lock is `SKIPPED_ACTIVE`; a
+  recognized clean-final entry is `SKIPPED_TERMINAL` with zero lock or
+  inspection calls. Any of these blocks admission of the new run
+  (`LifecycleStoreError(RECONCILIATION_BLOCKED)`) before a lifecycle_id
+  is minted or a run directory is created. `lifecycle_store.py` gained
+  `load_lifecycle_projection()` (fd-relative, `O_NOFOLLOW`, exact
+  private-file validation including link-count, size-bounded, strict
+  JSON, object-format-aware schema validation, trusted-identity
+  comparison) and `_publish_projection_state()` (reusing the existing
+  atomic-publish primitive for the `RECONCILING`/`RECONCILED`
+  transitions). A one-exclusive-file-per-pass maintenance trace
+  (`repos/<repo_key>/maintenance/<maintenance_id>.jsonl`) records
+  `ReconciliationStarted`/`ReconciliationEntryRecorded`/
+  `ReconciliationFinished` events, each individually `fsync`ed;
+  inability to create, write, `fsync`, directory-`fsync`, or close this
+  trace also blocks admission in this slice (no controller, CLI, or
+  event sink yet exists through which an in-memory warning could
+  otherwise reach an operator). `reconciliation.attempts_total`
+  increments exactly once per fresh (non-resuming) `RECONCILING`
+  transition; a resumed `RECONCILING` (found by a later pass) redoes
+  inspection from scratch without incrementing again. A subsequent
+  correction pass (2026-09-22) fixed four confirmed defects without
+  changing this scope or vocabulary: unbounded Docker/Git inspection
+  (both now byte-capped with confirmed child termination on timeout or
+  overflow; worktree listing now NUL-delimited via `-z`, immune to a
+  registered path containing a newline); untrusted recognized inner
+  entries (`lifecycle.json`/`lifecycle.lock`/temp-leftover are now each
+  fd-relative, no-follow validated before being trusted, and a
+  recognized leftover's presence now actually reaches the maintenance
+  trace's `has_recognized_temp_leftover` field); three raw-error-
+  escape/descriptor-leak bugs in the maintenance-trace open path and
+  the pass-level directory opens; and an eroded REFUSED-vs-
+  SUBSTRATE_UNAVAILABLE distinction at three boundaries, now restored
+  via two shared classification helpers. See `ENGINEERING_LOG.md`'s
+  dated correction-pass entry for exact detail. Verified: the
+  eight-file focused set (`test_lifecycle_fs.py`, `test_repo_
+  identity.py`, `test_state_locks.py`, `test_state_root.py`,
+  `test_lifecycle_store.py`, `test_checkpoint_session.py`,
+  `test_checkpoint_ref.py`, `test_reconciliation.py`) collected and
+  passed together, 616 passed, in both forward and reverse file order;
+  the full local suite (macOS), with a real Docker daemon and
+  `CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a failure): the 3
+  dedicated real-Docker tests (`tests/integration/test_slice_c.py`), 3
+  passed, 0 skipped; the complete suite, 2,249 passed, 0 skipped; no
+  leftover `codeagent-verify` containers, extra worktrees,
+  `refs/codeagent` refs, child processes, or temp state roots
+  afterward. A real cross-process test SIGKILLs a process immediately
+  after it durably publishes its initial `PREPARING` projection; a
+  fresh process's own `prepare_lifecycle()` call then performs genuine
+  Docker/Git/ref absence inspection, reconciles the dead entry to
+  `RECONCILED`, and only then mints its own separate lifecycle_id. A
+  second real test confirms `SKIPPED_ACTIVE` via a genuinely
+  inconsistent fixture (a process holding only the lifecycle lock,
+  never the repository lock — the only way to reach that state, since
+  a correct owner always holds the repository lock too while it holds
+  the lifecycle lock). **Not implemented**: any container/worktree/
+  checkpoint-ref *removal*, abandonment, the explicit `codeagent
+  reconcile`/`--abandon` CLI, retention, and `RunController`/CLI wiring
+  of `prepare_lifecycle()` itself — all later Milestone 3 work.
+  **Named residual risk**: a crash inside `prepare_lifecycle()` between
+  run-directory creation and initial-projection publish leaves a run
+  directory with no valid `lifecycle.json`, which this slice correctly
+  refuses (`REFUSED`) rather than adopts or repairs — that repository
+  then stays blocked until abandonment (not yet implemented) exists;
+  three pre-existing `test_lifecycle_store.py` tests that previously
+  asserted "a fresh retry succeeds" after leaving exactly this leftover
+  state were updated to assert the new, correct `RECONCILIATION_BLOCKED`
+  outcome instead. **T-E1 is now partially mitigated**
+  (`docs/threat-model.md`): a dead prior run in the current repository
+  is now recovered automatically before a new run is admitted, but
+  nothing yet calls `prepare_lifecycle()` before a real run starts, so
+  concurrent-run refusal still depends only on the repository lock's
+  ordinary `BUSY` behavior. Linux CI validation is still pending.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

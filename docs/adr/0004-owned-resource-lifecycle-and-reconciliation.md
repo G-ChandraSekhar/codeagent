@@ -1367,3 +1367,166 @@ reachable from this module). Nothing from this slice is wired into
 alone** (`docs/threat-model.md`): nothing yet calls `prepare_lifecycle()`
 before a real run starts. This note does not amend or restate the
 accepted design above it — it records implementation status only.
+
+---
+
+## Amendment 2 (Accepted 2026-09-22): Milestone 3 Slice 3B-1 — initial-shape automatic reconciliation
+
+Implementation status: **implemented.** This amendment fills in the
+durable decisions §10/§12 leave unpinned, narrowed to the one slice
+this repository actually builds. It does not reverse any earlier
+decision.
+
+### 1. Narrow slice boundary
+
+Slice 3B-1 recognizes and reconciles only entries whose durable state
+is `PREPARING` or `RECONCILING` **and** whose attribution is the
+complete initial absent shape: both containers `{intent: absent, id:
+null}`, worktree `{intent: absent, expected_head: null}`,
+`checkpoint_ref` exactly `ABSENT_TRANSITION`, `failure: null`. After
+freshly confirming every recomputed external resource (both container
+role names, the recomputed worktree path, the recomputed checkpoint
+ref) is absent, it writes `RECONCILING → RECONCILED`. It never removes
+or mutates a container, worktree, or checkpoint ref, and it never
+writes `LifecycleState.RECONCILIATION_FAILED` — that state remains
+schema-defined but unwritten, reserved for a future slice that has a
+real reason to stop retrying automatically (this slice never does,
+because its only side effects are read-only inspection plus its own
+idempotent, freely-retryable projection writes).
+
+### 2. Clean-final cross-field invariant
+
+`SKIPPED_TERMINAL` (zero lock, inspection, or mutation calls) is
+returned only when `state ∈ {COMPLETE, RECONCILED}` **and** the same
+complete absent-shape invariant above holds. A terminal state with any
+non-absent attribution or a populated `failure` is `REFUSED`, never
+skipped — the state value alone is never sufficient.
+
+### 3. Enumeration classification
+
+Within `runs/` and within a validated run directory, a **positively
+observed** wrong state (malformed name, symlink, wrong type, wrong
+owner, unsafe permissions, or an unrecognized inner entry) is
+`REFUSED`; a **genuine inability to inspect** (a failed `stat`/`lstat`/
+`listdir` syscall) is `SUBSTRATE_UNAVAILABLE`. This extends I6/I7
+explicitly to this reconciliation substrate, which the original ADR
+text does not cover. A malformed entry directly beneath `runs/` aborts
+the whole pass before any legitimate entry is inspected or mutated,
+since `runs/` is the shared trust boundary every entry depends on; an
+unrecognized entry inside one otherwise-valid run directory refuses
+only that one `lifecycle_id`. Inside a run directory, only
+`lifecycle.json`, `lifecycle.lock`, and the exact temp-publication
+pattern `^\.lifecycle\.json\.tmp-[0-9a-f]{16}$` are recognized; a
+recognized temp leftover is never opened, trusted, or deleted, only
+noted in the maintenance trace.
+
+### 4. Maintenance-trace contract
+
+One exclusive private file per pass, `repos/<repo_key>/maintenance/
+<maintenance_id>.jsonl` (`maintenance_id`: 32 lowercase hex,
+`secrets.token_hex(16)`), never reopened or resumed by a later pass.
+Envelope: one canonical-JSON object per line, UTF-8, sorted keys. Every
+event carries `schema_version=1`, `event_type`, `maintenance_id`,
+`state_root_id`, `repo_key`, `trigger="pre_run"` (the only value this
+slice emits; `"explicit"` is reserved for a later CLI slice), and a
+fixed UTC second-precision timestamp
+(`strftime("%Y-%m-%dT%H:%M:%SZ")`). Event types: `ReconciliationStarted`,
+`ReconciliationEntryRecorded` (+ `lifecycle_id`, `run_id`, `outcome`,
+`attempt_number`, per-role container `{id, confirmed_absent}`,
+worktree `{confirmed_absent}`, checkpoint-ref `{ref_name,
+confirmed_absent}`, `has_recognized_temp_leftover` (boolean — see
+below), `detail`), `ReconciliationFinished` (+ per-outcome counts,
+`blocked`). `has_recognized_temp_leftover` is `true` only when
+reconciliation observed at least one valid, recognized lifecycle-
+publication temporary file (the exact `^\.lifecycle\.json\.tmp-
+[0-9a-f]{16}$` pattern, itself fd-relative, no-follow validated as a
+private regular file) in that run directory — diagnostic evidence
+only. It never means the file was opened, trusted, adopted, or
+deleted; the recognized leftover is left exactly as found either way.
+This is not a new decision: it is the explicit boolean representation
+of the requirement, already accepted when this slice was implemented,
+that a recognized temp leftover be noted in the maintenance trace
+rather than silently ignored. Bounds: `run_id` reuses `RUN_ID_MAX_ENCODED_BYTES`
+(256); `detail` reuses the existing 512-byte sanitized-detail bound;
+a new `CONTAINER_ID_MAX_BYTES` (128) and `ref_name` bound (128); a new
+whole-line bound `MAINTENANCE_EVENT_MAX_BYTES` (4096). Durability:
+every event is written and `fsync`ed individually (never batched); the
+`maintenance/` directory itself is `fsync`ed once, at file-creation
+time. A future reader must tolerate and discard an unparseable line
+only when it is the last line (the per-event `fsync`-before-next-write
+ordering guarantees nothing else can be torn). Ordering: an entry's
+trace event is written only after that entry's outcome is already
+known — the trace is retrospective, never write-ahead; the projection
+is the sole write-ahead-protected record.
+
+Authority: **failure to create, write, `fsync`, directory-`fsync`, or
+close the maintenance trace blocks admission of the new run in this
+slice.** Slice 3B-1 has no controller, CLI, event sink, or other
+observable channel through which an in-memory trace warning could ever
+reach an operator, so a silently incomplete or missing trace would be
+indistinguishable from one nobody ever looks at. This is a deliberate,
+narrow policy for this slice — a later wiring slice, once a real
+observable destination for such a warning exists, may revisit whether
+trace-write failure should still be blocking. Trace success is
+diagnostic evidence of a pass, never part of projection correctness
+itself: if an entry reaches durable `RECONCILED` before the trace
+finalizes, that entry's projection is correct and final regardless —
+the pass still blocks this run, but a later pass recognizes the
+already-clean-final entry via `SKIPPED_TERMINAL`, writes its own fresh,
+complete trace, and may then proceed.
+
+### 5. Attempt counting
+
+`reconciliation.attempts_total` counts durable reconciliation
+write-cycles, not process invocations or inspection attempts. It
+increments exactly once, at a fresh (non-`RECONCILING`-resuming)
+`PREPARING → RECONCILING` transition, and is carried forward unchanged
+by the subsequent `RECONCILING → RECONCILED` write. A process that
+finds a pre-existing `RECONCILING` projection treats it as continuing
+the already-counted cycle: it repeats inspection from scratch (safe,
+since inspection is read-only and idempotent) but does not increment
+again before writing `RECONCILED`. An inspection failure performs no
+projection write and cannot affect the durable counter. A
+pre-installation publication failure of the incrementing write leaves
+the previous durable value unchanged (the attempt happened but could
+not be recorded). An installed-but-durability-unconfirmed write leaves
+whatever complete, incremented value was actually installed.
+
+### 6. Outcome vocabulary
+
+Per-pass entry outcomes (§10, unchanged names): `RECONCILED`,
+`SKIPPED_TERMINAL`, `SKIPPED_ACTIVE`, `REFUSED`, `FAILED`,
+`SUBSTRATE_UNAVAILABLE`. `FAILED` covers both projection-publication
+failure modes this slice can produce — pre-installation failure and
+installed-but-durability-unconfirmed — distinguished only by their
+`detail` string, both meaning "mutation attempted but not confirmed;
+retried on later passes," per §10's own definition. `SKIPPED_ACTIVE`
+blocks the pass (an invariant violation while the repository lock is
+held, never treated as a benign concurrent run). A pass-level
+enumeration or maintenance-trace failure aborts the entire pass and is
+treated identically to `blocked=True`.
+
+### 7. Missing projection
+
+A run directory with no valid, identity-matched `lifecycle.json`
+(missing, symlinked, hard-linked, unsafe, malformed, or oversized) is
+`REFUSED`, exactly as any other corrupt or inconsistent state (I7). It
+is never automatically deleted, repaired, or adopted. The designed
+recovery path is future abandonment (§11, not yet implemented); until
+it exists, such an entry blocks its repository, a named residual risk
+of this slice.
+
+### Milestone boundary
+
+Slice 3B-1 owns exactly the above. Container/worktree/checkpoint-ref
+*removal*, `RECONCILIATION_FAILED`, abandonment, the explicit
+`codeagent reconcile`/`--abandon` CLI, retention, and
+`RunController`/CLI wiring of `prepare_lifecycle()` itself all remain
+later Milestone 3 work, unchanged in scope by this amendment.
+
+### Evidence
+
+`src/codeagent/reconciliation.py` and `tests/unit/test_reconciliation.py`
+implement and verify every rule above, including real cross-process
+SIGKILL-and-reconcile and real-Docker container/worktree/ref
+inspection; see `ENGINEERING_LOG.md`'s dated entry for exact totals.

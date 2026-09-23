@@ -1852,3 +1852,261 @@ It does not change scope: `prepare_lifecycle()` remains unwired from
 `RunController` and the CLI, T-E1 remains unmitigated for that reason,
 and automatic reconciliation, abandonment, the maintenance trace, and
 controller/CLI wiring remain later Milestone 3 work.
+
+## 2026-09-22: Milestone 3 Slice 3B-1 — initial-shape automatic reconciliation
+
+Implemented per ADR 0004 Amendment 2 (recorded in this same session,
+after a three-round narrowing pass: an initial full-cleanup proposal
+was rejected as too large; a first narrower "Slice 3B-1" boundary was
+proposed and then corrected on ten separate points — clean-final
+cross-field invariants, a trusted API taking the caller's already-
+validated identity/context/lock rather than re-deriving them, safe
+fd-relative enumeration with an exact recognized-name policy, a
+precisely pinned maintenance-trace contract, a corrected SIGKILL model,
+attempt-counting semantics, the restored `FAILED` outcome, maintenance-
+trace blocking authority, and an exact REFUSED-vs-SUBSTRATE_UNAVAILABLE
+enumeration mapping — before implementation began).
+
+`src/codeagent/reconciliation.py` (new) implements `reconcile_
+repository()`: enumerates and prevalidates the complete `repos/<repo_
+key>/runs/` namespace (sorted, fd-relative, no-follow) before touching
+any legitimate entry — a positively observed malformed name, symlink,
+wrong type, wrong owner, or unsafe permissions aborts the whole pass as
+`REFUSED`; a genuine inspection failure aborts as `SUBSTRATE_
+UNAVAILABLE`. For each entry: a pre-lock terminal peek recognizes only
+`COMPLETE`/`RECONCILED` with the complete absent-attribution shape as
+`SKIPPED_TERMINAL` (zero lock or inspection calls) — a terminal state
+with any non-absent field is `REFUSED`, never skipped. A nonterminal
+`PREPARING`/`RECONCILING` entry in the same absent shape acquires its
+lifecycle lock non-blocking (busy → `SKIPPED_ACTIVE`, which blocks the
+pass — an invariant violation while the repository lock is held, never
+treated as a benign concurrent run), re-reads the projection fresh, and
+performs real inspection: an unfiltered `docker ps -a --no-trunc`
+listing, a real `git worktree list --porcelain` listing via the shared
+hardened `run_git` seam, and a real `CheckpointRef.observe()` (its
+independently rediscovered object format is compared against the
+trusted `RepositoryIdentity` and refused on disagreement). Any resource
+found present, or any inspection failure, produces `REFUSED`/
+`SUBSTRATE_UNAVAILABLE` respectively with **zero projection write**.
+Only when everything is confirmed absent does it write `RECONCILING`
+(incrementing `reconciliation.attempts_total` exactly once, only on a
+fresh non-resuming transition) then `RECONCILED`. Both writes reuse the
+existing atomic-publish primitive; either one failing (pre-installation
+or installed-but-durability-unconfirmed) is `FAILED`, blocking, with
+the exact distinct surviving on-disk state asserted by tests. It never
+removes or mutates a container, worktree, or checkpoint ref, and never
+writes `LifecycleState.RECONCILIATION_FAILED` (schema-defined,
+deliberately unwritten — reserved for a slice with a real external
+mutation to give up on, since this slice's own only side effects are
+read-only inspection plus its own freely-retryable projection writes).
+
+A one-exclusive-file-per-pass maintenance trace
+(`repos/<repo_key>/maintenance/<maintenance_id>.jsonl`, `O_CREAT|
+O_EXCL`, never reopened by a later pass) records `ReconciliationStarted`
+/`ReconciliationEntryRecorded`/`ReconciliationFinished`, each event
+individually written and `fsync`ed, with the containing directory
+`fsync`ed once at file-creation time, fixed UTC second-precision
+timestamps, and fixed bounds on every field (`CONTAINER_ID_MAX_BYTES`
+128, `MAINTENANCE_EVENT_MAX_BYTES` 4096, reusing the existing `run_id`
+and 512-byte detail bounds). Failure to create, write, `fsync`,
+directory-`fsync`, or close this trace also blocks admission in this
+slice — a deliberate, narrow policy recorded in the amendment, since
+this slice has no controller, CLI, or event sink through which an
+in-memory warning could otherwise ever reach an operator; a later
+wiring slice may revisit it once one exists.
+
+`lifecycle_store.py` gained `load_lifecycle_projection()` (fixed-name,
+fd-relative, `O_NOFOLLOW` open; the opened descriptor is authoritative
+for every check — regular-file type, `st_nlink == 1`, current-uid
+ownership, `0600`-or-narrower permissions, the existing size bound,
+strict duplicate-key-and-trailing-data-rejecting JSON, object-format-
+aware schema validation, and comparison against separately supplied
+trusted `lifecycle_id`/`repo_key`/`state_root_id` — never re-derived
+from a prior path-based check) and `_publish_projection_state()` (a
+thin wrapper reusing the exact existing atomic-publish primitive and
+size bounds for the `RECONCILING`/`RECONCILED` transitions). `reconcile_
+repository()` is wired into `prepare_lifecycle()` at the exact
+documented insertion point — the comment marker that had sat there
+since Slice 3A-2 — via a function-scoped import of `reconciliation.py`
+to avoid a module import cycle (`reconciliation.py` imports several
+names from `lifecycle_store.py`).
+
+**A genuine, expected behavior change surfaced three existing
+`test_lifecycle_store.py` tests as failing**, all for the same reason:
+each left a run directory durably created (with its lifecycle lock
+already acquired) but no `lifecycle.json` ever published into it — a
+crash-before-publish shape this slice correctly refuses (`REFUSED`,
+never adopted or repaired) rather than silently ignoring. One test
+additionally planted a hostile symlink directly under `runs/`, now
+caught by the shared-namespace prevalidation before ever reaching the
+old `create_exclusive_directory_at` collision check it originally
+exercised. All three were updated to assert the new, correct
+`RECONCILIATION_BLOCKED` outcome, with a comment explaining why —
+this is the named residual risk ADR 0004 Amendment 2 records (recovery
+requires future abandonment), not a regression.
+
+**A self-inflicted test bug found and fixed during verification**: the
+real-SIGKILL integration test initially called `importlib.reload()` on
+`lifecycle_store` in the surviving process after already importing
+`reconciliation` (which itself imports several names from `lifecycle_
+store`) at the test module's top level. Since `reload()` mutates a
+module's `__dict__` in place, this desynchronized enum class identity
+between `reconciliation.py`'s own old-bound `ContainerIntent`/
+`WorktreeIntent`/`LifecycleState` references and the new instances
+`load_lifecycle_projection` constructed after the reload — the same
+class of hazard already documented in this project's history for Slice
+3A-1's own correction pass. Fixed by removing the unnecessary reload
+entirely; no production code was involved.
+
+**Verified**: `py_compile` clean on all four changed/new files. The
+eight-file focused set (`test_lifecycle_fs.py`, `test_repo_identity.py`,
+`test_state_locks.py`, `test_state_root.py`, `test_lifecycle_store.py`,
+`test_checkpoint_session.py`, `test_checkpoint_ref.py`, `test_
+reconciliation.py`) collected and passed together, 596 passed, in both
+forward and reverse file order. `test_reconciliation.py` alone: 49
+passed (macOS, real Docker daemon, `CODEAGENT_REQUIRE_DOCKER=1`). Full
+local suite: 2,229 passed. With `CODEAGENT_REQUIRE_DOCKER=1` (a skip
+treated as a failure): the dedicated real-Docker step
+(`tests/integration/test_slice_c.py`), 3 passed, 0 skipped; the
+complete suite, 2,229 passed, 0 skipped; no leftover
+`codeagent-verify` containers, extra worktrees, `refs/codeagent` refs,
+child processes, or temp state roots afterward (`git worktree list`,
+`git for-each-ref refs/codeagent`, `docker ps -a`, `ps aux`, and a
+`/tmp`/scratch-directory scan all confirmed clean). `git diff --check`
+clean.
+
+Real cross-process tests: a process is SIGKILLed immediately after it
+durably publishes its initial `PREPARING` projection (still holding
+both locks, which the kernel releases on death); a fresh process's own
+`prepare_lifecycle()` call performs genuine Docker/Git/ref absence
+inspection against the real repository, reconciles the dead entry to
+`RECONCILED`, and only then mints its own separate lifecycle_id. A
+second real test confirms `SKIPPED_ACTIVE` via a deliberately
+inconsistent fixture — a subprocess holding only the lifecycle lock,
+never the repository lock, since a correct owner can never present that
+combination while the reconciler itself holds the repository lock (the
+prior proposal's "a live normal owner" framing was invalid for exactly
+this reason and was corrected before implementation).
+
+Not implemented, per Amendment 2's own accepted boundary: any
+container/worktree/checkpoint-ref *removal*, `RECONCILIATION_FAILED`,
+abandonment, the explicit `codeagent reconcile`/`--abandon` CLI, and
+any `RunController`/CLI wiring of `prepare_lifecycle()` itself. T-E1 is
+now partially mitigated: a dead prior run is recovered automatically,
+but concurrent-run refusal still depends only on the repository lock's
+existing `BUSY` behavior, since nothing yet calls `prepare_lifecycle()`
+before a real run starts. Linux CI validation is still pending for this
+slice.
+
+## 2026-09-22: Slice 3B-1 correction pass — bounded inspection, inner-entry validation, descriptor ownership, REFUSED/SUBSTRATE_UNAVAILABLE precision
+
+A focused review of the just-landed Slice 3B-1 implementation found four
+real defects, all independently verified against the code before being
+fixed (the architecture, scope, and outcome vocabulary itself were not
+revisited):
+
+1. **Unbounded external inspection.** `_docker_ps_all_names()` used
+   `subprocess.run(capture_output=True)` (no byte cap), and
+   `_worktree_registered_paths()` used the ordinary `run_git()` seam
+   (same). Fixed: Docker listing now uses a new bounded-read helper
+   (`_drain_bounded`/`_kill_and_confirm`, modeled directly on
+   `codeagent._git_safety`'s own private `_drain_stdout`/
+   `_terminate_and_confirm` shape, generalized for a non-Git
+   subprocess) with a 1 MiB cap and confirmed child termination on
+   timeout or overflow; worktree listing now reuses the existing
+   public `run_git_bounded()` primitive with the same cap, and adds
+   `-z` to `git worktree list --porcelain` so every field is
+   NUL-delimited rather than newline-delimited — a registered path
+   containing a newline (reproduced with a real worktree at a path
+   containing a literal newline component) can no longer be misparsed
+   or missed. Neither an overflow nor a timeout is ever silently
+   truncated into a partial "answer"; both are refused outright, since
+   a truncated worktree listing could otherwise produce a false
+   "absent" conclusion.
+2. **Untrusted inner entries.** `_check_inner_entries()` recognized
+   `lifecycle.json`/`lifecycle.lock`/the temp-publication pattern by
+   filename alone, with no fd-relative type/symlink/permission check —
+   a hostile symlinked or wrong-type `lifecycle.lock` next to a
+   terminal `RECONCILED` entry would previously have been silently
+   skipped as `SKIPPED_TERMINAL` without ever being inspected (zero
+   lock/inspection calls is exactly the terminal fast path's own
+   contract). Fixed: every recognized name is now independently
+   fd-relative, no-follow validated (regular file, current-uid owned,
+   no group/other permission bits); a positively observed violation is
+   `REFUSED`, a genuine inability to inspect is `SUBSTRATE_UNAVAILABLE`.
+   The function's return type is now a small typed result
+   (`_InnerEntriesCheck`) carrying `has_temp_leftover` all the way
+   through to the final `ReconciliationEntryResult` (previously
+   computed but discarded) and into the maintenance trace's
+   `has_recognized_temp_leftover` field, which the ADR requires and
+   this slice's first landing had silently dropped.
+3. **Maintenance-trace descriptor ownership.** `_open_maintenance_trace()`
+   had three real bugs: (a) a `close_confirmed([fd])` call inside its
+   own `except` handler could itself raise, letting a raw
+   `LifecycleFsError` escape a function that promises only
+   `ReconciliationError`; (b) the trailing `finally: close_confirmed
+   ([maintenance_dir_fd])` could likewise raise a raw error and, on the
+   success path, leave the just-created trace file's own descriptor
+   (`fd`) leaked with nothing left to ever close it; (c) `reconcile_
+   repository()`'s own `state_root.open_repo_dir()` and `open_managed_
+   directory_chain(repo_dir_fd, [RUNS_DIRNAME])` calls were entirely
+   unwrapped, relying on being incidentally caught by a broad
+   `except BaseException` and then re-raised **raw**. Fixed: every
+   descriptor now has an explicit ownership-transfer point (`fd` is
+   transferred to the returned `_MaintenanceTraceWriter` only on
+   confirmed final success; `maintenance_dir_fd` is never transferred
+   and is always closed by this function, attempted regardless of
+   outcome); a cleanup failure always dominates and chains from
+   whatever failure was already active, never from itself; and every
+   `LifecycleFsError`-raising call in this module is now wrapped at
+   its own site before it can propagate further.
+4. **Eroded REFUSED-vs-SUBSTRATE_UNAVAILABLE distinction.**
+   `lifecycle_store.load_lifecycle_projection()`'s `os.open()` call
+   mapped every `OSError` to `SCHEMA_INVALID` (→ `REFUSED`), including
+   genuine I/O failures that are not a positively observed bad shape;
+   `reconciliation._process_entry()` mapped every directory-open
+   `LifecycleFsError` to `REFUSED` regardless of its actual reason; and
+   `_check_inner_entries()`'s own listing failure was reported as a
+   bare refusal string, always classified `REFUSED` by its caller.
+   Fixed: `load_lifecycle_projection()` now inspects `errno` — `ENOENT`
+   (missing) and `ELOOP` (`O_NOFOLLOW` refusing a symlink) remain
+   `REFUSED`; any other `OSError` (permission genuinely denied at the
+   OS level, `EIO`, resource exhaustion) is `SUBSTRATE_UNAVAILABLE`.
+   Two new shared helpers, `_classify_pass_level_fs_failure()` and
+   `_classify_entry_fs_failure()`, apply the same rule (`LifecycleFsFailure.
+   SUBSTRATE_UNAVAILABLE`/`.CLEANUP_UNCONFIRMED` → `SUBSTRATE_UNAVAILABLE`;
+   every other reason, e.g. `SYMLINK_REFUSED`/`NOT_A_DIRECTORY`/
+   `UNSAFE_PERMISSIONS` → `REFUSED`) at every corrected boundary:
+   `_process_entry()`'s directory open, and the pass-level
+   `open_repo_dir()`/`runs/`/`maintenance/` opens from finding 3.
+
+**Verified**: `py_compile` clean on all three changed files. One
+pre-existing test (`test_recognized_temp_leftover_is_not_refused`)
+needed a one-line fix — it wrote its synthetic temp-leftover file with
+default (umask-derived) permissions, which the new fd-relative
+validation now correctly refuses as unsafe; the fix sets the same
+private `0600` mode the real publication primitive always uses.
+`test_reconciliation.py` alone: 69 passed (macOS, real Docker daemon,
+`CODEAGENT_REQUIRE_DOCKER=1`), up from 49 — 20 net additional collected
+tests (confirmed by `pytest --collect-only`), covering every finding
+above: bounded-read overflow/timeout with confirmed
+termination, Docker launch failure, bounded worktree-listing overflow,
+a real newline-containing worktree path parsed correctly by both the
+unit-level parser and a full reconciliation pass, symlinked/wrong-type
+recognized inner entries, inner-entry inspection failure, explicit
+maintenance-trace evidence for a recognized leftover, four
+maintenance-trace descriptor-ownership failure-injection scenarios
+including simultaneous primary-plus-cleanup failure, repository-
+directory open failure in both classifications, and REFUSED-vs-
+SUBSTRATE_UNAVAILABLE coverage at every corrected boundary). The
+eight-file focused set collected and passed together, 616 passed, in
+both forward and reverse file order. Full local suite: 2,249 passed.
+With `CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a failure): the
+dedicated real-Docker step (`tests/integration/test_slice_c.py`), 3
+passed, 0 skipped; the complete suite, 2,249 passed, 0 skipped; no
+leftover `codeagent` containers, extra worktrees, `refs/codeagent`
+refs, child processes, or temp state roots afterward. `git diff
+--check` clean. No architectural or scope change: the accepted Slice
+3B-1 boundary, outcome vocabulary, clean-final invariant, attempt-
+counting semantics, lock ordering, and no-removal boundary are all
+unchanged.

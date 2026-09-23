@@ -378,7 +378,12 @@ def test_hostile_preexisting_symlink_at_lifecycle_id_is_refused(tmp_path, monkey
     monkeypatch.setattr(ls, "new_lifecycle_id", lambda: fixed_id)
     with pytest.raises(ls.LifecycleStoreError) as excinfo:
         ls.prepare_lifecycle(str(repo), run_id="hostile")
-    assert excinfo.value.reason is ls.LifecycleStoreFailure.LIFECYCLE_ID_COLLISION
+    # Slice 3B-1: automatic pre-run reconciliation now enumerates the
+    # complete runs/ namespace before a lifecycle_id is ever minted, so
+    # this hostile symlink is caught there (REFUSED, aborting the whole
+    # pass) rather than later at `create_exclusive_directory_at`'s own
+    # collision check.
+    assert excinfo.value.reason is ls.LifecycleStoreFailure.RECONCILIATION_BLOCKED
     # The symlink itself is left in place -- never deleted or adopted.
     assert (runs_dir / fixed_id).is_symlink()
 
@@ -425,11 +430,21 @@ def test_source_repo_path_over_bound_refused_after_locks_still_cleans_up(tmp_pat
             ls.prepare_lifecycle(str(repo), run_id="run-1")
         assert excinfo.value.reason is ls.LifecycleStoreFailure.OVERSIZED
 
-    # A fresh, untampered attempt afterward must still succeed: the
-    # repository lock and state root were both released, and the
-    # tampering patch above no longer applies outside the `with` block.
-    lease = ls.prepare_lifecycle(str(repo), run_id="run-2")
-    lease.close()
+    # The repository lock and state root were both released, and the
+    # tampering patch above no longer applies outside the `with` block
+    # -- but the failed attempt already created a real run directory
+    # and acquired its lifecycle lock before the oversized-path check
+    # ran, so that directory durably exists with no `lifecycle.json`
+    # ever published into it. Slice 3B-1's automatic pre-run
+    # reconciliation (ADR 0004 Amendment 2 section 7) refuses exactly
+    # this shape -- a run directory without a valid, identity-matched
+    # projection is never adopted or repaired -- so a fresh attempt now
+    # correctly blocks rather than silently proceeding past it. This is
+    # the named residual risk in Amendment 2: recovery requires future
+    # abandonment, not implemented in this slice.
+    with pytest.raises(ls.LifecycleStoreError) as excinfo:
+        ls.prepare_lifecycle(str(repo), run_id="run-2")
+    assert excinfo.value.reason is ls.LifecycleStoreFailure.RECONCILIATION_BLOCKED
 
 
 def test_whole_projection_over_bound_refused(tmp_path, monkeypatch):
@@ -943,10 +958,16 @@ def test_write_failure_before_replace_leaves_no_lifecycle_json_and_cleans_temp(t
     assert ls.LIFECYCLE_JSON_FILENAME not in entries
     assert not any(name.startswith(f".{ls.LIFECYCLE_JSON_FILENAME}.tmp-") for name in entries)
 
-    # A fresh attempt afterward succeeds (locks were released; the
-    # write patch above no longer applies outside the `with` block).
-    lease = ls.prepare_lifecycle(str(repo), run_id="run-2")
-    lease.close()
+    # The locks were released, but the run directory above durably
+    # exists with no `lifecycle.json` ever published into it. Slice
+    # 3B-1's automatic pre-run reconciliation (ADR 0004 Amendment 2
+    # section 7) refuses exactly this shape rather than adopting or
+    # repairing it, so a fresh attempt now correctly blocks -- the
+    # named residual risk in Amendment 2 (recovery requires future
+    # abandonment, not implemented in this slice).
+    with pytest.raises(ls.LifecycleStoreError) as excinfo:
+        ls.prepare_lifecycle(str(repo), run_id="run-2")
+    assert excinfo.value.reason is ls.LifecycleStoreFailure.RECONCILIATION_BLOCKED
 
 
 def test_replace_failure_cleans_temp_and_leaves_no_final_file(tmp_path, monkeypatch):

@@ -635,40 +635,66 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   correction below)
 - Impact: metadata corruption, confusing/incorrect event traces, or a failed
   worktree operation
-- Implemented control: **not mitigated or resolved.** Milestone 3 Slice
-  3A-1 (`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`
+- Implemented control: **partially mitigated for a dead prior run;
+  concurrent live runs still not prevented in practice.** Milestone 3
+  Slice 3A-1 (`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`
   Amendment 1) implements the generic verified nonblocking lock
   primitive and `acquire_repository_lock` (`state_locks.py`), plus the
   trusted state-root and repository-identity substrate a run-level lock
   would key on (`state_root.py`, `repo_identity.py`). Slice 3A-2
-  (`lifecycle_store.py`) now additionally implements the composition
-  itself — Git preflight, repository-lock acquisition, an exclusively
-  created `runs/<lifecycle_id>/` directory, the lifecycle lock
+  (`lifecycle_store.py`) implements the composition itself — Git
+  preflight, repository-lock acquisition, an exclusively created
+  `runs/<lifecycle_id>/` directory, the lifecycle lock
   (`acquire_lifecycle_lock`), and an atomically published initial
   `PREPARING` `lifecycle.json` — and a real cross-process test confirms
   both locks are mutually exclusive between two separate OS processes.
-  None of this is wired into `RunController`, the CLI, or any other
-  entry point: nothing today actually calls this composition before a
-  real run starts, so two concurrent invocations against the same
-  repository are still not prevented in practice.
+  **Slice 3B-1 (Amendment 2) now additionally implements automatic
+  pre-run reconciliation** (`reconciliation.py`): wired into
+  `prepare_lifecycle()` at ADR 0004 §10's exact documented insertion
+  point (after repository-lock acquisition and repository-identity
+  validation, before a new lifecycle_id is minted), it recognizes a
+  dead prior run left in the initial `PREPARING`/`RECONCILING`
+  all-absent shape, performs real Docker/Git/checkpoint-ref absence
+  inspection, and reconciles it to `RECONCILED` before admitting the
+  new run — verified by a real cross-process test that SIGKILLs a
+  process right after its initial projection publish and confirms a
+  fresh process both reconciles the dead entry and mints its own
+  separate lifecycle_id. It only recognizes this one narrow shape: any
+  other persisted state, a non-absent attribution, a corrupt or
+  identity-mismatched projection, an ambiguity, or an inspection
+  failure blocks admission of the new run entirely
+  (`RECONCILIATION_BLOCKED`) rather than adopting or guessing. None of
+  this is wired into `RunController`, the CLI, or any other entry
+  point: nothing today actually calls `prepare_lifecycle()` before a
+  real run starts, so two concurrent *live* invocations against the
+  same repository are still not prevented in practice — reconciliation
+  only recovers a *dead* one.
 - Planned control: controller entry-gating on `prepare_lifecycle()`
-  before a run starts; automatic pre-run reconciliation of a dead run's
-  lock/lifecycle state (ADR 0004 §10, inserted after repository-lock
-  acquisition and repository-identity validation but before a new
-  lifecycle_id is minted); and abandonment (ADR 0004 §11) — all still
-  unimplemented
-- Evidence/future test: adversarial test starting two runs concurrently,
-  asserting the second is rejected rather than silently corrupting state
+  before a run starts; container/worktree/checkpoint-ref *removal*
+  during reconciliation for a non-absent dead-run shape (Slice 3B-1
+  deliberately does not attempt this); and abandonment (ADR 0004 §11)
+  — all still unimplemented
+- Evidence/future test: adversarial test starting two *live* runs
+  concurrently, asserting the second is rejected rather than silently
+  corrupting state (reconciliation alone does not address this, since
+  it only ever acts on a dead run whose lifecycle lock is free)
 - Residual risk: **accepted for v1 as a stated constraint, but not yet
-  enforced** — single-run-per-repository is a stated constraint
+  fully enforced** — single-run-per-repository is a stated constraint
   (`PROJECT_BRIEF.md`: "one task and one repository per run"), not a gap
-  to close, but the underlying lock/identity substrate existing is not
-  the same as the constraint being enforced; enforcement requires the
-  controller wiring, durable lifecycle records, and reconciliation
-  listed above
+  to close, but the underlying lock/identity substrate and dead-run
+  reconciliation existing is not the same as full enforcement against a
+  *live* concurrent run; enforcement requires the controller wiring
+  listed above. Separately, Slice 3B-1 introduces its own narrow named
+  residual risk: a crash inside `prepare_lifecycle()` between run-
+  directory creation and initial-projection publish leaves a run
+  directory with no valid `lifecycle.json`, which reconciliation
+  correctly refuses rather than adopts — that repository then stays
+  blocked until abandonment (not yet implemented) exists.
 - Owning milestone/spike: Stage-2 worktree spike (S1's successor),
   Milestone 1 constraint statement; Milestone 3 Slice 3A-1 (substrate,
-  implemented but unwired) and Slice 3A-2+ (enforcement, unimplemented)
+  implemented but unwired), Slice 3B-1 (dead-run reconciliation,
+  implemented but unwired), and later slices (removal, abandonment,
+  controller/CLI wiring — unimplemented)
 
 **T-E2 — TOCTOU between patch validation and application.**
 - Asset/objective: O1
