@@ -663,17 +663,30 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   other persisted state, a non-absent attribution, a corrupt or
   identity-mismatched projection, an ambiguity, or an inspection
   failure blocks admission of the new run entirely
-  (`RECONCILIATION_BLOCKED`) rather than adopting or guessing. None of
+  (`RECONCILIATION_BLOCKED`) rather than adopting or guessing.
+  **Slice 3B-5 (Amendment 5) widens this to also reconcile and remove
+  ADR-attributable Docker containers**: eligibility now extends to
+  `PREPARING`/`ACTIVE`/`CLEANING`/`RECONCILING` entries whose worktree
+  and checkpoint ref are absent and whose `failure` is null, with
+  either container's own shape (`absent`/`creating`/`present`/
+  `removing`) inspected via a real unfiltered listing plus a real
+  ownership-proof `docker inspect`, and — only for a positively
+  labeled, owned container — actually removed by immutable id before
+  the entry collapses to `RECONCILED`. An ownership conflict (a
+  candidate at the recomputed name or id with missing/wrong labels, or
+  an ambiguous observation) still refuses the entire entry with zero
+  mutation, exactly like Slice 3B-1's own conflict handling. None of
   this is wired into `RunController`, the CLI, or any other entry
   point: nothing today actually calls `prepare_lifecycle()` before a
   real run starts, so two concurrent *live* invocations against the
   same repository are still not prevented in practice — reconciliation
   only recovers a *dead* one.
 - Planned control: controller entry-gating on `prepare_lifecycle()`
-  before a run starts; container/worktree/checkpoint-ref *removal*
-  during reconciliation for a non-absent dead-run shape (Slice 3B-1
-  deliberately does not attempt this); and abandonment (ADR 0004 §11)
-  — all still unimplemented
+  before a run starts; worktree/checkpoint-ref *removal* during
+  reconciliation for a non-absent dead-run shape (Slice 3B-5 implements
+  this for containers only — worktree and checkpoint-ref removal remain
+  unimplemented); and abandonment (ADR 0004 §11) — all still
+  unimplemented
 - Evidence/future test: adversarial test starting two *live* runs
   concurrently, asserting the second is rejected rather than silently
   corrupting state (reconciliation alone does not address this, since

@@ -1,20 +1,36 @@
-"""Milestone 3 Slice 3B-1: initial-shape automatic reconciliation.
+"""Milestone 3 Slices 3B-1 and 3B-5: automatic reconciliation, including
+safe reconciliation and removal of ADR-attributable Docker containers.
 
 (`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`,
-Amendment 1 section 10, Amendment 2.)
+Amendment 1 section 10, Amendment 2, Amendment 5.)
 
-Recognizes and reconciles only entries whose durable state is
-`PREPARING` or `RECONCILING` with the complete initial absent
-attribution shape (both containers `{intent: absent, id: null}`,
-worktree `{intent: absent, expected_head: null}`, `checkpoint_ref`
-exactly `ABSENT_TRANSITION`, `failure: null`). After freshly confirming
-every recomputed external resource is absent (a real, unfiltered
-`docker ps -a` listing, a real `git worktree list --porcelain` listing,
-and a real `CheckpointRef.observe()`), it writes
-`RECONCILING -> RECONCILED`. It never removes or mutates a Docker
-container, Git worktree, or checkpoint ref, and it never writes
-`LifecycleState.RECONCILIATION_FAILED` (reserved for a later slice that
-has a real external mutation to give up on).
+Recognizes and reconciles entries whose durable state is `PREPARING`,
+`ACTIVE`, `CLEANING`, or `RECONCILING` (Amendment 5 widened this from
+3B-1's original `PREPARING`/`RECONCILING`-only eligibility, since a
+crash can leave a dead owner in any of the three owner-writable states)
+whose worktree and checkpoint ref are both at their initial absent
+shape and whose `failure` is null --
+`lifecycle_store.is_projection_reconciliation_eligible_shape` -- with
+either container's own shape otherwise unconstrained. Worktree and
+checkpoint-ref removal remain entirely out of scope (still 3B-1's own
+narrowing); only container reconciliation and removal are new in 3B-5.
+
+After freshly confirming every recomputed external resource (a real,
+unfiltered `docker ps -a` listing plus, for every candidate that
+matches a recomputed name, a real ownership-proof `docker inspect` by
+that candidate's immutable id; a real `git worktree list --porcelain`
+listing; and a real `CheckpointRef.observe()`), it writes each
+container's own reconciler-owned write-ahead transition
+(`lifecycle_store._publish_reconciler_container_transition`,
+distinct from the live-owner's own `record_container_transition`, since
+a reconciliation pass runs precisely in the states that writer
+categorically refuses), removes an attributable present/creating
+container by its immutable id, and, once every container plus the
+worktree and checkpoint ref are all durably absent, writes the final
+`RECONCILING -> RECONCILED` collapse via the unchanged
+`_publish_projection_state`. It never writes
+`LifecycleState.RECONCILIATION_FAILED` (still reserved for a later
+slice that gives up on a genuinely irrecoverable external mutation).
 
 Called by `lifecycle_store.prepare_lifecycle()` while the repository
 lock is already held, after `load_or_create_repo_json()` and before a
@@ -22,16 +38,17 @@ new `lifecycle_id` is minted or a new run directory is created. Every
 filesystem, Docker, worktree, and checkpoint-ref target derives
 exclusively from the trusted `state_root`/`identity`/`context`, a
 validated directory-name lifecycle id, and fixed recomputed names.
-Projection field values are compared, never used as mutation targets.
+Ownership is proven by inspecting each candidate's own labels, never
+assumed from its name alone.
 
 Not implemented here (later Milestone 3 work): abandonment, the
 explicit `codeagent reconcile`/`--abandon` CLI and its `explicit`
-maintenance-trigger, and any container/worktree/checkpoint-ref
-*removal*.
+maintenance-trigger, and any worktree or checkpoint-ref *removal*.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -61,12 +78,16 @@ from .lifecycle_store import (
     LIFECYCLE_JSON_FILENAME,
     RUN_ID_MAX_ENCODED_BYTES,
     RUNS_DIRNAME,
+    ContainerAttribution,
+    ContainerIntent,
     LifecycleProjection,
     LifecycleState,
     LifecycleStoreError,
     LifecycleStoreFailure,
     _publish_projection_state,
+    _publish_reconciler_container_transition,
     is_projection_fully_absent_shape,
+    is_projection_reconciliation_eligible_shape,
     load_lifecycle_projection,
 )
 from .repo_identity import RepositoryIdentity, TrustedRepositoryContext
@@ -93,6 +114,19 @@ _DOCKER_TIMEOUT_SECONDS = 30.0
 # read a caller might mistake for the complete picture.
 _DOCKER_OUTPUT_MAX_BYTES = 1_048_576
 _WORKTREE_LISTING_MAX_BYTES = 1_048_576
+# One ownership-proof `docker inspect` result (id, name, and a JSON
+# labels object) is small; 16 KiB is generous but still a real bound --
+# a hostile or malformed `Config.Labels` payload is confirmed-terminated
+# on overflow rather than unboundedly captured.
+_INSPECT_OWNERSHIP_MAX_BYTES = 16 * 1024
+
+_CONTAINER_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+_CONTAINER_ID_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+CONTAINER_LABEL_SCHEMA = "codeagent.lifecycle.schema"
+CONTAINER_LABEL_STATE_ROOT_ID = "codeagent.lifecycle.state-root-id"
+CONTAINER_LABEL_ID = "codeagent.lifecycle.id"
+CONTAINER_LABEL_ROLE = "codeagent.lifecycle.role"
 
 
 @unique
@@ -117,6 +151,13 @@ class ReconciliationEntryResult:
     worktree_confirmed_absent: bool = False
     checkpoint_ref_confirmed_absent: bool = False
     has_temp_leftover: bool = False
+    # The live container id this pass positively observed for each role
+    # (Slice 3B-5) — retained even after a successful removal (the
+    # maintenance trace is retrospective, never write-ahead: ADR 0004
+    # Amendment 2 section 4), `None` when the role was already absent or
+    # no well-formed candidate was ever positively observed.
+    baseline_id: str | None = None
+    verification_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -186,29 +227,401 @@ class _DockerListingError(Exception):
     pass
 
 
-def _docker_ps_all_names() -> set[str]:
+def _docker_ps_all_id_name_pairs() -> tuple[dict[str, str], dict[str, str]]:
     """One bounded, unfiltered, timeout-controlled, no-shell
-    `docker ps -a` listing of every container name (running or
-    stopped) — never a name-filtered or label-filtered query (I2).
-    Output is capped at `_DOCKER_OUTPUT_MAX_BYTES` via the shared
-    `_bounded_subprocess.run_bounded_stdout`, which owns the complete
-    launch/monitor/read/wait/kill/confirm lifecycle; a timeout or
-    overflow is confirmed-terminated before this function raises."""
-    argv = ["docker", "ps", "-a", "--no-trunc", "--format", "{{.Names}}"]
+    `docker ps -a --no-trunc --format '{{.ID}}\\t{{.Names}}'` listing of
+    every container (running or stopped) — never a name-filtered or
+    label-filtered query (I2). Output is capped at
+    `_DOCKER_OUTPUT_MAX_BYTES` via the shared `_bounded_subprocess.
+    run_bounded_stdout`, which owns the complete launch/monitor/read/
+    wait/kill/confirm lifecycle; a timeout or overflow is confirmed-
+    terminated before this function raises.
+
+    Strictly parsed: each nonempty line must be exactly one
+    tab-separated `id`/`name` pair, `id` exactly 64 lowercase hex
+    characters, `name` matching Docker's own container-name grammar; a
+    duplicate id or duplicate name anywhere in the listing makes the
+    whole listing untrusted (never partially trusted), mirroring
+    `executor._parse_cleanup_listing`'s own discipline. Returns both
+    directions (`name -> id`, `id -> name`) from the single listing so
+    a caller can detect "the id appears under a different name" without
+    a second query."""
+    argv = ["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"]
     try:
         result = run_bounded_stdout(
             argv, timeout_seconds=_DOCKER_TIMEOUT_SECONDS, stdout_limit=_DOCKER_OUTPUT_MAX_BYTES
         )
     except BoundedProcessError as exc:
         raise _DockerListingError("docker listing failed, timed out, or exceeded its output bound") from exc
-
     if result.returncode != 0:
         raise _DockerListingError("docker listing exited with a nonzero status")
     try:
         text = result.stdout.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise _DockerListingError("docker listing produced invalid UTF-8 output") from exc
-    return {name for name in text.splitlines() if name}
+
+    if text and not text.endswith("\n"):
+        raise _DockerListingError("docker listing output was missing its final line terminator")
+
+    name_to_id: dict[str, str] = {}
+    id_to_name: dict[str, str] = {}
+    # Split strictly on `\n` only -- never `str.splitlines()`, which also
+    # treats `\r`, lone `\r`, and several Unicode line separators as row
+    # boundaries and would silently absorb a CRLF-terminated row as if
+    # it were the expected bare-LF shape. A stray `\r` that a real CRLF
+    # row would leave attached to its last field is caught below by the
+    # name grammar instead (`\r` is never a legal name character).
+    #
+    # Empty output (`text == ""`) is valid -- zero containers -- and
+    # never reaches this loop at all (`"".split("\n")[:-1] == []`).
+    # Once output is nonempty, however, every row must be a genuine
+    # id/name record: a blank row (leading, internal, or an extra
+    # trailing one beyond the single required final LF) is fail-closed
+    # rejected, never silently skipped, matching ADR 0004 Amendment 5's
+    # own statement that each row is exactly one id/name record.
+    for line in text.split("\n")[:-1]:
+        if not line:
+            raise _DockerListingError("a docker listing contained a blank row")
+        fields = line.split("\t")
+        if len(fields) != 2:
+            raise _DockerListingError("a docker listing row was not the expected two-field shape")
+        raw_id, raw_name = fields
+        if not _CONTAINER_ID_HEX_RE.fullmatch(raw_id):
+            raise _DockerListingError("a docker listing row's id was not the expected 64-lowercase-hex shape")
+        if not _CONTAINER_NAME_RE.fullmatch(raw_name):
+            raise _DockerListingError("a docker listing row's name was not the expected shape")
+        if raw_id in id_to_name or raw_name in name_to_id:
+            raise _DockerListingError("a docker listing contained a duplicate id or name")
+        name_to_id[raw_name] = raw_id
+        id_to_name[raw_id] = raw_name
+    return name_to_id, id_to_name
+
+
+class _DockerInspectError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class _InspectOwnership:
+    id: str
+    name: str
+    labels: dict[str, str]
+
+
+def _docker_inspect_ownership(candidate_id: str) -> _InspectOwnership:
+    """One bounded, timeout-controlled, no-shell ownership-proof
+    `docker inspect` of exactly one candidate, by its immutable id —
+    never by name (a name can be reused). `_INSPECT_OWNERSHIP_MAX_BYTES`
+    bounds the output; a timeout, overflow, or nonzero exit (including
+    the candidate having vanished in a race between the listing and
+    this call) is never treated as confirmed absence — it is a genuine
+    inspection failure the caller must classify as
+    `SUBSTRATE_UNAVAILABLE`, forcing a retry on a later pass rather than
+    guessing."""
+    argv = [
+        "docker",
+        "inspect",
+        "--type",
+        "container",
+        "--format",
+        '{{.Id}}{{"\t"}}{{.Name}}{{"\t"}}{{json .Config.Labels}}',
+        candidate_id,
+    ]
+    try:
+        result = run_bounded_stdout(
+            argv, timeout_seconds=_DOCKER_TIMEOUT_SECONDS, stdout_limit=_INSPECT_OWNERSHIP_MAX_BYTES
+        )
+    except BoundedProcessError as exc:
+        raise _DockerInspectError("docker inspect failed, timed out, or exceeded its output bound") from exc
+    if result.returncode != 0:
+        raise _DockerInspectError("docker inspect could not confirm the candidate container")
+    try:
+        text = result.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _DockerInspectError("docker inspect produced invalid UTF-8 output") from exc
+    if text.count("\n") != 1 or not text.endswith("\n"):
+        raise _DockerInspectError("docker inspect output was not the expected single-line shape")
+    if "\r" in text:
+        # A CRLF row's `\r` would otherwise survive as trailing
+        # whitespace the JSON decoder silently tolerates after a
+        # complete value (correction pass finding 3) -- rejected
+        # explicitly here rather than relying on that decoder's own
+        # leniency to ever catch it.
+        raise _DockerInspectError("docker inspect output contained a carriage return")
+    fields = text[:-1].split("\t")
+    if len(fields) != 3:
+        raise _DockerInspectError("docker inspect output was not the expected three-field shape")
+    raw_id, raw_name, raw_labels_json = fields
+    if not _CONTAINER_ID_HEX_RE.fullmatch(raw_id):
+        raise _DockerInspectError("docker inspect id was not the expected 64-lowercase-hex shape")
+    # `docker inspect`'s `.Name` always carries exactly one leading `/`
+    # for a container's primary name -- a missing slash or more than one
+    # is malformed output, never a valid name to strip and proceed with.
+    if not raw_name.startswith("/") or raw_name.startswith("//"):
+        raise _DockerInspectError("docker inspect name did not have exactly one leading '/'")
+    name = raw_name[1:]
+    if not _CONTAINER_NAME_RE.fullmatch(name):
+        raise _DockerInspectError("docker inspect name was not the expected shape")
+    try:
+        labels = json.loads(raw_labels_json)
+    except json.JSONDecodeError as exc:
+        raise _DockerInspectError("docker inspect labels were not valid JSON") from exc
+    if labels is None:
+        labels = {}
+    if not isinstance(labels, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in labels.items()):
+        raise _DockerInspectError("docker inspect labels were not a flat string-keyed object")
+    return _InspectOwnership(id=raw_id, name=name, labels=labels)
+
+
+def _labels_match(labels: dict[str, str], *, state_root_id: str, lifecycle_id: str, role: str) -> bool:
+    """ADR 0004 section 7's exactly-four-required-labels ownership
+    check. Extra, unrecognized labels are always ignored; every one of
+    the four required labels must be present with the exact expected
+    value."""
+    return (
+        labels.get(CONTAINER_LABEL_SCHEMA) == "1"
+        and labels.get(CONTAINER_LABEL_STATE_ROOT_ID) == state_root_id
+        and labels.get(CONTAINER_LABEL_ID) == lifecycle_id
+        and labels.get(CONTAINER_LABEL_ROLE) == role
+    )
+
+
+@unique
+class _ContainerDecisionOutcome(str, Enum):
+    NOOP = "noop"
+    CONFIRMED_ABSENT = "confirmed_absent"
+    OWNED_REMOVE = "owned_remove"
+    REFUSED = "refused"
+    SUBSTRATE_UNAVAILABLE = "substrate_unavailable"
+
+
+@dataclass(frozen=True)
+class _ContainerDecision:
+    """`removal_id` and `observed_id` are deliberately separate fields
+    (correction pass finding 1) -- they are not always the same value,
+    and conflating them let an unobserved persisted id leak into the
+    maintenance trace as if it were positively confirmed evidence.
+
+    `removal_id` is set only when a write targeting that id is
+    authorized: `OWNED_REMOVE` (removal is authorized) or
+    `CONFIRMED_ABSENT` with `direct_to_absent=False` (the persisted id
+    must still be carried through the `PRESENT/REMOVING -> removing ->
+    absent` write-ahead path even though nothing is live, since no
+    direct `present -> absent` edge exists). It is never set on
+    `REFUSED`/`SUBSTRATE_UNAVAILABLE`/`NOOP`, and the write-ahead loop
+    never removes or writes using anything but this field.
+
+    `observed_id` is the safely parsed candidate actually, positively
+    observed live for this role during classification -- for
+    retrospective trace-evidence purposes only, never for a write. It
+    is `None` whenever nothing was confirmed live for this role
+    (already absent, or persisted-but-now-confirmed-absent)."""
+
+    outcome: _ContainerDecisionOutcome
+    detail: str
+    removal_id: str | None = None
+    observed_id: str | None = None
+    direct_to_absent: bool = False
+    live_present: bool = False
+
+
+def _classify_container(
+    *,
+    attribution: ContainerAttribution,
+    role: str,
+    expected_name: str,
+    name_to_id: dict[str, str],
+    id_to_name: dict[str, str],
+    state_root_id: str,
+    lifecycle_id: str,
+) -> _ContainerDecision:
+    """ADR 0004 section 7's persisted-combination table, per role.
+    Performs an ownership-proof `docker inspect` only for a candidate
+    the listing itself says occupies the recomputed name or the
+    persisted id — never trusts the listing's own name/id pairing as
+    ownership proof by itself (I2)."""
+    live_id_at_name = name_to_id.get(expected_name)
+
+    if attribution.intent is ContainerIntent.ABSENT:
+        if live_id_at_name is None:
+            return _ContainerDecision(_ContainerDecisionOutcome.NOOP, "already absent and confirmed absent")
+        return _ContainerDecision(
+            _ContainerDecisionOutcome.REFUSED,
+            "a container exists at the recomputed name for a persisted-absent role",
+            observed_id=live_id_at_name,
+        )
+
+    if attribution.intent is ContainerIntent.CREATING:
+        if live_id_at_name is None:
+            return _ContainerDecision(
+                _ContainerDecisionOutcome.CONFIRMED_ABSENT,
+                "no container exists at the recomputed name",
+                direct_to_absent=True,
+            )
+        try:
+            proof = _docker_inspect_ownership(live_id_at_name)
+        except _DockerInspectError:
+            return _ContainerDecision(
+                _ContainerDecisionOutcome.SUBSTRATE_UNAVAILABLE,
+                "the candidate container could not be inspected",
+                observed_id=live_id_at_name,
+            )
+        if proof.id != live_id_at_name or proof.name != expected_name:
+            return _ContainerDecision(
+                _ContainerDecisionOutcome.REFUSED,
+                "the candidate's own inspected identity disagrees with the listing",
+                observed_id=live_id_at_name,
+            )
+        if not _labels_match(proof.labels, state_root_id=state_root_id, lifecycle_id=lifecycle_id, role=role):
+            return _ContainerDecision(
+                _ContainerDecisionOutcome.REFUSED,
+                "a container exists at the recomputed name but its labels do not prove ownership",
+                observed_id=live_id_at_name,
+            )
+        return _ContainerDecision(
+            _ContainerDecisionOutcome.OWNED_REMOVE,
+            "an owned container was observed for a creating role",
+            removal_id=live_id_at_name,
+            observed_id=live_id_at_name,
+            live_present=True,
+        )
+
+    # PRESENT or REMOVING: a persisted id always exists for these intents.
+    persisted_id = attribution.id
+    assert persisted_id is not None
+    live_name_of_persisted_id = id_to_name.get(persisted_id)
+
+    if live_id_at_name is None and live_name_of_persisted_id is None:
+        return _ContainerDecision(
+            _ContainerDecisionOutcome.CONFIRMED_ABSENT,
+            "neither the recomputed name nor the persisted id appears live",
+            removal_id=persisted_id,  # write-ahead absent-recovery target, not positively observed
+            live_present=False,
+        )
+
+    if live_id_at_name == persisted_id and live_name_of_persisted_id == expected_name:
+        try:
+            proof = _docker_inspect_ownership(persisted_id)
+        except _DockerInspectError:
+            return _ContainerDecision(
+                _ContainerDecisionOutcome.SUBSTRATE_UNAVAILABLE,
+                "the owned candidate container could not be inspected",
+                observed_id=persisted_id,
+            )
+        if proof.id != persisted_id or proof.name != expected_name:
+            return _ContainerDecision(
+                _ContainerDecisionOutcome.REFUSED,
+                "the candidate's own inspected identity disagrees with the listing",
+                observed_id=persisted_id,
+            )
+        if not _labels_match(proof.labels, state_root_id=state_root_id, lifecycle_id=lifecycle_id, role=role):
+            return _ContainerDecision(
+                _ContainerDecisionOutcome.REFUSED,
+                "the owned candidate's labels do not prove ownership",
+                observed_id=persisted_id,
+            )
+        return _ContainerDecision(
+            _ContainerDecisionOutcome.OWNED_REMOVE,
+            "an owned container was observed for a present/removing role",
+            removal_id=persisted_id,
+            observed_id=persisted_id,
+            live_present=True,
+        )
+
+    # Neither the matched-pair nor the fully-absent shape: some kind of
+    # ambiguity. At least one of the two positively exists live here
+    # (the fully-absent case was already returned above), so exactly
+    # one of the three sub-cases below always applies. Reported
+    # evidence prefers whatever occupies the recomputed name itself
+    # (this role's own identity is the more directly relevant conflict
+    # evidence); the persisted id is reported only when it is live
+    # exclusively under a different name. Never fabricated, never the
+    # unobserved `persisted_id` alone.
+    if live_id_at_name is not None:
+        observed_id = live_id_at_name
+    else:
+        observed_id = persisted_id  # live_name_of_persisted_id is not None here
+    return _ContainerDecision(
+        _ContainerDecisionOutcome.REFUSED,
+        "the persisted id and the recomputed name disagree about which container currently exists",
+        observed_id=observed_id,
+    )
+
+
+@unique
+class _DockerRemovalOutcome(str, Enum):
+    CONFIRMED_ABSENT = "confirmed_absent"
+    STILL_PRESENT = "still_present"
+    CONFLICT = "conflict"
+    SUBSTRATE_UNAVAILABLE = "substrate_unavailable"
+
+
+def _remove_and_confirm_absent(
+    *,
+    removal_id: str,
+    expected_name: str,
+    role: str,
+    state_root_id: str,
+    lifecycle_id: str,
+    attempt_rm: bool,
+) -> tuple[_DockerRemovalOutcome, str]:
+    """Remove-by-immutable-id, then always attempt a fresh, independent,
+    strict listing regardless of the removal attempt's own outcome
+    (launch failure, timeout, overflow, nonzero exit, or unconfirmed
+    termination included) — `docker rm`'s own result is never
+    authoritative for removal; only this fresh observation is. When
+    `attempt_rm` is false (the container was already confirmed absent
+    by an earlier observation this same pass; nothing needs removing),
+    the fresh listing is still performed, both for genuine defense in
+    depth and because it is this function's sole source of truth.
+
+    A listing that still shows the exact owned id/name pair live is not
+    by itself enough to conclude `STILL_PRESENT`: the listing alone
+    cannot prove ownership (I2), so the surviving candidate is
+    re-inspected by immutable id, exactly like the original
+    classification did, before this function will report anything
+    beyond absence. A listing-level pairing disagreement (the id
+    appears under a different name than expected, or a different id
+    occupies the expected name) is `CONFLICT` without an inspect — the
+    listing itself already disproves ownership continuity. A
+    well-formed re-inspect that still proves ownership is
+    `STILL_PRESENT`; a well-formed re-inspect whose identity or labels
+    now disagree is `CONFLICT`; a failed or malformed re-inspect is
+    `SUBSTRATE_UNAVAILABLE`."""
+    if attempt_rm:
+        try:
+            run_bounded_stdout(
+                ["docker", "rm", "--force", removal_id],
+                timeout_seconds=_DOCKER_TIMEOUT_SECONDS,
+                stdout_limit=_DOCKER_OUTPUT_MAX_BYTES,
+            )
+        except BoundedProcessError:
+            pass
+
+    try:
+        name_to_id, id_to_name = _docker_ps_all_id_name_pairs()
+    except _DockerListingError:
+        return _DockerRemovalOutcome.SUBSTRATE_UNAVAILABLE, "the post-removal listing failed"
+
+    live_id_at_name = name_to_id.get(expected_name)
+    live_name_of_id = id_to_name.get(removal_id)
+    if live_id_at_name is None and live_name_of_id is None:
+        return _DockerRemovalOutcome.CONFIRMED_ABSENT, "confirmed absent by a fresh independent listing"
+    if not (live_id_at_name == removal_id and live_name_of_id == expected_name):
+        return (
+            _DockerRemovalOutcome.CONFLICT,
+            "the post-removal listing disagrees about which container currently exists",
+        )
+
+    try:
+        proof = _docker_inspect_ownership(removal_id)
+    except _DockerInspectError:
+        return _DockerRemovalOutcome.SUBSTRATE_UNAVAILABLE, "the still-present candidate could not be re-inspected"
+    if proof.id != removal_id or proof.name != expected_name:
+        return _DockerRemovalOutcome.CONFLICT, "the re-inspected candidate's own identity disagrees with the listing"
+    if not _labels_match(proof.labels, state_root_id=state_root_id, lifecycle_id=lifecycle_id, role=role):
+        return _DockerRemovalOutcome.CONFLICT, "the re-inspected candidate's labels no longer prove ownership"
+    return _DockerRemovalOutcome.STILL_PRESENT, "the owned container is still present after removal"
 
 
 class _GitWorktreeListingError(Exception):
@@ -358,6 +771,20 @@ def _classify_projection_load_failure(exc: LifecycleStoreError) -> Reconciliatio
     return ReconciliationEntryOutcome.REFUSED
 
 
+# The states a dead run's entry may legitimately be found in (Slice
+# 3B-5, ADR 0004 Amendment 5) — every owner-writable state plus
+# RECONCILING itself (a resumed pass). Must match
+# `lifecycle_store._RECONCILER_ELIGIBLE_STATES` (an independent
+# constant in that module, not imported, since the two modules'
+# eligibility checks are each responsible for their own boundary).
+_RECONCILER_ELIGIBLE_STATES = (
+    LifecycleState.PREPARING,
+    LifecycleState.ACTIVE,
+    LifecycleState.CLEANING,
+    LifecycleState.RECONCILING,
+)
+
+
 def _reconcile_locked_entry(
     *,
     run_dir_fd: int,
@@ -366,6 +793,19 @@ def _reconcile_locked_entry(
     identity: RepositoryIdentity,
     context: TrustedRepositoryContext,
 ) -> ReconciliationEntryResult:
+    """Inspect-before-mutate, per entry: load and validate the
+    projection, confirm the checkpoint ref then the worktree absent
+    (unchanged from Slice 3B-1, still out of removal scope), then
+    inspect both container roles completely (one Docker listing plus
+    every ownership-proof inspect it requires) and compute both roles'
+    complete decisions *before* any mutation of either — a conflict on
+    either role aborts the whole entry with zero mutation attempted.
+    Only once both decisions are known does this function publish any
+    write-ahead transition, and only once both roles' write-ahead
+    writes are durably confirmed does it ever issue a `docker rm`,
+    baseline before verification, stopping before verification's
+    removal if baseline's own resolution did not reach absent this
+    pass."""
     try:
         projection = load_lifecycle_projection(
             run_dir_fd,
@@ -381,56 +821,13 @@ def _reconcile_locked_entry(
             "lifecycle.json could not be loaded after acquiring the lifecycle lock",
         )
 
-    if projection.state not in (LifecycleState.PREPARING, LifecycleState.RECONCILING) or not is_projection_fully_absent_shape(
+    if projection.state not in _RECONCILER_ELIGIBLE_STATES or not is_projection_reconciliation_eligible_shape(
         projection
     ):
         return ReconciliationEntryResult(
             lifecycle_id,
             ReconciliationEntryOutcome.REFUSED,
-            "entry is no longer the recognized nonterminal absent shape",
-            run_id=projection.run_id,
-            attempt_number=projection.reconciliation.attempts_total,
-        )
-
-    baseline_name = f"codeagent-baseline-{lifecycle_id}"
-    verification_name = f"codeagent-verification-{lifecycle_id}"
-    try:
-        live_container_names = _docker_ps_all_names()
-    except _DockerListingError:
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
-            "container listing failed",
-            run_id=projection.run_id,
-            attempt_number=projection.reconciliation.attempts_total,
-        )
-    if baseline_name in live_container_names or verification_name in live_container_names:
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.REFUSED,
-            "a container with a recomputed owned name is present",
-            run_id=projection.run_id,
-            attempt_number=projection.reconciliation.attempts_total,
-        )
-
-    expected_worktree_path = os.path.normpath(
-        os.path.join(state_root.path, "worktrees", identity.repo_key, lifecycle_id)
-    )
-    try:
-        registered_paths = _worktree_registered_paths(context.working_tree_root)
-    except _GitWorktreeListingError:
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
-            "worktree listing failed",
-            run_id=projection.run_id,
-            attempt_number=projection.reconciliation.attempts_total,
-        )
-    if expected_worktree_path in registered_paths or os.path.lexists(expected_worktree_path):
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.REFUSED,
-            "the recomputed worktree is registered or present",
+            "entry is no longer the recognized nonterminal reconciliation-eligible shape",
             run_id=projection.run_id,
             attempt_number=projection.reconciliation.attempts_total,
         )
@@ -472,12 +869,212 @@ def _reconcile_locked_entry(
             attempt_number=projection.reconciliation.attempts_total,
         )
 
-    # Everything confirmed absent: write RECONCILING (fresh transitions
-    # only increment attempts_total; a resumed RECONCILING carries its
-    # already-incremented value forward unchanged), then RECONCILED.
-    attempts_total = projection.reconciliation.attempts_total
-    if projection.state is LifecycleState.PREPARING:
-        attempts_total += 1
+    expected_worktree_path = os.path.normpath(
+        os.path.join(state_root.path, "worktrees", identity.repo_key, lifecycle_id)
+    )
+    try:
+        registered_paths = _worktree_registered_paths(context.working_tree_root)
+    except _GitWorktreeListingError:
+        return ReconciliationEntryResult(
+            lifecycle_id,
+            ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+            "worktree listing failed",
+            run_id=projection.run_id,
+            attempt_number=projection.reconciliation.attempts_total,
+        )
+    if expected_worktree_path in registered_paths or os.path.lexists(expected_worktree_path):
+        return ReconciliationEntryResult(
+            lifecycle_id,
+            ReconciliationEntryOutcome.REFUSED,
+            "the recomputed worktree is registered or present",
+            run_id=projection.run_id,
+            attempt_number=projection.reconciliation.attempts_total,
+        )
+
+    baseline_name = f"codeagent-baseline-{lifecycle_id}"
+    verification_name = f"codeagent-verification-{lifecycle_id}"
+    try:
+        name_to_id, id_to_name = _docker_ps_all_id_name_pairs()
+    except _DockerListingError:
+        return ReconciliationEntryResult(
+            lifecycle_id,
+            ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+            "container listing failed",
+            run_id=projection.run_id,
+            attempt_number=projection.reconciliation.attempts_total,
+        )
+
+    decisions: dict[str, _ContainerDecision] = {}
+    for role, attribution, expected_name in (
+        ("baseline", projection.baseline, baseline_name),
+        ("verification", projection.verification, verification_name),
+    ):
+        decisions[role] = _classify_container(
+            attribution=attribution,
+            role=role,
+            expected_name=expected_name,
+            name_to_id=name_to_id,
+            id_to_name=id_to_name,
+            state_root_id=state_root.state_root_id,
+            lifecycle_id=lifecycle_id,
+        )
+
+    for role in ("baseline", "verification"):
+        decision = decisions[role]
+        if decision.outcome in (_ContainerDecisionOutcome.REFUSED, _ContainerDecisionOutcome.SUBSTRATE_UNAVAILABLE):
+            final_outcome = (
+                ReconciliationEntryOutcome.REFUSED
+                if decision.outcome is _ContainerDecisionOutcome.REFUSED
+                else ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE
+            )
+            return ReconciliationEntryResult(
+                lifecycle_id,
+                final_outcome,
+                f"{role} container: {decision.detail}",
+                run_id=projection.run_id,
+                attempt_number=projection.reconciliation.attempts_total,
+                baseline_id=decisions["baseline"].observed_id,
+                verification_id=decisions["verification"].observed_id,
+            )
+
+    # Both roles' decisions are conflict-free. Compute the one
+    # attempt-count increment this pass may perform (fresh cycle only;
+    # a resumed RECONCILING keeps its already-incremented value).
+    fresh_cycle = projection.state is not LifecycleState.RECONCILING
+    attempts_total = projection.reconciliation.attempts_total + 1 if fresh_cycle else projection.reconciliation.attempts_total
+
+    # Correction pass finding 2: both retrospective trace ids are
+    # derived immediately from both already-completed decisions, before
+    # any publication whatsoever -- every return from this point on,
+    # success or failure, retains these exact values unchanged. This is
+    # deliberately independent of `removal_id` (finding 1): a role that
+    # was never positively observed live (e.g. `CONFIRMED_ABSENT` while
+    # persisted `present`) still correctly reports `None` here, even
+    # though its `removal_id` is set for the write-ahead path.
+    observed_ids: dict[str, str | None] = {
+        "baseline": decisions["baseline"].observed_id,
+        "verification": decisions["verification"].observed_id,
+    }
+
+    # Write-ahead phase: baseline then verification, entirely before
+    # any `docker rm` is issued for either role.
+    pending_removal: dict[str, str] = {}
+    resolved_absent: dict[str, bool] = {"baseline": False, "verification": False}
+    for role in ("baseline", "verification"):
+        decision = decisions[role]
+        if decision.outcome is _ContainerDecisionOutcome.NOOP:
+            resolved_absent[role] = True
+            continue
+        if decision.outcome is _ContainerDecisionOutcome.CONFIRMED_ABSENT and decision.direct_to_absent:
+            try:
+                projection = _publish_reconciler_container_transition(
+                    run_dir_fd,
+                    projection,
+                    role=role,
+                    intent=ContainerIntent.ABSENT,
+                    id=None,
+                    attempts_total=attempts_total,
+                )
+            except LifecycleStoreError as exc:
+                return ReconciliationEntryResult(
+                    lifecycle_id,
+                    ReconciliationEntryOutcome.FAILED,
+                    f"the {role} confirmed-absent write failed ({exc.reason.value})",
+                    run_id=projection.run_id,
+                    attempt_number=attempts_total,
+                    baseline_id=observed_ids["baseline"],
+                    verification_id=observed_ids["verification"],
+                )
+            resolved_absent[role] = True
+            continue
+
+        # OWNED_REMOVE, or CONFIRMED_ABSENT-while-persisted-present:
+        # both require a REMOVING write-ahead write before absence can
+        # be declared (no direct PRESENT/CREATING->ABSENT edge exists).
+        # `observed_ids` was already fully derived above and is never
+        # touched here -- only `decision.removal_id` (the authorized
+        # write target) is used for the actual write.
+        assert decision.removal_id is not None
+        try:
+            projection = _publish_reconciler_container_transition(
+                run_dir_fd,
+                projection,
+                role=role,
+                intent=ContainerIntent.REMOVING,
+                id=decision.removal_id,
+                attempts_total=attempts_total,
+            )
+        except LifecycleStoreError as exc:
+            return ReconciliationEntryResult(
+                lifecycle_id,
+                ReconciliationEntryOutcome.FAILED,
+                f"the {role} removing write-ahead write failed ({exc.reason.value})",
+                run_id=projection.run_id,
+                attempt_number=attempts_total,
+                baseline_id=observed_ids["baseline"],
+                verification_id=observed_ids["verification"],
+            )
+        pending_removal[role] = decision.removal_id
+
+    # Removal phase: baseline first, then verification — only after
+    # baseline reaches durable absence.
+    for role in ("baseline", "verification"):
+        if role not in pending_removal:
+            continue
+        removal_id = pending_removal[role]
+        expected_name = baseline_name if role == "baseline" else verification_name
+        outcome, detail = _remove_and_confirm_absent(
+            removal_id=removal_id,
+            expected_name=expected_name,
+            role=role,
+            state_root_id=state_root.state_root_id,
+            lifecycle_id=lifecycle_id,
+            attempt_rm=decisions[role].live_present,
+        )
+        if outcome is _DockerRemovalOutcome.CONFIRMED_ABSENT:
+            try:
+                projection = _publish_reconciler_container_transition(
+                    run_dir_fd,
+                    projection,
+                    role=role,
+                    intent=ContainerIntent.ABSENT,
+                    id=None,
+                    attempts_total=attempts_total,
+                )
+            except LifecycleStoreError as exc:
+                return ReconciliationEntryResult(
+                    lifecycle_id,
+                    ReconciliationEntryOutcome.FAILED,
+                    f"the {role} absent collapse write failed ({exc.reason.value})",
+                    run_id=projection.run_id,
+                    attempt_number=attempts_total,
+                    baseline_id=observed_ids["baseline"],
+                    verification_id=observed_ids["verification"],
+                )
+            resolved_absent[role] = True
+            continue
+
+        final_outcome = {
+            _DockerRemovalOutcome.STILL_PRESENT: ReconciliationEntryOutcome.FAILED,
+            _DockerRemovalOutcome.CONFLICT: ReconciliationEntryOutcome.REFUSED,
+            _DockerRemovalOutcome.SUBSTRATE_UNAVAILABLE: ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+        }[outcome]
+        return ReconciliationEntryResult(
+            lifecycle_id,
+            final_outcome,
+            f"{role} container: {detail}",
+            run_id=projection.run_id,
+            attempt_number=attempts_total,
+            baseline_id=observed_ids["baseline"],
+            verification_id=observed_ids["verification"],
+        )
+
+    # Both containers (and the worktree/checkpoint ref, already
+    # confirmed above) are now durably absent: enter RECONCILING if a
+    # container write did not already do so, then collapse to
+    # RECONCILED.
+    assert resolved_absent["baseline"] and resolved_absent["verification"]
+    if projection.state is not LifecycleState.RECONCILING:
         try:
             projection = _publish_projection_state(
                 run_dir_fd, projection, state=LifecycleState.RECONCILING, attempts_total=attempts_total
@@ -489,6 +1086,8 @@ def _reconcile_locked_entry(
                 f"the RECONCILING projection write failed ({exc.reason.value})",
                 run_id=projection.run_id,
                 attempt_number=attempts_total,
+                baseline_id=observed_ids["baseline"],
+                verification_id=observed_ids["verification"],
             )
 
     try:
@@ -502,6 +1101,8 @@ def _reconcile_locked_entry(
             f"the RECONCILED projection write failed ({exc.reason.value})",
             run_id=projection.run_id,
             attempt_number=attempts_total,
+            baseline_id=observed_ids["baseline"],
+            verification_id=observed_ids["verification"],
         )
 
     return ReconciliationEntryResult(
@@ -514,6 +1115,8 @@ def _reconcile_locked_entry(
         verification_confirmed_absent=True,
         worktree_confirmed_absent=True,
         checkpoint_ref_confirmed_absent=True,
+        baseline_id=observed_ids["baseline"],
+        verification_id=observed_ids["verification"],
     )
 
 
@@ -589,7 +1192,7 @@ def _process_open_entry_body(
             attempt_number=peek.reconciliation.attempts_total,
         )
 
-    if peek.state not in (LifecycleState.PREPARING, LifecycleState.RECONCILING) or not is_projection_fully_absent_shape(peek):
+    if peek.state not in _RECONCILER_ELIGIBLE_STATES or not is_projection_reconciliation_eligible_shape(peek):
         return ReconciliationEntryResult(
             lifecycle_id,
             ReconciliationEntryOutcome.REFUSED,
@@ -785,8 +1388,14 @@ class _MaintenanceTraceWriter:
                 "outcome": result.outcome.value,
                 "attempt_number": result.attempt_number,
                 "containers": {
-                    "baseline": {"id": None, "confirmed_absent": result.baseline_confirmed_absent},
-                    "verification": {"id": None, "confirmed_absent": result.verification_confirmed_absent},
+                    "baseline": {
+                        "id": _bounded(result.baseline_id, _CONTAINER_ID_MAX_BYTES),
+                        "confirmed_absent": result.baseline_confirmed_absent,
+                    },
+                    "verification": {
+                        "id": _bounded(result.verification_id, _CONTAINER_ID_MAX_BYTES),
+                        "confirmed_absent": result.verification_confirmed_absent,
+                    },
                 },
                 "worktree": {"confirmed_absent": result.worktree_confirmed_absent},
                 "checkpoint_ref": {"ref_name": ref_name, "confirmed_absent": result.checkpoint_ref_confirmed_absent},

@@ -284,6 +284,26 @@ def is_projection_fully_absent_shape(projection: LifecycleProjection) -> bool:
     )
 
 
+def is_projection_reconciliation_eligible_shape(projection: LifecycleProjection) -> bool:
+    """True when the worktree and checkpoint ref are both at their
+    initial absent shape and `failure` is null, regardless of either
+    container's own shape (Slice 3B-5, ADR 0004 Amendment 5).
+
+    Strictly looser than `is_projection_fully_absent_shape` (which this
+    also satisfies whenever both containers happen to be absent too) --
+    every container shape reaching this point already passed
+    `_validate_container_shape` during load, so no further grammar
+    check is needed here. Worktree and checkpoint-ref removal remain
+    entirely out of this slice's scope (unchanged from Slice 3B-1), so
+    this predicate does not loosen either of those two fields."""
+    return (
+        projection.worktree.intent is WorktreeIntent.ABSENT
+        and projection.worktree.expected_head is None
+        and projection.checkpoint_ref == ABSENT_TRANSITION
+        and projection.failure is None
+    )
+
+
 def _container_to_dict(container: ContainerAttribution) -> dict:
     return {"intent": container.intent.value, "id": container.id}
 
@@ -1014,6 +1034,194 @@ def _validate_checkpoint_ref_edge(current: CheckpointTransition, target: Checkpo
 
 def _illegal_transition(message: str) -> LifecycleStoreError:
     return LifecycleStoreError(LifecycleStoreFailure.ILLEGAL_TRANSITION, message)
+
+
+# Full Docker container-id grammar (matches `executor._CONTAINER_ID_RE`):
+# exactly 64 lowercase hex characters, no other shape ever accepted.
+# The reconciler-owned writer requires this exact grammar (stricter than
+# the live-owner writer's own `record_container_transition`, which only
+# checks non-emptiness) because every id this writer ever persists comes
+# from a real, already-validated `docker inspect`/`docker create`
+# observation, never an operator-supplied or synthetic value.
+_CONTAINER_ID_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# Milestone 3 Slice 3B-5 (ADR 0004 Amendment 5): the states a dead run's
+# entry may be found in by an automatic reconciliation pass -- every
+# owner-writable state (PREPARING/ACTIVE/CLEANING, since
+# record_container_transition permits container mutation from any of
+# them per the resource-state gate) plus RECONCILING itself (a resumed
+# pass). COMPLETE is clean-final and never reaches this function;
+# RECONCILED/RECONCILIATION_FAILED are reconciler-owned terminal/give-up
+# states this function never targets or resumes from.
+_RECONCILER_ELIGIBLE_STATES = (
+    LifecycleState.PREPARING,
+    LifecycleState.ACTIVE,
+    LifecycleState.CLEANING,
+    LifecycleState.RECONCILING,
+)
+
+# Reconciliation-specific container edges -- distinct from
+# `_CONTAINER_TRANSITION_EDGES` (the live-owner's own table), since only
+# reconciliation may ever observe and act on a dead run's already-
+# nonterminal shape. `(CREATING, ABSENT)` here is a deliberately weaker
+# claim than the live-owner edge of the same shape: it means "a fresh,
+# successful, unfiltered listing shows no container currently bears the
+# deterministic name" -- a point-in-time observation -- never the live-
+# owner's own stronger historical claim that "no container was ever
+# created for this attempt", which reconciliation has no way to prove
+# after a crash.
+_RECONCILER_CONTAINER_TRANSITION_EDGES: frozenset[tuple[ContainerIntent, ContainerIntent]] = frozenset(
+    {
+        (ContainerIntent.CREATING, ContainerIntent.ABSENT),
+        (ContainerIntent.CREATING, ContainerIntent.REMOVING),
+        (ContainerIntent.PRESENT, ContainerIntent.REMOVING),
+        (ContainerIntent.REMOVING, ContainerIntent.ABSENT),
+    }
+)
+
+
+def _publish_reconciler_container_transition(
+    run_dir_fd: int,
+    projection: LifecycleProjection,
+    *,
+    role: str,
+    intent: ContainerIntent,
+    id: str | None,
+    attempts_total: int,
+) -> LifecycleProjection:
+    """The one reconciler-owned write-ahead primitive for entering or
+    resuming `RECONCILING` while durably recording a container-field
+    transition for exactly one role, atomically (Slice 3B-5, ADR 0004
+    Amendment 5).
+
+    Hard-codes its target `state` to `RECONCILING` -- it can never write
+    any other state. This is how this function and
+    `_publish_projection_state` cooperate without letting an arbitrary
+    caller invent a state/resource combination: every other state
+    transition (including the terminal `RECONCILING`->`RECONCILED`
+    collapse) remains `_publish_projection_state`'s own exclusive,
+    unchanged responsibility; this function never touches `RECONCILED`,
+    `RECONCILIATION_FAILED`, or any owner state.
+
+    Not `_LifecycleProjectionWriter.record_container_transition` --
+    that is the live-owner writer, explicitly refused while the
+    authoritative state is `RECONCILING`/`RECONCILED`/
+    `RECONCILIATION_FAILED` (Amendment 3's resource-state gate); a
+    reconciliation pass runs precisely in those states, so the
+    live-owner writer would categorically reject every call this
+    function's caller could ever make to it.
+
+    Validates, in this order:
+    1. `projection.state` is a member of `_RECONCILER_ELIGIBLE_STATES`
+       -- any other current state is a caller bug (`ILLEGAL_TRANSITION`),
+       since the caller is responsible for having already refused
+       anything else before ever reaching this function.
+    2. `role` is exactly `"baseline"` or `"verification"`.
+    3. `id` is `None` when `intent` is `ABSENT`/`CREATING`, or an exact
+       64-lowercase-hexadecimal string when `intent` is `PRESENT`/
+       `REMOVING` -- identical grammar to the live-owner writer's own
+       check.
+    4. `(current_role_attribution.intent, intent)` is a member of
+       `_RECONCILER_CONTAINER_TRANSITION_EDGES`; a `REMOVING`->`REMOVING`
+       request (a resumed no-op candidate) additionally requires the
+       exact same `id` as the currently installed one (same-ID
+       continuity) -- checked even though a true no-op never reaches
+       the edge table at all (see below).
+    5. `attempts_total` is consistent with `projection.state`: if the
+       current state is `PREPARING`/`ACTIVE`/`CLEANING` (a fresh cycle),
+       `attempts_total` must equal
+       `projection.reconciliation.attempts_total + 1` -- exactly one
+       increment, enforced here, never left to the caller's own
+       bookkeeping. If the current state is already `RECONCILING` (a
+       resumed cycle, or the second of two roles published within the
+       same pass, since the first role's own write already advanced
+       `state` to `RECONCILING`), `attempts_total` must equal
+       `projection.reconciliation.attempts_total` unchanged -- no
+       re-increment. A mismatch is `ILLEGAL_TRANSITION`, never inferred
+       from a Docker observation.
+
+    No-op rule (deliberately stricter than
+    `record_container_transition`'s own, which only ever has to compare
+    its one container field): returns `projection` completely unchanged,
+    publishing nothing, only when *all three* hold simultaneously --
+    `projection.state` is already `RECONCILING`, the requested
+    `attempts_total` equals `projection.reconciliation.attempts_total`
+    (already correct for a resumed cycle), and the target role's
+    attribution already exactly equals `(intent, id)`. Any one of these
+    differing still performs a real publish, even when the container
+    sub-field alone is unchanged -- entering `RECONCILING` for the first
+    time, or recording a resumed cycle's own attempt bookkeeping, must
+    never be skipped merely because a dead owner had already durably
+    published a matching container shape before crashing.
+
+    Every other projection field (the other role's attribution,
+    `checkpoint_ref`, `worktree`, `failure`, every identity field) is
+    carried forward completely unchanged. Encodes and bounds via the
+    existing `_encode_and_bound_projection` (unchanged size bounds),
+    publishes via the existing `publish_private_file_atomically_at` in
+    one atomic write -- `state` and the container edge are never split
+    across two separate writes -- and classifies any publication
+    failure via the existing `_classify_publication_failure`
+    (`PROJECTION_PUBLICATION_FAILED` vs `PROJECTION_DURABILITY_
+    UNCONFIRMED`, identical semantics to `_publish_projection_state`).
+    Returns the updated in-memory projection only on confirmed success.
+
+    This function is called once per role that actually needs
+    publication -- two roles are never combined into one call or one
+    atomic write; each role's own transition (if any) is its own,
+    separately atomic, publication.
+    """
+    if projection.state not in _RECONCILER_ELIGIBLE_STATES:
+        raise _illegal_transition("reconciler container transitions require an eligible nonterminal state")
+    if role not in ("baseline", "verification"):
+        raise _illegal_transition("role must be exactly 'baseline' or 'verification'")
+    if intent in (ContainerIntent.ABSENT, ContainerIntent.CREATING):
+        if id is not None:
+            raise _illegal_transition("absent/creating must carry no id")
+    else:
+        if not isinstance(id, str) or not _CONTAINER_ID_HEX_RE.fullmatch(id):
+            raise _illegal_transition("present/removing requires a full 64-lowercase-hex id")
+
+    current_attr = projection.baseline if role == "baseline" else projection.verification
+    target_attr = ContainerAttribution(intent=intent, id=id)
+
+    fresh_cycle = projection.state is not LifecycleState.RECONCILING
+    expected_attempts_total = (
+        projection.reconciliation.attempts_total + 1 if fresh_cycle else projection.reconciliation.attempts_total
+    )
+    if attempts_total != expected_attempts_total:
+        raise _illegal_transition(
+            "attempts_total must increment exactly once entering RECONCILING, or remain unchanged while resuming it"
+        )
+
+    if (
+        not fresh_cycle
+        and attempts_total == projection.reconciliation.attempts_total
+        and current_attr == target_attr
+    ):
+        return projection
+
+    if current_attr.intent is ContainerIntent.REMOVING and intent is ContainerIntent.REMOVING:
+        if id != current_attr.id:
+            raise _illegal_transition("removing->removing resume must retain the exact same id")
+    elif (current_attr.intent, intent) not in _RECONCILER_CONTAINER_TRANSITION_EDGES:
+        raise _illegal_transition("not a legal reconciler-owned container transition edge")
+
+    if role == "baseline":
+        updated = replace(projection, baseline=target_attr)
+    else:
+        updated = replace(projection, verification=target_attr)
+    updated = replace(
+        updated,
+        state=LifecycleState.RECONCILING,
+        reconciliation=replace(updated.reconciliation, attempts_total=attempts_total),
+    )
+    data = _encode_and_bound_projection(updated)
+    try:
+        publish_private_file_atomically_at(run_dir_fd, LIFECYCLE_JSON_FILENAME, data, mode=0o600)
+    except LifecycleFsError as exc:
+        raise _classify_publication_failure(exc) from exc
+    return updated
 
 
 class _LifecycleProjectionWriter:

@@ -2864,3 +2864,489 @@ section), and run `35889103564` (Amendment 4's evidence section).
 `docs/threat-model.md` was inspected and contains no occurrence of
 this specific false attribution and no stale Slice 3B-4
 Linux-CI-pending statement to update — left unchanged.
+
+## 2026-09-23: Milestone 3 Slice 3B-5 — safe reconciliation and removal of ADR-attributable Docker containers
+
+Extends Slice 3B-1's automatic reconciliation (`reconciliation.py`)
+with the container half of ADR 0004 §7's persisted-combination table:
+real observation, ownership proof, write-ahead transitions, and
+removal, per `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`
+Amendment 5 (Accepted 2026-09-23). Worktree and checkpoint-ref removal
+remain out of scope, unchanged.
+
+Five design points were locked in across five rounds of planning
+review before implementation started (see this session's own planning
+transcript, not reproduced here): (1) a legacy-named, unlabeled
+container is structurally invisible to reconciliation forever, not
+merely "unwired" — ownership proof requires the exact deterministic
+name *and* all four required labels; (2) the live-owner's
+`_CONTAINER_TRANSITION_EDGES` table has no `creating -> removing` edge,
+so reconciliation needed its own separate edge table
+(`_RECONCILER_CONTAINER_TRANSITION_EDGES`) and its own write path
+(`_publish_reconciler_container_transition`), since the live-owner
+writer is categorically refused during `RECONCILING`; (3)
+reconciliation's own `creating -> absent` edge proves a weaker,
+point-in-time claim ("confirmed absent by a fresh observation") than
+the live-owner's stronger historical claim ("no container was ever
+created") — the ADR text is explicit about this distinction; (4) a
+no-op write-ahead skip requires all three of state-already-
+`RECONCILING`, `attempts_total`-already-correct, and attribution-
+already-equal — omitting any one risks silently skipping a required
+state/attempt-count transition; (5) after any `docker rm` attempt
+(including a launch failure, timeout, overflow, nonzero exit, or
+unconfirmed termination), a fresh independent listing is always
+performed regardless of that attempt's own outcome — `docker rm`'s
+exit code is never authoritative for removal.
+
+New in `lifecycle_store.py`: `_CONTAINER_ID_HEX_RE` (exact 64-
+lowercase-hex grammar), `_RECONCILER_ELIGIBLE_STATES`,
+`_RECONCILER_CONTAINER_TRANSITION_EDGES`,
+`_publish_reconciler_container_transition` (hard-coded to
+`RECONCILING`, never any other state; validates state eligibility,
+role, id grammar, edge legality, and `attempts_total` consistency; one
+atomic write per call), and `is_projection_reconciliation_eligible_shape`
+(worktree/checkpoint-ref/failure absent, containers unconstrained —
+strictly looser than the existing `is_projection_fully_absent_shape`).
+
+New in `reconciliation.py`: `_docker_ps_all_id_name_pairs` (strict
+`{{.ID}}\t{{.Names}}` listing, replacing the old name-only
+`_docker_ps_all_names`; duplicate id or name anywhere untrusts the
+whole listing), `_docker_inspect_ownership` (strict three-field
+`docker inspect --type container --format
+'{{.Id}}{{"\t"}}{{.Name}}{{"\t"}}{{json .Config.Labels}}'` by immutable
+id, `_INSPECT_OWNERSHIP_MAX_BYTES = 16 KiB`), `_classify_container`
+(the ADR §7 table per role), `_remove_and_confirm_absent` (remove by
+id, always re-observe), and the rewritten `_reconcile_locked_entry`:
+checkpoint-ref and worktree inspection now run *before* containers
+(reordered from 3B-1, since both roles' container decisions must be
+fully computed — with zero mutation on either conflict — before any
+container write happens); both roles' write-ahead writes are published
+before any `docker rm`; removal proceeds baseline-first, stopping
+before verification's removal if baseline does not reach durable
+absence this pass; the final `RECONCILING -> RECONCILED` collapse is
+unchanged (`_publish_projection_state`). `_process_open_entry_body`'s
+early terminal-peek gate is widened to match. `ReconciliationEntryResult`
+gains `baseline_id`/`verification_id`, populated from a positively
+observed candidate and retained after a successful removal (the
+maintenance trace is retrospective, never write-ahead — Amendment 2
+§4); `_MaintenanceTraceWriter.entry_recorded` now populates real ids
+instead of always `None`.
+
+`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md` section
+7's own table is corrected in place: the old "(observed ID recorded in
+the maintenance trace first)" parenthetical was wrong given Amendment
+2 §4's already-accepted retrospective-trace rule (the projection's own
+write-ahead transition is what actually protects the id, not the
+trace) — corrected to reference the real write-ahead mechanism and
+Amendment 5. `docs/threat-model.md`'s T-E1 entry is updated: dead-run
+container recovery is now implemented, not merely planned; worktree/
+checkpoint-ref removal remain the open planned-control gap.
+
+The pre-existing 3B-1 test `test_no_removal_call_reachable_from_
+reconciliation_module` (a static AST proof that *zero* removal-shaped
+calls or literals were reachable anywhere in `reconciliation.py`) is
+obsolete by design, not a regression — this slice's whole point is a
+sanctioned `docker rm` path. Replaced with two narrower static proofs:
+no *filesystem*-removal primitive (`shutil.rmtree`/`os.remove`/
+`os.unlink`/`os.rmdir`) is reachable (the real invariant that still
+holds, since worktree/checkpoint-ref removal remain out of scope), and
+exactly one `["docker", "rm", "--force", ...]`-shaped argv literal
+exists in the module.
+
+Verified: `tests/unit/test_reconciliation.py` and
+`tests/unit/test_lifecycle_store.py` together, 215 passed (the eight
+pre-existing tests broken by the `_docker_ps_all_names` rename/
+reshaping were fixed mechanically, not weakened — same assertions,
+updated mock shape). New tests added: strict listing/inspect grammar
+and duplicate-id rejection, label-match/mismatch ownership proof,
+id-under-a-different-name conflict, zero-mutation-when-either-role-
+conflicts, a `creating`-role direct-to-absent path, a `present`-role
+owned-removal path, a `present`-role already-confirmed-absent path
+that write-aheads through `removing` without ever calling `docker rm`,
+a true resumed no-op (asserted via a write-count spy on
+`publish_private_file_atomically_at`), `ACTIVE`/`CLEANING` state
+eligibility, and maintenance-trace id population/retention. Two new
+tests use real Docker fixtures created directly with the exact
+deterministic name and required labels (never through `DockerVerifier`
+— consistent with this project's established real-fixture discipline):
+one proves a genuinely owned, labeled container is observed and
+removed end to end with the projection collapsing to
+`{intent: absent, id: null}` and the container genuinely gone from
+`docker inspect` afterward; the other proves an unlabeled container
+occupying the same deterministic name is refused and never removed.
+
+Full local suite (macOS, real Docker daemon,
+`CODEAGENT_REQUIRE_DOCKER=1`, a skip treated as a failure): all 3
+dedicated real-Docker tests in `test_slice_c.py` passed, 0 skipped; the
+complete suite, 2,453 passed, 0 skipped (up from the 2,435-test
+pre-3B-5 baseline: +18 net — 20 new tests, 1 pre-existing test replaced
+by 2 narrower ones, minus the obsolete removed test); no leftover
+`codeagent-verify` containers after the run (confirmed via `docker ps
+-a --filter name=codeagent-`). The nine-file focused set used since
+Slice 3A-1 (`test_lifecycle_fs.py`, `test_repo_identity.py`,
+`test_state_locks.py`, `test_state_root.py`, `test_lifecycle_store.py`,
+`test_checkpoint_session.py`, `test_checkpoint_ref.py`,
+`test_reconciliation.py`, `test_executor.py`), plus
+`test_bounded_subprocess.py`, collected and passed together, 875
+passed, in both forward and reverse file order. **Not yet run**: Linux
+CI (this slice was left unstaged/uncommitted per the author's explicit
+instruction for joint review before any commit or push).
+
+Not implemented (later Milestone 3 work, unchanged from prior slices):
+`executor.py` changes, lifecycle-aware container creation, a producer-
+side publisher seam wired into `DockerVerifier`, deterministic-name
+container creation, `RunController`/CLI wiring, worktree or
+checkpoint-ref removal, abandonment, and signal handling.
+
+## 2026-09-23: Slice 3B-5 correction pass — narrow, pre-review fixes
+
+A narrow correction pass on the unstaged Slice 3B-5 implementation,
+against the accepted "Slice 3B-5 — Precision Correction (Final)" plan.
+Preflight confirmed: branch `main`, HEAD `c8b66b31d977074ff17bb1457dab1272d19f1bf8`,
+matches `origin/main`, dirty set unchanged from the prior session (the
+3B-5 files only). All eight findings independently re-verified against
+source before any change; all eight were **confirmed** real gaps, not
+disputed or refined away.
+
+1. **Strict Docker-inspect name grammar (confirmed).**
+   `_docker_inspect_ownership()` accepted a name with no leading `/` by
+   silently treating it as already-bare. Fixed: exactly one leading
+   `/` is now required (`raw_name.startswith("//")` also rejected);
+   anything else is `SUBSTRATE_UNAVAILABLE`-shaped malformed output,
+   never a name to strip and proceed with. `_docker_ps_all_id_name_pairs`
+   also switched from `str.splitlines()` (which treats `\r`, lone `\r`,
+   and several Unicode separators as row boundaries, silently absorbing
+   a CRLF-terminated row as the expected bare-LF shape) to a strict
+   `text.split("\n")` with an explicit missing-trailing-newline check —
+   a stray `\r` a real CRLF row would leave on its last field is now
+   caught by the existing name grammar instead of being silently
+   stripped.
+2. **Inspection order (confirmed).** The implementation checked the
+   worktree before the checkpoint ref, contradicting its own docstring,
+   the ADR, and `CLAUDE.md`'s own description of the accepted order.
+   Reordered to checkpoint-ref → worktree → Docker, matching the
+   accepted plan; no compelling reason existed to instead correct the
+   documentation to the accidental order, so the code was fixed.
+3. **Post-removal re-observation contract (confirmed).** `_remove_and_
+   confirm_absent()` trusted the post-removal *listing* alone to
+   conclude `STILL_PRESENT` — a listing can never itself prove
+   ownership (I2). Fixed: when the listing still shows the exact owned
+   id/name pair live, the candidate is now re-inspected by immutable id
+   before concluding anything beyond absence; a listing-level pairing
+   disagreement remains `CONFLICT` without a redundant inspect (the
+   listing already disproves continuity there); a well-formed re-
+   inspect that still proves ownership is `STILL_PRESENT`; identity or
+   label disagreement on re-inspect is `CONFLICT` (→ `REFUSED`); a
+   failed or malformed re-inspect is `SUBSTRATE_UNAVAILABLE`.
+4. **Retrospective container-ID preservation on every applicable exit
+   (confirmed).** `_ContainerDecision.removal_id` was only populated
+   for `OWNED_REMOVE`/`CONFIRMED_ABSENT`, so every `REFUSED`/
+   `SUBSTRATE_UNAVAILABLE` classification branch in `_classify_container`
+   silently dropped a real, already-observed candidate id. Fixed: every
+   branch that has observed *any* candidate id now carries it on
+   `removal_id` (used only for reporting on a refused/unavailable
+   decision — the actual write-ahead/removal logic still only consumes
+   `removal_id` from `OWNED_REMOVE`/`CONFIRMED_ABSENT` decisions, which
+   are the only ones ever reaching the write-ahead loop). The container-
+   decision-conflict early exit and both write-ahead-failure exits in
+   `_reconcile_locked_entry` now also populate `baseline_id`/
+   `verification_id` from whatever had already been observed for
+   *both* roles at that point, not just the failing one.
+5. **Direct writer/ordering tests (confirmed — zero existed).** Added
+   26 new direct, fd-only unit tests for `lifecycle_store.
+   _publish_reconciler_container_transition` to `test_lifecycle_store.py`
+   (exact legal/illegal edges, state eligibility, role/id grammar,
+   fresh-cycle exact-increment and its rejection, resumed-cycle
+   unchanged-count and its double-increment rejection, the true no-op's
+   all-three condition, `removing→removing` same-id continuity and its
+   different-id rejection, full preservation of every unrelated
+   projection field, and both publication-failure classifications) —
+   none of these existed before this pass; `_publish_reconciler_
+   container_transition` had previously been exercised only indirectly
+   through the full `reconcile_repository()` pipeline. Added 3 explicit
+   ordering tests to `test_reconciliation.py`: both roles' candidates
+   are inspected before either role's first write-ahead publish, both
+   roles' write-ahead publishes precede baseline's own `docker rm`,
+   baseline's `docker rm` precedes verification's; an unresolved
+   baseline blocks verification's own removal for that pass while still
+   preserving verification's own already-published write-ahead; and a
+   one-role conflict causes zero `docker rm` calls for either role
+   (extending the pre-existing zero-projection-write assertion).
+6. **Crash-resume and real-Docker acceptance criteria (confirmed —
+   partially incomplete before this pass).** Added two real-SIGKILL
+   crash-resume tests, each spawning a genuinely separate child process
+   that runs one real `reconcile_repository()` pass against a real
+   Docker container and self-SIGKILLs immediately after its n-th
+   reconciler-owned container write durably lands (a monkeypatched
+   counting wrapper around `lifecycle_store._publish_reconciler_
+   container_transition`, resolved fresh in the child's own re-imported
+   module — not inherited from the parent): one crashes after a single
+   role's own write-ahead (baseline `removing(id)` durably on disk,
+   real container still genuinely present, real `docker rm` never
+   issued yet); the other crashes after *both* roles' write-ahead
+   writes land (both durably `removing`, both real containers still
+   present). In both cases a fresh `reconcile_repository()` pass then
+   resumes, removes the real container(s), reaches `RECONCILED`, and
+   the attempt count is never re-incremented across the crash — the
+   dead process's own attempts_total increment is durable and honored,
+   not repeated. Also added two more real-Docker ADR-§7-table-row
+   tests independent of the pre-existing `creating`-role coverage: row
+   2 (`present`/owned, exercised on the *verification* role) and row 3
+   (`present` + a real container whose live id disagrees with the
+   persisted id, exercised on the *baseline* role) — both roles are now
+   independently exercised with real Docker for at least one non-
+   `creating` row each. **Not exercised with real Docker** (rows 4/7/8/
+   9 of the table): the trivial `creating`+absent / `absent`+absent
+   confirmed-absent rows (already exhaustively covered by dozens of
+   mocked tests and implicitly confirmed by every real-Docker test's
+   own pre-condition that nothing else is present) and the `absent`+
+   name-present ambiguity row (`ID null, absent | Name present ->
+   REFUSED`) — this specific ambiguity row is covered only by mocks
+   (`test_present_container_causes_refused_no_projection_write`), a
+   real deliberate limitation: constructing it with real Docker adds no
+   further confidence over the already-real `creating`+present-
+   unlabeled coverage, since both paths exercise the identical
+   `_classify_container` `ABSENT`/`CREATING` REFUSED branches against a
+   real live container: the *code path proving ownership-vs-ambiguity
+   classification against real Docker* is already exercised; only the
+   specific `attribution.intent is ABSENT` guard clause itself is
+   mock-only.
+7. **Pinned Docker image and load-bearing cleanup (confirmed).** Every
+   real-Docker fixture in `test_reconciliation.py` now creates
+   containers from this repository's own pinned, digest-verified
+   `executor.DEFAULT_IMAGE` (imported, never duplicated) running
+   `python3 -c pass`, replacing the floating, CI-unapproved
+   `alpine:latest`. Fixture teardown (`_force_remove_container`) now
+   asserts `check=True` — a cleanup failure now fails the test instead
+   of being silently swallowed. Added `test_final_cleanup_no_leftover_
+   slice_3b5_containers`, querying both `codeagent-baseline-*` and
+   `codeagent-verification-*` name families (not only the unrelated
+   `codeagent-verify` family Milestone 1 already checks), as the last
+   test in the module's real-Docker set.
+8. **Documentation reconciled to the corrected behavior only after (1)–(7)
+   above were implemented and verified** — this entry, plus in-place
+   corrections to `CLAUDE.md`'s Slice 3B-5 bullet and the checkpoint-
+   ref/worktree ordering language already in
+   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+   Amendment 5. No scope boundary changed: still no `executor.py`
+   change, no producer publisher seam, no controller/CLI wiring, no
+   worktree/checkpoint-ref removal, no abandonment, no signals, no
+   model or UI work.
+
+Verified (post-correction-pass): `test_reconciler_writer` direct tests,
+33 passed on first run, then 33 (unchanged) as part of the full
+`test_lifecycle_store.py` file; `test_reconciliation.py` alone, 94
+passed with `CODEAGENT_REQUIRE_DOCKER=1` (0 skipped — up from 86 before
+this pass: +8 net, all real-Docker or direct-parser tests); the
+established nine-file focused set plus `test_bounded_subprocess.py`,
+916 passed (up from 875), in both forward and reverse file order; the
+full local suite (macOS): 2,494 passed with no `CODEAGENT_REQUIRE_
+DOCKER` set, and 2,494 passed / 0 skipped with `CODEAGENT_REQUIRE_
+DOCKER=1` (identical total — every real-Docker test ran both times, none
+skipped either way); `git diff --check` clean; no leftover
+`codeagent-baseline-*`/`codeagent-verification-*` containers, extra
+worktrees, `refs/codeagent` refs, or temp state roots confirmed
+directly after the run. Nothing staged, committed, or pushed.
+
+## 2026-09-23: Slice 3B-5 second correction pass — narrower, review-driven
+
+A second, narrower correction pass on the still-unstaged Slice 3B-5
+implementation. Preflight confirmed: branch `main`, HEAD unchanged at
+`c8b66b31d977074ff17bb1457dab1272d19f1bf8`, matches `origin/main`,
+dirty set unchanged (same eight files). All seven findings
+independently re-verified against current source before any change;
+all seven were **confirmed**, none disputed or refined away.
+
+1. **`observed_id` vs `removal_id` (confirmed).** `_ContainerDecision.
+   removal_id` was overloaded for both "the id authorized for removal"
+   and "the retrospective id actually observed" — for the final
+   ambiguity fallthrough in `_classify_container` (persisted id and
+   recomputed name disagree), the old code reported `removal_id=
+   persisted_id` even when `persisted_id` itself was never positively
+   observed live (only a *different* live id at the name, or the
+   persisted id live only under a different name, was actually
+   confirmed). Fixed: `_ContainerDecision` now carries both fields with
+   distinct, documented semantics — `removal_id` set only when a write
+   targeting that id is authorized (`OWNED_REMOVE`, or `CONFIRMED_ABSENT`
+   with a persisted id that must still transit `removing` on its way to
+   `absent`); `observed_id` set only to a safely parsed candidate
+   genuinely, positively observed live, for retrospective trace
+   purposes only, never for a write. The three-way ambiguity case
+   (different live id at the name / persisted id live elsewhere / both)
+   now reports whichever occupies the recomputed name when something
+   does, falling back to the persisted id only when it is live
+   exclusively under a different name — documented as a deliberate
+   precedence choice, never a fabricated value.
+2. **Both retrospective ids derived immediately (confirmed).**
+   `observed_ids` was populated progressively inside the write-ahead
+   loop, so a role whose loop iteration was never reached (an earlier
+   role's failure returned first) silently reported `None` even though
+   its id was already known from classification. Fixed: both ids are
+   now derived from both already-completed decisions immediately after
+   the conflict-check gate, before the first publication of any kind;
+   every later return (the write-ahead loop no longer touches this
+   dict at all) retains those exact values. One pre-existing test
+   (`test_present_container_already_confirmed_absent_needs_no_actual_
+   rm_call`) asserted the old, incorrect behavior for the "persisted
+   present, now confirmed absent" case and was corrected to assert
+   `entry.baseline_id is None` (nothing was ever positively observed
+   for that role) — distinct from `removal_id`, still `persisted_id`,
+   which still correctly drives the write-ahead path.
+3. **Parser regression tests (confirmed — none existed for this
+   boundary).** Added 12 explicit tests for the inspect-name grammar
+   and strict listing split fixed in the prior correction pass:
+   no-leading-slash, two-leading-slashes, inspect CRLF, an extra
+   trailing line, a missing field, an extra field, listing CRLF,
+   missing final listing LF, an internal blank listing row (pinned as
+   deliberately *skipped*, not rejected — documented rationale: a blank
+   line carries no data to be ambiguous about), duplicate name, and
+   duplicate id (already covered) plus an extra-tab-field row. Writing
+   the CRLF-in-inspect-output test **found and fixed a real, second gap
+   beyond the seven findings**: `_docker_inspect_ownership`'s
+   single-line check (`text.count("\n") != 1`) did not reject an
+   embedded `\r` — a CRLF row's trailing `\r` survived into the labels
+   JSON field, and `json.loads` silently tolerates trailing whitespace
+   after a complete value, so the malformed row passed undetected. Now
+   explicitly rejected (`"\r" in text`) before any field parsing.
+4. **Post-removal classification tests (confirmed — largely untested
+   directly).** Added 8 direct unit tests for `_remove_and_confirm_
+   absent` (still-present-owned → `FAILED`; re-inspect wrong
+   identity/wrong labels → `CONFLICT`; re-inspect failure →
+   `SUBSTRATE_UNAVAILABLE`; a listing-level pairing conflict → `CONFLICT`
+   *without* ever calling inspect, asserted via a spy that raises if
+   invoked; three `docker rm` failure shapes — launch failure, nonzero
+   exit, timeout — each still followed by a successful fresh
+   confirmation) plus one parametrized pipeline test proving all three
+   non-absent removal outcomes leave the role's on-disk attribution at
+   exactly the `removing(id)` its write-ahead phase already published,
+   untouched. Diagnostic-detail strings were confirmed to contain no
+   raw id/payload in the still-present and wrong-identity cases.
+5. **Load-bearing SIGKILL evidence (confirmed).** Both real-SIGKILL
+   crash-resume tests now assert `proc.exitcode == -signal.SIGKILL`
+   (POSIX's own negative-signal exit-code convention) as load-bearing
+   evidence the child actually crashed via signal, not merely exited;
+   a child still alive after the join timeout is now explicitly
+   `kill()`ed and joined before the test fails, so a failed run can
+   never leave an orphaned process behind. The pre-crash durable-
+   projection and attempt-count assertions are unchanged.
+6. **Real-Docker acceptance-criterion gap (confirmed — addressed by
+   adding coverage, not by narrowing the criterion).** Two more real-
+   Docker tests close the two safe, deterministic remaining ADR 0004 §7
+   table rows explicitly named in review: a `present`-persisted role
+   whose real container was genuinely removed out of band before
+   reconciliation ever ran (row 1's "no container has that name or id"
+   confirmed-absent case, using a real container's own id, never a
+   fabricated one) and an `absent`-persisted role with a real,
+   correctly-labeled container still occupying the deterministic name
+   (row 8's ambiguity, which the ADR is explicit is `REFUSED`
+   regardless of labels). One row remains deliberately unit-only, not
+   silently: the trivial "nothing at all live" confirmed-absent case
+   (`creating`/`absent` + no container anywhere), which is already the
+   default precondition of every other real-Docker test in this module
+   plus dozens of mocked tests — a dedicated real-Docker test for
+   literal absence-of-anything would assert only that `docker ps`
+   returns nothing, which adds no evidence beyond what every existing
+   real-Docker test's own setup and the final cleanup test already
+   confirm every run. This is presented as the recommendation, not
+   baked into the ADR or `CLAUDE.md` as a fait accompli.
+7. **Final-cleanup filter accuracy (confirmed).** The regex `--filter
+   name=` query was independently verified against a real Docker
+   Desktop container to actually anchor (`^`) and alternate
+   (`(baseline|verification)`) as intended, not merely substring-match
+   (confirmed it does *not* match the unrelated `codeagent-verify-*`
+   family). A second, fully parser/filter-independent query was added
+   alongside it: one unfiltered `docker ps -a` listing, matched
+   client-side in plain Python string logic that depends on nothing
+   Docker-version- or platform-specific — both are asserted
+   independently, and a failure now lists the actual leftover names
+   rather than a bare boolean.
+
+Verified (post-second-correction-pass): `tests/unit/test_reconciliation.py`
+alone, 132 collected (up from 94), with `CODEAGENT_REQUIRE_DOCKER=1`; the
+established nine-file focused set plus `test_bounded_subprocess.py`, 954
+passed (up from 916), in both forward and reverse file order; the full
+local suite (macOS): 2,532 passed both with and without
+`CODEAGENT_REQUIRE_DOCKER=1` (identical total both times — every
+real-Docker test ran both times, none skipped either way, up from
+2,494); `git diff --check` clean; no leftover
+`codeagent-baseline-*`/`codeagent-verification-*` containers by either
+the regex-filtered or the parser-independent client-side query, no
+extra worktrees, no `refs/codeagent` refs. Docker Desktop was started,
+when needed, only via the plain `open -a Docker` command (no elevation
+requested by anything in this pass); no macOS administrator-access
+dialog appeared during this pass. Nothing staged, committed, or pushed.
+
+## 2026-09-24: Slice 3B-5 third correction pass — narrow consistency fixes
+
+A third, narrow consistency pass on the still-unstaged Slice 3B-5
+implementation, crossing midnight from the second pass (2026-09-23) —
+this entry is dated 2026-09-24, the date this specific pass actually
+ran; the two prior dated entries are unchanged, since that work
+genuinely completed on 2026-09-23. Preflight confirmed: branch `main`,
+HEAD unchanged at `c8b66b31d977074ff17bb1457dab1272d19f1bf8`, matches
+`origin/main`, dirty set unchanged (same eight files), Docker already
+ready (no restart needed, no administrator-access dialog).
+
+1. **Strict listing blank-row behavior (confirmed).**
+   `_docker_ps_all_id_name_pairs()` silently skipped every blank row
+   anywhere in a nonempty listing (`if not line: continue`) — genuinely
+   inconsistent with ADR 0004 Amendment 5's own "each row is exactly
+   one id/name record" statement and with this slice's own fail-closed
+   discipline elsewhere. Fixed: empty output (`stdout == b""`) remains
+   valid and returns two empty maps (the loop never executes, since
+   `"".split("\n")[:-1] == []`); once output is nonempty, a blank row —
+   leading, internal, or an extra trailing one beyond the single
+   required final LF — is now rejected (`_DockerListingError`), never
+   silently skipped. One pre-existing test from the second correction
+   pass (`test_docker_ps_all_id_name_pairs_skips_internal_blank_row`)
+   had explicitly pinned the old, now-reversed behavior as a deliberate
+   decision; replaced with four tests: empty output is valid, and
+   leading/internal/extra-trailing blank rows are each rejected.
+2. **ADR Amendment 5 section 5 corrected in place (confirmed).** The
+   accepted text described the post-removal listing as directly
+   classifying an exact surviving owned id as `FAILED`, omitting the
+   ownership-proof re-inspect step production has actually performed
+   since the first correction pass (finding 3 there). Corrected to
+   state the real sequence: neither name nor id present -> confirmed
+   absent; a listing-level disagreement -> `REFUSED` with no further
+   inspection; the exact pair still present -> re-inspected by
+   immutable id, requiring both identity and all four labels again;
+   confirmed ownership -> `FAILED`; disagreement -> `REFUSED`; a failed
+   or malformed re-inspect -> `SUBSTRATE_UNAVAILABLE` — all three
+   non-absent outcomes retaining `removing(id)`. No change to the
+   transition table, edge set, or scope.
+3. **ADR Amendment 5 evidence wording corrected (confirmed).** "exact
+   totals and CI evidence" implied a CI run this slice does not yet
+   have (it has never been pushed). Corrected to "exact local
+   verification totals and evidence... Linux CI is still pending".
+4. **`CLAUDE.md` internal contradiction resolved (confirmed).** The
+   first correction pass's own paragraph stated the `absent`+name-
+   present ambiguity row remained mock-only; the second correction
+   pass's paragraph immediately after it described a real-Docker test
+   for exactly that row, without updating the first paragraph — an
+   apparent live contradiction to a reader going top to bottom. Fixed
+   in place (not rewritten as if the limitation never existed): the
+   first paragraph now says explicitly "at the time this first
+   correction pass concluded" and points forward to the second pass's
+   own closure of that specific row, leaving only the trivial "nothing
+   live at all" rows as the remaining stated unit-only limitation.
+5. **Date accuracy verified.** The system's own clock crossed midnight
+   between the second and third passes (2026-09-23 -> 2026-09-24); this
+   entry and the corresponding `CLAUDE.md` note are dated 2026-09-24,
+   the date this pass genuinely ran. Both prior dated entries
+   (2026-09-23) were independently re-confirmed as correct for the work
+   they record and left untouched.
+
+Verified: the listing-parser test group (`test_docker_ps_all_id_name_
+pairs*`), 11 passed; `tests/unit/test_reconciliation.py` alone, 135
+passed with `CODEAGENT_REQUIRE_DOCKER=1`, 0 skipped; the nine-file
+focused set plus `test_bounded_subprocess.py`, 957 passed (up from
+954), in both forward and reverse file order; the full local suite
+(macOS), 2,535 passed both with and without `CODEAGENT_REQUIRE_
+DOCKER=1` (identical total both times, up from 2,532); `git diff
+--check` clean; no leftover `codeagent-baseline-*`/
+`codeagent-verification-*` containers by either the regex-filtered or
+the parser-independent client-side query, no extra worktrees, no
+`refs/codeagent` refs. Docker was already ready and was not restarted;
+no macOS administrator-access dialog appeared. Nothing staged,
+committed, or pushed.

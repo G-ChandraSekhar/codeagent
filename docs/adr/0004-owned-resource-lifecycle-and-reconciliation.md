@@ -350,7 +350,7 @@ used to explain what a run did.
 | ID set, `present`/`removing` | Name maps to exactly that ID, all four labels match | Owned: remove |
 | ID set | Name maps to a different ID, the ID appears under another name, or labels missing/wrong | Ownership conflict: `REFUSED` |
 | ID null, `creating` | Name absent | Confirmed absent |
-| ID null, `creating` | Name present, all four labels match | Owned: remove (observed ID recorded in the maintenance trace first) |
+| ID null, `creating` | Name present, all four labels match | Owned: remove (write-ahead: `creating` -> `removing(observed_id)`, published to the projection before removal; the maintenance trace itself is retrospective and records the id afterward — see Amendment 2 section 4 and Amendment 5) |
 | ID null, `creating` | Name present, labels missing or wrong | Ownership conflict: `REFUSED` — never confirmed absence |
 | ID null, `absent` | Name absent | Confirmed absent |
 | ID null, `absent` | Name present, any labels | Ambiguity: `REFUSED` |
@@ -1943,3 +1943,174 @@ platform/host-specific tests skipped (exact likely identities come
 from source inspection, not this run's own `pytest -q` log — see
 `ENGINEERING_LOG.md`'s dated erratum entry for detail). No leftover
 `codeagent-verify` containers.
+
+---
+
+## Amendment 5 (Accepted 2026-09-23): Milestone 3 Slice 3B-5 — safe reconciliation and removal of ADR-attributable Docker containers
+
+Implementation status: **implemented.** Extends Slice 3B-1's automatic
+reconciliation with the container half of section 7's persisted-
+combination table: observation, ownership proof, write-ahead
+transitions, and removal. Worktree and checkpoint-ref removal remain
+entirely out of scope, unchanged from Slice 3B-1.
+
+### 1. Widened eligibility
+
+Slice 3B-1 recognized only `PREPARING`/`RECONCILING` entries in the
+complete initial absent shape. A crash can leave a dead owner in any
+owner-writable state, not only `PREPARING` — `record_container_
+transition` permits container mutation from `PREPARING`, `ACTIVE`, or
+`CLEANING` alike (Amendment 3's resource-state gate). Reconciliation
+eligibility is therefore widened to `PREPARING`/`ACTIVE`/`CLEANING`/
+`RECONCILING`, with the required shape narrowed correspondingly: the
+worktree and checkpoint ref must both be at their initial absent shape
+and `failure` must be null (`lifecycle_store.
+is_projection_reconciliation_eligible_shape`), while either container's
+own shape is otherwise unconstrained — it is exactly what this slice
+now inspects and, where legal, resolves. `COMPLETE`/`RECONCILED`
+terminal recognition is unchanged.
+
+### 2. A reconciliation-specific container edge is not the live owner's edge
+
+`record_container_transition`'s own `CREATING -> ABSENT` edge is
+documented as meaning "no container was ever created" — a strong,
+historical claim only the process that never called `docker create`
+can make. Reconciliation can only ever prove a weaker, point-in-time
+claim: "a fresh, successful, unfiltered listing shows no container
+currently bears the deterministic name." A dead owner could in
+principle have created and even started a container between its own
+last durable write and its crash, and it could reappear as a Docker
+daemon restart artifact; reconciliation's claim is bounded by what its
+own observation actually shows, not by anything it can conclude about
+history.
+
+Because of this, reconciliation writes exclusively through its own new
+table, `_RECONCILER_CONTAINER_TRANSITION_EDGES` (`lifecycle_store.py`):
+`(creating, absent)`, `(creating, removing)`, `(present, removing)`,
+`(removing, absent)` — distinct from, not layered on top of,
+`_CONTAINER_TRANSITION_EDGES`. Notably absent: any direct
+`present -> absent` edge. A persisted `present`/`removing` role that a
+fresh observation already shows confirmed absent must still pass
+through the `removing` write-ahead step before absence is declared —
+there is no shortcut, even when no `docker rm` call will actually be
+issued.
+
+### 3. `_publish_reconciler_container_transition`
+
+A new function in `lifecycle_store.py`, parallel to but distinct from
+`_LifecycleProjectionWriter.record_container_transition`: the live-
+owner writer is categorically refused while the authoritative state is
+`RECONCILING`/`RECONCILED`/`RECONCILIATION_FAILED` (Amendment 3's
+resource-state gate) — precisely the states a reconciliation pass runs
+in — so reconciliation needed its own write path rather than reusing
+that one. It hard-codes its target `state` to `RECONCILING`; every
+other state transition, including the terminal `RECONCILING ->
+RECONCILED` collapse, remains `_publish_projection_state`'s own
+exclusive responsibility, unchanged.
+
+Per call: validates the current state is eligible, the role is exactly
+`baseline` or `verification`, the id grammar matches the intent (full
+64-lowercase-hex, or `None`), the requested edge is legal
+(`removing -> removing` additionally requires the same id, for a
+resumed in-flight removal), and `attempts_total` is consistent with a
+fresh cycle (exactly current + 1) or a resumed one (unchanged) — a
+mismatch is `ILLEGAL_TRANSITION`, never inferred from a Docker
+observation. A true no-op (nothing published) requires all three:
+state already `RECONCILING`, `attempts_total` already correct, and the
+target role's attribution already exactly equal — anything less still
+performs a real publish, so a first entry into `RECONCILING`, or a
+resumed cycle's own attempt bookkeeping, is never skipped merely
+because a dead owner had already published a matching container shape.
+One atomic `publish_private_file_atomically_at` call per invocation;
+state and the container edge are never split across two writes.
+
+### 4. Entry-wide inspection order
+
+Per entry, strictly: load and validate the projection; confirm the
+checkpoint ref, then the worktree, absent (unchanged from Slice 3B-1,
+reordered ahead of containers); one complete, unfiltered
+`docker ps -a --no-trunc --format '{{.ID}}\t{{.Names}}'` listing
+(`reconciliation._docker_ps_all_id_name_pairs`, strictly parsed —
+exactly one tab-separated id/name pair per row, 64-lowercase-hex id,
+Docker's own name grammar, no duplicate id or name anywhere, or the
+whole listing is untrusted); an ownership-proof
+`docker inspect --type container --format
+'{{.Id}}{{"\t"}}{{.Name}}{{"\t"}}{{json .Config.Labels}}' <id>`
+(`reconciliation._docker_inspect_ownership`, by immutable id only,
+16 KiB bound) for every candidate either role's classification needs;
+both roles' complete decisions are computed before either is mutated —
+a conflict (ownership mismatch, ambiguity, or a genuine inspection
+failure) on either role aborts the whole entry with zero mutation
+attempted for both.
+
+### 5. Write-ahead, then baseline-first removal
+
+Once both decisions are conflict-free: every required write-ahead or
+direct confirmed-absence transition is published for baseline, then
+verification — entirely before any `docker rm` is issued for either
+role. Only after both roles' write-ahead writes are durably confirmed
+does removal begin, baseline first: `docker rm --force <id>` (skipped
+entirely when nothing was ever observed live — e.g. the "already
+confirmed absent while `present`" case above), then always, regardless
+of that removal attempt's own outcome (launch failure, timeout,
+overflow, nonzero exit, or unconfirmed termination alike — `docker
+rm`'s own result is never authoritative), one fresh independent strict
+listing, classified as follows. Neither the name nor the id present in
+that listing -> confirmed absent -> `removing -> absent`. A listing-
+level disagreement about which container exists (the id under a
+different name, or a different id at the expected name) -> `REFUSED`,
+retaining `removing(id)`, with no further inspection — the listing
+alone already disproves continuity. The exact owned id/name pair still
+present in that listing is not by itself sufficient to conclude
+anything beyond absence: the surviving candidate is re-inspected by
+immutable id, exactly like the original classification (section 4)
+did, requiring both identity and all four required labels again before
+this function will report anything further. A well-formed re-inspect
+that still confirms ownership -> `FAILED`, retaining `removing(id)`. A
+well-formed re-inspect whose identity or labels now disagree ->
+`REFUSED`, retaining `removing(id)`. A failed or malformed re-inspect
+-> `SUBSTRATE_UNAVAILABLE`, retaining `removing(id)`. Verification's own removal is only attempted
+once baseline reaches durable absence this pass; if baseline does not,
+the entry stops there for this pass (verification's own write-ahead,
+already published, stands and is resumed on a later pass). The final
+`RECONCILING -> RECONCILED` collapse (`_publish_projection_state`,
+unchanged) is written only once both containers, the worktree, and the
+checkpoint ref are all durably absent.
+
+### 6. Maintenance-trace container ids
+
+`ReconciliationEntryResult` gains `baseline_id`/`verification_id`
+(`str | None`), populated from a positively observed candidate id and
+retained even after a successful removal — the maintenance trace is
+retrospective, never write-ahead (Amendment 2 section 4); the
+projection's own write-ahead `removing(id)` transition is what actually
+protects the id before removal, not the trace. `None` when a role was
+already absent or no well-formed candidate was ever observed for a
+conflict.
+
+### Milestone boundary
+
+Slice 3B-5 owns exactly the above: container reconciliation and
+removal inside `reconciliation.py`, plus the one new writer primitive
+and predicate in `lifecycle_store.py`. No `executor.py` change, no
+lifecycle-aware container creation, no producer-side publisher seam
+wired into `DockerVerifier`, no deterministic-name creation, no
+`RunController` or CLI wiring, and no worktree or checkpoint-ref
+removal — all later Milestone 3 work. `docs/threat-model.md`'s T-E1 is
+unchanged by this slice specifically (nothing here changes when or
+whether `prepare_lifecycle()` is called before a real run starts); a
+dead run's *containers* are now recoverable once reconciliation does
+run, extending the partial T-E1 mitigation Slice 3B-1 already recorded
+from worktree/ref-adjacent state to containers as well.
+
+### Evidence
+
+`src/codeagent/reconciliation.py`, `src/codeagent/lifecycle_store.py`,
+and `tests/unit/test_reconciliation.py` implement and verify every rule
+above, including real Docker fixtures created directly with the exact
+deterministic names and required labels (never through `DockerVerifier`)
+proving both a genuine owned-removal path and a genuine unlabeled-
+conflict refusal end to end; see `ENGINEERING_LOG.md`'s dated entries
+for exact local verification totals and evidence (macOS, a real Docker
+daemon, `CODEAGENT_REQUIRE_DOCKER=1`). **Linux CI is still pending** —
+this slice has not been pushed, so no CI run exists for it yet.

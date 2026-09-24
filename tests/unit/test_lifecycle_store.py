@@ -2418,3 +2418,369 @@ def test_real_checkpoint_session_durably_publishes_through_the_real_writer(tmp_p
 
 def _head(repo) -> str:
     return _run("git", "-C", str(repo), "rev-parse", "HEAD").stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# Slice 3B-5 correction pass, finding 5: direct tests for the reconciler-
+# owned writer `_publish_reconciler_container_transition` (ADR 0004
+# Amendment 5). These are deliberately unit-level and fd-only -- no
+# lease, no lock, no Docker/Git call -- exercising every validation
+# rule the function itself owns, independent of the full
+# `reconcile_repository()` pipeline already covered in
+# `test_reconciliation.py`.
+# ---------------------------------------------------------------------------
+
+
+def _open_run_dir_fd(tmp_path, name="run"):
+    run_dir = tmp_path / name
+    run_dir.mkdir()
+    return os.open(str(run_dir), os.O_RDONLY | os.O_DIRECTORY), run_dir
+
+
+def _base_projection(*, lifecycle_id="a" * 32, state=ls.LifecycleState.PREPARING, attempts_total=0):
+    projection = ls.build_initial_preparing_projection(
+        lifecycle_id=lifecycle_id,
+        state_root_id="s" * 16,
+        repo_key="r" * 32,
+        run_id="run-1",
+        source_repo_path="/tmp/x",
+    )
+    return dataclasses.replace(
+        projection,
+        state=state,
+        reconciliation=ls.ReconciliationSummary(attempts_total=attempts_total, recent_failures=()),
+    )
+
+
+def _with_role(projection, *, role, intent, id):
+    attr = ls.ContainerAttribution(intent=intent, id=id)
+    if role == "baseline":
+        return dataclasses.replace(projection, baseline=attr)
+    return dataclasses.replace(projection, verification=attr)
+
+
+def _role_attr(projection, role):
+    return projection.baseline if role == "baseline" else projection.verification
+
+
+def _read_back(run_dir):
+    data = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    return lf.canonical_json_loads_strict(data, max_bytes=ls.LIFECYCLE_JSON_MAX_BYTES)
+
+
+_LEGAL_RECONCILER_EDGES = [
+    (ls.ContainerIntent.CREATING, None, ls.ContainerIntent.ABSENT, None),
+    (ls.ContainerIntent.CREATING, None, ls.ContainerIntent.REMOVING, "1" * 64),
+    (ls.ContainerIntent.PRESENT, "2" * 64, ls.ContainerIntent.REMOVING, "2" * 64),
+    (ls.ContainerIntent.REMOVING, "3" * 64, ls.ContainerIntent.ABSENT, None),
+]
+
+
+@pytest.mark.parametrize("from_intent,from_id,to_intent,to_id", _LEGAL_RECONCILER_EDGES)
+def test_reconciler_writer_exact_legal_edges(tmp_path, from_intent, from_id, to_intent, to_id):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _base_projection()
+        projection = _with_role(projection, role="baseline", intent=from_intent, id=from_id)
+        ls.publish_private_file_atomically_at(
+            fd, ls.LIFECYCLE_JSON_FILENAME, lf.canonical_json_dumps(ls.projection_to_dict(projection)), mode=0o600
+        )
+
+        updated = ls._publish_reconciler_container_transition(
+            fd, projection, role="baseline", intent=to_intent, id=to_id, attempts_total=1
+        )
+        assert _role_attr(updated, "baseline") == ls.ContainerAttribution(intent=to_intent, id=to_id)
+        assert updated.state is ls.LifecycleState.RECONCILING
+        assert updated.reconciliation.attempts_total == 1
+
+        on_disk = _read_back(run_dir)
+        assert on_disk["state"] == "RECONCILING"
+        assert on_disk["containers"]["baseline"] == {"intent": to_intent.value, "id": to_id}
+    finally:
+        os.close(fd)
+
+
+_ILLEGAL_RECONCILER_EDGES = [
+    (ls.ContainerIntent.ABSENT, None, ls.ContainerIntent.CREATING, None),  # live-owner-only edge
+    (ls.ContainerIntent.CREATING, None, ls.ContainerIntent.PRESENT, "4" * 64),
+    (ls.ContainerIntent.ABSENT, None, ls.ContainerIntent.REMOVING, "5" * 64),
+    (ls.ContainerIntent.PRESENT, "6" * 64, ls.ContainerIntent.ABSENT, None),  # no direct present->absent edge
+    (ls.ContainerIntent.PRESENT, "7" * 64, ls.ContainerIntent.CREATING, None),
+]
+
+
+@pytest.mark.parametrize("from_intent,from_id,to_intent,to_id", _ILLEGAL_RECONCILER_EDGES)
+def test_reconciler_writer_illegal_edges(tmp_path, from_intent, from_id, to_intent, to_id):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_role(_base_projection(), role="baseline", intent=from_intent, id=from_id)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_container_transition(
+                fd, projection, role="baseline", intent=to_intent, id=to_id, attempts_total=1
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [ls.LifecycleState.COMPLETE, ls.LifecycleState.RECONCILED, ls.LifecycleState.RECONCILIATION_FAILED],
+)
+def test_reconciler_writer_rejects_ineligible_state(tmp_path, state):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _base_projection(state=state)
+        projection = _with_role(projection, role="baseline", intent=ls.ContainerIntent.CREATING, id=None)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_container_transition(
+                fd, projection, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None, attempts_total=1
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "state,attempts_total",
+    [
+        (ls.LifecycleState.PREPARING, 0),
+        (ls.LifecycleState.ACTIVE, 3),
+        (ls.LifecycleState.CLEANING, 5),
+        (ls.LifecycleState.RECONCILING, 2),
+    ],
+)
+def test_reconciler_writer_accepts_every_eligible_state(tmp_path, state, attempts_total):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _base_projection(state=state, attempts_total=attempts_total)
+        projection = _with_role(projection, role="baseline", intent=ls.ContainerIntent.CREATING, id=None)
+        expected_attempts = attempts_total if state is ls.LifecycleState.RECONCILING else attempts_total + 1
+        updated = ls._publish_reconciler_container_transition(
+            fd, projection, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None, attempts_total=expected_attempts
+        )
+        assert updated.state is ls.LifecycleState.RECONCILING
+        assert updated.reconciliation.attempts_total == expected_attempts
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_writer_rejects_bad_role(tmp_path):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_role(_base_projection(), role="baseline", intent=ls.ContainerIntent.CREATING, id=None)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_container_transition(
+                fd, projection, role="not-a-role", intent=ls.ContainerIntent.ABSENT, id=None, attempts_total=1
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "intent,id",
+    [
+        (ls.ContainerIntent.ABSENT, "8" * 64),  # absent must carry no id
+        (ls.ContainerIntent.CREATING, "9" * 64),  # creating must carry no id
+        (ls.ContainerIntent.PRESENT, None),  # present requires an id
+        (ls.ContainerIntent.REMOVING, ""),  # removing requires a nonempty id
+        (ls.ContainerIntent.REMOVING, "not-hex"),  # must be 64 lowercase hex
+        (ls.ContainerIntent.REMOVING, "A" * 64),  # uppercase rejected
+        (ls.ContainerIntent.REMOVING, "a" * 63),  # too short
+    ],
+)
+def test_reconciler_writer_rejects_bad_id_grammar(tmp_path, intent, id):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_role(_base_projection(), role="baseline", intent=ls.ContainerIntent.CREATING, id=None)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_container_transition(
+                fd, projection, role="baseline", intent=intent, id=id, attempts_total=1
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_writer_fresh_cycle_requires_exact_increment(tmp_path):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_role(
+            _base_projection(state=ls.LifecycleState.PREPARING, attempts_total=0),
+            role="baseline",
+            intent=ls.ContainerIntent.CREATING,
+            id=None,
+        )
+        for bad_attempts in (0, 2):
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                ls._publish_reconciler_container_transition(
+                    fd, projection, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None, attempts_total=bad_attempts
+                )
+            assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_writer_resumed_cycle_rejects_double_increment(tmp_path):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_role(
+            _base_projection(state=ls.LifecycleState.RECONCILING, attempts_total=4),
+            role="baseline",
+            intent=ls.ContainerIntent.CREATING,
+            id=None,
+        )
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_container_transition(
+                fd, projection, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None, attempts_total=5
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_writer_true_noop_publishes_nothing(tmp_path, monkeypatch):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_role(
+            _base_projection(state=ls.LifecycleState.RECONCILING, attempts_total=1),
+            role="baseline",
+            intent=ls.ContainerIntent.REMOVING,
+            id="a" * 64,
+        )
+
+        def _boom(*a, **k):
+            raise AssertionError("must not publish for a true no-op")
+
+        monkeypatch.setattr(ls, "publish_private_file_atomically_at", _boom)
+        updated = ls._publish_reconciler_container_transition(
+            fd, projection, role="baseline", intent=ls.ContainerIntent.REMOVING, id="a" * 64, attempts_total=1
+        )
+        assert updated is projection
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_writer_matching_attribution_but_wrong_attempts_is_not_a_noop(tmp_path):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        # A dead owner already durably wrote removing(id) while still in
+        # PREPARING (not yet RECONCILING) -- attribution alone matches
+        # what this call would compute, but state/attempts still require
+        # a real write to reach RECONCILING.
+        projection = _with_role(
+            _base_projection(state=ls.LifecycleState.PREPARING, attempts_total=0),
+            role="baseline",
+            intent=ls.ContainerIntent.REMOVING,
+            id="b" * 64,
+        )
+        updated = ls._publish_reconciler_container_transition(
+            fd, projection, role="baseline", intent=ls.ContainerIntent.REMOVING, id="b" * 64, attempts_total=1
+        )
+        assert updated is not projection
+        assert updated.state is ls.LifecycleState.RECONCILING
+        assert updated.reconciliation.attempts_total == 1
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_writer_removing_to_removing_same_id_is_allowed(tmp_path):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_role(
+            _base_projection(state=ls.LifecycleState.RECONCILING, attempts_total=1),
+            role="baseline",
+            intent=ls.ContainerIntent.REMOVING,
+            id="c" * 64,
+        )
+        # Same id, but a different (still-eligible) call shape than the
+        # true no-op above -- attempts_total unchanged and id unchanged,
+        # so this specific call *is* the no-op case; exercise the edge
+        # logic directly by starting from CLEANING instead, which forces
+        # a real state/attempts transition even though the id is retained.
+        projection = dataclasses.replace(projection, state=ls.LifecycleState.CLEANING, reconciliation=ls.ReconciliationSummary(attempts_total=1, recent_failures=()))
+        updated = ls._publish_reconciler_container_transition(
+            fd, projection, role="baseline", intent=ls.ContainerIntent.REMOVING, id="c" * 64, attempts_total=2
+        )
+        assert _role_attr(updated, "baseline") == ls.ContainerAttribution(intent=ls.ContainerIntent.REMOVING, id="c" * 64)
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_writer_removing_to_removing_different_id_is_rejected(tmp_path):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_role(
+            _base_projection(state=ls.LifecycleState.RECONCILING, attempts_total=1),
+            role="baseline",
+            intent=ls.ContainerIntent.REMOVING,
+            id="d" * 64,
+        )
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_container_transition(
+                fd, projection, role="baseline", intent=ls.ContainerIntent.REMOVING, id="e" * 64, attempts_total=1
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_writer_preserves_every_unrelated_field(tmp_path):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _base_projection(state=ls.LifecycleState.ACTIVE, attempts_total=0)
+        projection = _with_role(projection, role="baseline", intent=ls.ContainerIntent.CREATING, id=None)
+        projection = _with_role(projection, role="verification", intent=ls.ContainerIntent.PRESENT, id="f" * 64)
+
+        updated = ls._publish_reconciler_container_transition(
+            fd, projection, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None, attempts_total=1
+        )
+        # Only baseline and state/attempts changed; everything else, byte for byte.
+        assert updated.verification == projection.verification
+        assert updated.worktree == projection.worktree
+        assert updated.checkpoint_ref == projection.checkpoint_ref
+        assert updated.failure == projection.failure
+        assert updated.lifecycle_id == projection.lifecycle_id
+        assert updated.state_root_id == projection.state_root_id
+        assert updated.repo_key == projection.repo_key
+        assert updated.run_id == projection.run_id
+        assert updated.source_repo_path == projection.source_repo_path
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_writer_publication_failure_is_sanitized_and_classified(tmp_path, monkeypatch):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_role(_base_projection(), role="baseline", intent=ls.ContainerIntent.CREATING, id=None)
+
+        def _boom(*a, **k):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.IO_FAILED, "forced write failure")
+
+        monkeypatch.setattr(ls, "publish_private_file_atomically_at", _boom)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_container_transition(
+                fd, projection, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None, attempts_total=1
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_writer_durability_unconfirmed_is_classified_distinctly(tmp_path, monkeypatch):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_role(_base_projection(), role="baseline", intent=ls.ContainerIntent.CREATING, id=None)
+
+        def _boom(*a, **k):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.INSTALLED_DURABILITY_UNCONFIRMED, "forced")
+
+        monkeypatch.setattr(ls, "publish_private_file_atomically_at", _boom)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_container_transition(
+                fd, projection, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None, attempts_total=1
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+    finally:
+        os.close(fd)

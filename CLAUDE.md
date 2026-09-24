@@ -1090,6 +1090,212 @@ Stage 2 (of the four-stage planning process in
   publisher, lifecycle projection write, ownership label, deterministic
   lifecycle-derived container name, controller wiring, or crash-
   reconciliation behavior of any kind.
+- **Milestone 3 Slice 3B-5** (safe reconciliation and removal of
+  ADR-attributable Docker containers), per
+  `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  "Amendment 5 (Accepted 2026-09-23)", **is implemented and locally
+  validated on macOS (2026-09-23); left unstaged/uncommitted for joint
+  review per the author's explicit instruction — Linux CI has not yet
+  run.** Extends Slice 3B-1's automatic reconciliation with the
+  container half of ADR 0004 §7's persisted-combination table:
+  eligibility widens from `PREPARING`/`RECONCILING`-only to also
+  `ACTIVE`/`CLEANING` (a dead owner can crash in any owner-writable
+  state), with the required shape narrowed to worktree/checkpoint-ref/
+  failure absent while either container's own shape is otherwise
+  unconstrained (`lifecycle_store.is_projection_reconciliation_eligible_shape`).
+  New in `lifecycle_store.py`: `_publish_reconciler_container_transition`
+  (a reconciler-owned write-ahead primitive, hard-coded to `RECONCILING`,
+  distinct from the live-owner's `record_container_transition` since
+  that writer is categorically refused during `RECONCILING`) and its
+  own `_RECONCILER_CONTAINER_TRANSITION_EDGES` table — deliberately not
+  layered on the live-owner's own table, since reconciliation's
+  `creating -> absent` edge proves only a weaker, point-in-time
+  "confirmed absent by a fresh observation" claim, never the live
+  owner's stronger historical "no container was ever created" claim.
+  New in `reconciliation.py`: a strict `docker ps -a --no-trunc
+  --format '{{.ID}}\t{{.Names}}'` listing (`_docker_ps_all_id_name_pairs`,
+  replacing the old name-only listing; a duplicate id or name anywhere
+  untrusts the whole listing) and a strict ownership-proof
+  `docker inspect --type container --format
+  '{{.Id}}{{"\t"}}{{.Name}}{{"\t"}}{{json .Config.Labels}}'` by
+  immutable id (`_docker_inspect_ownership`, all four required labels
+  checked); `_reconcile_locked_entry` is reordered so checkpoint-ref
+  and worktree absence are confirmed before containers are inspected,
+  computes both roles' complete decisions before mutating either (zero
+  mutation on either conflict), publishes every write-ahead transition
+  for both roles before any `docker rm` is issued, then removes
+  baseline-first — stopping before verification's own removal if
+  baseline does not reach durable absence this pass — always
+  re-observing by a fresh independent listing after any `docker rm`
+  attempt regardless of that attempt's own outcome (never trusting
+  `docker rm`'s exit code). `ReconciliationEntryResult` gains
+  `baseline_id`/`verification_id`, retained in the (retrospective,
+  never write-ahead) maintenance trace even after a successful removal.
+  The old 3B-1 static test asserting *zero* removal-shaped calls
+  anywhere in `reconciliation.py` is obsolete by design (this slice's
+  whole point is one sanctioned `docker rm` path) and is replaced by
+  two narrower static proofs: no filesystem-removal primitive
+  (`shutil.rmtree`/`os.remove`/`os.unlink`/`os.rmdir`) is reachable
+  (worktree/checkpoint-ref removal remain out of scope), and exactly
+  one `["docker", "rm", "--force", ...]`-shaped argv literal exists.
+  `docs/adr/0004-...md` section 7's own table is corrected in place
+  (the old "recorded in the maintenance trace first" parenthetical
+  contradicted Amendment 2 §4's already-accepted retrospective-trace
+  rule); `docs/threat-model.md`'s T-E1 entry now records dead-run
+  container recovery as implemented, not merely planned. Verified: the
+  nine-file focused set used since Slice 3A-1 plus
+  `test_bounded_subprocess.py`, 875 passed, in both forward and reverse
+  file order; the full local suite (macOS), with a real Docker daemon
+  and `CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a failure): the 3
+  dedicated real-Docker tests in `test_slice_c.py`, 3 passed, 0
+  skipped; the complete suite, 2,453 passed, 0 skipped (up from the
+  2,435-test pre-3B-5 baseline); no leftover `codeagent-verify`
+  containers afterward, confirmed directly via `docker ps -a --filter
+  name=codeagent-`. Two of the new tests use real Docker fixtures
+  created directly with the exact deterministic name and required
+  labels (never through `DockerVerifier`): one proves a genuinely
+  owned, labeled container is observed and removed end to end; the
+  other proves an unlabeled container at the same deterministic name is
+  refused and never removed. **Not implemented** (later Milestone 3
+  work, unchanged scope from prior slices): any `executor.py` change,
+  lifecycle-aware container creation, a producer-side publisher seam
+  wired into `DockerVerifier`, deterministic-name container creation,
+  `RunController`/CLI wiring, worktree or checkpoint-ref removal,
+  abandonment, and signal handling. See `ENGINEERING_LOG.md`'s dated
+  entry for the five design points locked in during planning review
+  and the full test/verification detail.
+  **A correction pass (2026-09-23) fixed eight real gaps found by
+  review before this slice was considered final, all confirmed by
+  independent re-verification against source, none disputed**: (1)
+  `_docker_inspect_ownership` accepted an inspect name with no leading
+  `/`, now requiring exactly one; the listing parser switched from
+  `str.splitlines()` (which silently absorbs a CRLF-terminated row as
+  bare-LF) to a strict `\n`-only split with an explicit trailing-
+  newline check; (2) the implementation actually checked the worktree
+  before the checkpoint ref, contradicting its own docstring, the ADR,
+  and this file's own prior description — reordered to the accepted
+  checkpoint-ref-then-worktree order (the earlier bullet's own text was
+  already correct; only the code disagreed with it); (3)
+  `_remove_and_confirm_absent` trusted a post-removal listing alone to
+  conclude `STILL_PRESENT`, never re-proving ownership (I2) — a
+  surviving exact id/name pair is now re-inspected by immutable id
+  before that conclusion, with a listing-level pairing disagreement
+  still `CONFLICT` without a redundant inspect; (4) every `REFUSED`/
+  `SUBSTRATE_UNAVAILABLE` container-classification branch now carries
+  whatever candidate id it actually observed into `ReconciliationEntryResult.
+  baseline_id`/`verification_id` (previously only `OWNED_REMOVE`/
+  `CONFIRMED_ABSENT` did), and the container-conflict and write-ahead-
+  failure exits in `_reconcile_locked_entry` now populate both roles'
+  ids from whatever had already been observed; (5) 26 new direct,
+  fd-only unit tests for `_publish_reconciler_container_transition`
+  were added to `test_lifecycle_store.py` (previously zero existed —
+  it was exercised only indirectly through the full pipeline), plus 3
+  explicit ordering tests in `test_reconciliation.py`; (6) two real-
+  SIGKILL crash-resume tests were added (a genuinely separate child
+  process self-SIGKILLs immediately after its 1st, then separately
+  after its 2nd, reconciler-owned container write durably lands against
+  a real Docker container; a fresh pass then resumes, removes the real
+  container(s), and never re-increments the attempt count across the
+  crash), plus two more real-Docker ADR-§7-table-row tests independent
+  of the pre-existing `creating`-role coverage (a `present`-role owned
+  removal on the *verification* role, and a `present`-role persisted-
+  id/live-id conflict on the *baseline* role). At the time this first
+  correction pass concluded, the trivial absent/confirmed-absent rows
+  and the `absent`+name-present ambiguity row still remained mock-only;
+  **the second correction pass below closed the ambiguity row with a
+  real-Docker test** — only the trivial "nothing live at all"
+  confirmed-absent rows remain deliberately unit-only, per the
+  recommendation the second pass's own entry below and
+  `ENGINEERING_LOG.md` record;
+  (7) every real-Docker fixture now creates containers from this
+  repository's own pinned `executor.DEFAULT_IMAGE` (imported, not
+  duplicated) instead of a floating, CI-unapproved `alpine:latest`,
+  fixture teardown is now load-bearing (`check=True`, a cleanup failure
+  fails the test), and a new final test queries both
+  `codeagent-baseline-*` and `codeagent-verification-*` name families
+  for leftovers, not only the unrelated `codeagent-verify` family.
+  Verified (post-correction-pass): `test_reconciliation.py` alone, 94
+  passed with `CODEAGENT_REQUIRE_DOCKER=1`, 0 skipped (up from 86); the
+  nine-file focused set plus `test_bounded_subprocess.py`, 916 passed
+  (up from 875), in both forward and reverse file order; the full local
+  suite, 2,494 passed both with and without `CODEAGENT_REQUIRE_
+  DOCKER=1` (identical total both times — every real-Docker test ran
+  both times, none skipped either way); `git diff --check` clean; no
+  leftover `codeagent-baseline-*`/`codeagent-verification-*`
+  containers, extra worktrees, `refs/codeagent` refs, or temp state
+  roots afterward. See `ENGINEERING_LOG.md`'s dated correction-pass
+  entry for full detail.
+  **A second, narrower correction pass (2026-09-23) fixed seven more
+  real gaps found by review, all confirmed, none disputed**: separated
+  `_ContainerDecision.removal_id` (write authorization) from a new
+  `observed_id` (retrospective trace evidence only) so an unobserved
+  persisted id could no longer leak into the maintenance trace as if
+  positively confirmed; both roles' retrospective trace ids are now
+  derived immediately from both already-completed decisions before the
+  first publication, so an early role's failure can no longer silently
+  drop a later role's already-known id; 12 new parser regression tests
+  for the inspect-name/listing-split grammar, which in the process
+  **found and fixed one further real gap**: `_docker_inspect_ownership`
+  did not reject an embedded `\r`, letting a CRLF row's trailing
+  carriage return survive into the labels JSON field, where `json.
+  loads` silently tolerates it as trailing whitespace — now explicitly
+  rejected; 8 new direct unit tests plus 1 parametrized pipeline test
+  for `_remove_and_confirm_absent`'s complete post-removal
+  classification (still-present/wrong-identity/wrong-labels/inspect-
+  failure/listing-conflict, three `docker rm` failure shapes each still
+  followed by successful confirmation, and durable `removing(id)`
+  retention through every non-absent outcome); both real-SIGKILL tests
+  now assert `proc.exitcode == -signal.SIGKILL` as load-bearing
+  evidence and kill+join a still-alive child before failing, rather
+  than only checking `is_alive()`; 2 more real-Docker ADR-§7-table-row
+  tests close the two remaining safe, deterministic rows named in
+  review (a `present` role whose real container was genuinely removed
+  out of band before reconciliation ran; an `absent` role with a real,
+  correctly-labeled container still occupying the deterministic name) —
+  the one row left deliberately unit-only (literal absence-of-anything)
+  is stated as a recommendation in `ENGINEERING_LOG.md`, not silently
+  narrowed into this file or the ADR; and the final-cleanup test's
+  regex filter was independently confirmed against a real container to
+  actually anchor and alternate as intended, then paired with a second,
+  fully parser-independent client-side query, both asserted, a failure
+  now naming the actual leftover containers. Verified: `test_
+  reconciliation.py` alone, 132 tests collected (up from 94); the
+  nine-file focused set plus `test_bounded_subprocess.py`, 954 passed
+  (up from 916), forward and reverse; the full local suite, 2,532
+  passed both with and without `CODEAGENT_REQUIRE_DOCKER=1` (identical
+  total both times, up from 2,494); `git diff --check` clean; no
+  leftover containers by either cleanup query, no extra worktrees or
+  refs. Docker Desktop was started only via plain `open -a Docker`; no
+  administrator-access dialog appeared during this pass. See
+  `ENGINEERING_LOG.md`'s dated second-correction-pass entry for full
+  detail.
+  **A third, narrow consistency pass (2026-09-24) fixed five review
+  points, all confirmed**: `_docker_ps_all_id_name_pairs` now rejects
+  any blank listing row (leading, internal, or an extra trailing one)
+  once output is nonempty, rather than silently skipping it — empty
+  output itself remains valid; ADR 0004 Amendment 5 section 5's own
+  text is corrected in place to describe the real post-removal
+  sequence (a still-present exact id/name pair is re-inspected by
+  immutable id before `FAILED` is ever concluded, matching production
+  since the first correction pass), with its evidence paragraph
+  corrected from "exact totals and CI evidence" to local verification
+  totals with "Linux CI is still pending" stated explicitly (this
+  slice has never been pushed); and this file's own first-correction-
+  pass paragraph above, which had said the `absent`+name-present
+  ambiguity row stayed mock-only, is corrected in place to say that was
+  true only "at the time this first correction pass concluded" and to
+  point at the second pass's own later closure of that row, removing
+  the contradiction a top-to-bottom reader would otherwise hit.
+  Verified: the listing-parser test group, 11 passed; `test_
+  reconciliation.py` alone, 135 passed with `CODEAGENT_REQUIRE_
+  DOCKER=1`; the nine-file focused set plus `test_bounded_subprocess.py`,
+  957 passed (up from 954), forward and reverse; the full local suite,
+  2,535 passed both with and without `CODEAGENT_REQUIRE_DOCKER=1`
+  (identical total, up from 2,532); `git diff --check` clean; no
+  leftover containers, extra worktrees, or refs. Docker was already
+  ready and was not restarted; no administrator-access dialog appeared.
+  See `ENGINEERING_LOG.md`'s dated third-correction-pass entry for full
+  detail. Still unstaged and uncommitted — Linux CI has not run.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
