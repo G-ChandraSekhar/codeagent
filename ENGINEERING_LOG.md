@@ -3350,3 +3350,86 @@ the parser-independent client-side query, no extra worktrees, no
 `refs/codeagent` refs. Docker was already ready and was not restarted;
 no macOS administrator-access dialog appeared. Nothing staged,
 committed, or pushed.
+
+## 2026-09-24: Slice 3B-5 — Linux CI evidence reconciliation
+
+Documentation-only pass reconciling the "Linux CI pending" wording left
+in place after finalization, per the author's own instruction to treat
+that reconciliation as a separate pass. No production code, tests,
+workflow, configuration, dependencies, accepted transition tables, or
+scope boundaries changed.
+
+Preflight confirmed: branch `main`, HEAD
+`923d99a6596771c37defb801237e4642c56a3305`, matches `origin/main`,
+working tree clean. Every cited CI fact was independently re-verified
+against the GitHub API and a freshly re-fetched job log (byte-identical
+to the log fetched during finalization) before being written into
+documentation, not merely copied from the prior finalization report.
+
+**Commit** `923d99a6596771c37defb801237e4642c56a3305` ("feat:
+reconcile owned lifecycle containers"), pushed as an ordinary
+fast-forward (`c8b66b3..923d99a`), no force push.
+
+**CI run** [35954619345](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35954619345),
+job `Test (ubuntu-24.04, Python 3.12)`, `ubuntu-24.04` x86_64, Python
+3.12, `headSha` confirmed `923d99a6596771c37defb801237e4642c56a3305`,
+conclusion `success`. Every step succeeded: mandatory Docker preflight;
+`Resolve pinned verification image`; `Pull pinned verification image
+and confirm linux/amd64` (confirmed pulled
+`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`,
+platform line read verbatim: "Pulled image reports platform:
+linux/amd64"); `Run real Docker verification tests (must execute, not
+skip)` — env confirmed `CODEAGENT_REQUIRE_DOCKER: 1`, result "3 passed
+in 2.26s", 0 skipped; `Run complete test suite` — invoked as
+`python -m pytest -q` (no `-v`, so no individual test identities are
+ever printed), env also confirmed `CODEAGENT_REQUIRE_DOCKER: 1`,
+result "2532 passed, 3 skipped in 39.37s". Since the dedicated
+real-Docker tests already ran and passed within this same
+complete-suite step under the identical env var, these 3 skips are
+**not** the real-Docker tests — described here only as three
+platform/host-specific skips, never a guessed test identity, since the
+log genuinely does not expose them. `Verify no leftover codeagent-verify
+containers` — the step's own embedded script filters exactly
+`docker ps -a --filter "name=codeagent-verify"`; output: "codeagent-verify
+containers currently present (expected: none):" followed by nothing —
+confirmed empty, and confirmed (by reading the step's own script in the
+log) that this workflow-level check covers only the unrelated
+`codeagent-verify` family (Milestone 1's), unchanged by this slice.
+Slice 3B-5's own `codeagent-baseline-*`/`codeagent-verification-*`
+leftover-container assertion (`test_final_cleanup_no_leftover_
+slice_3b5_containers`) is not a separate workflow step — it is one of
+the 2,532 tests that passed inside the complete-suite step itself.
+
+**Post-CI state reconfirmed**: local `main` and `origin/main` both at
+`923d99a6596771c37defb801237e4642c56a3305`.
+
+This is `ubuntu-24.04` x86_64 implementation/automated-test evidence
+specifically — not a general Linux or ARM64 portability claim, and not
+a security review. It confirms nothing about `prepare_lifecycle()`
+being wired into any real entry point, nor about producer-side
+lifecycle publication, controller/CLI wiring, worktree/checkpoint-ref
+removal, abandonment, or signal handling, none of which exist yet;
+`docs/threat-model.md`'s T-E1 partial-mitigation boundary is unchanged
+by this slice and was inspected during this pass — it contains no
+stale Slice-3B-5-specific Linux-CI-pending statement to correct, so it
+was left untouched.
+
+`CLAUDE.md`'s Slice 3B-5 bullet (both its opening framing and its
+closing statement, previously "Linux CI has not yet run"/"Linux CI has
+not run") and `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+Amendment 5 evidence section (previously "Linux CI is still pending —
+this slice has not been pushed, so no CI run exists for it yet") are
+both updated in place with the verified evidence above. No other prose
+in either file — design, transition tables, ownership rules, failure
+classification, inspection/mutation order, or milestone boundary — was
+touched. The three earlier dated `ENGINEERING_LOG.md` entries
+(2026-09-23 x2, 2026-09-24's own third-correction-pass entry), which
+truthfully stated CI was pending or unrun *at the time each was
+written*, are left unmodified, per this project's own established
+convention of never rewriting historical entries to match later state.
+
+Verified: `git diff --check` clean on the resulting documentation-only
+diff; no production code, test, workflow, configuration, or dependency
+file changed; nothing staged. No test run or Docker session was needed
+for this pass — the completed, independently re-verified CI run is the
+evidence.

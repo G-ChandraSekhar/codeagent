@@ -2112,5 +2112,26 @@ deterministic names and required labels (never through `DockerVerifier`)
 proving both a genuine owned-removal path and a genuine unlabeled-
 conflict refusal end to end; see `ENGINEERING_LOG.md`'s dated entries
 for exact local verification totals and evidence (macOS, a real Docker
-daemon, `CODEAGENT_REQUIRE_DOCKER=1`). **Linux CI is still pending** —
-this slice has not been pushed, so no CI run exists for it yet.
+daemon, `CODEAGENT_REQUIRE_DOCKER=1`).
+
+**Confirmed on GitHub-hosted Linux CI** (commit
+`923d99a6596771c37defb801237e4642c56a3305`, run
+[35954619345](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35954619345),
+job `Test (ubuntu-24.04, Python 3.12)`, `ubuntu-24.04` x86_64, Python
+3.12, conclusion `success`): the mandatory Docker preflight passed; the
+pinned verification image was pulled and confirmed `linux/amd64`; the
+dedicated real-Docker step ran with `CODEAGENT_REQUIRE_DOCKER=1` and
+passed 3 tests, 0 skipped; the complete-suite step also ran with
+`CODEAGENT_REQUIRE_DOCKER=1` and reported 2,532 passed, 3 skipped —
+since the real-Docker tests already passed within this same step under
+that env var, these 3 skips are not the real-Docker tests; the run
+used `pytest -q`, which prints no test identities, so these are three
+platform/host-specific skips, not a guessed identity. This slice's own
+`codeagent-baseline-*`/`codeagent-verification-*` leftover-container
+assertion ran and passed inside this same complete-suite step; the
+workflow's separate final cleanup step checks only the unrelated
+`codeagent-verify` family (Milestone 1's, unchanged by this slice) and
+confirmed empty. This is implementation/automated-test evidence
+only — it does not constitute or substitute for a security review, and
+is `ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+ARM64 portability claim.

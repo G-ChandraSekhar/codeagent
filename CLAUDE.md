@@ -1093,10 +1093,17 @@ Stage 2 (of the four-stage planning process in
 - **Milestone 3 Slice 3B-5** (safe reconciliation and removal of
   ADR-attributable Docker containers), per
   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
-  "Amendment 5 (Accepted 2026-09-23)", **is implemented and locally
-  validated on macOS (2026-09-23); left unstaged/uncommitted for joint
-  review per the author's explicit instruction — Linux CI has not yet
-  run.** Extends Slice 3B-1's automatic reconciliation with the
+  "Amendment 5 (Accepted 2026-09-23)", **is implemented, locally
+  validated on macOS (2026-09-23), committed
+  (`923d99a6596771c37defb801237e4642c56a3305`), and confirmed on
+  GitHub-hosted Linux CI** (run
+  [35954619345](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35954619345),
+  `ubuntu-24.04` x86_64, Python 3.12, success — see the closing
+  paragraph below for the exact totals this run covers; this is
+  implementation/automated-test evidence only, not a security review,
+  and is `ubuntu-24.04` x86_64 evidence specifically, not a general
+  Linux or ARM64 portability claim). Extends Slice 3B-1's automatic
+  reconciliation with the
   container half of ADR 0004 §7's persisted-combination table:
   eligibility widens from `PREPARING`/`RECONCILING`-only to also
   `ACTIVE`/`CLEANING` (a dead owner can crash in any owner-writable
@@ -1295,7 +1302,36 @@ Stage 2 (of the four-stage planning process in
   leftover containers, extra worktrees, or refs. Docker was already
   ready and was not restarted; no administrator-access dialog appeared.
   See `ENGINEERING_LOG.md`'s dated third-correction-pass entry for full
-  detail. Still unstaged and uncommitted — Linux CI has not run.
+  detail.
+  **Finalized and confirmed on GitHub-hosted Linux CI** (commit
+  `923d99a6596771c37defb801237e4642c56a3305`, run
+  [35954619345](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35954619345),
+  `ubuntu-24.04` x86_64, Python 3.12, success): the mandatory Docker
+  preflight passed; the pinned verification image was pulled and
+  confirmed `linux/amd64`; the dedicated real-Docker step
+  (`CODEAGENT_REQUIRE_DOCKER=1` confirmed set), 3 passed, 0 skipped;
+  the complete-suite step (`CODEAGENT_REQUIRE_DOCKER=1` also confirmed
+  set for this step), 2,532 passed, 3 skipped — since the real-Docker
+  tests already passed within this same step under that env var, these
+  3 skips are **not** the real-Docker tests; the run used `pytest -q`,
+  which prints no test identities, so these are described only as
+  three platform/host-specific skips, never a guessed identity. This
+  slice's own `codeagent-baseline-*`/`codeagent-verification-*`
+  leftover-container assertion ran and passed inside this same
+  complete-suite step, not as a separate workflow step; the workflow's
+  own separate final cleanup step checks only the unrelated
+  `codeagent-verify` family (Milestone 1's), unchanged by this slice,
+  and confirmed empty. This is implementation/automated-test evidence
+  only — it does not constitute or substitute for a security review,
+  and is `ubuntu-24.04` x86_64 evidence specifically, not a general
+  Linux or ARM64 portability claim. It does not claim
+  `prepare_lifecycle()` is wired into any real entry point, nor that
+  producer-side lifecycle publication, controller/CLI wiring, worktree/
+  checkpoint-ref removal, abandonment, or signal handling exist —
+  T-E1's existing partial-mitigation boundary in `docs/threat-model.md`
+  is unchanged by this slice. Pushed as an ordinary fast-forward
+  (`c8b66b3..923d99a`), no force push; local `main` and `origin/main`
+  confirmed synchronized post-CI.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
