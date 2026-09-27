@@ -2414,3 +2414,246 @@ GitHub-hosted `ubuntu-24.04` x86_64 — not a general Linux or ARM64
 claim, and not a security review. It does not change T-E1's existing
 partial-mitigation boundary in `docs/threat-model.md`, and does not
 claim any `RunController`/CLI entry-point wiring exists.
+
+## Amendment 7 (Accepted 2026-09-27): Milestone 3 Slice 3B-7 — shared lifecycle-projection coordination and the controller-facing checkpoint lifecycle-publication boundary
+
+Slice 3B-6 gave containers a durable write-ahead publisher; Amendment 4
+(Slice 3B-3) gave the checkpoint ref one too. Both `LifecycleContainerPublisher`
+and `LifecycleCheckpointRefPublisher` each independently tracked their
+own `_current` expected `LifecycleProjection`. This was safe only as
+long as each was ever used alone against a lease. The moment more than
+one of them, or a direct `writer.advance_lifecycle_state()` call, ever
+touched the same lease — the exact shape any future entry-point wiring
+would need — it was not merely a latent risk: `LifecycleProjection`
+equality is whole-object, so *any* successful write through *any* path
+invalidates every other independently-held `_current` snapshot for its
+very next write, which then fails with `STALE_EXPECTED_PROJECTION` on
+its very next use, not eventually. Independently reproduced and fixed
+in this slice, before any entry-point wiring was ever attempted.
+
+Separately, `LifecycleCheckpointRefPublisher.publish()` let a raw
+`LifecycleStoreError` escape uncaught. `RunController`'s two checkpoint
+call sites (`_dispatch_apply_patch`'s `establish()`/`advance()` calls)
+caught only `CheckpointRefError`/`CheckpointSessionError` (this
+amendment's own predecessor, Amendment 4, explicitly recorded that as
+the controller's exact catch set) — a raw `LifecycleStoreError` would
+have propagated straight out of `RunController.run()` itself (which has
+no enclosing try/except), skipping `_fail()`, the domain transition,
+`_terminate()`, evidence capture, worktree disposal, and checkpoint-ref
+deletion entirely. An outer wrapper catching it after the fact cannot
+repair any of that.
+
+This amendment revises Amendment 4's stated exception-identity contract
+at exactly these two named call sites — nowhere else — and closes the
+staleness gap. No entry-point wiring, no `RunController` construction
+change beyond its exception-catching surface, and no worktree-tracking
+work are part of this slice.
+
+### 1. `LifecycleProjectionCursor` — the one authoritative cursor
+
+```python
+class LifecycleProjectionCursor:
+    def __init__(self, writer: _LifecycleProjectionWriter, initial: LifecycleProjection) -> None: ...
+    @property
+    def current(self) -> LifecycleProjection: ...
+    def advance_state(self, state: LifecycleState) -> LifecycleProjection: ...
+    def record_container(self, *, role: str, intent: ContainerIntent, id: str | None) -> LifecycleProjection: ...
+    def record_checkpoint_ref(self, transition: CheckpointTransition) -> LifecycleProjection: ...
+    def refresh(self) -> LifecycleProjection: ...
+```
+
+Each write method delegates to the writer with `expected=self._current`
+and updates `self._current` only after a confirmed successful write —
+exactly what each adapter did individually before, but now there is
+only one such value per lease, shared by every facade constructed
+against it. Raises the writer's own raw `LifecycleStoreError`
+unchanged — translation to a facade-specific public exception remains
+each facade's own responsibility. Never retries or refreshes
+automatically; `refresh()` re-syncs every facade sharing the cursor in
+one call.
+
+### 2. Coordinated construction: `SharedLifecyclePublishers` and its factory
+
+```python
+@dataclass(frozen=True)
+class SharedLifecyclePublishers:
+    cursor: LifecycleProjectionCursor
+    checkpoint_ref_publisher: LifecycleCheckpointRefPublisher
+    container_publisher: LifecycleContainerPublisher
+
+def create_shared_lifecycle_publishers(
+    writer: _LifecycleProjectionWriter, initial: LifecycleProjection
+) -> SharedLifecyclePublishers: ...
+```
+
+A named bundle, not a positional tuple, so a call site can never
+confuse which field is which. Both `LifecycleCheckpointRefPublisher`
+and `LifecycleContainerPublisher` gain a private `_from_cursor`
+classmethod — the only way to construct an instance that shares a
+cursor with another facade; not part of either class's public
+interface. Their existing public `__init__(writer, initial_projection)`
+signatures are unchanged and remain source-compatible for isolated use
+— each such instance privately owns its own cursor, never shared with
+anything else. Both classes' docstrings now explicitly warn against
+combining independently constructed instances against one writer;
+`create_shared_lifecycle_publishers()` is the only sanctioned path for
+any scenario touching more than one facade against one lease. A
+structural test proves a facade built via `_from_cursor` holds nothing
+but `{"_cursor"}` — no shadow `_current`/`_writer` state that could
+silently drift from the shared one.
+
+### 3. Checkpoint lifecycle-publication error boundary
+
+`checkpoint_session.py` (dependency-light — never imports
+`lifecycle_store`) gains, beside `CheckpointTransitionPublisher`:
+
+```python
+class CheckpointPublicationFailure(str, Enum): ...   # mirrors container_lifecycle.ContainerPublicationFailure exactly
+class CheckpointPublicationError(Exception):
+    def __init__(self, reason: CheckpointPublicationFailure, message: str) -> None:
+        ...
+        self.pre_recovery_cause: BaseException | None = None
+```
+
+`LifecycleCheckpointRefPublisher.publish()` now catches
+`LifecycleStoreError` and translates it (`raise CheckpointPublicationError(...)
+from exc`), via an exhaustive, subscript-access map
+(`_CHECKPOINT_PUBLICATION_FAILURE_MAP`, `tests/unit/test_lifecycle_store.py`
+asserts its keys equal the complete `LifecycleStoreFailure` enum) —
+mirroring `LifecycleContainerPublisher`'s own Amendment 6 inversion
+pattern exactly. This is the one place a `LifecycleStoreError` is ever
+caught for the checkpoint-ref publisher path.
+
+`RunController`'s two checkpoint call sites now catch
+`(CheckpointRefError, CheckpointSessionError, CheckpointPublicationError)`;
+`_map_checkpoint_error` gains one `elif isinstance(exc,
+CheckpointPublicationError)` branch mapping to the new
+`ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED` (`ErrorDomain.LIFECYCLE`)
+— placed before the generic `CheckpointSessionError`-or-else fallback,
+so it is never conflated with a programming-invariant violation. The
+name is deliberately not `CHECKPOINT_PUBLICATION_FAILED`: it must read
+unambiguously as "the durable lifecycle-projection record of this
+checkpoint-ref transition failed to publish," never as "the Git
+checkpoint-ref mutation itself failed" (every existing `CHECKPOINT_REF_*`
+code already means that). The finer-grained
+`CheckpointPublicationError.reason` is deliberately not persisted in
+the `OperationalError` — it stays available in-process for
+logging/debugging without widening this stable, serialized taxonomy,
+mirroring the same choice Amendment 6 already made for containers.
+
+`session.delete()`'s own failures are unaffected: they still sit under
+`RunController._terminate()`'s existing broad `except Exception` — any
+delete-time `CheckpointPublicationError` still folds into the existing
+`LIFECYCLE_CLEANUP_UNCONFIRMED` path unchanged. This slice adds no
+second, conflicting mapping for delete-time publication failure.
+
+**Scope boundary, explicit**: this amendment revises only
+`LifecycleCheckpointRefPublisher`'s prior raw-`LifecycleStoreError`-
+propagation behavior and the two named `RunController` catch sites. A
+caller-supplied, non-lifecycle-store `CheckpointTransitionPublisher`
+implementation's own exception type still propagates through
+`checkpoint_session.py` exactly as before — untouched by this
+amendment.
+
+### 4. Dual-cause preservation during confirmed-`UNCHANGED` recovery
+
+`establish()`/`advance()`'s existing recovery flow
+(`raise publish_exc from exc`, Slice 3B-3's own "projection-consistency
+failure dominance") reuses the *same* exception object across two
+`raise ... from ...` statements when the recovery-collapse publish
+itself raises `CheckpointPublicationError`. Python's exception chaining
+is single-linked: this silently overwrote `publish_exc.__cause__`
+(ordinarily the adapter's own `LifecycleStoreError`) with `exc` (the
+confirmed-`UNCHANGED` `CheckpointRefError`), demoting the original cause
+to `__context__` — which `raise ... from ...` also sets
+`__suppress_context__=True` for, hiding it from every standard
+traceback/log renderer. Independently reproduced with a minimal
+reduction (`raise b from a; ...; raise b from c` — confirmed `b.__cause__
+== c`, `b.__context__ == a`, `b.__suppress_context__ is True`) before
+any fix was written.
+
+**Contract, exact, per phase** (verified against every call site in
+`establish()`/`advance()`/`delete()`):
+
+| Phase | `__cause__` | `pre_recovery_cause` |
+|---|---|---|
+| Pre-mutation publish failure (no Git call attempted yet) | the adapter's own `LifecycleStoreError` | `None` |
+| Post-mutation collapse-publish failure (Git mutation already succeeded) | the adapter's own `LifecycleStoreError` | `None` |
+| Confirmed-`UNCHANGED` Git failure, then recovery-collapse publish failure | the `CheckpointRefError` that triggered recovery (Slice 3B-3's own rule, unchanged) | the `CheckpointPublicationError`'s own prior `__cause__` (ordinarily a `LifecycleStoreError`), preserved instead of silently lost |
+| `delete()`'s transitional-publish failure | the adapter's own `LifecycleStoreError` | `None` |
+| `delete()`'s Git failure after a successful transitional publish | N/A — a plain `CheckpointRefError`, no `CheckpointPublicationError` involved at all | N/A |
+
+Only the third row required a change:
+
+```python
+except Exception as publish_exc:
+    if isinstance(publish_exc, CheckpointPublicationError):
+        publish_exc.pre_recovery_cause = publish_exc.__cause__
+    raise publish_exc from exc
+```
+
+`CheckpointPublicationError.reason` always remains the categorical
+reason the publish call itself failed, in every phase. A generic
+(non-`CheckpointPublicationError`) recovery-publish exception from an
+alternate `CheckpointTransitionPublisher` implementation is completely
+untouched by this `isinstance` guard — existing `_Boom`-based recovery
+tests in `tests/unit/test_checkpoint_session.py` continue to pass
+unmodified, proving it.
+
+Neither an `ExceptionGroup` nor any other multi-cause representation
+was used: nothing in this repository's existing exception-handling
+precedent, and no `RunController` catch site, justifies one, and a
+linear `__cause__` chain already had a well-defined, deliberate meaning
+(Slice 3B-3's own dominance rule) this amendment preserves rather than
+redesigns.
+
+### Milestone boundary
+
+This slice is exactly: `LifecycleProjectionCursor`,
+`SharedLifecyclePublishers`/`create_shared_lifecycle_publishers`,
+`CheckpointPublicationFailure`/`CheckpointPublicationError`, the two
+`RunController` catch-site/mapping changes, and
+`ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED`. Explicitly **not**
+part of this slice, and not accepted APIs of this amendment: any
+`prepare_lifecycle()` invocation from production orchestration; any
+lifecycle entry-point/composition-root construction; a `CLEANING`-
+publication hook or any other new `RunController` constructor
+parameter beyond the exception types it now catches; any lifecycle
+state change during a real controller run; any worktree-tracking
+schema or allocation change; CLI/model/UI integration; abandonment or
+signals; and any Docker, SIGKILL, or cross-process test. `docs/
+threat-model.md`'s T-E1 entry is completely unaffected — this slice
+adds zero entry-point behavior.
+
+A `CLEANING`-publication hook and a future composition root both
+depend on this slice's fixes: a hook publishing `CLEANING` alongside a
+container/checkpoint write built on the pre-fix adapters would
+reproduce the staleness collision the first time a real run touched
+both in one `_terminate()` pass, and a checkpoint-publication failure
+surfacing during that hook's own call would have escaped uncaught
+exactly as this amendment's own investigation demonstrated. Both are
+sequencing consequences of this slice, not APIs it accepts.
+
+### Evidence
+
+`src/codeagent/lifecycle_store.py`, `src/codeagent/checkpoint_session.py`,
+`src/codeagent/controller.py`, `src/codeagent/errors.py`, and
+`src/codeagent/events.py` implement every rule above. Verified locally
+(macOS, real Docker daemon, `CODEAGENT_REQUIRE_DOCKER=1`): the directly
+affected files (`tests/unit/test_lifecycle_store.py`,
+`tests/unit/test_checkpoint_session.py`, `tests/unit/test_errors.py`,
+`tests/unit/test_events.py`, `tests/integration/test_controller.py`)
+collected and passed together, 1,099 passed, in both forward and
+reverse file order; the thirteen-file focused set established since
+Slice 3B-6, 1,036 passed; the complete suite, 2,648 passed, 0 skipped,
+identical with and without `CODEAGENT_REQUIRE_DOCKER=1`; `git diff
+--check` clean. See `ENGINEERING_LOG.md`'s dated entry for the complete
+detail, including the real-lease/real-writer interleaving test proving
+`PREPARING→ACTIVE`, both container roles through confirmed absence, and
+`checkpoint ABSENT→CREATING→PRESENT→ADVANCING→PRESENT→REMOVING→ABSENT`
+all succeed through the shared bundle with zero spurious staleness,
+genuine external staleness still refused, and explicit `refresh()`
+correctly re-syncing both facades after a fault-injected durability-
+unconfirmed publication. Linux CI has not yet run for this slice — do
+not claim it has until it is committed, pushed, and a workflow run
+against that commit completes.

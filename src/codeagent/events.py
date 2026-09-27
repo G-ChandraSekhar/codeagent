@@ -599,6 +599,13 @@ class ToolCompleted(Event):
             ErrorCode.CHECKPOINT_REF_OPERATION_FAILED,
             ErrorCode.CHECKPOINT_REF_UNEXPECTED_STATE,
             ErrorCode.CHECKPOINT_REF_OUTCOME_UNKNOWN,
+            # Milestone 3 Slice 3B-7 (ADR 0004 Amendment 7): the
+            # checkpoint-ref Git mutation's own durable lifecycle-
+            # projection record failed to publish
+            # (`checkpoint_session.CheckpointPublicationError`) —
+            # distinct from every `CHECKPOINT_REF_*` code above, which
+            # are all about the Git mutation itself.
+            ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED,
             # The approved-path postcondition failure (a PatchApplier
             # that changed files outside the approved plan) — ADR 0003
             # Amendment 1 point 4's ordering.

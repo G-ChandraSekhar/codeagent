@@ -2260,9 +2260,10 @@ def test_publisher_adapter_does_not_hide_stale_expectation(tmp_path, monkeypatch
         )
         assert real_current != current
 
-        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+        with pytest.raises(cs.CheckpointPublicationError) as excinfo:
             publisher.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1")))
-        assert excinfo.value.reason is ls.LifecycleStoreFailure.STALE_EXPECTED_PROJECTION
+        assert excinfo.value.reason is cs.CheckpointPublicationFailure.STALE_EXPECTATION
+        assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.STALE_EXPECTED_PROJECTION
         # The adapter's own belief is untouched by the failed call.
         assert publisher.current == current
     finally:
@@ -2280,11 +2281,12 @@ def test_publisher_adapter_pre_installation_failure_leaves_expected_unchanged(tm
 
         with monkeypatch.context() as scoped:
             scoped.setattr(lf, "write_all_eintr_safe", _boom)
-            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            with pytest.raises(cs.CheckpointPublicationError) as excinfo:
                 publisher.publish(
                     cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1"))
                 )
-            assert excinfo.value.reason is ls.LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED
+            assert excinfo.value.reason is cs.CheckpointPublicationFailure.NOT_INSTALLED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED
         assert publisher.current == current
     finally:
         lease.close()
@@ -2307,11 +2309,12 @@ def test_publisher_adapter_durability_unconfirmed_does_not_silently_update_and_r
 
         with monkeypatch.context() as scoped:
             scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
-            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            with pytest.raises(cs.CheckpointPublicationError) as excinfo:
                 publisher.publish(
                     cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1"))
                 )
-            assert excinfo.value.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+            assert excinfo.value.reason is cs.CheckpointPublicationFailure.DURABILITY_UNCONFIRMED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
 
         # Never silently treated as success: the adapter's own belief
         # is unchanged.
@@ -2346,11 +2349,12 @@ def test_publisher_adapter_cleanup_unconfirmed_remains_distinct_and_propagates(t
         with monkeypatch.context() as scoped:
             scoped.setattr(lf, "write_all_eintr_safe", _fail_write)
             scoped.setattr(lf.os, "unlink", _fail_unlink)
-            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            with pytest.raises(cs.CheckpointPublicationError) as excinfo:
                 publisher.publish(
                     cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1"))
                 )
-            assert excinfo.value.reason is ls.LifecycleStoreFailure.CLEANUP_UNCONFIRMED
+            assert excinfo.value.reason is cs.CheckpointPublicationFailure.CLEANUP_UNCONFIRMED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.CLEANUP_UNCONFIRMED
         assert publisher.current == current
     finally:
         lease.close()
@@ -2362,9 +2366,10 @@ def test_publisher_adapter_wrong_lock_scope_propagates_unchanged(tmp_path, monke
     lease.close()
     publisher = ls.LifecycleCheckpointRefPublisher(writer, current)
 
-    with pytest.raises(ls.LifecycleStoreError) as excinfo:
+    with pytest.raises(cs.CheckpointPublicationError) as excinfo:
         publisher.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1")))
-    assert excinfo.value.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+    assert excinfo.value.reason is cs.CheckpointPublicationFailure.WRONG_LOCK_SCOPE
+    assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
     assert publisher.current == current
 
 
@@ -2997,5 +3002,225 @@ def test_publisher_adapter_illegal_transition_is_translated_to_container_publica
         # The persistence-layer message never leaks into the public error.
         assert "ILLEGAL_TRANSITION" not in str(excinfo.value)
         assert publisher.current == current
+    finally:
+        lease.close()
+
+
+# ---------------------------------------------------------------------------
+# Slice 3B-7 (ADR 0004 Amendment 7): shared lifecycle-projection cursor,
+# the coordinated-publisher bundle/factory, and checkpoint-publication
+# error translation.
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_publication_failure_map_is_exhaustive():
+    """Every current `LifecycleStoreFailure` member must have an
+    explicit mapping entry — mirrors the container-side exhaustiveness
+    test exactly."""
+    assert set(ls._CHECKPOINT_PUBLICATION_FAILURE_MAP.keys()) == set(ls.LifecycleStoreFailure)
+
+
+def test_checkpoint_publisher_translates_lifecycle_store_error(tmp_path, monkeypatch):
+    """Amendment 7's own behavioral change: `LifecycleCheckpointRefPublisher.
+    publish()` no longer lets a raw `LifecycleStoreError` escape — it
+    translates to `checkpoint_session.CheckpointPublicationError`,
+    chained, mirroring the container-side inversion pattern exactly."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    writer, current = lease.open_projection_writer()
+    publisher = ls.LifecycleCheckpointRefPublisher(writer, current)
+    lease.close()  # forces WRONG_LOCK_SCOPE on the next publish
+
+    with pytest.raises(cs.CheckpointPublicationError) as excinfo:
+        publisher.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1")))
+    assert excinfo.value.reason is cs.CheckpointPublicationFailure.WRONG_LOCK_SCOPE
+    assert isinstance(excinfo.value.__cause__, ls.LifecycleStoreError)
+    assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+    assert "WRONG_LOCK_SCOPE" not in str(excinfo.value)
+
+
+# --- The staleness bug (documentation regression, not a target to preserve) ---
+
+
+def test_standalone_adapters_must_never_be_combined_against_one_writer(tmp_path, monkeypatch):
+    """Documents exactly why standalone adapters exist for isolated use
+    only: two independently constructed adapters (never via
+    `create_shared_lifecycle_publishers()`) against the same writer each
+    hold their own private, quickly-stale belief about `current`. A
+    write through one invalidates the other's next write —
+    `LifecycleProjection` equality is whole-object, so *any* field
+    changing anywhere breaks it, not just the field that changed. This
+    is not a target behavior to preserve; it is why the coordinator
+    exists."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        checkpoint_pub = ls.LifecycleCheckpointRefPublisher(writer, current)
+        container_pub = ls.LifecycleContainerPublisher(writer, current)
+
+        # A write through the container publisher moves the real
+        # projection; the checkpoint publisher's own `_current` still
+        # believes the original `current`.
+        container_pub.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+
+        with pytest.raises(cs.CheckpointPublicationError) as excinfo:
+            checkpoint_pub.publish(
+                cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1"))
+            )
+        assert excinfo.value.reason is cs.CheckpointPublicationFailure.STALE_EXPECTATION
+    finally:
+        lease.close()
+
+
+# --- LifecycleProjectionCursor / SharedLifecyclePublishers structure ---
+
+
+def test_shared_publishers_have_no_shadow_current(tmp_path, monkeypatch):
+    """Structural proof: a facade built via `create_shared_lifecycle_publishers()`
+    stores nothing but a reference to the shared cursor -- no per-facade
+    `_current`/`_writer` shadow state that could silently drift from the
+    shared one."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        bundle = ls.create_shared_lifecycle_publishers(writer, current)
+
+        assert set(vars(bundle.checkpoint_ref_publisher).keys()) == {"_cursor"}
+        assert set(vars(bundle.container_publisher).keys()) == {"_cursor"}
+        assert bundle.checkpoint_ref_publisher._cursor is bundle.container_publisher._cursor is bundle.cursor
+    finally:
+        lease.close()
+
+
+def test_standalone_constructor_still_works_and_is_source_compatible(tmp_path, monkeypatch):
+    """Standalone construction (not via the factory) remains exactly as
+    it was before this slice -- each instance privately owns its own
+    cursor, never shared."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        checkpoint_pub = ls.LifecycleCheckpointRefPublisher(writer, current)
+        container_pub = ls.LifecycleContainerPublisher(writer, current)
+        assert set(vars(checkpoint_pub).keys()) == {"_cursor"}
+        assert set(vars(container_pub).keys()) == {"_cursor"}
+        assert checkpoint_pub._cursor is not container_pub._cursor
+        assert checkpoint_pub.current == current
+        assert container_pub.current == current
+    finally:
+        lease.close()
+
+
+# --- The real, principal interleaving test (real lease/writer; no Docker, no real Git-ref mutation) ---
+
+
+def test_shared_bundle_realistic_interleaving_no_spurious_staleness(tmp_path, monkeypatch):
+    from codeagent import container_lifecycle as cl
+
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        bundle = ls.create_shared_lifecycle_publishers(writer, current)
+        cursor = bundle.cursor
+        checkpoint_pub = bundle.checkpoint_ref_publisher
+        container_pub = bundle.container_publisher
+
+        # PREPARING -> ACTIVE (via the shared cursor directly).
+        cursor.advance_state(ls.LifecycleState.ACTIVE)
+        assert cursor.current.state is ls.LifecycleState.ACTIVE
+
+        # Baseline container transitions through confirmed ABSENT.
+        container_pub.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+        container_pub.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.PRESENT, id="a" * 64)
+        container_pub.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.REMOVING, id="a" * 64)
+        container_pub.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.ABSENT, id=None)
+        assert cursor.current.baseline.intent is ls.ContainerIntent.ABSENT
+
+        # Checkpoint ABSENT -> CREATING -> PRESENT.
+        sha1 = _sha("1")
+        checkpoint_pub.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=sha1))
+        checkpoint_pub.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=sha1))
+        assert cursor.current.checkpoint_ref.accepted_sha == sha1
+
+        # Verification container transitions through confirmed ABSENT.
+        container_pub.publish(role=ls.ContainerRole.VERIFICATION, intent=ls.ContainerIntent.CREATING, id=None)
+        container_pub.publish(role=ls.ContainerRole.VERIFICATION, intent=ls.ContainerIntent.PRESENT, id="b" * 64)
+        container_pub.publish(role=ls.ContainerRole.VERIFICATION, intent=ls.ContainerIntent.REMOVING, id="b" * 64)
+        container_pub.publish(role=ls.ContainerRole.VERIFICATION, intent=ls.ContainerIntent.ABSENT, id=None)
+        assert cursor.current.verification.intent is ls.ContainerIntent.ABSENT
+
+        # Checkpoint advance, then removal.
+        sha2 = _sha("2")
+        checkpoint_pub.publish(
+            cs.CheckpointTransition(
+                intent=cs.CheckpointIntent.ADVANCING, accepted_sha=sha1, expected_old_sha=sha1, proposed_new_sha=sha2
+            )
+        )
+        checkpoint_pub.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=sha2))
+        checkpoint_pub.publish(
+            cs.CheckpointTransition(
+                intent=cs.CheckpointIntent.REMOVING, accepted_sha=sha2, expected_old_sha=sha2
+            )
+        )
+        checkpoint_pub.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.ABSENT))
+        assert cursor.current.checkpoint_ref == cs.ABSENT_TRANSITION
+
+        # Fault-inject a durability-unconfirmed failure on the next
+        # container write, then prove explicit refresh() re-syncs BOTH
+        # facades sharing this cursor at once.
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_last_fsync(fd):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced directory fsync failure")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
+            with pytest.raises(cl.ContainerPublicationError) as excinfo:
+                container_pub.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+            assert excinfo.value.reason is cl.ContainerPublicationFailure.DURABILITY_UNCONFIRMED
+
+        # Not silently treated as success — cursor's own belief unchanged.
+        assert cursor.current.baseline.intent is ls.ContainerIntent.ABSENT
+
+        cursor.refresh()
+        assert cursor.current.baseline.intent is ls.ContainerIntent.CREATING
+
+        # The next write through the SAME facade now succeeds — no
+        # spurious staleness, proving the shared refresh benefit.
+        container_pub.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.ABSENT, id=None)
+        assert cursor.current.baseline.intent is ls.ContainerIntent.ABSENT
+
+        # Direct proof of the shared benefit in the OTHER direction too:
+        # fault-inject a durability-unconfirmed failure on a
+        # checkpoint-ref write, refresh, then prove the checkpoint
+        # facade's own next write succeeds — the acceptance criterion is
+        # "either facade," not merely the one already exercised above.
+        sha3 = _sha("3")
+        call_count["n"] = 0
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
+            with pytest.raises(cs.CheckpointPublicationError) as excinfo:
+                checkpoint_pub.publish(
+                    cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=sha3)
+                )
+            assert excinfo.value.reason is cs.CheckpointPublicationFailure.DURABILITY_UNCONFIRMED
+
+        assert cursor.current.checkpoint_ref == cs.ABSENT_TRANSITION  # unchanged, not silently advanced
+
+        cursor.refresh()
+        assert cursor.current.checkpoint_ref.intent is cs.CheckpointIntent.CREATING
+
+        checkpoint_pub.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=sha3))
+        assert cursor.current.checkpoint_ref.accepted_sha == sha3
+
+        # Genuine external staleness is still refused: a second,
+        # independent writer publishes behind the bundle's back.
+        stale_expected = cursor.current
+        writer.advance_lifecycle_state(expected=stale_expected, state=ls.LifecycleState.CLEANING)
+        with pytest.raises(cl.ContainerPublicationError) as excinfo:
+            container_pub.publish(role=ls.ContainerRole.VERIFICATION, intent=ls.ContainerIntent.CREATING, id=None)
+        assert excinfo.value.reason is cl.ContainerPublicationFailure.STALE_EXPECTATION
     finally:
         lease.close()

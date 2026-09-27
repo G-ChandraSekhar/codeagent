@@ -260,17 +260,94 @@ class CheckpointTransitionPublisher(Protocol):
     constructed and injected by whichever later slice wires a real
     `LifecycleLease` in. `publish()` is called synchronously, in the
     exact places `self._transition` itself changes. A raised exception
-    is never wrapped, translated, or swallowed by this module. The one
+    is never wrapped, translated, or swallowed by *this module* -- it
+    always propagates exactly as the publisher itself raised it (Slice
+    3B-7, ADR 0004 Amendment 7, narrowed this statement to this module's
+    own behavior specifically: `lifecycle_store.
+    LifecycleCheckpointRefPublisher.publish()` itself now translates a
+    `LifecycleStoreError` it catches into a `CheckpointPublicationError`
+    before this module ever sees it -- an implementation detail of that
+    one publisher, not a new behavior this module adds). The one
     exception is during confirmed-`UNCHANGED` recovery: this module
     deliberately catches a publisher exception there solely to raise
     that same exception instance explicitly `from` the existing
     `CheckpointRefError`, establishing projection-consistency failure
     dominance without changing the publisher exception's type or
-    identity -- see `establish`/`advance`/`delete` for the precise
-    ordering and failure semantics.
+    identity. When the caught exception is a `CheckpointPublicationError`,
+    its own `pre_recovery_cause` is populated first, with whatever
+    `__cause__` it already carried -- Python's exception chaining is
+    single-linked, so the outer `raise ... from <CheckpointRefError>`
+    would otherwise silently overwrite (never merge with) that
+    already-attached cause -- see `establish`/`advance`/`delete` for the
+    precise ordering and failure semantics.
     """
 
     def publish(self, transition: CheckpointTransition) -> None: ...
+
+
+@unique
+class CheckpointPublicationFailure(str, Enum):
+    """Producer-facing translation of every `lifecycle_store.
+    LifecycleStoreFailure` reason reachable (or not) from
+    `record_checkpoint_ref_transition`. Deliberately dependency-light --
+    this module never imports `lifecycle_store` -- mirroring
+    `container_lifecycle.ContainerPublicationFailure`'s own inversion
+    pattern exactly (ADR 0004 Amendment 6). `UNCLASSIFIED` is reserved
+    exclusively for reasons confirmed unreachable from that call path
+    today (`LIFECYCLE_ID_COLLISION`, `RECONCILIATION_BLOCKED` -- both
+    `prepare_lifecycle()`-only) -- never a silent default for a reason
+    nobody has classified."""
+
+    NOT_INSTALLED = "not_installed"
+    DURABILITY_UNCONFIRMED = "durability_unconfirmed"
+    CLEANUP_UNCONFIRMED = "cleanup_unconfirmed"
+    STALE_EXPECTATION = "stale_expectation"
+    WRONG_LOCK_SCOPE = "wrong_lock_scope"
+    ILLEGAL_TRANSITION = "illegal_transition"
+    SUBSTRATE_UNAVAILABLE = "substrate_unavailable"
+    SCHEMA_INVALID = "schema_invalid"
+    OVERSIZED = "oversized"
+    UNCLASSIFIED = "unclassified"
+
+
+class CheckpointPublicationError(Exception):
+    """The public exception type a `CheckpointTransitionPublisher`
+    implementation raises to report a durable lifecycle-projection
+    publication failure (Slice 3B-7, ADR 0004 Amendment 7). In
+    production, `lifecycle_store.LifecycleCheckpointRefPublisher.
+    publish()` is the sole translation boundary that raises it --
+    catching `LifecycleStoreError` and re-raising this instead
+    (`raise CheckpointPublicationError(...) from exc`, preserving the
+    original as `__cause__`) -- but this is a public type, importable
+    from this module: any conforming `CheckpointTransitionPublisher`
+    implementation (a test double, or a future alternate production
+    publisher) may raise it directly too, and `RunController` handles
+    either origin identically. `message` is fixed, sanitized
+    categorical text only -- never a raw persistence-layer message,
+    path, or traceback. `RunController` catches only this specific
+    type at its two checkpoint call sites, never
+    `Exception`/`BaseException`.
+
+    `pre_recovery_cause` is set only by this module's own confirmed-
+    `UNCHANGED` recovery flow in `establish()`/`advance()`, when this
+    exact exception instance's `__cause__` is about to be reassigned to
+    the `CheckpointRefError` that triggered that recovery attempt.
+    Python's exception chaining is single-linked -- reusing the same
+    exception object across two `raise ... from ...` statements
+    overwrites `__cause__` rather than merging it -- so this field holds
+    whatever `__cause__` this exception carried immediately beforehand
+    (ordinarily the adapter's own `LifecycleStoreError`), which would
+    otherwise be silently demoted to `__context__` and hidden from every
+    standard traceback/log renderer by Python's own
+    `__suppress_context__=True`. `None` in every other case (a
+    pre-mutation or post-mutation publication failure with no recovery
+    attempt involved)."""
+
+    def __init__(self, reason: CheckpointPublicationFailure, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+        self.pre_recovery_cause: BaseException | None = None
 
 
 class CheckpointSession:
@@ -375,7 +452,16 @@ class CheckpointSession:
                     # this durable-record failure, not the original Git
                     # error, is what the caller must react to.
                     # Deliberately chained, not left to incidental
-                    # `__context__`.
+                    # `__context__`. Slice 3B-7: the outer `raise ...
+                    # from exc` below is about to overwrite
+                    # `publish_exc.__cause__` (Python's exception
+                    # chaining is single-linked) -- if `publish_exc` is a
+                    # `CheckpointPublicationError`, preserve whatever
+                    # cause it already carried in its own
+                    # `pre_recovery_cause` field first, so that fact is
+                    # never silently lost.
+                    if isinstance(publish_exc, CheckpointPublicationError):
+                        publish_exc.pre_recovery_cause = publish_exc.__cause__
                     raise publish_exc from exc
             raise
         collapse = CheckpointTransition(
@@ -425,6 +511,10 @@ class CheckpointSession:
                 try:
                     self._publish(recovery)
                 except Exception as publish_exc:
+                    # Slice 3B-7: see the identical comment in
+                    # `establish()`'s own recovery block.
+                    if isinstance(publish_exc, CheckpointPublicationError):
+                        publish_exc.pre_recovery_cause = publish_exc.__cause__
                     raise publish_exc from exc
             raise
         collapse = CheckpointTransition(

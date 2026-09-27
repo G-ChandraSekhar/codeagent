@@ -47,7 +47,7 @@ from codeagent.checkpoint_ref import (
     CheckpointRefFailure,
     MutationOutcome,
 )
-from codeagent.checkpoint_session import CheckpointIntent, CheckpointSessionError
+from codeagent.checkpoint_session import CheckpointIntent, CheckpointPublicationError, CheckpointSessionError
 from codeagent.errors import ErrorCode, OperationalError
 from codeagent.evidence import EvidenceReceipt, EvidenceSink
 
@@ -885,6 +885,27 @@ class RunController:
         malformed commit hash, or calling establish/advance from the
         wrong intent) is a controller-facing invariant violation, not a
         Git-level failure with an outcome to classify.
+
+        `CheckpointPublicationError` (Milestone 3 Slice 3B-7, ADR 0004
+        Amendment 7): the durable lifecycle-projection record of a
+        checkpoint-ref transition could not be confirmed published.
+        Whether the Git mutation itself was ever reached depends on
+        which publication phase failed — a pre-mutation (transitional-
+        intent) publication failure means Git was never attempted; a
+        post-mutation (collapse) or confirmed-UNCHANGED-recovery
+        publication failure means the Git mutation already concluded
+        (successfully, or confirmed UNCHANGED and recovered) before
+        this failure occurred. This branch never asserts which case
+        applies. This is a distinct failure surface from every
+        `CheckpointRefError` outcome above — always
+        `CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED`, with its own fixed,
+        sanitized message (distinct from the `CheckpointRefError`/
+        `CheckpointSessionError` message below) — never folded into the
+        `CheckpointSessionError` fallback branch (which would wrongly
+        report it as a programming-invariant violation). The exception's
+        own finer-grained `reason`, and any persistence-layer detail it
+        might carry, are never persisted in the `OperationalError` —
+        `reason` remains available in-process only.
         """
         if isinstance(exc, CheckpointRefError):
             if exc.outcome is MutationOutcome.UNCHANGED:
@@ -897,12 +918,20 @@ class RunController:
                 code = ErrorCode.CHECKPOINT_REF_UNEXPECTED_STATE
             else:
                 code = ErrorCode.CHECKPOINT_REF_OUTCOME_UNKNOWN
+            message = "the checkpoint-ref operation for this patch could not be accepted"
+        elif isinstance(exc, CheckpointPublicationError):
+            code = ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED
+            # Deliberately distinct, fixed, sanitized text — never the
+            # exception's own message/reason, which could describe
+            # persistence-layer detail this taxonomy never exposes.
+            message = "the checkpoint lifecycle projection transition could not be confirmed"
         else:
             code = ErrorCode.INTERNAL_INVARIANT_VIOLATION
+            message = "the checkpoint-ref operation for this patch could not be accepted"
         return OperationalError(
             code=code,
             error_id=f"{self._c.run_id}-checkpoint-{iteration}",
-            message="the checkpoint-ref operation for this patch could not be accepted",
+            message=message,
         )
 
     def _dispatch_apply_patch(
@@ -975,7 +1004,7 @@ class RunController:
         if self._session.intent is CheckpointIntent.ABSENT:
             try:
                 self._session.establish(self._workspace.initial_commit)
-            except (CheckpointRefError, CheckpointSessionError) as exc:
+            except (CheckpointRefError, CheckpointSessionError, CheckpointPublicationError) as exc:
                 return _fail(self._map_checkpoint_error(exc, iteration))
 
         # Step 5: the patch itself.
@@ -1003,7 +1032,7 @@ class RunController:
         # Step 7: advance the checkpoint ref to the newly accepted commit.
         try:
             self._session.advance(result.commit_hash)
-        except (CheckpointRefError, CheckpointSessionError) as exc:
+        except (CheckpointRefError, CheckpointSessionError, CheckpointPublicationError) as exc:
             return _fail(self._map_checkpoint_error(exc, iteration))
 
         # Steps 8-10: only now, with the transaction fully accepted.

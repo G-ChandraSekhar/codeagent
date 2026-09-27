@@ -3795,3 +3795,111 @@ diff; only `CLAUDE.md`, this file, and the ADR changed — no production
 code, test, workflow, configuration, or dependency file touched;
 nothing staged. No test run or Docker session was needed for this pass
 — the independently re-verified, completed CI run is the evidence.
+
+## 2026-09-27 — Milestone 3 Slice 3B-7: shared lifecycle-projection coordination and the controller-facing checkpoint lifecycle-publication boundary
+
+A review of the previously-proposed composition-root slice (wiring
+`prepare_lifecycle()` into `RunController`) found two real correctness
+defects in already-existing, already-ADR-accepted code, both
+independently reproduced against the repository before any fix was
+written, and neither hypothetical:
+
+1. **Independent publisher cursors.** `LifecycleContainerPublisher` and
+   `LifecycleCheckpointRefPublisher` each tracked their own `_current`
+   `LifecycleProjection`. Traced the exact real sequence: after a
+   `writer.advance_lifecycle_state()` call moves the real projection
+   from `PREPARING` to `ACTIVE`, the very next write through either
+   adapter's own stale `_current` (still `PREPARING`) fails with
+   `STALE_EXPECTED_PROJECTION` immediately — `LifecycleProjection`
+   equality is whole-object, so any field changing anywhere invalidates
+   every independently-held snapshot, not just a race across container/
+   checkpoint interleaving as first assumed. Fixed with a new
+   `LifecycleProjectionCursor` (the one authoritative `current` per
+   lease) and a `SharedLifecyclePublishers` bundle plus
+   `create_shared_lifecycle_publishers()` factory — the only sanctioned
+   coordinated-construction path. Both publishers' existing public
+   constructors are completely unchanged and remain source-compatible
+   for isolated use.
+
+2. **Checkpoint publication was not controller-safe.**
+   `LifecycleCheckpointRefPublisher.publish()` let a raw
+   `LifecycleStoreError` escape uncaught, and `RunController.run()` has
+   no enclosing try/except — confirmed by reading the method in full —
+   so that error would have propagated straight out of `run()`,
+   skipping `_fail()`, the domain transition, `_terminate()`, evidence
+   capture, worktree disposal, and checkpoint-ref deletion entirely.
+   Fixed with `checkpoint_session.CheckpointPublicationFailure`/
+   `CheckpointPublicationError` (dependency-light, mirroring
+   `container_lifecycle`'s Amendment 6 pattern exactly),
+   `LifecycleCheckpointRefPublisher.publish()` now translating via an
+   exhaustive map, and `RunController`'s two checkpoint call sites
+   (`establish()`/`advance()`) now also catching it, mapped to a new
+   `ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED`
+   (`ErrorDomain.LIFECYCLE`) — named deliberately to avoid ambiguity
+   with the existing `CHECKPOINT_REF_*` codes (which are about the Git
+   mutation itself, never its lifecycle-projection record), with its
+   own fixed, sanitized `OperationalError` message ("the checkpoint
+   lifecycle projection transition could not be confirmed") distinct
+   from the generic message the `CheckpointRefError`/
+   `CheckpointSessionError` branches still use. This explicitly,
+   narrowly revises Amendment 4's own previously-documented exception-
+   identity contract at exactly these two call sites, not silently.
+   `session.delete()`'s own failures remain under `_terminate()`'s
+   existing broad teardown catch, unaffected — proven by a dedicated
+   regression, not assumed. A same-session correction pass fixed one
+   inaccurate claim before this slice was ever committed: an internal
+   code comment (`errors.py`) and `_map_checkpoint_error`'s own
+   docstring both originally asserted the Git mutation "was attempted"
+   whenever `CheckpointPublicationError` occurs — false for a
+   pre-mutation, transitional-intent publication failure, where Git is
+   never reached at all. Corrected to state only that the lifecycle-
+   projection record could not be confirmed, with whether Git was ever
+   reached left explicitly dependent on which publication phase failed.
+
+A third finding surfaced while fixing #2: `establish()`/`advance()`'s
+existing confirmed-`UNCHANGED` recovery flow (`raise publish_exc from
+exc`) reuses the same exception object across two `raise ... from ...`
+statements. Independently verified with a minimal Python reduction
+(`raise b from a` then `raise b from c` on the same `b`) that this
+silently overwrites `b.__cause__` from `a` to `c`, demoting `a` to
+`b.__context__` — which the `from` syntax also hides from every
+standard traceback via `__suppress_context__=True`. This meant a real
+recovery-publish failure's own underlying `LifecycleStoreError` would
+have been silently lost the moment the existing "projection-consistency
+failure dominance" rule (Slice 3B-3) re-chained the same exception
+object to the triggering `CheckpointRefError`. Fixed with a new,
+additive `CheckpointPublicationError.pre_recovery_cause` attribute,
+populated only in this exact dual-failure phase; every other phase
+(pre-mutation publish, post-mutation collapse publish, delete's
+transitional publish, delete's own Git failure) has only one cause and
+needed no change — each was individually traced against the current
+source, not assumed identical to the others. No `ExceptionGroup`: this
+repository has no precedent for one and no `RunController` catch site
+would benefit from it; the existing linear chain already had a
+deliberate meaning this fix preserves.
+
+Verified (macOS, real Docker daemon): the five directly affected files
+(`test_lifecycle_store.py`, `test_checkpoint_session.py`,
+`test_errors.py`, `test_events.py`, `test_controller.py`) collected and
+passed together, 1,099 passed, in both forward and reverse file order;
+the thirteen-file focused set established since Slice 3B-6, 1,036
+passed; the complete suite, 2,648 passed, 0 skipped, identical with and
+without `CODEAGENT_REQUIRE_DOCKER=1`; `git diff --check` clean. A real
+lease/real-writer interleaving test drives the shared bundle through
+`PREPARING→ACTIVE`, both container roles through confirmed absence, and
+the full checkpoint-ref lifecycle with zero spurious staleness, then
+fault-injects a durability-unconfirmed publication and proves explicit
+`refresh()` re-syncs both facades sharing the cursor in one call, and
+finally proves a genuine external stale write is still correctly
+refused — no Docker or real Git-ref mutation needed for any of it.
+
+Not implemented (unchanged scope, explicitly deferred): any
+`prepare_lifecycle()` call from production orchestration, any
+`RunController` composition/entry-point wiring, a `CLEANING`-publication
+hook, any lifecycle state change during a real controller run, and any
+worktree-tracking schema or allocation change — all depend on this
+slice's fixes and would have reproduced the same two defects the moment
+they touched more than one publisher against a real controller run.
+`docs/threat-model.md`'s T-E1 entry is unaffected. Linux CI has not yet
+run for this slice — do not claim it has until it is committed, pushed,
+and a workflow run against that commit completes.

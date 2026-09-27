@@ -12,6 +12,13 @@ from __future__ import annotations
 import pytest
 
 from codeagent import domain, events
+from codeagent.checkpoint_ref import CheckpointRefError, CheckpointRefFailure, MutationOutcome
+from codeagent.checkpoint_session import (
+    CheckpointPublicationError,
+    CheckpointPublicationFailure,
+    CheckpointSessionError,
+    CheckpointSessionFailure,
+)
 from codeagent.controller import (
     EventLog,
     ModelClient,
@@ -848,3 +855,160 @@ def test_raising_evidence_sink_with_unconfirmed_verifier_still_preserves_workspa
     assert workspace.preserved is True
     assert workspace.disposed is False
     assert session.delete_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3 Slice 3B-7 (ADR 0004 Amendment 7): controller handling of
+# `CheckpointPublicationError` at both checkpoint call sites.
+# ---------------------------------------------------------------------------
+
+
+_EXPECTED_PUBLICATION_MESSAGE = "the checkpoint lifecycle projection transition could not be confirmed"
+
+
+def test_checkpoint_publication_error_at_establish_is_caught_and_mapped() -> None:
+    session = FakeCheckpointSession()
+    session.establish_error = CheckpointPublicationError(
+        CheckpointPublicationFailure.DURABILITY_UNCONFIRMED,
+        "forced-injected-detail-that-must-not-leak",
+    )
+    workspace = FakeWorkspace()
+    evidence_sink = FakeEvidenceSink()
+    controller = _build(
+        "r-checkpoint-pub-establish", session=session, workspace=workspace, evidence_sink=evidence_sink
+    )
+
+    finished = controller.run()
+
+    _assert_monotonic_sequence(controller)
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED
+    assert finished.error.message == _EXPECTED_PUBLICATION_MESSAGE
+    assert "forced-injected-detail-that-must-not-leak" not in finished.error.message
+    assert "DURABILITY_UNCONFIRMED" not in finished.error.message
+
+    failed_tool_completions = [
+        e for e in controller.log.events if isinstance(e, events.ToolCompleted) and not e.success
+    ]
+    assert len(failed_tool_completions) == 1
+    tool_error = failed_tool_completions[0].error
+    assert tool_error is not None
+    assert tool_error.message == _EXPECTED_PUBLICATION_MESSAGE
+    # Not merely matching error_id -- the identical OperationalError
+    # object, exactly like every other checkpoint/patch failure.
+    assert tool_error is finished.error
+    assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
+    assert not any(isinstance(e, events.CheckpointCreated) for e in controller.log.events)
+
+    # Ordinary teardown still runs to completion: evidence capture was
+    # attempted, the workspace was disposed (not preserved -- this
+    # failure never sets `_any_verifier_cleanup_unconfirmed`), and
+    # checkpoint deletion was attempted (a no-op from ABSENT, since
+    # establish() never succeeded).
+    assert evidence_sink.capture_calls == 1
+    assert workspace.disposed is True
+    assert workspace.preserved is False
+    assert session.delete_calls == 1
+
+
+def test_checkpoint_publication_error_at_advance_is_caught_and_mapped() -> None:
+    """`advance()` runs unconditionally right after a successful
+    `establish()` on the very first `apply_patch` (ADR 0003 Amendment 2:
+    establish records the starting commit, advance immediately moves it
+    to the first real patch's commit) — no repair iteration is needed to
+    reach this call site."""
+    session = FakeCheckpointSession()
+    session.advance_error = CheckpointPublicationError(
+        CheckpointPublicationFailure.STALE_EXPECTATION,
+        "forced-injected-detail-that-must-not-leak",
+    )
+    workspace = FakeWorkspace()
+    evidence_sink = FakeEvidenceSink()
+    controller = _build(
+        "r-checkpoint-pub-advance", session=session, workspace=workspace, evidence_sink=evidence_sink
+    )
+
+    finished = controller.run()
+
+    _assert_monotonic_sequence(controller)
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED
+    assert finished.error.message == _EXPECTED_PUBLICATION_MESSAGE
+    assert "forced-injected-detail-that-must-not-leak" not in finished.error.message
+    assert "STALE_EXPECTATION" not in finished.error.message
+
+    failed_tool_completions = [
+        e for e in controller.log.events if isinstance(e, events.ToolCompleted) and not e.success
+    ]
+    assert len(failed_tool_completions) == 1
+    tool_error = failed_tool_completions[0].error
+    assert tool_error is not None
+    assert tool_error.message == _EXPECTED_PUBLICATION_MESSAGE
+    assert tool_error is finished.error
+    # The patch itself succeeded, but the transaction is not accepted
+    # until advance() also succeeds -- no success-shaped event for it.
+    assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
+    assert not any(isinstance(e, events.CheckpointCreated) for e in controller.log.events)
+
+    # Ordinary teardown still runs to completion: evidence capture was
+    # attempted, the workspace was disposed, and checkpoint deletion was
+    # attempted. Because establish() succeeded, the fake session remains
+    # PRESENT; FakeCheckpointSession.delete() therefore executes rather
+    # than taking its ABSENT no-op path.
+    assert evidence_sink.capture_calls == 1
+    assert workspace.disposed is True
+    assert workspace.preserved is False
+    assert session.delete_calls == 1
+
+
+def test_checkpoint_ref_error_mapping_remains_unchanged_at_establish() -> None:
+    """Regression: this slice adds a new `elif` branch to
+    `_map_checkpoint_error` — the existing `CheckpointRefError` mapping
+    must be completely unaffected."""
+    session = FakeCheckpointSession()
+    session.establish_error = CheckpointRefError(
+        CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED, "forced", outcome=MutationOutcome.UNCHANGED
+    )
+    controller = _build("r-checkpoint-ref-establish", session=session)
+
+    finished = controller.run()
+
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.CHECKPOINT_REF_UPDATE_REJECTED
+
+
+def test_checkpoint_session_error_mapping_remains_unchanged_at_establish() -> None:
+    """Regression: `CheckpointSessionError` still falls through to the
+    generic invariant-violation branch, unaffected by the new
+    `CheckpointPublicationError` branch inserted before it."""
+    session = FakeCheckpointSession()
+    session.establish_error = CheckpointSessionError(
+        CheckpointSessionFailure.INCOMPATIBLE_OPERATION, "forced"
+    )
+    controller = _build("r-checkpoint-session-establish", session=session)
+
+    finished = controller.run()
+
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.INTERNAL_INVARIANT_VIOLATION
+
+
+def test_delete_time_publication_error_still_maps_to_lifecycle_cleanup_unconfirmed() -> None:
+    """`session.delete()` sits under `_terminate()`'s own broad
+    `except Exception` teardown catch, already folding any delete-time
+    failure into `LIFECYCLE_CLEANUP_UNCONFIRMED` -- this slice must not
+    create a second, conflicting mapping for a `CheckpointPublicationError`
+    raised from `delete()` specifically."""
+    session = FakeCheckpointSession()
+    session.delete_error = CheckpointPublicationError(CheckpointPublicationFailure.CLEANUP_UNCONFIRMED, "forced")
+    workspace = FakeWorkspace()
+    controller = _build("r-checkpoint-pub-delete", session=session, workspace=workspace)
+
+    finished = controller.run()
+
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+    assert session.delete_calls == 1

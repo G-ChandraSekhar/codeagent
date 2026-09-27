@@ -1618,6 +1618,124 @@ Stage 2 (of the four-stage planning process in
   entry-point wiring exists, or that T-E1's existing partial-mitigation
   boundary in `docs/threat-model.md` has changed — both remain exactly
   as this slice's implementation section above already states.
+- **Milestone 3 Slice 3B-7** (shared lifecycle-projection coordination
+  and the controller-facing checkpoint lifecycle-publication boundary),
+  per `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  "Amendment 7 (Accepted 2026-09-27)", **is implemented and locally
+  validated on macOS (2026-09-27), Linux CI not yet run for this
+  slice.** A review of the previously-proposed composition-root slice
+  found two real correctness gaps in already-existing, already-ADR-
+  accepted code before any entry-point wiring was ever attempted; this
+  slice fixes both and stops there — no `prepare_lifecycle()` call, no
+  `RunController` construction change beyond its exception-catching
+  surface, no worktree work, no CLI/model/UI.
+  **Gap 1 (independent publisher cursors)**: `LifecycleContainerPublisher`
+  and `LifecycleCheckpointRefPublisher` each independently tracked their
+  own `_current` `LifecycleProjection`. Since `LifecycleProjection`
+  equality is whole-object, any successful write through *any* path
+  (the other adapter, or a direct `writer.advance_lifecycle_state()`
+  call) invalidated every other independently-held `_current` for its
+  very next write — not eventually, immediately, reproduced exactly and
+  documented as a permanent regression test
+  (`test_standalone_adapters_must_never_be_combined_against_one_writer`).
+  Fixed with a new `lifecycle_store.LifecycleProjectionCursor` — the one
+  authoritative in-memory `current` per lease, with `advance_state()`/
+  `record_container()`/`record_checkpoint_ref()`/`refresh()` — and a new
+  named bundle `SharedLifecyclePublishers` plus its factory
+  `create_shared_lifecycle_publishers(writer, initial)`, the only
+  sanctioned way to obtain a checkpoint-ref publisher and a container
+  publisher safe to use together against one lease. Both publisher
+  classes' existing public `__init__(writer, initial_projection)`
+  signatures are completely unchanged and remain source-compatible for
+  isolated use (each privately owns its own cursor, never shared) — a
+  new private `_from_cursor` classmethod on each is the factory's own
+  internal construction path, never called directly by anything else. A
+  structural test (`test_shared_publishers_have_no_shadow_current`)
+  proves a coordinated facade holds nothing but `{"_cursor"}` — no
+  shadow state to silently drift.
+  **Gap 2 (checkpoint publication was not controller-safe)**:
+  `LifecycleCheckpointRefPublisher.publish()` let a raw
+  `LifecycleStoreError` escape uncaught; `RunController.run()` has no
+  enclosing try/except, so that error would have propagated straight out
+  of `run()` itself, skipping `_fail()`, the domain transition,
+  `_terminate()`, evidence capture, worktree disposal, and checkpoint-
+  ref deletion entirely — confirmed by direct code reading, not assumed.
+  Fixed by giving `checkpoint_session.py` (still dependency-light — it
+  never imports `lifecycle_store`) a `CheckpointPublicationFailure`/
+  `CheckpointPublicationError` pair beside `CheckpointTransitionPublisher`,
+  mirroring `container_lifecycle.ContainerPublicationFailure`/
+  `ContainerPublicationError`'s own Amendment 6 inversion pattern
+  exactly. `LifecycleCheckpointRefPublisher.publish()` is now the one
+  place a `LifecycleStoreError` is ever caught for this path, translated
+  via an exhaustive, subscript-access map
+  (`tests/unit/test_lifecycle_store.py` asserts its keys equal the
+  complete `LifecycleStoreFailure` enum). `RunController`'s two
+  checkpoint call sites (`establish()`/`advance()` in
+  `_dispatch_apply_patch`) now also catch `CheckpointPublicationError`;
+  `_map_checkpoint_error` gains one new branch mapping it to a new,
+  deliberately unambiguously-named
+  `ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED`
+  (`ErrorDomain.LIFECYCLE`) — distinct from every `CHECKPOINT_REF_*`
+  code, which are all about the Git mutation itself, never its
+  lifecycle-projection record, and whether the Git mutation was ever
+  reached depends on which publication phase failed (a pre-mutation
+  transitional-intent publication failure means it was not; a post-
+  mutation collapse or confirmed-UNCHANGED-recovery publication failure
+  means it already concluded) — this code never asserts either way. The
+  `OperationalError` also gets its own fixed, sanitized message ("the
+  checkpoint lifecycle projection transition could not be confirmed"),
+  distinct from the generic message every `CheckpointRefError`/
+  `CheckpointSessionError` mapping still uses. This explicitly, narrowly
+  revises
+  Amendment 4's own previously-stated exception-identity contract at
+  exactly these two named call sites. `session.delete()`'s own failures
+  are unaffected — they still fall under `_terminate()`'s existing broad
+  teardown catch and fold into the pre-existing
+  `LIFECYCLE_CLEANUP_UNCONFIRMED` path, proven by a dedicated regression
+  test rather than assumed.
+  **Dual-cause preservation**: `establish()`/`advance()`'s existing
+  confirmed-`UNCHANGED` recovery flow reuses the same exception object
+  across two `raise ... from ...` statements when the recovery-collapse
+  publish itself raises `CheckpointPublicationError`. Verified directly
+  (a minimal Python reduction, not assumed) that this silently
+  overwrites `__cause__`, demoting the original cause to `__context__`
+  — which `raise ... from ...` also hides from every standard traceback
+  via `__suppress_context__=True`. Fixed with a new, additive
+  `CheckpointPublicationError.pre_recovery_cause` attribute, populated
+  only in this one dual-failure scenario, preserving what `__cause__`
+  held immediately before the existing, unchanged "projection-
+  consistency failure dominance" rule (Slice 3B-3) reassigns it to the
+  triggering `CheckpointRefError`. No `ExceptionGroup` — nothing in this
+  repository's precedent or any `RunController` catch site justified
+  one, and the existing linear chain already had a deliberate meaning
+  this fix preserves rather than redesigns.
+  Verified: the five directly affected files
+  (`test_lifecycle_store.py`, `test_checkpoint_session.py`,
+  `test_errors.py`, `test_events.py`, `test_controller.py`) collected
+  and passed together, 1,099 passed, in both forward and reverse file
+  order; the thirteen-file focused set established since Slice 3B-6,
+  1,036 passed; the full local suite, with a real Docker daemon and
+  `CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a failure): 2,648
+  passed, 0 skipped, identical total with and without that env var;
+  `git diff --check` clean. A real lease/real-writer interleaving test
+  (`test_shared_bundle_realistic_interleaving_no_spurious_staleness`,
+  no Docker, no real Git-ref mutation) drives the shared bundle through
+  `PREPARING→ACTIVE`, both container roles through confirmed absence,
+  and the full checkpoint-ref lifecycle
+  (`ABSENT→CREATING→PRESENT→ADVANCING→PRESENT→REMOVING→ABSENT`) with
+  zero spurious `STALE_EXPECTED_PROJECTION`, then fault-injects a
+  durability-unconfirmed container publish and proves explicit
+  `refresh()` re-syncs both facades in one call, and finally proves a
+  genuine external stale write (a second, independent writer) is still
+  correctly refused. **Not implemented** (later Milestone 3 work,
+  unchanged scope): any `prepare_lifecycle()` call from production
+  orchestration, any `RunController` composition/entry-point wiring, a
+  `CLEANING`-publication hook, any lifecycle state change during a real
+  controller run, and any worktree-tracking schema or allocation
+  change. `docs/threat-model.md`'s T-E1 entry is unaffected — this
+  slice adds zero entry-point behavior. **Linux CI validation for this
+  specific slice has not yet been run** — do not claim it has until a
+  workflow run against this commit actually completes.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

@@ -37,6 +37,8 @@ from codeagent.checkpoint_ref import (
 from codeagent.checkpoint_session import (
     ABSENT_TRANSITION,
     CheckpointIntent,
+    CheckpointPublicationError,
+    CheckpointPublicationFailure,
     CheckpointSession,
     CheckpointSessionError,
     CheckpointSessionFailure,
@@ -1174,6 +1176,129 @@ def test_advance_unchanged_recovery_publish_failure_chains_from_original_error()
     assert excinfo.value is boom
     assert excinfo.value.__cause__ is original
     assert session.transition == CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=A)
+
+
+# ---------------------------------------------------------------------------
+# Slice 3B-7 (ADR 0004 Amendment 7): dual-cause preservation during
+# confirmed-UNCHANGED recovery, when the recovery-collapse publish itself
+# raises a CheckpointPublicationError (as the real
+# lifecycle_store.LifecycleCheckpointRefPublisher does). Python's
+# exception chaining is single-linked: the outer `raise publish_exc from
+# exc` inside establish()/advance() would otherwise silently overwrite
+# `publish_exc.__cause__` (the adapter's own LifecycleStoreError stand-
+# in here), losing it. `pre_recovery_cause` is where that value must
+# survive instead.
+# ---------------------------------------------------------------------------
+
+
+def test_establish_unchanged_recovery_publication_error_preserves_pre_recovery_cause() -> None:
+    store_cause = _Boom("stand-in for the adapter's own LifecycleStoreError")
+    publication_error = CheckpointPublicationError(
+        CheckpointPublicationFailure.DURABILITY_UNCONFIRMED, "recovery publish failed"
+    )
+    try:
+        raise publication_error from store_cause
+    except CheckpointPublicationError:
+        pass
+    assert publication_error.__cause__ is store_cause  # sanity, before the session ever touches it
+    assert publication_error.pre_recovery_cause is None  # not yet set
+
+    original = _error(CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED, MutationOutcome.UNCHANGED)
+    ref = _RecordingRef(failure=original)
+    publisher = _RecordingPublisher(failure=publication_error, fail_on_call=2)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    with pytest.raises(CheckpointPublicationError) as excinfo:
+        session.establish(A)
+
+    assert excinfo.value is publication_error
+    # Projection-consistency failure dominance (Slice 3B-3, unchanged):
+    # __cause__ is the CheckpointRefError that triggered recovery.
+    assert excinfo.value.__cause__ is original
+    # Slice 3B-7: what __cause__ held before that reassignment is
+    # preserved here instead of being silently lost to __context__.
+    assert excinfo.value.pre_recovery_cause is store_cause
+    assert session.transition == ABSENT_TRANSITION
+
+
+def test_advance_unchanged_recovery_publication_error_preserves_pre_recovery_cause() -> None:
+    store_cause = _Boom("stand-in for the adapter's own LifecycleStoreError")
+    publication_error = CheckpointPublicationError(
+        CheckpointPublicationFailure.DURABILITY_UNCONFIRMED, "recovery publish failed"
+    )
+    try:
+        raise publication_error from store_cause
+    except CheckpointPublicationError:
+        pass
+
+    ref = _RecordingRef()
+    session = CheckpointSession(ref)
+    session.establish(A)
+    original = _error(CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED, MutationOutcome.UNCHANGED)
+    ref._failure = original
+    # call #1 is advance()'s own pre-mutation "advancing" publish (must
+    # succeed); call #2 is the recovery-collapse publish this test
+    # targets.
+    publisher = _RecordingPublisher(failure=publication_error, fail_on_call=2)
+    session._transition_publisher = publisher  # noqa: SLF001
+
+    with pytest.raises(CheckpointPublicationError) as excinfo:
+        session.advance(B)
+
+    assert excinfo.value is publication_error
+    assert excinfo.value.__cause__ is original
+    assert excinfo.value.pre_recovery_cause is store_cause
+    assert session.transition == CheckpointTransition(intent=CheckpointIntent.PRESENT, accepted_sha=A)
+
+
+def test_recovery_failure_with_non_publication_exception_gains_no_pre_recovery_cause_attribute() -> None:
+    """A generic (non-CheckpointPublicationError) recovery-publish
+    exception is completely untouched by the new logic -- proving the
+    fix is narrowly scoped to CheckpointPublicationError only, exactly
+    like every pre-existing `_Boom`-based recovery test above."""
+    boom = _Boom("forced")
+    original = _error(CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED, MutationOutcome.UNCHANGED)
+    ref = _RecordingRef(failure=original)
+    publisher = _RecordingPublisher(failure=boom, fail_on_call=2)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    with pytest.raises(_Boom) as excinfo:
+        session.establish(A)
+
+    assert not hasattr(excinfo.value, "pre_recovery_cause")
+
+
+def test_pre_mutation_publication_failure_has_no_pre_recovery_cause() -> None:
+    """Phase 1 (pre-mutation publish, before any Git call): no recovery
+    flow is involved at all, so `pre_recovery_cause` stays `None`."""
+    publication_error = CheckpointPublicationError(CheckpointPublicationFailure.NOT_INSTALLED, "boom")
+    ref = _RecordingRef()
+    publisher = _RecordingPublisher(failure=publication_error, fail_on_call=1)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    with pytest.raises(CheckpointPublicationError) as excinfo:
+        session.establish(A)
+
+    assert excinfo.value is publication_error
+    assert excinfo.value.pre_recovery_cause is None
+
+
+def test_post_mutation_collapse_publication_failure_has_no_pre_recovery_cause() -> None:
+    """Phase 2 (collapse publish after a successful Git mutation): no
+    recovery flow is involved, so `pre_recovery_cause` stays `None`."""
+    publication_error = CheckpointPublicationError(CheckpointPublicationFailure.NOT_INSTALLED, "boom")
+    ref = _RecordingRef()
+    # call #1 is the pre-mutation "creating" publish (must succeed);
+    # call #2 is the post-mutation "present" collapse publish this test
+    # targets.
+    publisher = _RecordingPublisher(failure=publication_error, fail_on_call=2)
+    session = CheckpointSession(ref, transition_publisher=publisher)
+
+    with pytest.raises(CheckpointPublicationError) as excinfo:
+        session.establish(A)
+
+    assert excinfo.value is publication_error
+    assert excinfo.value.pre_recovery_cause is None
 
 
 @pytest.mark.parametrize("outcome", _NON_COLLAPSING)

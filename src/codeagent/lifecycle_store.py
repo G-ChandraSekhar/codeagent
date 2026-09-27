@@ -73,6 +73,7 @@ from ._lifecycle_fs import (
 )
 from .checkpoint_ref import new_lifecycle_id
 from .checkpoint_session import ABSENT_TRANSITION, CheckpointIntent, CheckpointTransition
+from .checkpoint_session import CheckpointPublicationError, CheckpointPublicationFailure
 from .container_lifecycle import ContainerIntent
 from .container_lifecycle import ContainerPublicationError, ContainerPublicationFailure
 from .container_lifecycle import ContainerRole
@@ -1450,26 +1451,91 @@ class _LifecycleProjectionWriter:
         return self._publish(updated)
 
 
-class LifecycleCheckpointRefPublisher:
-    """Adapts a `_LifecycleProjectionWriter` to `checkpoint_session.
-    CheckpointTransitionPublisher`'s structural `publish(transition)`
-    boundary (Slice 3B-3, ADR 0004 Amendment 4).
+class LifecycleProjectionCursor:
+    """The one authoritative in-memory belief about the current
+    `LifecycleProjection` for a single open lease's writer (Slice 3B-7,
+    ADR 0004 Amendment 7).
 
-    Retains the writer and its own `current` expected `LifecycleProjection`
-    across calls, so `checkpoint_session.CheckpointSession` never needs
-    to know anything about `LifecycleProjection`. `publish()` does not
-    catch or translate anything: `record_checkpoint_ref_transition()`
-    both loads the currently installed authoritative projection fresh
-    (which can itself fail, e.g. `SCHEMA_INVALID` or
-    `SUBSTRATE_UNAVAILABLE`) and performs the write, so `publish()` lets
-    every `LifecycleStoreError` it raises propagate unchanged, including
-    but not limited to a stale expectation, a wrong lock scope, an
-    illegal transition, and a pre-installation, cleanup-unconfirmed, or
-    durability-unconfirmed publication failure. `current` replaces the
-    stored value only after that call returns normally (a confirmed
-    publication) — it never retries automatically, and it never treats
-    `PROJECTION_DURABILITY_UNCONFIRMED` as success. On any failure,
-    `current` is left exactly as it was before the failed call.
+    `LifecycleCheckpointRefPublisher` and `LifecycleContainerPublisher`
+    each independently tracking their own `_current` (as they did before
+    this slice) is unsafe the moment more than one of them, or a direct
+    `writer.advance_lifecycle_state()` call, touches the same lease:
+    `LifecycleProjection` equality is whole-object, so *any* successful
+    write through *any* path invalidates every other independently-held
+    `_current` snapshot for its very next write, which then fails with
+    `STALE_EXPECTED_PROJECTION` -- not eventually, but on the very next
+    cross-path write. This cursor is the single shared owner of
+    `current`; every write method delegates to the writer with
+    `expected=self._current` and updates `self._current` only after a
+    confirmed successful write, exactly like each adapter did
+    individually before -- but now there is only one such value per
+    lease, shared by every facade constructed against it.
+
+    Raises the writer's own raw `LifecycleStoreError` unchanged -- this
+    class lives in the same module as the writer; translation to a
+    facade-specific public exception (`ContainerPublicationError`,
+    `CheckpointPublicationError`) is each facade's own responsibility,
+    not this cursor's. Never retries or refreshes automatically:
+    `refresh()` is the sole explicit recovery operation, and re-syncing
+    it re-syncs every facade sharing this cursor in one step."""
+
+    def __init__(self, writer: "_LifecycleProjectionWriter", initial: LifecycleProjection) -> None:
+        self._writer = writer
+        self._current = initial
+
+    @property
+    def current(self) -> LifecycleProjection:
+        return self._current
+
+    def advance_state(self, state: LifecycleState) -> LifecycleProjection:
+        self._current = self._writer.advance_lifecycle_state(expected=self._current, state=state)
+        return self._current
+
+    def record_container(self, *, role: str, intent: ContainerIntent, id: str | None) -> LifecycleProjection:
+        self._current = self._writer.record_container_transition(expected=self._current, role=role, intent=intent, id=id)
+        return self._current
+
+    def record_checkpoint_ref(self, transition: CheckpointTransition) -> LifecycleProjection:
+        self._current = self._writer.record_checkpoint_ref_transition(expected=self._current, transition=transition)
+        return self._current
+
+    def refresh(self) -> LifecycleProjection:
+        """Explicit, never-automatic recovery operation: re-reads the
+        currently installed authoritative projection via the writer's
+        own `refresh()` and updates the shared `current` to match it --
+        un-staling every facade sharing this cursor in one call."""
+        self._current = self._writer.refresh()
+        return self._current
+
+
+class LifecycleCheckpointRefPublisher:
+    """Adapts a `_LifecycleProjectionWriter` (via a `LifecycleProjectionCursor`)
+    to `checkpoint_session.CheckpointTransitionPublisher`'s structural
+    `publish(transition)` boundary (Slice 3B-3, ADR 0004 Amendment 4;
+    revised Slice 3B-7, Amendment 7).
+
+    **Isolated use only** when constructed via `__init__` directly: this
+    instance owns a *private* `LifecycleProjectionCursor` no other
+    facade shares. Never construct a second
+    `LifecycleCheckpointRefPublisher`/`LifecycleContainerPublisher`
+    against the *same* writer this way and use both against one lease
+    concurrently -- the moment a write lands through one, the other's
+    own private cursor's `current` is stale, and its very next write
+    fails with `STALE_EXPECTED_PROJECTION`. For any scenario touching
+    more than one of these against one lease, use
+    `create_shared_lifecycle_publishers()` instead, which hands both
+    facades the *same* cursor.
+
+    `publish()` catches `LifecycleStoreError` and translates it to a
+    `checkpoint_session.CheckpointPublicationError` (Slice 3B-7) --
+    every failure a bare `record_checkpoint_ref_transition()` call could
+    raise, including but not limited to a stale expectation, a wrong
+    lock scope, an illegal transition, and a pre-installation, cleanup-
+    unconfirmed, or durability-unconfirmed publication failure. `current`
+    advances only after a confirmed successful write; on any failure it
+    is left exactly as it was before the failed call -- this method
+    never retries automatically, and it never treats
+    `PROJECTION_DURABILITY_UNCONFIRMED` as success.
 
     Call `refresh()` explicitly to recover after
     `PROJECTION_DURABILITY_UNCONFIRMED` — it is never invoked
@@ -1478,24 +1544,58 @@ class LifecycleCheckpointRefPublisher:
     """
 
     def __init__(self, writer: "_LifecycleProjectionWriter", initial_projection: LifecycleProjection) -> None:
-        self._writer = writer
-        self._current = initial_projection
+        self._cursor = LifecycleProjectionCursor(writer, initial_projection)
+
+    @classmethod
+    def _from_cursor(cls, cursor: LifecycleProjectionCursor) -> "LifecycleCheckpointRefPublisher":
+        """Private: the only sanctioned coordinated-construction path is
+        `create_shared_lifecycle_publishers()`."""
+        obj = cls.__new__(cls)
+        obj._cursor = cursor
+        return obj
 
     @property
     def current(self) -> LifecycleProjection:
-        return self._current
+        return self._cursor.current
 
     def publish(self, transition: CheckpointTransition) -> None:
-        updated = self._writer.record_checkpoint_ref_transition(expected=self._current, transition=transition)
-        self._current = updated
+        try:
+            self._cursor.record_checkpoint_ref(transition)
+        except LifecycleStoreError as exc:
+            raise CheckpointPublicationError(
+                _CHECKPOINT_PUBLICATION_FAILURE_MAP[exc.reason],
+                "checkpoint-ref transition could not be published",
+            ) from exc
 
     def refresh(self) -> LifecycleProjection:
-        """Explicit recovery operation: re-reads the currently installed
-        authoritative projection via the writer's own `refresh()` and
-        updates this adapter's stored `current` to match it. Never
-        invoked automatically."""
-        self._current = self._writer.refresh()
-        return self._current
+        """Explicit, never-automatic recovery operation — delegates to
+        the shared cursor, un-staling every facade sharing it."""
+        return self._cursor.refresh()
+
+
+# Milestone 3 Slice 3B-7 (ADR 0004 Amendment 7): the complete, explicit
+# translation from every `LifecycleStoreFailure` member to a
+# `CheckpointPublicationFailure` reachable from
+# `record_checkpoint_ref_transition`'s own call path. Mirrors
+# `_CONTAINER_PUBLICATION_FAILURE_MAP` exactly (same reachability
+# analysis: `LIFECYCLE_ID_COLLISION`/`RECONCILIATION_BLOCKED` are
+# `prepare_lifecycle()`-only and unreachable here too). Subscript access
+# only, never `.get(..., default)` — `tests/unit/test_lifecycle_store.py`
+# asserts this dict's keys equal the complete real `LifecycleStoreFailure`
+# enum.
+_CHECKPOINT_PUBLICATION_FAILURE_MAP: dict[LifecycleStoreFailure, CheckpointPublicationFailure] = {
+    LifecycleStoreFailure.SUBSTRATE_UNAVAILABLE: CheckpointPublicationFailure.SUBSTRATE_UNAVAILABLE,
+    LifecycleStoreFailure.LIFECYCLE_ID_COLLISION: CheckpointPublicationFailure.UNCLASSIFIED,
+    LifecycleStoreFailure.OVERSIZED: CheckpointPublicationFailure.OVERSIZED,
+    LifecycleStoreFailure.SCHEMA_INVALID: CheckpointPublicationFailure.SCHEMA_INVALID,
+    LifecycleStoreFailure.CLEANUP_UNCONFIRMED: CheckpointPublicationFailure.CLEANUP_UNCONFIRMED,
+    LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED: CheckpointPublicationFailure.NOT_INSTALLED,
+    LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED: CheckpointPublicationFailure.DURABILITY_UNCONFIRMED,
+    LifecycleStoreFailure.RECONCILIATION_BLOCKED: CheckpointPublicationFailure.UNCLASSIFIED,
+    LifecycleStoreFailure.WRONG_LOCK_SCOPE: CheckpointPublicationFailure.WRONG_LOCK_SCOPE,
+    LifecycleStoreFailure.STALE_EXPECTED_PROJECTION: CheckpointPublicationFailure.STALE_EXPECTATION,
+    LifecycleStoreFailure.ILLEGAL_TRANSITION: CheckpointPublicationFailure.ILLEGAL_TRANSITION,
+}
 
 
 # Milestone 3 Slice 3B-6 (ADR 0004 Amendment 6): the complete, explicit
@@ -1528,11 +1628,17 @@ _CONTAINER_PUBLICATION_FAILURE_MAP: dict[LifecycleStoreFailure, ContainerPublica
 
 
 class LifecycleContainerPublisher:
-    """Adapts a `_LifecycleProjectionWriter` to `container_lifecycle.
-    ContainerTransitionPublisher`'s structural `publish(role, intent,
-    id)` boundary (Slice 3B-6, ADR 0004 Amendment 6) — the *only* place
-    a `LifecycleStoreError` is ever caught and translated into a
+    """Adapts a `_LifecycleProjectionWriter` (via a `LifecycleProjectionCursor`)
+    to `container_lifecycle.ContainerTransitionPublisher`'s structural
+    `publish(role, intent, id)` boundary (Slice 3B-6, ADR 0004
+    Amendment 6; revised Slice 3B-7, Amendment 7) — the *only* place a
+    `LifecycleStoreError` is ever caught and translated into a
     `ContainerPublicationError`.
+
+    **Isolated use only** when constructed via `__init__` directly —
+    see `LifecycleCheckpointRefPublisher`'s identical warning. Use
+    `create_shared_lifecycle_publishers()` for any scenario touching
+    more than one facade against one lease.
 
     Unlike `LifecycleCheckpointRefPublisher` (which wraps exactly one
     ref), one `LifecycleContainerPublisher` instance serves *both*
@@ -1562,38 +1668,74 @@ class LifecycleContainerPublisher:
     have issued."""
 
     def __init__(self, writer: "_LifecycleProjectionWriter", initial_projection: LifecycleProjection) -> None:
-        self._writer = writer
-        self._current = initial_projection
+        self._cursor = LifecycleProjectionCursor(writer, initial_projection)
+
+    @classmethod
+    def _from_cursor(cls, cursor: LifecycleProjectionCursor) -> "LifecycleContainerPublisher":
+        """Private: the only sanctioned coordinated-construction path is
+        `create_shared_lifecycle_publishers()`."""
+        obj = cls.__new__(cls)
+        obj._cursor = cursor
+        return obj
 
     @property
     def current(self) -> LifecycleProjection:
-        return self._current
+        return self._cursor.current
 
     @property
     def lifecycle_id(self) -> str:
-        return self._current.lifecycle_id
+        return self._cursor.current.lifecycle_id
 
     @property
     def state_root_id(self) -> str:
-        return self._current.state_root_id
+        return self._cursor.current.state_root_id
 
     def publish(self, *, role: ContainerRole, intent: ContainerIntent, id: str | None) -> None:
         try:
-            updated = self._writer.record_container_transition(
-                expected=self._current, role=role.value, intent=intent, id=id
-            )
+            self._cursor.record_container(role=role.value, intent=intent, id=id)
         except LifecycleStoreError as exc:
             raise ContainerPublicationError(
                 _CONTAINER_PUBLICATION_FAILURE_MAP[exc.reason],
                 "container transition could not be published",
             ) from exc
-        self._current = updated
 
     def refresh(self) -> LifecycleProjection:
-        """Explicit, never-automatic recovery operation — mirrors
-        `LifecycleCheckpointRefPublisher.refresh()` exactly."""
-        self._current = self._writer.refresh()
-        return self._current
+        """Explicit, never-automatic recovery operation — delegates to
+        the shared cursor, un-staling every facade sharing it."""
+        return self._cursor.refresh()
+
+
+@dataclass(frozen=True)
+class SharedLifecyclePublishers:
+    """The bundle `create_shared_lifecycle_publishers()` returns (Slice
+    3B-7, ADR 0004 Amendment 7): one shared `LifecycleProjectionCursor`
+    plus a `LifecycleCheckpointRefPublisher` and a
+    `LifecycleContainerPublisher` both constructed against that exact
+    same cursor — never against independent private ones. A named bundle
+    rather than a positional tuple, so a call site can never confuse
+    which field is which."""
+
+    cursor: LifecycleProjectionCursor
+    checkpoint_ref_publisher: LifecycleCheckpointRefPublisher
+    container_publisher: LifecycleContainerPublisher
+
+
+def create_shared_lifecycle_publishers(
+    writer: "_LifecycleProjectionWriter", initial: LifecycleProjection
+) -> SharedLifecyclePublishers:
+    """The one sanctioned way to obtain a `LifecycleCheckpointRefPublisher`
+    and a `LifecycleContainerPublisher` safe to use together against the
+    same lease (Slice 3B-7, ADR 0004 Amendment 7). Both facades share the
+    single `LifecycleProjectionCursor` returned alongside them, so a
+    write through either one keeps the other's own next write correctly
+    synchronized — the independent-`_current`-per-facade staleness bug
+    this slice fixes is structurally unreachable through this factory."""
+    cursor = LifecycleProjectionCursor(writer, initial)
+    return SharedLifecyclePublishers(
+        cursor=cursor,
+        checkpoint_ref_publisher=LifecycleCheckpointRefPublisher._from_cursor(cursor),
+        container_publisher=LifecycleContainerPublisher._from_cursor(cursor),
+    )
 
 
 def prepare_lifecycle(source_repo_path: Path | str, *, run_id: str) -> LifecycleLease:

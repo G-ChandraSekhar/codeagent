@@ -233,6 +233,25 @@ class ErrorCode(str, Enum):
     # result even though the underlying domain outcome may have
     # succeeded (ADR 0003 Amendment 2's terminal precedence).
     LIFECYCLE_CLEANUP_UNCONFIRMED = "lifecycle_cleanup_unconfirmed"
+    # Milestone 3 Slice 3B-7 (ADR 0004 Amendment 7): the durable
+    # lifecycle-projection *record* of a checkpoint-ref transition could
+    # not be confirmed published
+    # (`checkpoint_session.CheckpointPublicationError`). Whether the Git
+    # ref mutation itself was ever reached depends on which publication
+    # phase failed — a pre-mutation (transitional-intent) publication
+    # failure means Git was never attempted at all; a post-mutation
+    # (collapse) or confirmed-UNCHANGED-recovery publication failure
+    # means the Git mutation already concluded (successfully, or
+    # confirmed UNCHANGED and recovered) before this failure occurred.
+    # This code never asserts which case applies — it only reports that
+    # the projection record could not be confirmed. Deliberately
+    # distinct from every `CHECKPOINT_REF_*` code above, which are all
+    # about the Git ref mutation itself, never its lifecycle-projection
+    # record. The finer-grained categorical reason
+    # (`CheckpointPublicationError.reason`) is not persisted here — it
+    # remains available in-process for logging/debugging without
+    # widening this stable, serialized taxonomy.
+    CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED = "checkpoint_lifecycle_publication_failed"
 
 
 ERROR_DOMAIN_BY_CODE: dict[ErrorCode, ErrorDomain] = {
@@ -264,6 +283,7 @@ ERROR_DOMAIN_BY_CODE: dict[ErrorCode, ErrorDomain] = {
     ErrorCode.CHECKPOINT_REF_OUTCOME_UNKNOWN: ErrorDomain.LIFECYCLE,
     ErrorCode.WORKSPACE_ENTRY_GATE_FAILED: ErrorDomain.LIFECYCLE,
     ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED: ErrorDomain.LIFECYCLE,
+    ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED: ErrorDomain.LIFECYCLE,
 }
 
 
