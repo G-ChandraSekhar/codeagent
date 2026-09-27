@@ -2389,6 +2389,28 @@ evidence (real `prepare_lifecycle()` lease, real
 Docker — no mocking anywhere in the seven real-Docker tests) including
 the three real-SIGKILL boundary tests, and the five mock-only tests
 plus the structural test all run and pass with Docker unavailable.
-Linux CI has not yet run for this (thrice-corrected) slice — do not
-claim it has until this version is committed, pushed, and a workflow
-run against that commit completes.
+**Confirmed on GitHub-hosted Linux CI** (commit
+`388e80a496fe39075c8261ab9c407d16c7130b82`, run
+[36338011857](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36338011857),
+`ubuntu-24.04` x86_64, Python 3.12, conclusion `success`): the mandatory
+Docker preflight passed and the pinned verification image was pulled
+and confirmed `linux/amd64`. The dedicated "Run real Docker
+verification tests" step ran only `tests/integration/test_slice_c.py`
+(3 passed, 0 skipped) — it did not run `test_slice_3b6.py`. This
+slice's own seven Docker-dependent tests ran instead inside the
+separate "Run complete test suite" step (`python -m pytest -q`, with
+`CODEAGENT_REQUIRE_DOCKER=1` confirmed present), which reported `2613
+passed, 3 skipped`; that step used `pytest -q`, which prints no test
+identities, so the three skips are three unidentified platform/host-
+specific skips, never guessed at, and are not evidence of Docker
+unavailability (the daemon, image pull, and `CODEAGENT_REQUIRE_DOCKER=1`
+were all already confirmed for that same step). Local macOS evidence
+(2,616 passed, 0 skipped) and this CI run account for the identical
+2,616 collected outcomes. The final leftover-container check (the
+anchored `grep -E '^codeagent-(verify-|baseline-|verification-)'` over
+a complete `docker ps -a` listing) returned empty and succeeded. This is
+implementation/automated-test evidence only, scoped specifically to
+GitHub-hosted `ubuntu-24.04` x86_64 — not a general Linux or ARM64
+claim, and not a security review. It does not change T-E1's existing
+partial-mitigation boundary in `docs/threat-model.md`, and does not
+claim any `RunController`/CLI entry-point wiring exists.

@@ -3712,3 +3712,86 @@ figures the immediately preceding entry recorded. Linux CI has still
 not run for this (thrice-corrected) version — do not claim it has until
 it is committed, pushed, and a workflow run against that commit
 completes.
+
+## 2026-09-27 — Milestone 3 Slice 3B-6: Linux CI evidence reconciliation
+
+Documentation-only pass. The prior entry's "Linux CI has still not run"
+statement is now superseded — the slice was committed
+(`388e80a496fe39075c8261ab9c407d16c7130b82`) and pushed as an ordinary
+fast-forward, and the resulting GitHub Actions run
+([36338011857](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36338011857),
+`ubuntu-24.04` x86_64, Python 3.12) was independently re-fetched and
+re-verified against its own raw logs before writing anything below —
+not merely trusted from an earlier report.
+
+**Verified facts**: overall conclusion `success`; Docker preflight
+succeeded; the pinned image was pulled and confirmed `linux/amd64`.
+
+**The dedicated-step/complete-suite distinction, recorded explicitly so
+a future reader cannot conflate the two**: the separately named "Run
+real Docker verification tests (must execute, not skip)" step ran
+exactly `python -m pytest tests/integration/test_slice_c.py -v` and
+reported `3 passed in 2.28s` — this is Milestone 1's own 3 legacy
+tests, and only those. It did **not** run
+`tests/integration/test_slice_3b6.py`. This slice's own seven genuine
+Docker-dependent tests (three real end-to-end/labels/recovery tests,
+three real-SIGKILL tests, and the lock/reconciliation test — each
+carrying its own per-test `requires_docker` marker) ran instead inside
+the separate "Run complete
+test suite" step, `python -m pytest -q`, with `CODEAGENT_REQUIRE_
+DOCKER=1` independently confirmed present in that step's own logged
+environment. With Docker genuinely available there, every one of those
+seven tests' `requires_docker` marker was inactive (skipif conditions
+false, so not skipped), and the module-level mandatory-Docker guard
+(`CODEAGENT_REQUIRE_DOCKER=1` set with no daemon found fails collection
+outright, verified by reading that guard's own source) would have
+failed the entire run rather than letting any of the seven silently
+skip. That step reported exactly `2613 passed, 3 skipped in 46.03s`,
+verified against the raw log.
+
+The step used `pytest -q`, which prints no test identities — the three
+skips are recorded here only as three unidentified, platform/host-
+specific skips, never guessed at. They are explicitly not evidence of
+Docker unavailability: preflight succeeded, the image was pulled, and
+`CODEAGENT_REQUIRE_DOCKER=1` was present for that exact step. Local
+macOS evidence (2,616 passed, 0 skipped, from the prior entries) and
+this Linux run account for the identical 2,616 collected outcomes as
+2,613 passed plus these 3 skips.
+
+The final "Verify no leftover CodeAgent verification containers" step
+was independently confirmed to use the anchored pattern
+`grep -E '^codeagent-(verify-|baseline-|verification-)'` against a
+complete, unfiltered `docker ps -a --format '{{.Names}}'` listing —
+covering all three CodeAgent container families — and its captured
+output was empty; the step succeeded.
+
+This is implementation/automated-test evidence only — it does not
+constitute or substitute for a security review — and is GitHub-hosted
+`ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+ARM64 portability claim. `RunController`/CLI entry-point wiring remains
+absent and T-E1's existing partial-mitigation boundary in
+`docs/threat-model.md` is unchanged by this evidence.
+
+`CLAUDE.md`'s Slice 3B-6 bullet (both its opening framing, previously
+"Linux CI not yet run for this slice," and its closing statement,
+previously "Linux CI validation for this specific (thrice-corrected)
+slice has not yet been run") and `docs/adr/0004-owned-resource-
+lifecycle-and-reconciliation.md`'s Amendment 6 evidence section
+(previously "Linux CI has not yet run for this (thrice-corrected)
+slice") are both updated in place with the verified evidence above,
+explicitly preserving the dedicated-step/complete-suite distinction.
+`docs/threat-model.md` was inspected and contains no Slice-3B-6-specific
+stale Linux-CI-pending statement to correct, so it was left untouched.
+No other prose in either file — design, transition tables, ownership
+rules, failure classification, inspection/mutation order, milestone
+boundary, or local macOS evidence — was touched. The earlier
+correction-pass `ENGINEERING_LOG.md` entries, which truthfully stated
+Linux CI had not yet run *at the time each was written*, are left
+unmodified, per this project's own established convention of never
+rewriting historical entries to match later state.
+
+Verified: `git diff --check` clean on the resulting documentation-only
+diff; only `CLAUDE.md`, this file, and the ADR changed — no production
+code, test, workflow, configuration, or dependency file touched;
+nothing staged. No test run or Docker session was needed for this pass
+— the independently re-verified, completed CI run is the evidence.

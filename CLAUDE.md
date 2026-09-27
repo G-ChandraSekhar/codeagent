@@ -1335,9 +1335,14 @@ Stage 2 (of the four-stage planning process in
 - **Milestone 3 Slice 3B-6** (lifecycle-aware `DockerVerifier` container
   production), per
   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
-  "Amendment 6 (Accepted 2026-09-27)", **is implemented and locally
-  validated on macOS (2026-09-27), Linux CI not yet run for this
-  slice.** Entirely opt-in: `DockerVerifier` behaves exactly as before
+  "Amendment 6 (Accepted 2026-09-27)", **is implemented, locally
+  validated on macOS (2026-09-27), committed
+  (`388e80a496fe39075c8261ab9c407d16c7130b82`), and confirmed on
+  GitHub-hosted Linux CI** (run
+  [36338011857](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36338011857),
+  `ubuntu-24.04` x86_64, Python 3.12, conclusion `success` — see the
+  closing paragraph below for the exact evidence this run supports).
+  Entirely opt-in: `DockerVerifier` behaves exactly as before
   when constructed without a `lifecycle_context`, and adopts
   deterministic naming, labeling, and durable write-ahead publication
   only when one is supplied. Two new dependency-light leaf modules:
@@ -1571,10 +1576,48 @@ Stage 2 (of the four-stage planning process in
   figures, which are corrected to reference the final thirteen-file
   focused set reported at the top of this bullet). See
   `ENGINEERING_LOG.md`'s dated entry for the exact final,
-  post-all-correction-passes totals. **Linux CI validation for this
-  specific (thrice-corrected) slice has not yet been run** — do not
-  claim it has until this corrected version is committed, pushed, and a
-  workflow run against that commit actually completes.
+  post-all-correction-passes local totals.
+
+  **Confirmed on GitHub-hosted Linux CI** (commit
+  `388e80a496fe39075c8261ab9c407d16c7130b82`, run
+  [36338011857](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36338011857),
+  `ubuntu-24.04` x86_64, Python 3.12, conclusion `success`): the
+  mandatory Docker preflight passed; the pinned verification image was
+  pulled and confirmed `linux/amd64`. Two distinct real-Docker
+  surfaces ran, and must not be conflated: the dedicated, separately
+  named "Run real Docker verification tests" step ran only `python -m
+  pytest tests/integration/test_slice_c.py -v` — this file's own 3
+  legacy Milestone-1 tests, exactly, reporting `3 passed in 2.28s`, 0
+  skipped; it did **not** run `tests/integration/test_slice_3b6.py`.
+  This slice's own seven genuine Docker-dependent tests in
+  `test_slice_3b6.py` instead ran inside the separate "Run complete
+  test suite" step (`python -m pytest -q`, confirmed
+  `CODEAGENT_REQUIRE_DOCKER=1` present in that step's own environment)
+  — with Docker available there, every one of those seven tests' own
+  per-test `requires_docker` marker was inactive (not skipped), and the
+  module's own mandatory-Docker guard (`CODEAGENT_REQUIRE_DOCKER=1` set
+  but no daemon found fails collection outright) would have failed the
+  whole run rather than letting any of them silently skip. That step
+  reported exactly `2613 passed, 3 skipped in 46.03s`. The run used
+  `pytest -q`, which prints no test identities, so these 3 skips are
+  described only as three unidentified, platform/host-specific skips —
+  never guessed at — and are not evidence of Docker unavailability:
+  Docker preflight succeeded, the pinned image was pulled, and the
+  suite ran with `CODEAGENT_REQUIRE_DOCKER=1` throughout. Local macOS
+  evidence was 2,616 passed, 0 skipped; Linux CI accounts for the
+  identical 2,616 collected outcomes as 2,613 passed plus these 3
+  skips. The final leftover-container check ran the anchored
+  `grep -E '^codeagent-(verify-|baseline-|verification-)'` over a
+  complete, unfiltered `docker ps -a` name listing, covering all three
+  CodeAgent container families; its output was empty and the step
+  succeeded — no leftover containers of any family. This is
+  implementation/automated-test evidence only — it does not constitute
+  or substitute for a security review, and is GitHub-hosted
+  `ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+  ARM64 portability claim. It does not claim `RunController`/CLI
+  entry-point wiring exists, or that T-E1's existing partial-mitigation
+  boundary in `docs/threat-model.md` has changed — both remain exactly
+  as this slice's implementation section above already states.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
