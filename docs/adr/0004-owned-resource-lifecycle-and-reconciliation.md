@@ -2654,6 +2654,30 @@ detail, including the real-lease/real-writer interleaving test proving
 all succeed through the shared bundle with zero spurious staleness,
 genuine external staleness still refused, and explicit `refresh()`
 correctly re-syncing both facades after a fault-injected durability-
-unconfirmed publication. Linux CI has not yet run for this slice — do
-not claim it has until it is committed, pushed, and a workflow run
-against that commit completes.
+unconfirmed publication.
+
+**Confirmed on GitHub-hosted Linux CI** (commit
+`6a452b1d095584d754cbc51f291d1ebd5de9f3c9`, run
+[36350258312](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36350258312),
+`ubuntu-24.04` x86_64, Python 3.12, conclusion `success`): the mandatory
+Docker preflight passed and the pinned verification image was pulled
+and confirmed `linux/amd64`. The dedicated "Run real Docker
+verification tests" step ran only the legacy
+`tests/integration/test_slice_c.py` (3 passed in 2.63s) — it does not
+specifically exercise Slice 3B-7, which adds no real-Docker test of its
+own. The separate "Run complete test suite" step (with
+`CODEAGENT_REQUIRE_DOCKER=1` confirmed present) reported `2645 passed,
+3 skipped in 47.16s` (2645 + 3 = the local collected total of 2,648);
+that step used `pytest -q`, which prints no test identities, so the 3
+skips are recorded only as unidentified platform/host-specific skips,
+never guessed at, and are not evidence of Docker unavailability, since
+Docker was required and confirmed available for that step. The final
+leftover-container check (the anchored `grep -E
+'^codeagent-(verify-|baseline-|verification-)'` over a complete `docker
+ps -a` listing) returned empty and succeeded. This is implementation/
+automated-test evidence only — it does not constitute or substitute for
+a security review — and is GitHub-hosted `ubuntu-24.04` x86_64 evidence
+specifically, not a general Linux or ARM64 claim. It adds no
+entry-point wiring, no lifecycle state change during a real controller
+run, no `CLEANING` integration, no worktree tracking, and no CLI
+behavior; `docs/threat-model.md`'s T-E1 entry is unchanged.

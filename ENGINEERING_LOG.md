@@ -3903,3 +3903,72 @@ they touched more than one publisher against a real controller run.
 `docs/threat-model.md`'s T-E1 entry is unaffected. Linux CI has not yet
 run for this slice — do not claim it has until it is committed, pushed,
 and a workflow run against that commit completes.
+
+## 2026-09-27 — Milestone 3 Slice 3B-7: Linux CI evidence reconciliation
+
+Documentation-only pass. The prior entry's "Linux CI has not yet run
+for this slice" statement is now superseded — the slice was committed
+(`6a452b1d095584d754cbc51f291d1ebd5de9f3c9`) and pushed as an ordinary
+fast-forward, and the resulting GitHub Actions run
+([36350258312](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36350258312),
+`ubuntu-24.04` x86_64, Python 3.12) was independently re-fetched via the
+GitHub API and its own raw logs before writing anything below — not
+merely trusted from an earlier report.
+
+**Verified facts**: overall conclusion `success`; every job step
+concluded `success`; Docker preflight succeeded; the pinned image was
+pulled and confirmed `linux/amd64`.
+
+The dedicated "Run real Docker verification tests" step ran exactly
+`python -m pytest tests/integration/test_slice_c.py -v`, reporting `3
+passed in 2.63s` — this is Milestone 1's own legacy real-Docker suite;
+it does not specifically exercise Slice 3B-7, which introduces no
+real-Docker test of its own (none of this slice's work touches Docker
+at all — it is a purely in-memory cursor/exception-boundary fix). The
+separate "Run complete test suite" step ran `python -m pytest -q` with
+`CODEAGENT_REQUIRE_DOCKER: 1` independently confirmed present in that
+step's own logged environment, reporting `2645 passed, 3 skipped in
+47.16s` — `2645 + 3` equals the local collected total of 2,648
+established in the implementation entry above. That step used `pytest
+-q`, which prints no test identities; the three skips are recorded here
+only as unidentified, platform/host-specific skips, never guessed at,
+and are explicitly not evidence of Docker unavailability, since Docker
+was a required, already-confirmed precondition for that same step.
+
+The final "Verify no leftover CodeAgent verification containers" step
+was independently confirmed to use the anchored pattern `grep -E
+'^codeagent-(verify-|baseline-|verification-)'` against a complete,
+unfiltered `docker ps -a` listing, and its captured output was empty;
+the step succeeded.
+
+This is implementation/automated-test evidence only — it does not
+constitute or substitute for a security review — and is GitHub-hosted
+`ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+ARM64 portability claim. It adds no entry-point wiring, no lifecycle
+state change during a real controller run, no `CLEANING` integration,
+no worktree tracking, and no CLI behavior beyond what Slice 3B-7 itself
+already implements — `docs/threat-model.md`'s T-E1 entry remains
+unaffected, and `docs/threat-model.md` itself contains no Slice-3B-7-
+specific statement to correct.
+
+`CLAUDE.md`'s Slice 3B-7 bullet (both its opening framing, previously
+"Linux CI not yet run for this slice," and its closing statement,
+previously "Linux CI validation for this specific slice has not yet
+been run") and `docs/adr/0004-owned-resource-lifecycle-and-
+reconciliation.md`'s Amendment 7 evidence paragraph (previously "Linux
+CI has not yet run for this slice") are both updated in place with the
+verified evidence above, explicitly noting that the dedicated step
+tests the legacy suite, not Slice 3B-7 specifically. No other prose in
+either file — the cursor/publisher design, the exception-translation
+boundary, the dual-cause contract, the message correction, or the
+milestone boundary — was touched. The original Slice 3B-7 implementation
+entry above, which truthfully stated Linux CI had not yet run *at the
+time it was written*, is left unmodified, per this project's own
+established convention of never rewriting historical entries to match
+later state.
+
+Verified: `git diff --check` clean on the resulting documentation-only
+diff; only `CLAUDE.md`, this file, and the ADR changed — no production
+code, test, workflow, configuration, or dependency file touched;
+nothing staged. No test run or Docker session was needed for this pass
+— the independently re-verified, completed CI run is the evidence.

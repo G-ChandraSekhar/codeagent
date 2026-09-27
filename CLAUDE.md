@@ -1621,9 +1621,14 @@ Stage 2 (of the four-stage planning process in
 - **Milestone 3 Slice 3B-7** (shared lifecycle-projection coordination
   and the controller-facing checkpoint lifecycle-publication boundary),
   per `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
-  "Amendment 7 (Accepted 2026-09-27)", **is implemented and locally
-  validated on macOS (2026-09-27), Linux CI not yet run for this
-  slice.** A review of the previously-proposed composition-root slice
+  "Amendment 7 (Accepted 2026-09-27)", **is implemented, locally
+  validated on macOS (2026-09-27), committed
+  (`6a452b1d095584d754cbc51f291d1ebd5de9f3c9`), and confirmed on
+  GitHub-hosted Linux CI** (run
+  [36350258312](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36350258312),
+  `ubuntu-24.04` x86_64, Python 3.12, conclusion `success` — see the
+  closing paragraph below for the exact evidence this run supports). A
+  review of the previously-proposed composition-root slice
   found two real correctness gaps in already-existing, already-ADR-
   accepted code before any entry-point wiring was ever attempted; this
   slice fixes both and stops there — no `prepare_lifecycle()` call, no
@@ -1733,9 +1738,37 @@ Stage 2 (of the four-stage planning process in
   `CLEANING`-publication hook, any lifecycle state change during a real
   controller run, and any worktree-tracking schema or allocation
   change. `docs/threat-model.md`'s T-E1 entry is unaffected — this
-  slice adds zero entry-point behavior. **Linux CI validation for this
-  specific slice has not yet been run** — do not claim it has until a
-  workflow run against this commit actually completes.
+  slice adds zero entry-point behavior.
+
+  **Confirmed on GitHub-hosted Linux CI** (commit
+  `6a452b1d095584d754cbc51f291d1ebd5de9f3c9`, run
+  [36350258312](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36350258312),
+  `ubuntu-24.04` x86_64, Python 3.12, conclusion `success`): the
+  mandatory Docker preflight passed; the pinned verification image was
+  pulled and confirmed `linux/amd64`. The dedicated "Run real Docker
+  verification tests" step ran only `python -m pytest
+  tests/integration/test_slice_c.py -v` — this file's own 3 legacy
+  Milestone-1 tests, exactly, reporting `3 passed in 2.63s`; it does
+  **not** specifically exercise Slice 3B-7 (this slice adds no new
+  real-Docker test of its own — none of its work touches Docker). The
+  separate "Run complete test suite" step (`python -m pytest -q`, with
+  `CODEAGENT_REQUIRE_DOCKER=1` confirmed present in that step's own
+  environment) reported `2645 passed, 3 skipped in 47.16s`; `2645 + 3`
+  equals the local collected total of 2,648. That step used `pytest
+  -q`, which prints no test identities, so these 3 skips are described
+  only as three unidentified, platform/host-specific skips — never
+  guessed at — and are not evidence of Docker unavailability, since
+  Docker was required and confirmed available for that same step. The
+  final leftover-container check used the anchored `grep -E
+  '^codeagent-(verify-|baseline-|verification-)'` over a complete
+  `docker ps -a` listing; its output was empty and the step succeeded.
+  This is implementation/automated-test evidence only — it does not
+  constitute or substitute for a security review, and is GitHub-hosted
+  `ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+  ARM64 portability claim. It adds no entry-point wiring, no lifecycle
+  state change during a real controller run, no `CLEANING` integration,
+  no worktree tracking, and no CLI behavior — `docs/threat-model.md`'s
+  T-E1 entry remains exactly as stated above, unaffected.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
