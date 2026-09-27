@@ -2784,3 +2784,218 @@ def test_reconciler_writer_durability_unconfirmed_is_classified_distinctly(tmp_p
         assert excinfo.value.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
     finally:
         os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Slice 3B-6: LifecycleContainerPublisher adapter (ADR 0004 Amendment 6)
+# ---------------------------------------------------------------------------
+
+
+def test_container_publication_failure_map_is_exhaustive():
+    """Every current `LifecycleStoreFailure` member must have an
+    explicit mapping entry — no `.get(..., default)` fallback anywhere.
+    Run against the real enum so a future addition forces an explicit
+    decision (a `KeyError` at `publish()` call time) rather than a
+    silently missing or wrong classification."""
+    assert set(ls._CONTAINER_PUBLICATION_FAILURE_MAP.keys()) == set(ls.LifecycleStoreFailure)
+
+
+def test_container_publisher_adapter_success_threads_returned_projection_forward(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleContainerPublisher(writer, current)
+
+        publisher.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+
+        assert publisher.current.baseline.intent is ls.ContainerIntent.CREATING
+        assert publisher.current != current
+    finally:
+        lease.close()
+
+
+def test_publisher_adapter_serves_both_roles_against_one_shared_projection(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleContainerPublisher(writer, current)
+
+        publisher.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+        publisher.publish(role=ls.ContainerRole.VERIFICATION, intent=ls.ContainerIntent.CREATING, id=None)
+
+        assert publisher.current.baseline.intent is ls.ContainerIntent.CREATING
+        assert publisher.current.verification.intent is ls.ContainerIntent.CREATING
+    finally:
+        lease.close()
+
+
+def test_container_publisher_adapter_does_not_hide_stale_expectation(tmp_path, monkeypatch):
+    from codeagent import container_lifecycle as cl
+
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleContainerPublisher(writer, current)
+        # A second, independent writer publishes behind the adapter's back.
+        real_current = writer.record_checkpoint_ref_transition(
+            expected=current, transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1"))
+        )
+        assert real_current != current
+
+        with pytest.raises(cl.ContainerPublicationError) as excinfo:
+            publisher.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+        assert excinfo.value.reason is cl.ContainerPublicationFailure.STALE_EXPECTATION
+        assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.STALE_EXPECTED_PROJECTION
+        assert publisher.current == current
+    finally:
+        lease.close()
+
+
+def test_container_publisher_adapter_pre_installation_failure_leaves_expected_unchanged(tmp_path, monkeypatch):
+    from codeagent import container_lifecycle as cl
+
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleContainerPublisher(writer, current)
+
+        def _boom(fd, data):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.IO_FAILED, "forced")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "write_all_eintr_safe", _boom)
+            with pytest.raises(cl.ContainerPublicationError) as excinfo:
+                publisher.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+            assert excinfo.value.reason is cl.ContainerPublicationFailure.NOT_INSTALLED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED
+        assert publisher.current == current
+    finally:
+        lease.close()
+
+
+def test_container_publisher_adapter_durability_unconfirmed_does_not_silently_update_and_refresh_recovers(
+    tmp_path, monkeypatch
+):
+    from codeagent import container_lifecycle as cl
+
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleContainerPublisher(writer, current)
+
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_last_fsync(fd):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced directory fsync failure")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
+            with pytest.raises(cl.ContainerPublicationError) as excinfo:
+                publisher.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+            assert excinfo.value.reason is cl.ContainerPublicationFailure.DURABILITY_UNCONFIRMED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+
+        # Never silently treated as success: the adapter's own belief
+        # is unchanged, and it is never automatically refreshed either.
+        assert publisher.current == current
+
+        refreshed = publisher.refresh()
+        assert refreshed.baseline.intent is ls.ContainerIntent.CREATING
+        assert publisher.current is refreshed
+    finally:
+        lease.close()
+
+
+def test_container_publisher_adapter_wrong_lock_scope_is_translated(tmp_path, monkeypatch):
+    from codeagent import container_lifecycle as cl
+
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    writer, current = lease.open_projection_writer()
+    lease.close()
+    publisher = ls.LifecycleContainerPublisher(writer, current)
+
+    with pytest.raises(cl.ContainerPublicationError) as excinfo:
+        publisher.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+    assert excinfo.value.reason is cl.ContainerPublicationFailure.WRONG_LOCK_SCOPE
+    assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+    assert publisher.current == current
+
+
+def test_container_publisher_exposes_identity_from_current_projection(tmp_path, monkeypatch):
+    """`LifecycleContainerPublisher.lifecycle_id`/`state_root_id`
+    (Slice 3B-6 correction pass) are the single source of identity
+    `executor.DockerVerifierLifecycleContext` derives its Docker-side
+    naming/labeling identity from."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleContainerPublisher(writer, current)
+        assert publisher.lifecycle_id == current.lifecycle_id == lease.lifecycle_id
+        assert publisher.state_root_id == current.state_root_id == lease.state_root.state_root_id
+    finally:
+        lease.close()
+
+
+def test_container_publisher_mismatched_initial_projection_fails_before_any_docker_operation(
+    tmp_path, monkeypatch
+):
+    """A publisher constructed with an `initial_projection` that does
+    not actually match what is durably installed for the writer's own
+    lease (a caller bug -- e.g. a stale or wrongly paired projection)
+    is never silently trusted: the very first `publish()` call fails,
+    strictly before a `DockerVerifier` using this publisher could ever
+    have issued a real Docker mutation, since `DockerVerifier` always
+    publishes `CREATING` before any Docker call."""
+    from codeagent import container_lifecycle as cl
+
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        # A real, differently-shaped projection for the *same* lifecycle
+        # -- the identity fields still validate, but it no longer
+        # matches what is actually installed on disk, exactly the
+        # "caller supplied the wrong snapshot" scenario this guards
+        # against.
+        stale_initial = dataclasses.replace(current, run_id="a-different-run-id-than-what-is-installed")
+        publisher = ls.LifecycleContainerPublisher(writer, stale_initial)
+
+        with pytest.raises(cl.ContainerPublicationError) as excinfo:
+            publisher.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+        assert excinfo.value.reason is cl.ContainerPublicationFailure.STALE_EXPECTATION
+        assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.STALE_EXPECTED_PROJECTION
+        # Nothing was published; the adapter's own belief is untouched.
+        assert publisher.current == stale_initial
+    finally:
+        lease.close()
+
+
+def test_publisher_adapter_illegal_transition_is_translated_to_container_publication_error(tmp_path, monkeypatch):
+    """`lifecycle_store.LifecycleStoreError` (here: `ILLEGAL_TRANSITION` —
+    `PRESENT` is not a legal edge from the initial `ABSENT`, only
+    `CREATING` is) is translated by the adapter into a
+    `container_lifecycle.ContainerPublicationError`, never propagated
+    unchanged as a raw `LifecycleStoreError`, and the original is
+    preserved as `__cause__` (ADR 0004 Amendment 6, executor-side
+    dependency inversion)."""
+    from codeagent import container_lifecycle as cl
+
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleContainerPublisher(writer, current)
+
+        with pytest.raises(cl.ContainerPublicationError) as excinfo:
+            publisher.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.PRESENT, id="a" * 64)
+
+        assert excinfo.value.reason is cl.ContainerPublicationFailure.ILLEGAL_TRANSITION
+        assert isinstance(excinfo.value.__cause__, ls.LifecycleStoreError)
+        assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+        # The persistence-layer message never leaks into the public error.
+        assert "ILLEGAL_TRANSITION" not in str(excinfo.value)
+        assert publisher.current == current
+    finally:
+        lease.close()

@@ -73,6 +73,9 @@ from ._lifecycle_fs import (
 )
 from .checkpoint_ref import new_lifecycle_id
 from .checkpoint_session import ABSENT_TRANSITION, CheckpointIntent, CheckpointTransition
+from .container_lifecycle import ContainerIntent
+from .container_lifecycle import ContainerPublicationError, ContainerPublicationFailure
+from .container_lifecycle import ContainerRole
 from .repo_identity import discover_repository_identity_and_context, load_or_create_repo_json
 from .state_locks import LockError, LockKind, LockScope, acquire_lifecycle_lock, acquire_repository_lock
 from .state_root import init_state_root, open_or_create_canonical_root, validate_state_root_containment
@@ -111,12 +114,11 @@ class LifecycleState(str, Enum):
     RECONCILIATION_FAILED = "RECONCILIATION_FAILED"
 
 
-@unique
-class ContainerIntent(str, Enum):
-    ABSENT = "absent"
-    CREATING = "creating"
-    PRESENT = "present"
-    REMOVING = "removing"
+# `ContainerIntent` is no longer defined here (Slice 3B-6): it is now
+# `container_lifecycle.py`'s own canonical definition, imported above
+# under this exact same name for source compatibility — every existing
+# reference to `lifecycle_store.ContainerIntent` in this module and in
+# `reconciliation.py`/tests keeps working unchanged.
 
 
 @unique
@@ -1492,6 +1494,104 @@ class LifecycleCheckpointRefPublisher:
         authoritative projection via the writer's own `refresh()` and
         updates this adapter's stored `current` to match it. Never
         invoked automatically."""
+        self._current = self._writer.refresh()
+        return self._current
+
+
+# Milestone 3 Slice 3B-6 (ADR 0004 Amendment 6): the complete, explicit
+# translation from every `LifecycleStoreFailure` member to a
+# `ContainerPublicationFailure` reachable from
+# `record_container_transition`'s own call path.
+# `LIFECYCLE_ID_COLLISION`/`RECONCILIATION_BLOCKED` are confirmed
+# unreachable from that call path today (both are `prepare_lifecycle()`-
+# only) and map to `UNCLASSIFIED` -- a forward-compatible catch-all
+# for a reason nobody has classified, never a silent default: subscript
+# access (`[exc.reason]`, never `.get(..., default)`) means an ever-
+# added future `LifecycleStoreFailure` member with no mapping entry
+# raises `KeyError` immediately, forcing an explicit decision rather
+# than silently falling through. `tests/unit/test_lifecycle_store.py`
+# asserts this dict's keys equal the complete real `LifecycleStoreFailure`
+# enum.
+_CONTAINER_PUBLICATION_FAILURE_MAP: dict[LifecycleStoreFailure, ContainerPublicationFailure] = {
+    LifecycleStoreFailure.SUBSTRATE_UNAVAILABLE: ContainerPublicationFailure.SUBSTRATE_UNAVAILABLE,
+    LifecycleStoreFailure.LIFECYCLE_ID_COLLISION: ContainerPublicationFailure.UNCLASSIFIED,
+    LifecycleStoreFailure.OVERSIZED: ContainerPublicationFailure.OVERSIZED,
+    LifecycleStoreFailure.SCHEMA_INVALID: ContainerPublicationFailure.SCHEMA_INVALID,
+    LifecycleStoreFailure.CLEANUP_UNCONFIRMED: ContainerPublicationFailure.CLEANUP_UNCONFIRMED,
+    LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED: ContainerPublicationFailure.NOT_INSTALLED,
+    LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED: ContainerPublicationFailure.DURABILITY_UNCONFIRMED,
+    LifecycleStoreFailure.RECONCILIATION_BLOCKED: ContainerPublicationFailure.UNCLASSIFIED,
+    LifecycleStoreFailure.WRONG_LOCK_SCOPE: ContainerPublicationFailure.WRONG_LOCK_SCOPE,
+    LifecycleStoreFailure.STALE_EXPECTED_PROJECTION: ContainerPublicationFailure.STALE_EXPECTATION,
+    LifecycleStoreFailure.ILLEGAL_TRANSITION: ContainerPublicationFailure.ILLEGAL_TRANSITION,
+}
+
+
+class LifecycleContainerPublisher:
+    """Adapts a `_LifecycleProjectionWriter` to `container_lifecycle.
+    ContainerTransitionPublisher`'s structural `publish(role, intent,
+    id)` boundary (Slice 3B-6, ADR 0004 Amendment 6) — the *only* place
+    a `LifecycleStoreError` is ever caught and translated into a
+    `ContainerPublicationError`.
+
+    Unlike `LifecycleCheckpointRefPublisher` (which wraps exactly one
+    ref), one `LifecycleContainerPublisher` instance serves *both*
+    container roles against one shared projection — `publish()` takes
+    `role`/`intent`/`id` as three keyword parameters rather than one
+    pre-built transition object, since containers have no equivalent of
+    `CheckpointTransition`'s own pre-decided collapse value.
+
+    `current` advances only after a confirmed successful write; on any
+    failure it is left exactly as it was before the failed call — this
+    method never retries automatically, and `PROJECTION_DURABILITY_
+    UNCONFIRMED` is never treated as success. Call `refresh()` (never
+    automatic) to recover the currently installed authoritative
+    projection after a durability-unconfirmed result.
+
+    `lifecycle_id`/`state_root_id` (Slice 3B-6 correction pass) expose
+    this publisher's own identity, read directly from `current`'s
+    identity fields — the single source of truth
+    `executor.DockerVerifierLifecycleContext` derives its Docker-side
+    naming/labeling identity from, rather than accepting a second,
+    independently supplied value that could disagree with it. If
+    `initial_projection` does not actually match what is durably
+    installed for this writer's lease (a caller bug), that mismatch is
+    not caught here — it surfaces on the very first `publish()` call,
+    via the writer's own `_require_current()` stale-projection check,
+    strictly before any Docker mutation this publisher's caller could
+    have issued."""
+
+    def __init__(self, writer: "_LifecycleProjectionWriter", initial_projection: LifecycleProjection) -> None:
+        self._writer = writer
+        self._current = initial_projection
+
+    @property
+    def current(self) -> LifecycleProjection:
+        return self._current
+
+    @property
+    def lifecycle_id(self) -> str:
+        return self._current.lifecycle_id
+
+    @property
+    def state_root_id(self) -> str:
+        return self._current.state_root_id
+
+    def publish(self, *, role: ContainerRole, intent: ContainerIntent, id: str | None) -> None:
+        try:
+            updated = self._writer.record_container_transition(
+                expected=self._current, role=role.value, intent=intent, id=id
+            )
+        except LifecycleStoreError as exc:
+            raise ContainerPublicationError(
+                _CONTAINER_PUBLICATION_FAILURE_MAP[exc.reason],
+                "container transition could not be published",
+            ) from exc
+        self._current = updated
+
+    def refresh(self) -> LifecycleProjection:
+        """Explicit, never-automatic recovery operation — mirrors
+        `LifecycleCheckpointRefPublisher.refresh()` exactly."""
         self._current = self._writer.refresh()
         return self._current
 

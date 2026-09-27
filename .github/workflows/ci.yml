@@ -76,15 +76,25 @@ jobs:
           CODEAGENT_REQUIRE_DOCKER: "1"
         run: python -m pytest -q
 
-      - name: Verify no leftover codeagent-verify containers
+      - name: Verify no leftover CodeAgent verification containers (legacy and lifecycle-aware families)
         if: always()
         run: |
           set -euo pipefail
-          LEFTOVER=$(docker ps -a --filter "name=codeagent-verify" --format '{{.Names}}')
-          echo "codeagent-verify containers currently present (expected: none):"
+          # Docker's own `--filter name=` is a substring match, not an
+          # anchored family-grammar proof (Milestone 3 Slice 3B-6
+          # correction) — list every container once and apply a real
+          # anchored client-side match instead, covering all three
+          # families: the legacy UUID-suffixed `codeagent-verify-*`
+          # (Milestone 1) and the deterministic lifecycle-aware
+          # `codeagent-baseline-*`/`codeagent-verification-*` (Slice
+          # 3B-5/3B-6). Detection-only — never deletes.
+          ALL=$(docker ps -a --format '{{.Names}}')
+          LEFTOVER=$(echo "$ALL" | grep -E '^codeagent-(verify-|baseline-|verification-)' || true)
+          echo "CodeAgent verification containers currently present (expected: none):"
           echo "$LEFTOVER"
           if [ -n "$LEFTOVER" ]; then
-            echo "leftover codeagent-verify container(s) found — failing." >&2
+            echo "leftover CodeAgent container(s) found across the legacy codeagent-verify-*," >&2
+            echo "deterministic codeagent-baseline-*, and codeagent-verification-* families — failing." >&2
             echo "Not deleting them here: this check exists to catch a real cleanup bug," >&2
             echo "and unrelated containers on the runner are never touched by this job." >&2
             exit 1

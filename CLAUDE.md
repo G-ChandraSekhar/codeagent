@@ -1332,6 +1332,249 @@ Stage 2 (of the four-stage planning process in
   is unchanged by this slice. Pushed as an ordinary fast-forward
   (`c8b66b3..923d99a`), no force push; local `main` and `origin/main`
   confirmed synchronized post-CI.
+- **Milestone 3 Slice 3B-6** (lifecycle-aware `DockerVerifier` container
+  production), per
+  `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  "Amendment 6 (Accepted 2026-09-27)", **is implemented and locally
+  validated on macOS (2026-09-27), Linux CI not yet run for this
+  slice.** Entirely opt-in: `DockerVerifier` behaves exactly as before
+  when constructed without a `lifecycle_context`, and adopts
+  deterministic naming, labeling, and durable write-ahead publication
+  only when one is supplied. Two new dependency-light leaf modules:
+  `src/codeagent/container_lifecycle.py` (stdlib-only —
+  `ContainerRole`, `ContainerIntent` — re-imported by
+  `lifecycle_store.py` under this same name for source compatibility,
+  no longer defined there — `ContainerTransitionPublisher` Protocol,
+  `ContainerPublicationFailure`/`ContainerPublicationError`,
+  `deterministic_container_name()`, `required_labels()`/
+  `labels_match()`) and `src/codeagent/_docker_ownership.py`
+  (generalizes the strict `docker ps -a`/`docker inspect` parsing
+  grammar previously duplicated three times across `executor.py` and
+  `reconciliation.py`, exposing both pure parsers and full run-and-
+  parse convenience functions). `executor.py` never imports, catches,
+  compares, or annotates with `lifecycle_store.LifecycleStoreError`/
+  `LifecycleStoreFailure` — `lifecycle_store.
+  LifecycleContainerPublisher` is the *only* place a `LifecycleStoreError`
+  is ever caught and translated into a `ContainerPublicationError`
+  (explicit `raise ... from exc` chaining), via an exhaustive,
+  subscript-access (never `.get(..., default)`) mapping covering every
+  current `LifecycleStoreFailure` member —
+  `tests/unit/test_lifecycle_store.py` asserts the map's keys equal the
+  complete real enum. `executor.py` catches only
+  `ContainerPublicationError`, never a blanket `Exception`/
+  `BaseException`.
+  `DockerVerifier` gains an optional `lifecycle_context:
+  DockerVerifierLifecycleContext | None` parameter (eagerly validated
+  `lifecycle_id`/`state_root_id` against the canonical 32-lowercase-hex
+  grammar, redefined independently in `container_lifecycle.py` rather
+  than importing the persistence stack). When present, a new
+  `_execute_lifecycle_aware()` path publishes `CREATING` write-ahead,
+  performs a read-only pre-create occupied-name check, recovers a
+  proven-owned occupant via `PRESENT(id)->REMOVING(id)->rm(id)->
+  confirmed absence->ABSENT` before this invocation's own `docker
+  create` ever runs (refusing a foreign/unproven occupant with zero
+  mutation), sets the four ADR 0004 section 7 required labels at create
+  time (and no `attempt` label — extra/image-provided labels never
+  defeat ownership proof), publishes `PRESENT(id)` strictly before
+  `docker start --attach`, and publishes `REMOVING(id)`/`ABSENT`
+  strictly around a new id-only `_cleanup_by_id` (never the legacy
+  name-fallback-capable `_cleanup`, and never a name-targeted `docker
+  rm`). `run()` reuses one deterministic `verification`-role container
+  name across sequential attempts rather than minting a fresh
+  UUID-suffixed name each time. The exact public `ContainerCleanupStatus`
+  contract (a binding correction during this slice's own review,
+  superseding an earlier internal draft that conflated some rows):
+  `NOT_APPLICABLE` only when this invocation's own `docker create` was
+  never entered (a `CREATING` publication failure, a foreign/
+  conflicting pre-create occupied name, or a pre-create listing/
+  inspection failure); once `docker create` has been entered, including
+  a bare launch failure, every outcome is `CONFIRMED_ABSENT` (a fresh
+  strict observation confirming absence, even though the lifecycle
+  projection conservatively remains `CREATING`; or a proven-owned
+  candidate recovered successfully) or `UNCONFIRMED` (an owned candidate
+  that remains or whose removal is unconfirmed; a foreign/conflicting
+  candidate; or an unavailable/malformed observation) — never
+  `NOT_APPLICABLE` again. `create_attempted` is retained purely as
+  diagnostic evidence and never drives this decision; a new internal
+  `_CleanupDisposition` enum does.
+  `reconciliation.py` is migrated to the two new shared leaf modules by
+  import only — it deliberately still issues its own `run_bounded_stdout`
+  call (so its own existing tests, which monkeypatch
+  `reconciliation.run_bounded_stdout` directly, continue to intercept
+  every Docker call unchanged) and delegates only the parsing step to
+  the shared pure parsers; `CONTAINER_LABEL_*`/`_labels_match`/
+  `_DockerListingError`/`_DockerInspectError`/`_InspectOwnership` are
+  re-exported under their existing private names, a thin-delegator
+  migration with no behavior change, confirmed by the pre-existing
+  `test_reconciliation.py` suite passing unmodified as part of the
+  final thirteen-file focused set reported below (forward and reverse
+  file order). `.github/workflows/ci.yml`'s leftover-container
+  check is corrected: `docker ps -a --filter name=X` is Docker's own
+  substring match, not an anchored family-grammar proof, so the check
+  now lists every container name once and applies an anchored
+  client-side `grep -E '^codeagent-(verify-|baseline-|verification-)'`
+  covering all three families, still strictly detection-only —
+  `tests/unit/test_ci_container_leftover_check.py` proves the exact
+  pattern detects all three real families and rejects decoy substring
+  names.
+  **These totals are the final, post-correction-pass authoritative
+  ones** (see the correction-pass paragraph below for what changed
+  since the initial implementation pass): `py_compile` on every
+  changed/new production file; the thirteen-file focused set
+  (`test_lifecycle_fs`, `test_repo_identity`, `test_state_locks`,
+  `test_state_root`, `test_lifecycle_store`, `test_checkpoint_session`,
+  `test_checkpoint_ref`, `test_reconciliation`, `test_bounded_subprocess`,
+  `test_container_lifecycle`, `test_docker_ownership`, `test_executor`,
+  `test_ci_container_leftover_check`) collected and passed together,
+  1,025 passed, in both forward and reverse file order; the directly
+  affected set (`test_executor` + `test_lifecycle_store` +
+  `test_slice_3b6`) 336 passed; the dedicated real-Docker tests
+  (`test_slice_c` + `test_slice_3b6`), 16 passed, 0 skipped; the full
+  local suite, with a real Docker daemon and
+  `CODEAGENT_REQUIRE_DOCKER=1` (a skip treated as a failure): 2,616
+  passed, 0 skipped, identical total with and without that env var; no
+  leftover containers of any CodeAgent family (verified by a strict
+  listing covering all three name families), extra worktrees,
+  `refs/codeagent` refs, leftover processes, or temp state roots
+  afterward; `git diff --check` clean.
+  `tests/integration/test_slice_3b6.py` (new, 13 tests — 7 genuine
+  real-Docker tests, each individually marked with a per-test
+  `requires_docker` marker rather than a module-wide skip, plus 5
+  mock-based cleanup-helper regressions and 1 structural test proving
+  the marker placement itself, none of which touch Docker at all and
+  all of which run and pass even when Docker is unavailable) proves the
+  full real path end to end with **no mocking of the writer or the
+  Docker CLI in any of the seven real-Docker tests**: a
+  real `prepare_lifecycle()` lease, a real `_LifecycleProjectionWriter`,
+  a real `LifecycleContainerPublisher`, and a real `DockerVerifier`
+  complete a real baseline run (asserted `PASSED`, not merely a cleanup
+  side effect) plus two sequential `verification`-role attempts (also
+  asserted `PASSED`) that reuse the identical deterministic container
+  name; a separate real-Docker test inspects a live container mid-run
+  and confirms the exact deterministic name and exactly the four
+  required labels (no `codeagent.lifecycle.attempt` label) via `docker
+  inspect`; a third pre-creates a real, correctly owned container
+  carrying a genuine extra unrelated label, proves that label is
+  actually present, then proves occupied-name recovery accepts
+  ownership despite it and removes the pre-existing container by
+  immutable ID before completing a new run. Three real, independently
+  spawned SIGKILL
+  child-process tests each self-SIGKILL a genuinely separate process at
+  one of the three accepted crash boundaries (immediately after
+  durable `CREATING`, before `docker create`; immediately after durable
+  `PRESENT(id)`, before `docker start`; immediately after durable
+  `REMOVING(id)`, before `docker rm`), confirmed via
+  `proc.exitcode == -signal.SIGKILL`, each followed by a fresh
+  `reconcile_repository()` pass in a separate process proving the
+  correct residual-state resolution (no container anywhere; a real
+  created-but-never-started container recovered and removed; a real
+  started-and-finished container recovered and removed) — matching
+  ADR 0004 Amendment 6 section 5's residual-state table exactly.
+  **Not implemented** (later Milestone 3 work, unchanged scope from
+  every prior slice): `RunController`/CLI wiring, abandonment, worktree
+  or checkpoint-ref removal, signal handling, and model integration.
+  `docs/threat-model.md`'s T-E1 entry is unchanged by this slice
+  specifically — nothing here changes when or whether
+  `prepare_lifecycle()` is called before a real run starts; this slice
+  makes only the *producer* side lifecycle-aware, proven here via
+  direct construction, not through any existing entry point.
+  **A same-day correction pass (2026-09-27, before this slice was ever
+  committed) fixed one real correctness bug and hardened several
+  weaknesses a review found**: `DockerVerifierLifecycleContext` no
+  longer accepts `lifecycle_id`/`state_root_id` as independent
+  constructor fields alongside `publisher` — that shape let the two
+  disagree (a real, dangerous mismatch a crash could leave
+  unattributable to any reconciler). `container_lifecycle.
+  ContainerTransitionPublisher` now exposes `lifecycle_id`/
+  `state_root_id` as read-only properties, `lifecycle_store.
+  LifecycleContainerPublisher` implements them from its own `current`
+  projection, and `DockerVerifierLifecycleContext` derives both as
+  computed properties from `publisher` alone — the identity mismatch
+  this closes is now structurally unrepresentable, not merely refused
+  at runtime. A genuine bug this correction's own real end-to-end test
+  exposed: a fully successful occupied-name recovery collapses the
+  projection back to `ABSENT`, but the code then tried to publish
+  `PRESENT` for its own container directly — there is no
+  `ABSENT->PRESENT` edge in the live-owner's own table, only
+  `ABSENT->CREATING` — so a real writer refused it
+  (`ILLEGAL_TRANSITION`), leaving a real, created-but-never-started
+  container behind; fixed by re-publishing `CREATING` immediately after
+  a successful recovery, before the next `PRESENT`. The mock-based
+  `_FakeContainerPublisher` (which had not caught this, since it never
+  validated edges) now enforces the identical transition-edge table
+  locally. `tests/integration/test_slice_3b6.py` also gained: a
+  properly closed `_reconcile_fresh()` test helper (it previously
+  leaked an open `StateRoot`/repository-lock pair on every call — fixed
+  by releasing the lock before closing the state root, both attempted
+  regardless of an earlier failure, matching `LifecycleLease.close()`'s
+  own convention — with a load-bearing regression proving the lock is
+  immediately reacquirable afterward); load-bearing fixture cleanup
+  (`_force_remove_container()` now confirms absence and raises if it
+  cannot, rather than silently ignoring `docker rm`'s exit code; the
+  label-inspection test now asserts its worker thread genuinely
+  finished before the lease closes); a real replacement for the
+  previously unproven "may contain labels" extra-label test (a
+  deterministic pre-created container with a genuine extra label is
+  proven present, then genuinely recovered and removed by immutable ID
+  during occupied-name recovery); and a strengthened end-to-end
+  assertion (a deterministic `("true",)` command, mounting the real
+  repository rather than its parent directory, asserting `PASSED` for
+  the baseline and both verification attempts, not merely their cleanup
+  status). `tests/unit/test_ci_container_leftover_check.py` now reads
+  and extracts the actual configured `grep -E` pattern from
+  `.github/workflows/ci.yml` itself, rather than testing a hand-copied
+  duplicate that could silently drift from the real workflow.
+  **A second, narrower same-day correction pass** fixed a fail-open gap
+  in this same integration test file's own cleanup helpers:
+  `_container_exists()` previously treated *any* nonzero `docker
+  inspect` exit — including a genuinely unavailable Docker daemon — as
+  "container absent," so `_force_remove_container()` and
+  `_cleanup_deterministic_name_if_present()` could both report cleanup
+  confirmed without positive evidence. All three now derive presence
+  exclusively from a fresh, strict, unfiltered listing via the shared
+  `_docker_ownership.docker_ps_all_id_name_pairs()` (the same shared
+  listing this slice's own production code already uses) — a listing
+  failure (`DockerListingError`) now propagates and fails the test
+  instead of silently meaning "absent"; `_force_remove_container()`
+  additionally refuses a malformed id before ever calling `docker rm`;
+  `_cleanup_deterministic_name_if_present()` now obtains its candidate
+  id from that same strict name→id listing rather than `docker inspect
+  <name>`. Five new mock-based regression tests pin this behavior
+  (listing failure not treated as absence; a malformed id never reaches
+  `docker rm`; a still-present id fails cleanup; a confirmed-absent id
+  succeeds; removal is always by listed id, never by name) — this is a
+  test-infrastructure correction only, no production behavior changed.
+  **A third, narrower same-day correction pass** fixed a test-gating gap
+  those same five mock-only regressions had been given: this file's
+  Docker-availability skip had been applied module-wide
+  (`pytestmark = pytest.mark.skipif(...)`), so the five mock-only tests
+  — which make no Docker call at all — were also silently skipped
+  whenever Docker happened to be unavailable locally, defeating their
+  own purpose as failure-injection tests. Replaced with a per-test
+  `requires_docker` marker applied to exactly the seven genuine
+  real-Docker tests (independently re-derived, not merely copied from a
+  suggested list — `test_reconcile_fresh_releases_the_repository_lock`
+  was confirmed to genuinely need Docker too, since a fresh
+  `reconcile_repository()` pass over any eligible entry always issues a
+  real `docker ps -a`); the five mock-only tests now carry no marker and
+  run unconditionally. A new structural test,
+  `test_exactly_the_real_docker_tests_carry_the_requires_docker_marker`,
+  introspects the module directly and pins exactly this marker
+  placement, so a future test added to this file without deliberately
+  choosing whether it needs Docker cannot silently drift either way.
+  The prior mandatory-Docker CI hard-failure behavior
+  (`CODEAGENT_REQUIRE_DOCKER=1` set but no daemon available fails the
+  whole module at collection time, rather than skipping) is unchanged.
+  This pass also fixed one stale sentence elsewhere in this same section
+  (the `reconciliation.py` migration paragraph above previously cited
+  the pre-correction "1015 passed" / "other seven focused files"
+  figures, which are corrected to reference the final thirteen-file
+  focused set reported at the top of this bullet). See
+  `ENGINEERING_LOG.md`'s dated entry for the exact final,
+  post-all-correction-passes totals. **Linux CI validation for this
+  specific (thrice-corrected) slice has not yet been run** — do not
+  claim it has until this corrected version is committed, pushed, and a
+  workflow run against that commit actually completes.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

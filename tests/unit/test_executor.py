@@ -1330,3 +1330,565 @@ def test_start_launch_failure_is_command_start_failure(monkeypatch, tmp_path) ->
 
     assert result.outcome == events.VerificationOutcome.COMMAND_START_FAILURE
     assert result.error.code == ErrorCode.EXECUTOR_COMMAND_START_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3 Slice 3B-6: lifecycle-aware container naming/labeling/
+# publication (ADR 0004 Amendment 6). Mocks the Docker CLI boundary
+# exactly like the rest of this file; the real end-to-end path
+# (real prepare_lifecycle() lease + real writer + real
+# LifecycleContainerPublisher + real Docker, plus the three real
+# SIGKILL boundary scenarios) lives in
+# tests/integration/test_slice_3b6.py.
+# ---------------------------------------------------------------------------
+
+from codeagent import container_lifecycle as cl
+from codeagent import _docker_ownership as docker_ownership_module
+from codeagent.executor import DockerVerifierLifecycleContext, _CleanupDisposition
+
+_LIFECYCLE_ID = "a" * 32
+_STATE_ROOT_ID = "b" * 32
+
+
+# Mirrors `lifecycle_store._CONTAINER_TRANSITION_EDGES` (the real
+# live-owner edge table) so `_FakeContainerPublisher` below can catch an
+# illegal-edge bug locally, without a real writer -- the exact class of
+# bug a correction pass found (a fall-through from a fully successful
+# occupied-name recovery straight to publishing `PRESENT`, skipping the
+# required `ABSENT->CREATING` re-publish first).
+_FAKE_PUBLISHER_EDGES = frozenset(
+    {
+        (cl.ContainerIntent.ABSENT, cl.ContainerIntent.CREATING),
+        (cl.ContainerIntent.CREATING, cl.ContainerIntent.PRESENT),
+        (cl.ContainerIntent.CREATING, cl.ContainerIntent.ABSENT),
+        (cl.ContainerIntent.PRESENT, cl.ContainerIntent.REMOVING),
+        (cl.ContainerIntent.REMOVING, cl.ContainerIntent.ABSENT),
+    }
+)
+
+
+class _FakeContainerPublisher:
+    """Records every call in order and can be told to raise a
+    `ContainerPublicationError` exactly once for a given (role, intent)
+    pair — enough to exercise every write-ahead stop-on-failure branch
+    without a real lifecycle store.
+
+    Enforces `_FAKE_PUBLISHER_EDGES` per role (an exact no-op is also
+    permitted, matching the real writer's own no-op short-circuit) —
+    an illegal transition raises `AssertionError` immediately, the same
+    class of bug a real writer would refuse via `ILLEGAL_TRANSITION`.
+
+    Exposes `lifecycle_id`/`state_root_id` as read-only properties
+    (Slice 3B-6 correction pass), matching the real
+    `container_lifecycle.ContainerTransitionPublisher` contract exactly
+    — this is the *only* identity `DockerVerifierLifecycleContext`
+    trusts; there is no separate, independently suppliable identity for
+    it to disagree with."""
+
+    def __init__(self, *, lifecycle_id: str = _LIFECYCLE_ID, state_root_id: str = _STATE_ROOT_ID) -> None:
+        self._lifecycle_id = lifecycle_id
+        self._state_root_id = state_root_id
+        self.calls: list[tuple] = []
+        self._fail_once: dict[tuple, Exception] = {}
+        self._state: dict = {cl.ContainerRole.BASELINE: cl.ContainerIntent.ABSENT, cl.ContainerRole.VERIFICATION: cl.ContainerIntent.ABSENT}
+
+    @property
+    def lifecycle_id(self) -> str:
+        return self._lifecycle_id
+
+    @property
+    def state_root_id(self) -> str:
+        return self._state_root_id
+
+    def fail_once(self, role, intent, exc: Exception) -> None:
+        self._fail_once[(role, intent)] = exc
+
+    def publish(self, *, role, intent, id):
+        self.calls.append((role, intent, id))
+        key = (role, intent)
+        if key in self._fail_once:
+            raise self._fail_once.pop(key)
+        current = self._state[role]
+        if intent != current and (current, intent) not in _FAKE_PUBLISHER_EDGES:
+            raise AssertionError(f"illegal fake-publisher transition for {role}: {current} -> {intent}")
+        self._state[role] = intent
+
+
+def _pub_error(reason=cl.ContainerPublicationFailure.ILLEGAL_TRANSITION) -> cl.ContainerPublicationError:
+    return cl.ContainerPublicationError(reason, "forced")
+
+
+def _lifecycle_ctx(publisher: _FakeContainerPublisher | None = None) -> DockerVerifierLifecycleContext:
+    return DockerVerifierLifecycleContext(publisher=publisher or _FakeContainerPublisher())
+
+
+def _baseline_name() -> str:
+    return cl.deterministic_container_name(role=cl.ContainerRole.BASELINE, lifecycle_id=_LIFECYCLE_ID)
+
+
+def _make_lifecycle_verifier(
+    monkeypatch,
+    tmp_path,
+    *,
+    publisher: _FakeContainerPublisher,
+    docker_calls,
+    ps_results=(),
+    inspect_results=(),
+    popen_factory=None,
+) -> DockerVerifier:
+    """`docker_calls`: fed to `_run_docker` in call order (create,
+    [inspect-state], [rm], ...), exactly like `_make_verifier`.
+    `ps_results`/`inspect_results`: fed to
+    `docker_ownership.docker_ps_all_id_name_pairs`/`docker_inspect_ownership`
+    in call order — each entry is either a return value or an
+    exception instance to raise."""
+    calls = list(docker_calls)
+
+    def fake_run_docker(*args: str, **kwargs):
+        if not calls:
+            raise AssertionError(f"unexpected extra docker call: {args}")
+        outcome = calls.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    ps_queue = list(ps_results)
+    inspect_queue = list(inspect_results)
+
+    def fake_ps(**kwargs):
+        if not ps_queue:
+            raise AssertionError("unexpected extra docker_ps_all_id_name_pairs call")
+        outcome = ps_queue.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def fake_inspect(candidate_id, **kwargs):
+        if not inspect_queue:
+            raise AssertionError("unexpected extra docker_inspect_ownership call")
+        outcome = inspect_queue.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("codeagent.executor._run_docker", fake_run_docker)
+    monkeypatch.setattr(docker_ownership_module, "docker_ps_all_id_name_pairs", fake_ps)
+    monkeypatch.setattr(docker_ownership_module, "docker_inspect_ownership", fake_inspect)
+
+    if popen_factory is not None:
+        monkeypatch.setattr("codeagent.executor.subprocess.Popen", lambda *a, **k: popen_factory())
+
+    return DockerVerifier(tmp_path, clock=SteppingClock(), lifecycle_context=_lifecycle_ctx(publisher))
+
+
+def test_omitted_lifecycle_context_behavior_is_unchanged(tmp_path):
+    """`lifecycle_context` defaults to `None` — every one of this
+    file's other 113 tests exercises exactly that legacy path,
+    unmodified; this is a direct construction-time sanity check that
+    the parameter is genuinely optional."""
+    verifier = DockerVerifier(tmp_path)
+    assert verifier._lifecycle_context is None
+
+
+def test_lifecycle_context_rejects_malformed_lifecycle_id():
+    with pytest.raises(ValueError):
+        DockerVerifierLifecycleContext(publisher=_FakeContainerPublisher(lifecycle_id="not-hex32"))
+
+
+def test_lifecycle_context_rejects_malformed_state_root_id():
+    with pytest.raises(ValueError):
+        DockerVerifierLifecycleContext(publisher=_FakeContainerPublisher(state_root_id="ZZ"))
+
+
+def test_lifecycle_context_derives_identity_from_publisher_alone():
+    """There is no second, independently suppliable identity to
+    disagree with the publisher's own — `lifecycle_id`/`state_root_id`
+    are always read straight from it."""
+    publisher = _FakeContainerPublisher(lifecycle_id="1" * 32, state_root_id="2" * 32)
+    ctx = DockerVerifierLifecycleContext(publisher=publisher)
+    assert ctx.lifecycle_id == "1" * 32
+    assert ctx.state_root_id == "2" * 32
+    assert ctx.lifecycle_id == publisher.lifecycle_id
+    assert ctx.state_root_id == publisher.state_root_id
+
+
+def test_no_docker_operation_occurs_for_a_mismatched_configuration(monkeypatch):
+    """A malformed publisher identity fails at
+    `DockerVerifierLifecycleContext` construction, strictly before a
+    `DockerVerifier` bound to it could ever exist — no Docker listing,
+    inspect, create, start, or removal call is reachable."""
+
+    def _fail(*args, **kwargs):
+        raise AssertionError(f"no Docker operation may occur for a mismatched configuration: {args}")
+
+    monkeypatch.setattr("codeagent.executor._run_docker", _fail)
+    monkeypatch.setattr("codeagent.executor.subprocess.Popen", _fail)
+    monkeypatch.setattr(docker_ownership_module, "docker_ps_all_id_name_pairs", _fail)
+    monkeypatch.setattr(docker_ownership_module, "docker_inspect_ownership", _fail)
+
+    with pytest.raises(ValueError):
+        DockerVerifierLifecycleContext(publisher=_FakeContainerPublisher(lifecycle_id="not-hex32"))
+
+
+def test_names_and_labels_derive_from_the_same_publisher_identity(monkeypatch, tmp_path):
+    """Uses a distinctive, non-default lifecycle_id/state_root_id to
+    prove the real create-time name and labels are threaded through
+    from the publisher's own identity, not from some other hardcoded
+    or duplicated value."""
+    distinct_lifecycle_id = "3" * 32
+    distinct_state_root_id = "4" * 32
+    publisher = _FakeContainerPublisher(lifecycle_id=distinct_lifecycle_id, state_root_id=distinct_state_root_id)
+    ctx = DockerVerifierLifecycleContext(publisher=publisher)
+
+    create_argv: list[str] = []
+    real_calls = [_create_success(), _result(0, _state_json(status="exited", exit_code=0)), _result(0)]
+
+    def fake_run_docker(*args: str, **kwargs):
+        if args and args[0] == "create":
+            create_argv.extend(args)
+        outcome = real_calls.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("codeagent.executor._run_docker", fake_run_docker)
+    monkeypatch.setattr(docker_ownership_module, "docker_ps_all_id_name_pairs", lambda **k: ({}, {}))
+    monkeypatch.setattr("codeagent.executor.subprocess.Popen", lambda *a, **k: _FakeProc())
+
+    verifier = DockerVerifier(tmp_path, clock=SteppingClock(), lifecycle_context=ctx)
+    result = verifier.run_baseline()
+
+    assert result.outcome is events.VerificationOutcome.PASSED
+    expected_name = cl.deterministic_container_name(
+        role=cl.ContainerRole.BASELINE, lifecycle_id=distinct_lifecycle_id
+    )
+    assert "--name" in create_argv
+    assert create_argv[create_argv.index("--name") + 1] == expected_name
+    assert f"{cl.CONTAINER_LABEL_STATE_ROOT_ID}={distinct_state_root_id}" in create_argv
+    assert f"{cl.CONTAINER_LABEL_ID}={distinct_lifecycle_id}" in create_argv
+
+
+def test_creating_publication_failure_is_not_applicable(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    publisher.fail_once(cl.ContainerRole.BASELINE, cl.ContainerIntent.CREATING, _pub_error())
+    verifier = _make_lifecycle_verifier(monkeypatch, tmp_path, publisher=publisher, docker_calls=[])
+
+    result = verifier.run_baseline()
+
+    assert result.cleanup_status is events.ContainerCleanupStatus.NOT_APPLICABLE
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert publisher.calls == [(cl.ContainerRole.BASELINE, cl.ContainerIntent.CREATING, None)]
+
+
+def test_pre_create_listing_failure_is_not_applicable(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    verifier = _make_lifecycle_verifier(
+        monkeypatch, tmp_path, publisher=publisher, docker_calls=[],
+        ps_results=[docker_ownership_module.DockerListingError("boom")],
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.cleanup_status is events.ContainerCleanupStatus.NOT_APPLICABLE
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+
+
+def test_pre_create_occupied_name_inspect_failure_is_not_applicable(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    verifier = _make_lifecycle_verifier(
+        monkeypatch, tmp_path, publisher=publisher, docker_calls=[],
+        ps_results=[({_baseline_name(): _OTHER_CONTAINER_ID}, {_OTHER_CONTAINER_ID: _baseline_name()})],
+        inspect_results=[docker_ownership_module.DockerInspectError("boom")],
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.cleanup_status is events.ContainerCleanupStatus.NOT_APPLICABLE
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    # No mutation of any kind is authorized on an unproven candidate.
+    assert not any(c[1] is cl.ContainerIntent.REMOVING for c in publisher.calls)
+
+
+def test_pre_create_foreign_occupant_is_not_applicable_and_never_removed(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    foreign_proof = docker_ownership_module.InspectOwnership(
+        id=_OTHER_CONTAINER_ID, name=_baseline_name(), labels={}
+    )
+    verifier = _make_lifecycle_verifier(
+        monkeypatch, tmp_path, publisher=publisher, docker_calls=[],
+        ps_results=[({_baseline_name(): _OTHER_CONTAINER_ID}, {_OTHER_CONTAINER_ID: _baseline_name()})],
+        inspect_results=[foreign_proof],
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.cleanup_status is events.ContainerCleanupStatus.NOT_APPLICABLE
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert not any(c[1] is cl.ContainerIntent.REMOVING for c in publisher.calls)
+
+
+def test_occupied_owned_recovery_full_success_falls_through_to_create(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    owned_proof = docker_ownership_module.InspectOwnership(
+        id=_OTHER_CONTAINER_ID,
+        name=_baseline_name(),
+        labels=cl.required_labels(
+            state_root_id=_STATE_ROOT_ID, lifecycle_id=_LIFECYCLE_ID, role=cl.ContainerRole.BASELINE
+        ),
+    )
+    verifier = _make_lifecycle_verifier(
+        monkeypatch,
+        tmp_path,
+        publisher=publisher,
+        docker_calls=[
+            _result(0),  # rm(OTHER_CONTAINER_ID) -- recovery
+            _create_success(),  # this invocation's own create
+            _result(0, _state_json(status="exited", exit_code=0)),  # inspect state
+            _result(0),  # rm(FIXED_CONTAINER_ID) -- this invocation's own final cleanup
+        ],
+        ps_results=[
+            ({_baseline_name(): _OTHER_CONTAINER_ID}, {_OTHER_CONTAINER_ID: _baseline_name()}),  # occupied check
+            ({}, {}),  # recovery cleanup confirm: absent
+            ({}, {}),  # this invocation's own final cleanup confirm: absent
+        ],
+        inspect_results=[owned_proof],
+        popen_factory=lambda: _FakeProc(),
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.outcome is events.VerificationOutcome.PASSED
+    intents = [c[1] for c in publisher.calls]
+    assert intents == [
+        cl.ContainerIntent.CREATING,
+        cl.ContainerIntent.PRESENT,  # recovery: candidate marked present
+        cl.ContainerIntent.REMOVING,  # recovery: candidate marked removing
+        cl.ContainerIntent.ABSENT,  # recovery: confirmed absent
+        cl.ContainerIntent.CREATING,  # re-published: no direct ABSENT->PRESENT edge exists
+        cl.ContainerIntent.PRESENT,  # this invocation's own container
+        cl.ContainerIntent.REMOVING,  # this invocation's own container, before cleanup
+        cl.ContainerIntent.ABSENT,  # this invocation's own final cleanup
+    ]
+
+
+def test_occupied_owned_recovery_removal_unconfirmed_is_unconfirmed(monkeypatch, tmp_path):
+    """create_attempted is False for this invocation, yet the outcome
+    is still UNCONFIRMED -- proof that disposition, not
+    create_attempted, drives the public cleanup status."""
+    publisher = _FakeContainerPublisher()
+    owned_proof = docker_ownership_module.InspectOwnership(
+        id=_OTHER_CONTAINER_ID,
+        name=_baseline_name(),
+        labels=cl.required_labels(
+            state_root_id=_STATE_ROOT_ID, lifecycle_id=_LIFECYCLE_ID, role=cl.ContainerRole.BASELINE
+        ),
+    )
+    verifier = _make_lifecycle_verifier(
+        monkeypatch,
+        tmp_path,
+        publisher=publisher,
+        docker_calls=[_result(0)],  # rm(OTHER_CONTAINER_ID) -- still present afterward
+        ps_results=[
+            ({_baseline_name(): _OTHER_CONTAINER_ID}, {_OTHER_CONTAINER_ID: _baseline_name()}),  # occupied
+            ({_baseline_name(): _OTHER_CONTAINER_ID}, {_OTHER_CONTAINER_ID: _baseline_name()}),  # still present
+        ],
+        inspect_results=[owned_proof],
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+
+
+def test_post_create_confirmed_absence_even_when_projection_remains_creating(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    verifier = _make_lifecycle_verifier(
+        monkeypatch,
+        tmp_path,
+        publisher=publisher,
+        docker_calls=[_DockerControlPlaneFailure("create failed")],
+        ps_results=[
+            ({}, {}),  # pre-create occupied-name check: free
+            ({}, {}),  # post-uncertain-create observation: still free
+        ],
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    # The lifecycle projection is never collapsed to ABSENT by this
+    # invocation for this row -- only the initial CREATING publish ever
+    # happened.
+    assert publisher.calls == [(cl.ContainerRole.BASELINE, cl.ContainerIntent.CREATING, None)]
+
+
+def test_post_create_foreign_conflicting_candidate_is_unconfirmed(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    foreign_proof = docker_ownership_module.InspectOwnership(
+        id=_OTHER_CONTAINER_ID, name=_baseline_name(), labels={}
+    )
+    verifier = _make_lifecycle_verifier(
+        monkeypatch,
+        tmp_path,
+        publisher=publisher,
+        docker_calls=[_DockerControlPlaneFailure("create failed")],
+        ps_results=[
+            ({}, {}),  # pre-create occupied-name check: free
+            ({_baseline_name(): _OTHER_CONTAINER_ID}, {_OTHER_CONTAINER_ID: _baseline_name()}),
+        ],
+        inspect_results=[foreign_proof],
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+
+
+def test_post_create_unobservable_state_is_unconfirmed(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    verifier = _make_lifecycle_verifier(
+        monkeypatch,
+        tmp_path,
+        publisher=publisher,
+        docker_calls=[_DockerControlPlaneFailure("create failed")],
+        ps_results=[
+            ({}, {}),  # pre-create occupied-name check: free
+            docker_ownership_module.DockerListingError("boom"),
+        ],
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+
+
+def test_no_post_create_branch_ever_returns_not_applicable(monkeypatch, tmp_path):
+    """Every uncertain-create-recovery branch above (confirmed absent,
+    foreign/conflicting, unobservable) resolves to CONFIRMED_ABSENT or
+    UNCONFIRMED -- never NOT_APPLICABLE, since this invocation's own
+    `docker create` was genuinely entered even though it failed."""
+    for ps_results, inspect_results, expected in [
+        ([({}, {})], [], events.ContainerCleanupStatus.CONFIRMED_ABSENT),
+        (
+            [({_baseline_name(): _OTHER_CONTAINER_ID}, {_OTHER_CONTAINER_ID: _baseline_name()})],
+            [docker_ownership_module.InspectOwnership(id=_OTHER_CONTAINER_ID, name=_baseline_name(), labels={})],
+            events.ContainerCleanupStatus.UNCONFIRMED,
+        ),
+        ([docker_ownership_module.DockerListingError("boom")], [], events.ContainerCleanupStatus.UNCONFIRMED),
+    ]:
+        publisher = _FakeContainerPublisher()
+        verifier = _make_lifecycle_verifier(
+            monkeypatch,
+            tmp_path,
+            publisher=publisher,
+            docker_calls=[_DockerControlPlaneFailure("create failed")],
+            ps_results=[({}, {}), *ps_results],
+            inspect_results=inspect_results,
+        )
+        result = verifier.run_baseline()
+        assert result.cleanup_status is not events.ContainerCleanupStatus.NOT_APPLICABLE
+        assert result.cleanup_status is expected
+
+
+def test_attempt_result_preserves_exit_code_stdout_and_stderr(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    verifier = _make_lifecycle_verifier(
+        monkeypatch,
+        tmp_path,
+        publisher=publisher,
+        docker_calls=[
+            _create_success(),
+            _result(0, _state_json(status="exited", exit_code=7)),
+            _result(0),  # rm
+        ],
+        ps_results=[({}, {}), ({}, {})],
+        popen_factory=lambda: _FakeProc(stdout=b"hello-stdout", stderr=b"hello-stderr"),
+    )
+
+    result = verifier.run_baseline()
+
+    assert result.outcome is events.VerificationOutcome.TEST_FAILURE
+    assert result.exit_code == 7
+    assert result.stdout == "hello-stdout"
+    assert result.stderr == "hello-stderr"
+
+
+def test_lifecycle_aware_execution_never_calls_legacy_cleanup(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    verifier = _make_lifecycle_verifier(
+        monkeypatch,
+        tmp_path,
+        publisher=publisher,
+        docker_calls=[
+            _create_success(),
+            _result(0, _state_json(status="exited", exit_code=0)),
+            _result(0),  # rm
+        ],
+        ps_results=[({}, {}), ({}, {})],
+        popen_factory=lambda: _FakeProc(),
+    )
+
+    def _boom(self, name, container_id):
+        raise AssertionError("legacy _cleanup must never be called from the lifecycle-aware path")
+
+    monkeypatch.setattr(DockerVerifier, "_cleanup", _boom)
+
+    result = verifier.run_baseline()
+    assert result.outcome is events.VerificationOutcome.PASSED
+
+
+def test_lifecycle_aware_execution_never_issues_docker_rm_by_name(monkeypatch, tmp_path):
+    publisher = _FakeContainerPublisher()
+    rm_targets: list[str] = []
+    real_calls = [
+        _create_success(),
+        _result(0, _state_json(status="exited", exit_code=0)),
+        _result(0),  # rm
+    ]
+
+    def fake_run_docker(*args: str, **kwargs):
+        if args and args[0] == "rm":
+            rm_targets.append(args[2])
+        outcome = real_calls.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("codeagent.executor._run_docker", fake_run_docker)
+    monkeypatch.setattr(docker_ownership_module, "docker_ps_all_id_name_pairs", lambda **k: ({}, {}))
+    monkeypatch.setattr("codeagent.executor.subprocess.Popen", lambda *a, **k: _FakeProc())
+
+    verifier = DockerVerifier(tmp_path, clock=SteppingClock(), lifecycle_context=_lifecycle_ctx(publisher))
+    result = verifier.run_baseline()
+
+    assert result.outcome is events.VerificationOutcome.PASSED
+    assert rm_targets == [_FIXED_CONTAINER_ID]
+    assert _baseline_name() not in rm_targets
+
+
+def test_removing_id_none_is_unreachable(monkeypatch, tmp_path):
+    """Every `(REMOVING, id)` call this file's own scenarios produce
+    always carries a non-None id -- a spy-publisher exhaustive check
+    across the happy path and the occupied-recovery path."""
+    publisher = _FakeContainerPublisher()
+    verifier = _make_lifecycle_verifier(
+        monkeypatch,
+        tmp_path,
+        publisher=publisher,
+        docker_calls=[
+            _create_success(),
+            _result(0, _state_json(status="exited", exit_code=0)),
+            _result(0),  # rm
+        ],
+        ps_results=[({}, {}), ({}, {})],
+        popen_factory=lambda: _FakeProc(),
+    )
+    verifier.run_baseline()
+
+    removing_calls = [c for c in publisher.calls if c[1] is cl.ContainerIntent.REMOVING]
+    assert removing_calls
+    assert all(c[2] is not None for c in removing_calls)

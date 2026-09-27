@@ -3433,3 +3433,282 @@ diff; no production code, test, workflow, configuration, or dependency
 file changed; nothing staged. No test run or Docker session was needed
 for this pass — the completed, independently re-verified CI run is the
 evidence.
+
+## 2026-09-27 — Milestone 3 Slice 3B-6: lifecycle-aware `DockerVerifier` container production
+
+Implemented ADR 0004 Amendment 6: `DockerVerifier` gains an opt-in
+`lifecycle_context` that switches it to deterministic
+`codeagent-baseline-<lifecycle_id>`/`codeagent-verification-<lifecycle_id>`
+naming, the four ADR 0004 section 7 labels, and durable write-ahead
+publication of every container-attribution transition through a new
+`lifecycle_store.LifecycleContainerPublisher` — before this slice,
+`executor.py` still minted UUID-suffixed names and wrote no lifecycle
+projection at all, so nothing reconciliation's own Slice 3B-5 removal
+path could recover was ever actually produced.
+
+Two new dependency-light leaf modules keep `executor.py` out of the
+persistence stack: `container_lifecycle.py` (naming/labeling/publisher
+protocol/`ContainerPublicationError` vocabulary) and
+`_docker_ownership.py` (the strict `docker ps -a`/`docker inspect`
+parsing grammar, generalized out of three previously independent
+copies in `executor.py` and `reconciliation.py`). `lifecycle_store.
+LifecycleContainerPublisher` is the sole translation boundary from
+`LifecycleStoreError` to `ContainerPublicationError`, via an exhaustive
+map (subscript access, not `.get(..., default)`) that a dedicated test
+checks against the live `LifecycleStoreFailure` enum.
+
+One real correction happened mid-implementation, not after: an initial
+working draft (following an earlier, superseded planning pass) had
+several post-create observation branches returning the public
+`NOT_APPLICABLE` cleanup status, which is only legal before this
+invocation's own `docker create` is ever entered. Corrected before any
+test was written against the wrong behavior — `NOT_APPLICABLE` is now
+reserved strictly for pre-create failures (a `CREATING` publish
+failure, a foreign pre-create occupant, or a pre-create observation
+failure); everything after `docker create` has been entered resolves to
+`CONFIRMED_ABSENT` or `UNCONFIRMED`, including the row where a fresh
+post-failure observation confirms absence while the lifecycle
+projection itself conservatively stays at `CREATING` (a deliberate
+split between the public Docker-side cleanup claim and the durable
+lifecycle-projection state, since this invocation can never prove the
+live-owner's own stronger "nothing was ever created" precondition after
+an uncertain create).
+
+Verified locally (macOS, Docker Desktop): full suite 2,599 passed with
+and without `CODEAGENT_REQUIRE_DOCKER=1` (identical total both ways);
+the twelve-file focused set (existing eight plus
+`test_bounded_subprocess`, `test_container_lifecycle`,
+`test_docker_ownership`, `test_executor`) 1,015 passed in both forward
+and reverse file order; `tests/integration/test_slice_3b6.py` (new, 6
+tests, no mocking of the writer or Docker CLI) proves the real
+end-to-end path — real `prepare_lifecycle()` lease, real writer, real
+publisher, real Docker — including three real, independently spawned
+SIGKILL child-process tests (confirmed via `proc.exitcode ==
+-signal.SIGKILL`) at each of the three accepted crash boundaries, each
+followed by a fresh `reconcile_repository()` pass proving the correct
+residual-state resolution. No leftover containers, worktrees,
+`refs/codeagent` refs, processes, or temp state roots afterward;
+`git diff --check` clean. `.github/workflows/ci.yml`'s leftover-
+container check was also corrected in the same pass (Docker's own
+`--filter name=` is a substring match, not an anchored proof) to list
+every container name once and apply an anchored `grep -E` covering all
+three container-name families; a dedicated unit test pins the exact
+pattern. Linux CI has not yet run for this slice — do not claim it has
+until a workflow run against this commit completes.
+
+Not implemented (unchanged scope from every prior Milestone 3 slice):
+`RunController`/CLI wiring, abandonment, worktree/checkpoint-ref
+removal, signal handling, model integration. `docs/threat-model.md`'s
+T-E1 entry is unaffected — nothing here changes when or whether
+`prepare_lifecycle()` is called before a real run starts.
+
+### Correction pass (same day, before this slice was ever committed)
+
+A review pass on this still-unstaged slice found one real correctness
+bug and several hardening gaps, all fixed before commit:
+
+- **Identity-binding structural fix**: `DockerVerifierLifecycleContext`
+  previously accepted `lifecycle_id`/`state_root_id` as independent
+  constructor fields alongside `publisher`, which could disagree with
+  the publisher's own recorded identity — a real, dangerous mismatch a
+  crash could leave unattributable to any reconciler. Fixed by making
+  `container_lifecycle.ContainerTransitionPublisher` expose
+  `lifecycle_id`/`state_root_id` as read-only properties (implemented
+  by `LifecycleContainerPublisher` from its own `current` projection),
+  and by making `DockerVerifierLifecycleContext`'s own `lifecycle_id`/
+  `state_root_id` computed properties derived from `publisher` alone —
+  the mismatch is now structurally unrepresentable, not merely refused.
+- **Real bug found by the real integration test, not by any mock**: a
+  fully successful occupied-name recovery collapses the projection back
+  to `ABSENT`, and the code then tried to publish `PRESENT` for its own
+  new container directly — there is no `ABSENT->PRESENT` edge (only
+  `ABSENT->CREATING`), so the real writer refused it
+  (`ILLEGAL_TRANSITION`), leaving a real created-but-never-started
+  container behind that the run then reported as `UNCONFIRMED` cleanup
+  instead of `PASSED`. Fixed by re-publishing `CREATING` immediately
+  after a successful recovery. The mock-based `_FakeContainerPublisher`
+  in `tests/unit/test_executor.py` did not catch this originally
+  because it never validated transition edges at all; hardened in the
+  same pass to enforce the identical edge table locally, so this class
+  of bug is now caught without needing real Docker.
+- `tests/integration/test_slice_3b6.py::_reconcile_fresh()` leaked an
+  open `StateRoot` and repository `LockHandle` on every call (neither
+  type has destructor-based cleanup). Fixed: releases the lock before
+  closing the state root, both attempted regardless of an earlier
+  failure, chaining a cleanup failure from whatever failure was already
+  active (`LifecycleLease.close()`'s own convention). A new load-bearing
+  regression proves the same repository lock is immediately
+  reacquirable afterward.
+- Real-Docker fixture cleanup was made load-bearing:
+  `_force_remove_container()` now confirms the container is actually
+  gone and raises if it cannot, instead of silently ignoring `docker
+  rm`'s exit code; every test that builds a container under a
+  deterministic name now has a `finally`-block safety net that removes
+  it by validated ID if a mid-test assertion fails; the label-inspection
+  test now asserts its worker thread genuinely finished before the
+  lease closes.
+- `test_real_extra_image_provided_labels_never_defeat_ownership`
+  previously only asserted a run completed cleanly and speculated the
+  pinned image "may" carry extra labels — it never proved one existed.
+  Replaced with `test_real_occupied_name_recovery_accepts_extra_image_
+  provided_label`: pre-creates a real, correctly owned container
+  carrying the four required labels plus one genuine unrelated label,
+  proves that label is actually present, then proves occupied-name
+  recovery accepts ownership despite it and removes the pre-existing
+  container by immutable ID before completing a new run.
+- The real end-to-end test now uses a deterministic `("true",)` command
+  and mounts the actual repository (not `tmp_path`, which also contains
+  the state root), and asserts `PASSED` for the baseline and both
+  verification attempts — previously it only asserted cleanup status,
+  which does not distinguish a genuinely passing run from one that
+  merely failed to start.
+- `tests/unit/test_ci_container_leftover_check.py` previously tested a
+  hand-copied duplicate of the workflow's `grep -E` pattern, which could
+  stay green even if the real workflow drifted. It now reads
+  `.github/workflows/ci.yml` directly and extracts the actual configured
+  pattern before testing it, and additionally asserts the detection
+  step remains anchored, singular, `if: always()`, and never issues a
+  `docker rm`/`docker kill`.
+- The reviewer's finding that ADR 0004 Amendment 6 contained a
+  duplicated phrase in its `REMOVING(id=None)` paragraph was checked
+  directly against the file and did not reproduce — no change was made
+  for that specific item.
+
+Verified after these fixes: `tests/unit/test_executor.py` 133 passed
+(up from 130); `tests/unit/test_lifecycle_store.py` +
+`tests/unit/test_executor.py` 323 passed together;
+`tests/integration/test_slice_3b6.py` 7 passed (up from 6) against a
+real Docker daemon, including the corrected extra-label-recovery test
+and the new lock-release regression; no leftover containers, worktrees,
+`refs/codeagent` refs, or temp state roots afterward. Linux CI has
+still not run for this corrected version — do not claim it has until
+it is committed, pushed, and a workflow run against that commit
+completes.
+
+### Second correction pass (same day, still before this slice was ever committed)
+
+The totals in the section immediately above (`test_executor.py` 133,
+`test_lifecycle_store.py`+`test_executor.py` 323 together,
+`test_slice_3b6.py` 7) were this pass's own local totals at the time
+they were written and are preserved above as historical evidence of
+what that pass actually verified. They are **superseded** by the totals
+below, which reflect one further, narrower correction plus its own
+fresh full verification.
+
+A follow-up review found that `tests/integration/test_slice_3b6.py`'s
+own cleanup helpers were fail-open, not fail-closed:
+`_container_exists()` treated *any* nonzero `docker inspect` exit —
+including a genuinely unavailable Docker daemon, not just a genuinely
+absent container — as "absent." That let `_force_remove_container()`
+report cleanup confirmed, and `_cleanup_deterministic_name_if_present()`
+silently skip cleanup, without positive evidence in either case. Fixed
+by deriving presence/absence exclusively from a fresh, strict,
+unfiltered listing via the shared `_docker_ownership.
+docker_ps_all_id_name_pairs()` (the same shared listing this slice's
+own production code already uses) — a listing failure
+(`DockerListingError`) now propagates and fails the test, never
+silently meaning "absent." `_force_remove_container()` additionally
+refuses a malformed id before ever calling `docker rm` (via a new
+`_require_valid_container_id()`), and confirms absence via the same
+fresh listing rather than `docker inspect`'s own ambiguous nonzero
+exit; `_cleanup_deterministic_name_if_present()` now obtains its
+candidate id from that same strict name→id listing instead of `docker
+inspect <name>`. This is a test-infrastructure correction only — no
+production code changed in this pass. Five new mock-based regression
+tests were added to `tests/integration/test_slice_3b6.py` pinning this
+behavior: listing failure is never treated as absence; a malformed id
+never reaches `docker rm`; a still-present id fails cleanup; a
+listing confirming absence succeeds; and removal is always by the
+listed id, never by name.
+
+**Final, authoritative totals after both correction passes** (macOS,
+real Docker daemon, `CODEAGENT_REQUIRE_DOCKER=1`): the directly
+affected set (`test_executor.py` + `test_lifecycle_store.py` +
+`test_slice_3b6.py`), 335 passed; the thirteen-file focused set (the
+twelve named in the first correction-pass entry above plus
+`test_ci_container_leftover_check.py`), 1,025 passed, in both forward
+and reverse file order; the dedicated real-Docker tests
+(`test_slice_c.py` + `test_slice_3b6.py`), 15 passed, 0 skipped;
+`test_slice_3b6.py` alone, 12 tests (7 real-Docker end-to-end/SIGKILL
+tests plus the 5 new mock-based cleanup-helper regressions); the
+complete suite, 2,615 passed, 0 skipped, identical with and without
+`CODEAGENT_REQUIRE_DOCKER=1`; no leftover containers of any CodeAgent
+family (confirmed via a strict listing covering all three name
+families: `codeagent-verify-*`, `codeagent-baseline-*`,
+`codeagent-verification-*`), no extra worktrees, no `refs/codeagent`,
+no related processes, no stray temp state roots; `git diff --check`
+clean. These are the numbers `CLAUDE.md`'s main Slice 3B-6 section and
+ADR 0004 Amendment 6's evidence section now report — both were updated
+in this same pass to replace the stale pre-correction totals (1,015 /
+2,599 / 6 tests) with these final ones. Linux CI has still not run for
+this twice-corrected version — do not claim it has until it is
+committed, pushed, and a workflow run against that commit completes.
+
+### Third correction pass (same day, still before this slice was ever committed)
+
+The totals in the section immediately above (335 / 1,025 / 15 /
+`test_slice_3b6.py` 12 tests / complete suite 2,615) were that pass's
+own local totals at the time and are preserved above as historical
+evidence. They are **superseded** by the totals below.
+
+A follow-up review found that `tests/integration/test_slice_3b6.py`'s
+Docker-availability gating was applied module-wide
+(`pytestmark = pytest.mark.skipif(not _docker_available(), ...)`), so
+the five mock-only cleanup-helper regressions added by the second
+correction pass — which make no Docker call at all and exist
+specifically to test failure injection — were also silently skipped
+whenever Docker happened to be unavailable locally, defeating their own
+purpose. Fixed by replacing the module-wide marker with a per-test
+`requires_docker = pytest.mark.skipif(...)` applied only to the seven
+genuine real-Docker tests: `test_reconcile_fresh_releases_the_
+repository_lock`, `test_real_lifecycle_aware_baseline_and_two_
+verification_attempts_reuse_role`, `test_real_docker_create_sets_
+exact_deterministic_name_and_four_labels`,
+`test_real_occupied_name_recovery_accepts_extra_image_provided_label`,
+and the three `test_real_sigkill_after_*` tests. The lock/reconciliation
+test was independently re-derived rather than assumed: a fresh
+`reconcile_repository()` pass over any reconciliation-eligible entry
+always issues a real `docker ps -a` for both container roles, so it
+genuinely requires Docker and is marked accordingly. The prior
+mandatory-Docker CI hard-failure behavior (`CODEAGENT_REQUIRE_DOCKER=1`
+set but no daemon available fails the whole module at collection time)
+is unchanged. A new structural test,
+`test_exactly_the_real_docker_tests_carry_the_requires_docker_marker`,
+introspects the module directly and asserts exactly these seven
+functions carry the marker and no others — proven both by running the
+five mock tests with Docker's own binary made unreachable via `PATH`
+(6 passed: the five regressions plus the structural test itself; the
+seven real-Docker tests skipped cleanly, 0 failures) and by running the
+complete file with a real daemon present (all 13 pass, 0 skipped).
+
+Also fixed: a stale sentence in `CLAUDE.md`'s Slice 3B-6 section, in the
+paragraph describing `reconciliation.py`'s import-only migration, which
+still said "forward and reverse file order together with the other
+seven focused files, 1015 passed both ways" — inconsistent with the
+final thirteen-file focused-set description elsewhere in the same
+bullet. Replaced with wording that points at the final thirteen-file
+set instead of repeating a stale, narrower count.
+
+**Final, authoritative totals after all three correction passes**
+(macOS, real Docker daemon): the directly affected set
+(`test_executor.py` + `test_lifecycle_store.py` +
+`test_slice_3b6.py`), 336 passed; the thirteen-file focused set, 1,025
+passed, in both forward and reverse file order (unchanged by this
+pass — `test_slice_3b6.py` is not part of that set); the dedicated
+real-Docker tests (`test_slice_c.py` + `test_slice_3b6.py`), 16 passed,
+0 skipped; `test_slice_3b6.py` alone, 13 tests (7 real-Docker tests,
+each individually marked; 5 mock-based cleanup-helper regressions; 1
+structural marker-placement test) — with Docker unavailable, exactly
+the 6 non-Docker tests pass and the 7 real-Docker tests skip, 0
+failures; the complete suite, 2,616 passed, 0 skipped, identical with
+and without `CODEAGENT_REQUIRE_DOCKER=1` whenever Docker is actually
+available; no leftover containers of any CodeAgent family (a strict
+listing covering all three name families), no extra worktrees, no
+`refs/codeagent`, no related processes, no stray temp state roots;
+`git diff --check` clean. `CLAUDE.md`'s main Slice 3B-6 section and ADR
+0004 Amendment 6's evidence section were both updated in this same pass
+to these final numbers, superseding the 335/1,025/15/2,615/12-tests
+figures the immediately preceding entry recorded. Linux CI has still
+not run for this (thrice-corrected) version — do not claim it has until
+it is committed, pushed, and a workflow run against that commit
+completes.

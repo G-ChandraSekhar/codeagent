@@ -67,10 +67,13 @@ import math
 import re
 import subprocess
 import threading
+from dataclasses import dataclass
+from enum import Enum, unique
 from pathlib import Path
 from uuid import uuid4
 
-from codeagent import events
+from codeagent import container_lifecycle, events
+from codeagent import _docker_ownership as docker_ownership
 from codeagent._bounded_subprocess import BoundedProcessError, BoundedProcessFailure, run_bounded_stdout
 from codeagent.controller import Clock, SystemClock, VerificationResult
 from codeagent.errors import ErrorCode, OperationalError
@@ -273,6 +276,132 @@ def _parse_cleanup_listing(raw: bytes) -> tuple[frozenset[str], frozenset[str]] 
     return frozenset(ids), frozenset(names)
 
 
+@dataclass(frozen=True)
+class DockerVerifierLifecycleContext:
+    """Opt-in lifecycle-aware context (Milestone 3 Slice 3B-6, ADR 0004
+    Amendment 6). When supplied to `DockerVerifier`, container naming
+    becomes deterministic per role (`codeagent-baseline-<lifecycle_id>`/
+    `codeagent-verification-<lifecycle_id>`), the four ADR 0004 section 7
+    labels are set at create time, and every container-attribution
+    transition is durably published through `publisher` *before* the
+    corresponding Docker mutation — never after.
+
+    Deliberately depends on nothing from `codeagent.lifecycle_store` or
+    any other persistence-stack module: `publisher` is typed only as the
+    dependency-light `container_lifecycle.ContainerTransitionPublisher`
+    Protocol. Matching the existing `checkpoint_session.
+    CheckpointTransitionPublisher` precedent, `publisher`'s shape is not
+    runtime-checked here (no `@runtime_checkable`/`isinstance`) — only
+    Python's own type-checker-level `Protocol` conformance at call
+    sites, plus ordinary fail-on-first-use duck typing.
+
+    `lifecycle_id`/`state_root_id` (Slice 3B-6 correction pass) are
+    *not* independently supplied constructor fields — accepting them
+    that way alongside `publisher` let the two disagree (the publisher
+    durably recording lifecycle A's transitions while Docker names/
+    labels used lifecycle/state-root B), a real, dangerous mismatch a
+    crash could leave unattributable to any reconciler. They are
+    instead read-only properties derived from `publisher.lifecycle_id`/
+    `publisher.state_root_id` — the *single* source of identity — and
+    validated eagerly against the canonical 32-lowercase-hex grammar
+    (not merely "nonempty") at construction time, before this context
+    can ever be handed to a `DockerVerifier`. The grammar is the same
+    one `checkpoint_ref.LIFECYCLE_ID_RE`/`_lifecycle_fs.validate_hex32`
+    already enforce for these exact values elsewhere, redefined
+    independently in `container_lifecycle.py` so this module never has
+    to import that persistence-stack grammar."""
+
+    publisher: container_lifecycle.ContainerTransitionPublisher
+
+    def __post_init__(self) -> None:
+        lifecycle_id = self.publisher.lifecycle_id
+        state_root_id = self.publisher.state_root_id
+        if not container_lifecycle.is_valid_hex32(lifecycle_id):
+            raise ValueError(
+                f"publisher.lifecycle_id must be exactly 32 lowercase hex characters, got {lifecycle_id!r}"
+            )
+        if not container_lifecycle.is_valid_hex32(state_root_id):
+            raise ValueError(
+                f"publisher.state_root_id must be exactly 32 lowercase hex characters, got {state_root_id!r}"
+            )
+
+    @property
+    def lifecycle_id(self) -> str:
+        return self.publisher.lifecycle_id
+
+    @property
+    def state_root_id(self) -> str:
+        return self.publisher.state_root_id
+
+
+@dataclass(frozen=True)
+class _CreateOutcome:
+    """The outcome of `DockerVerifier._docker_create` alone — strictly
+    the `docker create` call, never `start`/`inspect`. `container_id` is
+    set only on a fully validated success; every failure shape (launch
+    failure, control-plane failure, nonzero exit, or a malformed/
+    untrustworthy id on an otherwise-zero exit) is reported via
+    `outcome`/`error` instead, with `container_id` left `None`."""
+
+    container_id: str | None
+    outcome: events.VerificationOutcome | None
+    error: OperationalError | None
+
+
+@dataclass(frozen=True)
+class _RecoveryResult:
+    """The outcome of recovering one already-existing, proven-owned
+    occupant container: `disposition` is always one of
+    `_CleanupDisposition.CONFIRMED_ABSENT`/`UNCONFIRMED_DEFERRED` —
+    never `NOT_APPLICABLE`/`REQUIRES_ID_CLEANUP`, since this function is
+    only ever invoked once a real, owned candidate container's id is
+    already in hand. `error is None` is the caller's sole "safe to
+    proceed" signal (a fully successful recovery); any non-`None` error
+    means the caller must not proceed to create at this name this
+    attempt, even when `disposition` also happens to be
+    `CONFIRMED_ABSENT` (the "physical absence confirmed, but the ABSENT
+    publish itself then failed" row)."""
+
+    disposition: "_CleanupDisposition"
+    error: OperationalError | None
+
+
+@unique
+class _CleanupDisposition(str, Enum):
+    """Slice 3B-6's unambiguous internal cleanup-disposition carrier,
+    replacing the legacy path's own `(create_attempted, confirmed_absent)`
+    pair for the lifecycle-aware path only (the legacy `_attempt`/
+    `_cleanup_status_for` pairing below is completely unchanged).
+    `create_attempted` alone was insufficient here: an occupied-name
+    recovery attempt can require deferred cleanup (`UNCONFIRMED_DEFERRED`)
+    for *this* invocation's own container even though *this*
+    invocation's own `docker create` was never reached
+    (`create_attempted=False`) — see the final correction plan's §1/§3."""
+
+    NOT_APPLICABLE = "not_applicable"
+    REQUIRES_ID_CLEANUP = "requires_id_cleanup"
+    CONFIRMED_ABSENT = "confirmed_absent"
+    UNCONFIRMED_DEFERRED = "unconfirmed_deferred"
+
+
+@dataclass(frozen=True)
+class _AttemptResult:
+    """Replaces the legacy path's own 8-tuple return shape for the
+    lifecycle-aware path only. `create_attempted` is retained purely as
+    diagnostic evidence (never drives any decision — `disposition`
+    alone does); `container_id` is set only when one genuinely,
+    currently exists and is this invocation's own to act on."""
+
+    create_attempted: bool
+    container_id: str | None
+    disposition: _CleanupDisposition
+    outcome: events.VerificationOutcome
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    error: OperationalError | None
+
+
 _SECURITY_FLAGS: tuple[str, ...] = (
     "--network",
     "none",
@@ -316,6 +445,7 @@ class DockerVerifier:
         command: tuple[str, ...] = DEFAULT_COMMAND,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         clock: Clock | None = None,
+        lifecycle_context: DockerVerifierLifecycleContext | None = None,
     ) -> None:
         resolved = Path(worktree_path).resolve()
         if not resolved.is_dir():
@@ -349,16 +479,21 @@ class DockerVerifier:
         self._timeout_seconds = timeout_seconds
         self._clock = clock or SystemClock()
         self._error_id_seq = 0
+        # Slice 3B-6: opt-in only. `None` (the default) means every
+        # existing behavior below is completely unchanged — the legacy
+        # `_attempt`/`_execute`/`_cleanup` methods, untouched by this
+        # slice, remain the sole code path.
+        self._lifecycle_context = lifecycle_context
 
     @property
     def command(self) -> tuple[str, ...]:
         return self._command
 
     def run_baseline(self) -> VerificationResult:
-        return self._execute("baseline")
+        return self._execute("baseline", role=container_lifecycle.ContainerRole.BASELINE)
 
     def run(self, attempt_index: int) -> VerificationResult:
-        return self._execute(f"verify-{attempt_index}")
+        return self._execute(f"verify-{attempt_index}", role=container_lifecycle.ContainerRole.VERIFICATION)
 
     def _next_error_id(self, label: str) -> str:
         self._error_id_seq += 1
@@ -614,37 +749,135 @@ class DockerVerifier:
             else events.ContainerCleanupStatus.UNCONFIRMED
         )
 
-    def _execute(self, label: str) -> VerificationResult:
+    def _execute(
+        self, label: str, *, role: container_lifecycle.ContainerRole | None = None
+    ) -> VerificationResult:
         start = self._clock.monotonic()
-        name = f"{CONTAINER_NAME_PREFIX}{label}-{uuid4().hex[:12]}"
 
-        create_attempted, _created, outcome, exit_code, stdout_text, stderr_text, error, container_id = (
-            self._attempt(name, label)
-        )
+        if self._lifecycle_context is None:
+            # Legacy path: completely unchanged from before Slice 3B-6.
+            # `role` is accepted but ignored here — it is meaningful
+            # only once a lifecycle context is actually supplied.
+            name = f"{CONTAINER_NAME_PREFIX}{label}-{uuid4().hex[:12]}"
 
-        # Cleanup confirmation runs unconditionally whenever creation
-        # was attempted — regardless of whether create itself failed,
-        # a launch failure occurred, or the container ran to completion
-        # — since any of those can leave a real container object
-        # behind. Only a genuine "never attempted" case skips it.
-        confirmed_absent = self._cleanup(name, container_id) if create_attempted else True
-        cleanup_status = self._cleanup_status_for(
-            create_attempted=create_attempted, confirmed_absent=confirmed_absent
-        )
+            create_attempted, _created, outcome, exit_code, stdout_text, stderr_text, error, container_id = (
+                self._attempt(name, label)
+            )
+
+            # Cleanup confirmation runs unconditionally whenever creation
+            # was attempted — regardless of whether create itself failed,
+            # a launch failure occurred, or the container ran to completion
+            # — since any of those can leave a real container object
+            # behind. Only a genuine "never attempted" case skips it.
+            confirmed_absent = self._cleanup(name, container_id) if create_attempted else True
+            cleanup_status = self._cleanup_status_for(
+                create_attempted=create_attempted, confirmed_absent=confirmed_absent
+            )
+
+            duration = self._clock.monotonic() - start
+
+            if cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED:
+                # Overrides any provisional outcome, including a would-be
+                # PASSED: a cleanup attempt is not a cleanup guarantee, and
+                # this module never reports a successful run it can't also
+                # confirm cleaned up after.
+                return VerificationResult(
+                    outcome=events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                    exit_code=None,
+                    duration_seconds=duration,
+                    stdout=stdout_text,
+                    stderr=stderr_text,
+                    cleanup_status=cleanup_status,
+                    error=self._error(
+                        ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                        label,
+                        "verification container could not be confirmed removed",
+                    ),
+                )
+
+            return VerificationResult(
+                outcome=outcome,
+                exit_code=exit_code,
+                duration_seconds=duration,
+                stdout=stdout_text,
+                stderr=stderr_text,
+                cleanup_status=cleanup_status,
+                error=error,
+            )
+
+        return self._execute_lifecycle_aware(label, role, start)
+
+    def _execute_lifecycle_aware(
+        self, label: str, role: container_lifecycle.ContainerRole, start: float
+    ) -> VerificationResult:
+        """Milestone 3 Slice 3B-6: the lifecycle-aware counterpart to the
+        legacy branch above. Never calls the legacy `_cleanup()` method
+        and never issues `docker rm` by name — every mutation this
+        branch performs targets an immutable, freshly validated
+        container id, and every attribution transition is durably
+        published *before* the Docker mutation it authorizes."""
+        assert role is not None
+        ctx = self._lifecycle_context
+        assert ctx is not None
+        name = container_lifecycle.deterministic_container_name(role=role, lifecycle_id=ctx.lifecycle_id)
+
+        attempt = self._attempt_lifecycle_aware(name, label, role, ctx)
+
+        disposition = attempt.disposition
+        final_error = attempt.error
+        absent_publish_failed = False
+
+        if disposition is _CleanupDisposition.REQUIRES_ID_CLEANUP:
+            assert attempt.container_id is not None
+            try:
+                ctx.publisher.publish(
+                    role=role, intent=container_lifecycle.ContainerIntent.REMOVING, id=attempt.container_id
+                )
+            except container_lifecycle.ContainerPublicationError as exc:
+                # The container is not removed: no mutation is
+                # authorized without a confirmed write-ahead publish.
+                disposition = _CleanupDisposition.UNCONFIRMED_DEFERRED
+                final_error = self._publication_error(label, exc)
+            else:
+                confirmed_absent = self._cleanup_by_id(attempt.container_id, name)
+                if confirmed_absent:
+                    try:
+                        ctx.publisher.publish(
+                            role=role, intent=container_lifecycle.ContainerIntent.ABSENT, id=None
+                        )
+                    except container_lifecycle.ContainerPublicationError as exc:
+                        disposition = _CleanupDisposition.CONFIRMED_ABSENT
+                        absent_publish_failed = True
+                        final_error = self._publication_error(label, exc)
+                    else:
+                        disposition = _CleanupDisposition.CONFIRMED_ABSENT
+                else:
+                    disposition = _CleanupDisposition.UNCONFIRMED_DEFERRED
+                    final_error = self._error(
+                        ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                        label,
+                        "verification container could not be confirmed removed",
+                    )
+
+        cleanup_status = {
+            _CleanupDisposition.NOT_APPLICABLE: events.ContainerCleanupStatus.NOT_APPLICABLE,
+            _CleanupDisposition.UNCONFIRMED_DEFERRED: events.ContainerCleanupStatus.UNCONFIRMED,
+            _CleanupDisposition.CONFIRMED_ABSENT: events.ContainerCleanupStatus.CONFIRMED_ABSENT,
+        }[disposition]
 
         duration = self._clock.monotonic() - start
 
         if cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED:
-            # Overrides any provisional outcome, including a would-be
-            # PASSED: a cleanup attempt is not a cleanup guarantee, and
-            # this module never reports a successful run it can't also
-            # confirm cleaned up after.
+            # Identical dominance rule to the legacy path: overrides any
+            # provisional outcome. The underlying cause (a publication
+            # failure or an unconfirmed removal) is never placed in the
+            # public error — only this fixed, sanitized message.
             return VerificationResult(
                 outcome=events.VerificationOutcome.ENVIRONMENT_FAILURE,
                 exit_code=None,
                 duration_seconds=duration,
-                stdout=stdout_text,
-                stderr=stderr_text,
+                stdout=attempt.stdout,
+                stderr=attempt.stderr,
                 cleanup_status=cleanup_status,
                 error=self._error(
                     ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
@@ -653,15 +886,433 @@ class DockerVerifier:
                 ),
             )
 
+        if absent_publish_failed:
+            # The one new dominance check (Slice 3B-6): physical absence
+            # was already confirmed, but the ABSENT publish itself then
+            # failed — never report a would-be PASSED/TEST_FAILURE here.
+            return VerificationResult(
+                outcome=events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                exit_code=None,
+                duration_seconds=duration,
+                stdout=attempt.stdout,
+                stderr=attempt.stderr,
+                cleanup_status=events.ContainerCleanupStatus.CONFIRMED_ABSENT,
+                error=final_error,
+            )
+
         return VerificationResult(
-            outcome=outcome,
-            exit_code=exit_code,
+            outcome=attempt.outcome,
+            exit_code=attempt.exit_code,
             duration_seconds=duration,
-            stdout=stdout_text,
-            stderr=stderr_text,
+            stdout=attempt.stdout,
+            stderr=attempt.stderr,
             cleanup_status=cleanup_status,
-            error=error,
+            error=attempt.error,
         )
+
+    def _publication_error(
+        self, label: str, exc: container_lifecycle.ContainerPublicationError
+    ) -> OperationalError:
+        """Never places `exc.reason`/`exc.message` (persistence-layer
+        detail) in the public error — only this fixed, sanitized
+        message, matching every other Docker-failure branch in this
+        module."""
+        return self._error(
+            ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+            label,
+            "a lifecycle projection transition could not be published",
+        )
+
+    def _attempt_lifecycle_aware(
+        self,
+        name: str,
+        label: str,
+        role: container_lifecycle.ContainerRole,
+        ctx: "DockerVerifierLifecycleContext",
+    ) -> _AttemptResult:
+        """Milestone 3 Slice 3B-6's full ordered algorithm: publish
+        `CREATING` write-ahead, prove and recover any occupied name,
+        create, publish `PRESENT(id)`, start/inspect. Every branch that
+        returns before a container is known to exist reports
+        `container_id=None`; every branch reached after `docker create`
+        both succeeds and is confirmed by `_parse_create_id` reports the
+        real, validated id."""
+        try:
+            ctx.publisher.publish(role=role, intent=container_lifecycle.ContainerIntent.CREATING, id=None)
+        except container_lifecycle.ContainerPublicationError as exc:
+            return _AttemptResult(
+                False, None, _CleanupDisposition.NOT_APPLICABLE,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE, None, "", "",
+                self._publication_error(label, exc),
+            )
+
+        try:
+            name_to_id, _id_to_name = docker_ownership.docker_ps_all_id_name_pairs()
+        except docker_ownership.DockerListingError:
+            # Binding correction: a pre-create listing failure is
+            # `NOT_APPLICABLE`, not `UNCONFIRMED` — nothing this
+            # invocation created could possibly exist yet (its own
+            # `docker create` has not been reached), so there is
+            # nothing of this invocation's own to report as unconfirmed
+            # cleanup, even though occupancy itself could not be
+            # determined.
+            return _AttemptResult(
+                False, None, _CleanupDisposition.NOT_APPLICABLE,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE, None, "", "",
+                self._error(
+                    ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                    label,
+                    "failed to inspect for an occupied verification container name",
+                ),
+            )
+
+        candidate_id = name_to_id.get(name)
+        if candidate_id is not None:
+            recovery = self._resolve_occupied_candidate(candidate_id, name, label, role, ctx)
+            if recovery.error is not None:
+                return _AttemptResult(
+                    False, None, recovery.disposition,
+                    events.VerificationOutcome.ENVIRONMENT_FAILURE, None, "", "",
+                    recovery.error,
+                )
+            # The name is now genuinely, durably free -- but the
+            # projection's own attribution just collapsed all the way
+            # back to ABSENT (the recovered occupant's own
+            # REMOVING->ABSENT edge). There is no direct ABSENT->PRESENT
+            # edge -- the live-owner table requires ABSENT->CREATING
+            # first -- so this invocation must re-publish its own
+            # CREATING before it can ever publish PRESENT for its own
+            # container below. A failure here is classified identically
+            # to the very first CREATING-publish failure above: nothing
+            # of this invocation's own doing exists yet (the prior
+            # occupant is already confirmed removed).
+            try:
+                ctx.publisher.publish(role=role, intent=container_lifecycle.ContainerIntent.CREATING, id=None)
+            except container_lifecycle.ContainerPublicationError as exc:
+                return _AttemptResult(
+                    False, None, _CleanupDisposition.NOT_APPLICABLE,
+                    events.VerificationOutcome.ENVIRONMENT_FAILURE, None, "", "",
+                    self._publication_error(label, exc),
+                )
+
+        create_attempted = True
+        create_outcome = self._docker_create_for_role(name, label, role, ctx)
+        if create_outcome.container_id is None:
+            return self._recover_after_uncertain_create(
+                name, label, role, ctx, create_outcome.outcome, create_outcome.error
+            )
+
+        container_id = create_outcome.container_id
+
+        try:
+            ctx.publisher.publish(role=role, intent=container_lifecycle.ContainerIntent.PRESENT, id=container_id)
+        except container_lifecycle.ContainerPublicationError as exc:
+            return _AttemptResult(
+                create_attempted, container_id, _CleanupDisposition.UNCONFIRMED_DEFERRED,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE, None, "", "",
+                self._publication_error(label, exc),
+            )
+
+        try:
+            exit_code, status, oom_killed, stdout_text, stderr_text, timed_out = self._start_and_inspect(
+                container_id
+            )
+        except _DockerLaunchError:
+            return _AttemptResult(
+                create_attempted, container_id, _CleanupDisposition.REQUIRES_ID_CLEANUP,
+                events.VerificationOutcome.COMMAND_START_FAILURE, None, "", "",
+                self._error(
+                    ErrorCode.EXECUTOR_COMMAND_START_FAILED, label, "docker executable could not be launched"
+                ),
+            )
+
+        if timed_out:
+            return _AttemptResult(
+                create_attempted, container_id, _CleanupDisposition.REQUIRES_ID_CLEANUP,
+                events.VerificationOutcome.TIMEOUT, None, stdout_text, stderr_text,
+                self._error(
+                    ErrorCode.EXECUTOR_TIMEOUT, label, "verification container exceeded its time budget"
+                ),
+            )
+        if status != "exited" or exit_code is None or oom_killed is None:
+            return _AttemptResult(
+                create_attempted, container_id, _CleanupDisposition.REQUIRES_ID_CLEANUP,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE, None, stdout_text, stderr_text,
+                self._error(
+                    ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                    label,
+                    "failed to inspect the verification container's final state",
+                ),
+            )
+        if oom_killed:
+            return _AttemptResult(
+                create_attempted, container_id, _CleanupDisposition.REQUIRES_ID_CLEANUP,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE, exit_code, stdout_text, stderr_text,
+                self._error(
+                    ErrorCode.EXECUTOR_OOM_KILLED,
+                    label,
+                    "verification container was killed for exceeding its memory limit",
+                ),
+            )
+        if exit_code == 0:
+            return _AttemptResult(
+                create_attempted, container_id, _CleanupDisposition.REQUIRES_ID_CLEANUP,
+                events.VerificationOutcome.PASSED, 0, stdout_text, stderr_text, None,
+            )
+        return _AttemptResult(
+            create_attempted, container_id, _CleanupDisposition.REQUIRES_ID_CLEANUP,
+            events.VerificationOutcome.TEST_FAILURE, exit_code, stdout_text, stderr_text, None,
+        )
+
+    def _docker_create_for_role(
+        self,
+        name: str,
+        label: str,
+        role: container_lifecycle.ContainerRole,
+        ctx: "DockerVerifierLifecycleContext",
+    ) -> _CreateOutcome:
+        """`docker create` with the four ADR 0004 section 7 labels set
+        (and no `attempt` label) — the lifecycle-aware counterpart to
+        `_docker_create`, which the legacy path does not use."""
+        label_flags: list[str] = []
+        for key, value in container_lifecycle.required_labels(
+            state_root_id=ctx.state_root_id, lifecycle_id=ctx.lifecycle_id, role=role
+        ).items():
+            label_flags.extend(["--label", f"{key}={value}"])
+        try:
+            create_result = _run_docker(
+                "create",
+                "--name",
+                name,
+                *_SECURITY_FLAGS,
+                *label_flags,
+                "--mount",
+                f"type=bind,source={self._worktree_path},target=/workspace,readonly",
+                "--workdir",
+                "/workspace",
+                self._image,
+                *self._command,
+                limit=_CREATE_ID_MAX_BYTES,
+            )
+        except _DockerLaunchError:
+            return _CreateOutcome(
+                None,
+                events.VerificationOutcome.COMMAND_START_FAILURE,
+                self._error(
+                    ErrorCode.EXECUTOR_COMMAND_START_FAILED, label, "docker executable could not be launched"
+                ),
+            )
+        except _DockerControlPlaneFailure:
+            return _CreateOutcome(
+                None,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                self._error(
+                    ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE, label, "failed to create the verification container"
+                ),
+            )
+        if create_result.returncode != 0:
+            return _CreateOutcome(
+                None,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                self._error(
+                    ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE, label, "failed to create the verification container"
+                ),
+            )
+        container_id = _parse_create_id(create_result.stdout)
+        if container_id is None:
+            return _CreateOutcome(
+                None,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                self._error(
+                    ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                    label,
+                    "the verification container's created ID could not be validated",
+                ),
+            )
+        return _CreateOutcome(container_id, None, None)
+
+    def _resolve_occupied_candidate(
+        self,
+        candidate_id: str,
+        name: str,
+        label: str,
+        role: container_lifecycle.ContainerRole,
+        ctx: "DockerVerifierLifecycleContext",
+    ) -> _RecoveryResult:
+        """Prove ownership of whatever currently occupies the
+        deterministic name before ever touching it. A foreign or
+        unproven candidate is refused outright (`NOT_APPLICABLE` — no
+        mutation of any kind is authorized); only a proven-owned
+        candidate is ever passed to `_recover_owned_occupant`."""
+        try:
+            proof = docker_ownership.docker_inspect_ownership(candidate_id)
+        except docker_ownership.DockerInspectError:
+            # Binding correction: a pre-create inspection failure is
+            # also `NOT_APPLICABLE` — this invocation still has not
+            # touched anything of its own (no mutation is authorized on
+            # an unproven candidate either way).
+            return _RecoveryResult(
+                _CleanupDisposition.NOT_APPLICABLE,
+                self._error(
+                    ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                    label,
+                    "the occupying verification container could not be inspected",
+                ),
+            )
+        if not (
+            proof.id == candidate_id
+            and proof.name == name
+            and container_lifecycle.labels_match(
+                proof.labels, state_root_id=ctx.state_root_id, lifecycle_id=ctx.lifecycle_id, role=role
+            )
+        ):
+            return _RecoveryResult(
+                _CleanupDisposition.NOT_APPLICABLE,
+                self._error(
+                    ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                    label,
+                    "a foreign container occupies the verification container name",
+                ),
+            )
+        return self._recover_owned_occupant(candidate_id, name, label, role, ctx)
+
+    def _recover_owned_occupant(
+        self,
+        candidate_id: str,
+        name: str,
+        label: str,
+        role: container_lifecycle.ContainerRole,
+        ctx: "DockerVerifierLifecycleContext",
+    ) -> _RecoveryResult:
+        """`CREATING -> PRESENT(id) -> REMOVING(id) -> rm(id) ->
+        confirmed absence -> ABSENT` for one already-existing, proven-
+        owned occupant. Every publish happens strictly before its
+        corresponding Docker mutation; any publication failure stops
+        this recovery before the next mutation, leaving the candidate
+        untouched (still present) at that point."""
+        try:
+            ctx.publisher.publish(role=role, intent=container_lifecycle.ContainerIntent.PRESENT, id=candidate_id)
+        except container_lifecycle.ContainerPublicationError as exc:
+            return _RecoveryResult(_CleanupDisposition.UNCONFIRMED_DEFERRED, self._publication_error(label, exc))
+
+        try:
+            ctx.publisher.publish(role=role, intent=container_lifecycle.ContainerIntent.REMOVING, id=candidate_id)
+        except container_lifecycle.ContainerPublicationError as exc:
+            return _RecoveryResult(_CleanupDisposition.UNCONFIRMED_DEFERRED, self._publication_error(label, exc))
+
+        confirmed_absent = self._cleanup_by_id(candidate_id, name)
+        if not confirmed_absent:
+            return _RecoveryResult(
+                _CleanupDisposition.UNCONFIRMED_DEFERRED,
+                self._error(
+                    ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE,
+                    label,
+                    "the occupying verification container could not be confirmed removed",
+                ),
+            )
+
+        try:
+            ctx.publisher.publish(role=role, intent=container_lifecycle.ContainerIntent.ABSENT, id=None)
+        except container_lifecycle.ContainerPublicationError as exc:
+            return _RecoveryResult(_CleanupDisposition.CONFIRMED_ABSENT, self._publication_error(label, exc))
+
+        return _RecoveryResult(_CleanupDisposition.CONFIRMED_ABSENT, None)
+
+    def _recover_after_uncertain_create(
+        self,
+        name: str,
+        label: str,
+        role: container_lifecycle.ContainerRole,
+        ctx: "DockerVerifierLifecycleContext",
+        failure_outcome: events.VerificationOutcome | None,
+        failure_error: OperationalError | None,
+    ) -> _AttemptResult:
+        """Fresh, independent, read-only observation only — never calls
+        `docker create` or removes anything by name; only ever removes
+        a freshly-proven candidate by its immutable id. Even a fully
+        successful recovery does not retroactively succeed *this*
+        attempt: the original `docker create` call that led here still
+        failed to produce a trustworthy container for this invocation —
+        `failure_outcome`/`failure_error` (this invocation's own
+        create-failure) are always what is ultimately reported unless
+        the recovery itself also failed, in which case the recovery's
+        own error dominates."""
+        try:
+            name_to_id, _id_to_name = docker_ownership.docker_ps_all_id_name_pairs()
+        except docker_ownership.DockerListingError:
+            return _AttemptResult(
+                True, None, _CleanupDisposition.UNCONFIRMED_DEFERRED,
+                failure_outcome, None, "", "", failure_error,
+            )
+
+        candidate_id = name_to_id.get(name)
+        if candidate_id is None:
+            # Binding correction: a fresh strict observation confirming
+            # absence is `CONFIRMED_ABSENT` — even though the lifecycle
+            # projection conservatively remains `CREATING` (this
+            # observation is a point-in-time claim, not the ADR's
+            # stronger "nothing was ever created for this attempt"
+            # precondition the live-owner's own `CREATING->ABSENT` edge
+            # requires, so no publish is ever attempted here). Publicly,
+            # though, there is genuinely nothing left to clean up.
+            return _AttemptResult(
+                True, None, _CleanupDisposition.CONFIRMED_ABSENT,
+                failure_outcome, None, "", "", failure_error,
+            )
+
+        try:
+            proof = docker_ownership.docker_inspect_ownership(candidate_id)
+        except docker_ownership.DockerInspectError:
+            return _AttemptResult(
+                True, None, _CleanupDisposition.UNCONFIRMED_DEFERRED,
+                failure_outcome, None, "", "", failure_error,
+            )
+
+        if not (
+            proof.id == candidate_id
+            and proof.name == name
+            and container_lifecycle.labels_match(
+                proof.labels, state_root_id=ctx.state_root_id, lifecycle_id=ctx.lifecycle_id, role=role
+            )
+        ):
+            # Binding correction: a foreign/conflicting candidate here
+            # is `UNCONFIRMED`, not `NOT_APPLICABLE` — this invocation's
+            # own `docker create` genuinely was entered (even though it
+            # failed), so "nothing to clean up" is no longer a safe
+            # claim once a real occupant is present at the name.
+            return _AttemptResult(
+                True, None, _CleanupDisposition.UNCONFIRMED_DEFERRED,
+                failure_outcome, None, "", "", failure_error,
+            )
+
+        recovery = self._recover_owned_occupant(candidate_id, name, label, role, ctx)
+        return _AttemptResult(
+            True, None, recovery.disposition, failure_outcome, None, "", "",
+            recovery.error if recovery.error is not None else failure_error,
+        )
+
+    def _cleanup_by_id(self, container_id: str, name: str) -> bool:
+        """id-only removal (Slice 3B-6): `docker rm --force <id>`, never
+        a name, then independent re-observation of both that id and the
+        deterministic `name` it was expected to occupy. Never called
+        from the legacy path — `_cleanup` (name-fallback-capable) is
+        that path's own, completely unchanged, method."""
+        try:
+            _run_docker("rm", "--force", container_id, limit=_RM_OUTPUT_MAX_BYTES)
+        except (_DockerLaunchError, _DockerControlPlaneFailure):
+            # rm's own outcome is never authoritative for removal — the
+            # independent listing below is.
+            pass
+
+        try:
+            name_to_id, id_to_name = docker_ownership.docker_ps_all_id_name_pairs()
+        except docker_ownership.DockerListingError:
+            return False
+        if container_id in id_to_name:
+            return False
+        if name in name_to_id:
+            return False
+        return True
 
     def _start_and_inspect(
         self, container_id: str

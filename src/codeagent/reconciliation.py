@@ -48,7 +48,6 @@ maintenance-trigger, and any worktree or checkpoint-ref *removal*.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import secrets
@@ -58,6 +57,17 @@ from datetime import datetime, timezone
 from enum import Enum, unique
 
 from ._bounded_subprocess import BoundedProcessError, run_bounded_stdout
+from ._docker_ownership import (
+    CONTAINER_ID_HEX_RE as _CONTAINER_ID_HEX_RE,
+)
+from ._docker_ownership import (
+    CONTAINER_NAME_RE as _CONTAINER_NAME_RE,
+)
+from ._docker_ownership import DockerInspectError as _DockerInspectError
+from ._docker_ownership import DockerListingError as _DockerListingError
+from ._docker_ownership import InspectOwnership as _InspectOwnership
+from ._docker_ownership import parse_inspect_output as _parse_inspect_output
+from ._docker_ownership import parse_ps_all_output as _parse_ps_all_output
 from ._git_safety import GIT_TIMEOUT_SECONDS, GitSafetyError, run_git_bounded
 from ._lifecycle_fs import (
     LifecycleFsError,
@@ -74,6 +84,14 @@ from ._lifecycle_fs import (
     write_all_eintr_safe,
 )
 from .checkpoint_ref import LIFECYCLE_ID_RE, CheckpointRef, CheckpointRefError
+from .container_lifecycle import (
+    CONTAINER_LABEL_ID,
+    CONTAINER_LABEL_ROLE,
+    CONTAINER_LABEL_SCHEMA,
+    CONTAINER_LABEL_STATE_ROOT_ID,
+    ContainerRole,
+)
+from .container_lifecycle import labels_match as _shared_labels_match
 from .lifecycle_store import (
     LIFECYCLE_JSON_FILENAME,
     RUN_ID_MAX_ENCODED_BYTES,
@@ -120,13 +138,12 @@ _WORKTREE_LISTING_MAX_BYTES = 1_048_576
 # on overflow rather than unboundedly captured.
 _INSPECT_OWNERSHIP_MAX_BYTES = 16 * 1024
 
-_CONTAINER_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
-_CONTAINER_ID_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
-
-CONTAINER_LABEL_SCHEMA = "codeagent.lifecycle.schema"
-CONTAINER_LABEL_STATE_ROOT_ID = "codeagent.lifecycle.state-root-id"
-CONTAINER_LABEL_ID = "codeagent.lifecycle.id"
-CONTAINER_LABEL_ROLE = "codeagent.lifecycle.role"
+# `_CONTAINER_NAME_RE`/`_CONTAINER_ID_HEX_RE`/`CONTAINER_LABEL_*` are no
+# longer defined here (Slice 3B-6): they are now `_docker_ownership.py`'s
+# and `container_lifecycle.py`'s own canonical definitions, imported
+# above under these exact same names for source compatibility with this
+# module's own call sites and with existing tests that reference them
+# via `reconciliation.CONTAINER_LABEL_*`.
 
 
 @unique
@@ -223,29 +240,25 @@ def _classify_entry_fs_failure(exc: LifecycleFsError) -> ReconciliationEntryOutc
     return ReconciliationEntryOutcome.REFUSED
 
 
-class _DockerListingError(Exception):
-    pass
+# `_DockerListingError`, `_DockerInspectError`, and `_InspectOwnership`
+# are no longer defined here (Slice 3B-6) -- they are `_docker_ownership.
+# py`'s own canonical types, imported above under these exact same names
+# so this module's own call sites, and existing tests that construct or
+# monkeypatch them via `reconciliation._InspectOwnership`/
+# `reconciliation._DockerListingError`/`reconciliation._DockerInspectError`,
+# keep working unchanged.
 
 
 def _docker_ps_all_id_name_pairs() -> tuple[dict[str, str], dict[str, str]]:
-    """One bounded, unfiltered, timeout-controlled, no-shell
-    `docker ps -a --no-trunc --format '{{.ID}}\\t{{.Names}}'` listing of
-    every container (running or stopped) — never a name-filtered or
-    label-filtered query (I2). Output is capped at
-    `_DOCKER_OUTPUT_MAX_BYTES` via the shared `_bounded_subprocess.
-    run_bounded_stdout`, which owns the complete launch/monitor/read/
-    wait/kill/confirm lifecycle; a timeout or overflow is confirmed-
-    terminated before this function raises.
-
-    Strictly parsed: each nonempty line must be exactly one
-    tab-separated `id`/`name` pair, `id` exactly 64 lowercase hex
-    characters, `name` matching Docker's own container-name grammar; a
-    duplicate id or duplicate name anywhere in the listing makes the
-    whole listing untrusted (never partially trusted), mirroring
-    `executor._parse_cleanup_listing`'s own discipline. Returns both
-    directions (`name -> id`, `id -> name`) from the single listing so
-    a caller can detect "the id appears under a different name" without
-    a second query."""
+    """Still issues its own `run_bounded_stdout` call, bound to this
+    module's own existing timeout/bound constants, so existing tests
+    that monkeypatch `reconciliation.run_bounded_stdout` directly
+    continue to intercept every Docker call this module makes
+    unchanged; only the strict output parsing is now delegated to the
+    shared `_docker_ownership.parse_ps_all_output` (Slice 3B-6 —
+    generalizes what was previously this module's own private parser,
+    a byte-for-byte identical duplicate of `executor.py`'s and
+    `reconciliation.py`'s own prior copies)."""
     argv = ["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"]
     try:
         result = run_bounded_stdout(
@@ -255,69 +268,14 @@ def _docker_ps_all_id_name_pairs() -> tuple[dict[str, str], dict[str, str]]:
         raise _DockerListingError("docker listing failed, timed out, or exceeded its output bound") from exc
     if result.returncode != 0:
         raise _DockerListingError("docker listing exited with a nonzero status")
-    try:
-        text = result.stdout.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise _DockerListingError("docker listing produced invalid UTF-8 output") from exc
-
-    if text and not text.endswith("\n"):
-        raise _DockerListingError("docker listing output was missing its final line terminator")
-
-    name_to_id: dict[str, str] = {}
-    id_to_name: dict[str, str] = {}
-    # Split strictly on `\n` only -- never `str.splitlines()`, which also
-    # treats `\r`, lone `\r`, and several Unicode line separators as row
-    # boundaries and would silently absorb a CRLF-terminated row as if
-    # it were the expected bare-LF shape. A stray `\r` that a real CRLF
-    # row would leave attached to its last field is caught below by the
-    # name grammar instead (`\r` is never a legal name character).
-    #
-    # Empty output (`text == ""`) is valid -- zero containers -- and
-    # never reaches this loop at all (`"".split("\n")[:-1] == []`).
-    # Once output is nonempty, however, every row must be a genuine
-    # id/name record: a blank row (leading, internal, or an extra
-    # trailing one beyond the single required final LF) is fail-closed
-    # rejected, never silently skipped, matching ADR 0004 Amendment 5's
-    # own statement that each row is exactly one id/name record.
-    for line in text.split("\n")[:-1]:
-        if not line:
-            raise _DockerListingError("a docker listing contained a blank row")
-        fields = line.split("\t")
-        if len(fields) != 2:
-            raise _DockerListingError("a docker listing row was not the expected two-field shape")
-        raw_id, raw_name = fields
-        if not _CONTAINER_ID_HEX_RE.fullmatch(raw_id):
-            raise _DockerListingError("a docker listing row's id was not the expected 64-lowercase-hex shape")
-        if not _CONTAINER_NAME_RE.fullmatch(raw_name):
-            raise _DockerListingError("a docker listing row's name was not the expected shape")
-        if raw_id in id_to_name or raw_name in name_to_id:
-            raise _DockerListingError("a docker listing contained a duplicate id or name")
-        name_to_id[raw_name] = raw_id
-        id_to_name[raw_id] = raw_name
-    return name_to_id, id_to_name
-
-
-class _DockerInspectError(Exception):
-    pass
-
-
-@dataclass(frozen=True)
-class _InspectOwnership:
-    id: str
-    name: str
-    labels: dict[str, str]
+    return _parse_ps_all_output(result.stdout)
 
 
 def _docker_inspect_ownership(candidate_id: str) -> _InspectOwnership:
-    """One bounded, timeout-controlled, no-shell ownership-proof
-    `docker inspect` of exactly one candidate, by its immutable id —
-    never by name (a name can be reused). `_INSPECT_OWNERSHIP_MAX_BYTES`
-    bounds the output; a timeout, overflow, or nonzero exit (including
-    the candidate having vanished in a race between the listing and
-    this call) is never treated as confirmed absence — it is a genuine
-    inspection failure the caller must classify as
-    `SUBSTRATE_UNAVAILABLE`, forcing a retry on a later pass rather than
-    guessing."""
+    """Still issues its own `run_bounded_stdout` call (same rationale as
+    `_docker_ps_all_id_name_pairs` above); only the strict output
+    parsing is delegated to the shared `_docker_ownership.
+    parse_inspect_output` (Slice 3B-6)."""
     argv = [
         "docker",
         "inspect",
@@ -335,54 +293,17 @@ def _docker_inspect_ownership(candidate_id: str) -> _InspectOwnership:
         raise _DockerInspectError("docker inspect failed, timed out, or exceeded its output bound") from exc
     if result.returncode != 0:
         raise _DockerInspectError("docker inspect could not confirm the candidate container")
-    try:
-        text = result.stdout.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise _DockerInspectError("docker inspect produced invalid UTF-8 output") from exc
-    if text.count("\n") != 1 or not text.endswith("\n"):
-        raise _DockerInspectError("docker inspect output was not the expected single-line shape")
-    if "\r" in text:
-        # A CRLF row's `\r` would otherwise survive as trailing
-        # whitespace the JSON decoder silently tolerates after a
-        # complete value (correction pass finding 3) -- rejected
-        # explicitly here rather than relying on that decoder's own
-        # leniency to ever catch it.
-        raise _DockerInspectError("docker inspect output contained a carriage return")
-    fields = text[:-1].split("\t")
-    if len(fields) != 3:
-        raise _DockerInspectError("docker inspect output was not the expected three-field shape")
-    raw_id, raw_name, raw_labels_json = fields
-    if not _CONTAINER_ID_HEX_RE.fullmatch(raw_id):
-        raise _DockerInspectError("docker inspect id was not the expected 64-lowercase-hex shape")
-    # `docker inspect`'s `.Name` always carries exactly one leading `/`
-    # for a container's primary name -- a missing slash or more than one
-    # is malformed output, never a valid name to strip and proceed with.
-    if not raw_name.startswith("/") or raw_name.startswith("//"):
-        raise _DockerInspectError("docker inspect name did not have exactly one leading '/'")
-    name = raw_name[1:]
-    if not _CONTAINER_NAME_RE.fullmatch(name):
-        raise _DockerInspectError("docker inspect name was not the expected shape")
-    try:
-        labels = json.loads(raw_labels_json)
-    except json.JSONDecodeError as exc:
-        raise _DockerInspectError("docker inspect labels were not valid JSON") from exc
-    if labels is None:
-        labels = {}
-    if not isinstance(labels, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in labels.items()):
-        raise _DockerInspectError("docker inspect labels were not a flat string-keyed object")
-    return _InspectOwnership(id=raw_id, name=name, labels=labels)
+    return _parse_inspect_output(result.stdout)
 
 
 def _labels_match(labels: dict[str, str], *, state_root_id: str, lifecycle_id: str, role: str) -> bool:
-    """ADR 0004 section 7's exactly-four-required-labels ownership
+    """Thin delegator to `container_lifecycle.labels_match` (Slice
+    3B-6): ADR 0004 section 7's exactly-four-required-labels ownership
     check. Extra, unrecognized labels are always ignored; every one of
     the four required labels must be present with the exact expected
     value."""
-    return (
-        labels.get(CONTAINER_LABEL_SCHEMA) == "1"
-        and labels.get(CONTAINER_LABEL_STATE_ROOT_ID) == state_root_id
-        and labels.get(CONTAINER_LABEL_ID) == lifecycle_id
-        and labels.get(CONTAINER_LABEL_ROLE) == role
+    return _shared_labels_match(
+        labels, state_root_id=state_root_id, lifecycle_id=lifecycle_id, role=ContainerRole(role)
     )
 
 
