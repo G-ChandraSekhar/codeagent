@@ -2928,5 +2928,35 @@ root was ever created there — the slice's own real-writer tests
 redirect `prepare_lifecycle()` to an isolated per-test `tmp_path` state
 root via `CODEAGENT_STATE_DIR`, never the default location. This is
 implementation/automated-test evidence only — it does not constitute or
-substitute for a security review. GitHub-hosted Linux CI has not yet
-run for this slice — it has not been committed or pushed.
+substitute for a security review.
+
+**Confirmed on GitHub-hosted Linux CI** (commit
+`3476b3d7a50e2f979059031ab9c670949a7c20fe`, run
+[36483533854](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36483533854),
+`ubuntu-24.04` x86_64, Python 3.12, conclusion `success`): the
+mandatory Docker preflight passed; the pinned verification image
+(`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`)
+was pulled and confirmed `linux/amd64`. The dedicated "Run real Docker
+verification tests" step ran only `python -m pytest
+tests/integration/test_slice_c.py -v` (`3 passed in 2.33s`) — this
+file's own legacy Milestone-1 tests, exactly; it does **not**
+specifically exercise Slice 3C-1, which adds no real-Docker test of its
+own. The separate "Run complete test suite" step (`python -m pytest
+-q`, with `CODEAGENT_REQUIRE_DOCKER=1` confirmed present in that step's
+own logged environment) reported `2687 passed, 3 skipped in 47.83s`;
+`2687 + 3` equals the local collected total of 2,690 — the
+skipped-test identities are not printed by the `pytest -q` log, and are
+not guessed here. These skips are not evidence of Docker unavailability,
+since the daemon, the pulled image, and `CODEAGENT_REQUIRE_DOCKER=1`
+were all already confirmed for that same step. The final
+leftover-container check used the anchored `grep -E
+'^codeagent-(verify-|baseline-|verification-)'` pattern over a
+complete, unfiltered `docker ps -a` listing; its captured output was
+empty and the step succeeded. This is implementation/automated-test
+evidence only — it does not constitute or substitute for a security
+review, and is GitHub-hosted `ubuntu-24.04` x86_64 evidence
+specifically, not a general Linux or ARM64 portability claim. It does
+not claim `prepare_lifecycle()`, `LifecycleLease` ownership/closure, CLI
+wiring, or any production entry-point composition exists — none of that
+is part of this slice, unchanged from the "Explicitly deferred" section
+above.

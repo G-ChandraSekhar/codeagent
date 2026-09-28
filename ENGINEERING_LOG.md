@@ -4159,3 +4159,99 @@ comments or documentation. This is wording-only: no control flow,
 schema, test, or behavior changed; `py_compile` on `src/codeagent/
 errors.py` and `git diff --check` both passed; the full suite was not
 rerun, since nothing executable changed.
+
+## 2026-09-28 — Milestone 3 Slice 3C-1: Linux CI evidence reconciliation
+
+Documentation-only pass. Slice 3C-1 was committed
+(`3476b3d7a50e2f979059031ab9c670949a7c20fe`) and pushed to `main` as an
+ordinary fast-forward (`27d0607..3476b3d`, no force). The resulting
+GitHub Actions run
+([36483533854](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36483533854),
+`ubuntu-24.04` x86_64, Python 3.12) was independently re-fetched via
+`gh run view --json` and its own raw job logs — re-fetched a second
+time in this pass specifically, confirmed byte-identical to the first
+fetch (the run is completed and immutable) — before writing anything
+below, not merely trusted from the prior turn's report.
+
+**Independently verified facts**: head SHA `3476b3d7a50e2f979059031ab9c670949a7c20fe`
+matches the new commit exactly; overall conclusion `success`; every job
+step (`Docker preflight (mandatory)`, `Resolve pinned verification
+image`, `Pull pinned verification image and confirm linux/amd64`, `Run
+real Docker verification tests`, `Run complete test suite`, `Verify no
+leftover CodeAgent verification containers`, and both `Post` steps)
+concluded `success`. The Docker preflight step ran a real `docker info`
+(`Server Version: 28.0.4` observed in its own log). The pinned image
+`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`
+was pulled, and its own log line reads exactly `Pulled image reports
+platform: linux/amd64`.
+
+The dedicated "Run real Docker verification tests" step's own log shows
+it ran exactly `python -m pytest tests/integration/test_slice_c.py -v`,
+reporting `3 passed in 2.33s` — this is Milestone 1's own legacy
+real-Docker suite; it does not specifically exercise Slice 3C-1, which
+introduces no real-Docker test of its own (none of this slice's work
+touches Docker — it is a controller/lifecycle-store/errors change plus
+in-memory-cursor tests). The separate "Run complete test suite" step
+ran `python -m pytest -q` with `CODEAGENT_REQUIRE_DOCKER: 1`
+independently confirmed present in that step's own logged environment,
+reporting `2687 passed, 3 skipped in 47.83s`. `2687 + 3` equals the
+local collected total of 2,690 established in the implementation entry
+above. **The complete-suite step reported 2,687 passed and 3 skipped;
+the skipped-test identities are not printed by the `pytest -q` log** —
+this pass does not guess them. These three skips are explicitly not
+evidence of Docker unavailability, since Docker was a required,
+already-confirmed precondition for that same step (the daemon was
+already up, the pinned image already pulled, and
+`CODEAGENT_REQUIRE_DOCKER=1` already confirmed set). Separately, and
+labeled here explicitly as source inspection rather than CI-log
+evidence: every prior Milestone 3 slice's own Linux CI run has reported
+the identical three skips, and earlier entries in this log identify the
+likely candidates by source inspection as three tests that
+unconditionally skip on a case-sensitive-filesystem runner
+(`test_evidence.py`'s Darwin-only ambient-`/tmp`-symlink test,
+`test_lifecycle_fs.py`'s Darwin-only case-canonicalization test, and
+`test_repo_identity.py`'s case-insensitive-filesystem-dependent alias
+test) — this is inference from source, not something this run's own
+`pytest -q` log proves, and none of Slice 3C-1's own new or modified
+tests are among them (all of Slice 3C-1's tests are platform-
+independent).
+
+The final "Verify no leftover CodeAgent verification containers" step's
+own log shows the exact pattern
+`grep -E '^codeagent-(verify-|baseline-|verification-)'` applied to a
+complete, unfiltered `docker ps -a` name listing — covering all three
+required families (`codeagent-verify-*`, `codeagent-baseline-*`,
+`codeagent-verification-*`) — and its captured output was empty; the
+step succeeded.
+
+This is implementation/automated-test evidence only — it does not
+constitute or substitute for a security review — and is GitHub-hosted
+`ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+ARM64 portability claim. It does not claim `prepare_lifecycle()`,
+`LifecycleLease` ownership/closure, CLI wiring, or any production
+entry-point composition exists — none of that is part of this slice.
+`docs/threat-model.md`'s T-E1 entry is unaffected and unchanged by this
+pass: it contains no Slice-3C-1-specific statement to correct, and
+T-E1 remains unmitigated because production composition/entry-point
+wiring is still absent.
+
+`CLAUDE.md`'s Slice 3C-1 bullet (previously "not yet committed, pushed,
+or reviewed on Linux CI," with no closing CI-evidence paragraph) and
+`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+Amendment 8 evidence paragraph (previously "GitHub-hosted Linux CI has
+not yet run for this slice — it has not been committed or pushed.")
+are both updated in place with the verified evidence above. No other
+prose in either file — the boundary design, the exhaustive failure map,
+the evidence-independence rule, the durability-unconfirmed state table,
+the deferred lease-ownership scope, or the milestone boundary — was
+touched. Every earlier `ENGINEERING_LOG.md` entry, including this
+slice's own prior implementation and two correction-pass entries above,
+is left unmodified, per this project's own established convention of
+never rewriting historical entries to match later state.
+
+Verified: `git diff --check` clean on the resulting documentation-only
+diff; only `CLAUDE.md`, this file, and the ADR changed — no production
+code, test, workflow, configuration, or dependency file touched;
+nothing staged. No test run or Docker session was needed for this
+pass — the independently re-verified, completed CI run is the
+evidence.

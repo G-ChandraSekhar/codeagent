@@ -1772,9 +1772,14 @@ Stage 2 (of the four-stage planning process in
 - **Milestone 3 Slice 3C-1** (dependency-light owner-state lifecycle-
   publication boundary and a `RunController` terminal hook), per
   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
-  "Amendment 8 (Accepted 2026-09-28)", **is implemented and locally
-  validated on macOS (2026-09-28) — not yet committed, pushed, or
-  reviewed on Linux CI.** Gives containers'/checkpoint-ref's existing
+  "Amendment 8 (Accepted 2026-09-28)", **is implemented, locally
+  validated on macOS (2026-09-28), committed
+  (`3476b3d7a50e2f979059031ab9c670949a7c20fe`), and confirmed on
+  GitHub-hosted Linux CI** (run
+  [36483533854](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36483533854),
+  `ubuntu-24.04` x86_64, Python 3.12, conclusion `success` — see the
+  closing paragraph below for the exact evidence this run supports).
+  Gives containers'/checkpoint-ref's existing
   durable write-ahead publishers (Slices 3B-6/3B-7) an owner-level
   counterpart: a new dependency-light leaf module,
   `src/codeagent/lifecycle_owner.py` (`OwnerStatePublicationFailure` —
@@ -1844,9 +1849,39 @@ Stage 2 (of the four-stage planning process in
   `prepare_lifecycle()` to an isolated per-test `tmp_path` state root via
   `CODEAGENT_STATE_DIR`, never the default one, and no production path
   this slice introduces calls `prepare_lifecycle()` at all.
-  `docs/threat-model.md`'s T-E1 entry is unchanged and remains
-  unmitigated by this slice — nothing here calls `prepare_lifecycle()`
-  or constructs a real entry point.
+  **Confirmed on GitHub-hosted Linux CI** (commit
+  `3476b3d7a50e2f979059031ab9c670949a7c20fe`, run
+  [36483533854](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36483533854),
+  `ubuntu-24.04` x86_64, Python 3.12, conclusion `success`): the
+  mandatory Docker preflight passed; the pinned verification image
+  (`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`)
+  was pulled and confirmed `linux/amd64`. The dedicated "Run real Docker
+  verification tests" step ran only `python -m pytest
+  tests/integration/test_slice_c.py -v` (`3 passed in 2.33s`) — this
+  file's own legacy Milestone-1 tests, exactly; it does **not**
+  specifically exercise Slice 3C-1, which adds no real-Docker test of
+  its own. The separate "Run complete test suite" step (`python -m
+  pytest -q`, with `CODEAGENT_REQUIRE_DOCKER=1` confirmed present in
+  that step's own logged environment) reported `2687 passed, 3 skipped
+  in 47.83s`; `2687 + 3` equals the local collected total of 2,690. The
+  skipped-test identities are not printed by the `pytest -q` log and are
+  not guessed here — they are not evidence of Docker unavailability,
+  since the daemon, the pulled image, and `CODEAGENT_REQUIRE_DOCKER=1`
+  were all already confirmed for that same step (source inspection, not
+  CI-log evidence, continues to identify the three Linux-unconditional
+  skips named in earlier slices' entries as the likely candidates — see
+  `ENGINEERING_LOG.md`). The final leftover-container check used the
+  anchored `grep -E '^codeagent-(verify-|baseline-|verification-)'`
+  pattern over a complete, unfiltered `docker ps -a` listing; its
+  captured output was empty and the step succeeded. This is
+  implementation/automated-test evidence only — it does not constitute
+  or substitute for a security review, and is GitHub-hosted
+  `ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+  ARM64 portability claim. It does not claim `prepare_lifecycle()`,
+  `LifecycleLease` ownership/closure, CLI wiring, or any production
+  entry-point composition exists. `docs/threat-model.md`'s T-E1 entry
+  is unchanged and remains unmitigated by this slice — nothing here
+  calls `prepare_lifecycle()` or constructs a real entry point.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
