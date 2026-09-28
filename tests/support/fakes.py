@@ -17,6 +17,7 @@ from codeagent.checkpoint_session import CheckpointIntent
 from codeagent.controller import PatchResult, PlanProposal, ReadResult, VerificationResult
 from codeagent.errors import ErrorCode, OperationalError
 from codeagent.evidence import EvidenceReceipt
+from codeagent.lifecycle_owner import OwnerStatePublicationError
 
 # FakeVerifier's own choice, not a controller-level restriction: this
 # synthetic harness only fabricates PASSED/TEST_FAILURE, since it has
@@ -390,6 +391,39 @@ class FakeCheckpointSession:
             raise self.delete_error
         self.intent = CheckpointIntent.ABSENT
         self.accepted_sha = None
+
+
+class FakeLifecycleOwnerPublisher:
+    """Deterministic `controller.LifecycleOwnerPublisher` double
+    (Milestone 3 Slice 3C-1): no filesystem, Git, or lifecycle-store
+    involved. Records the exact call order of `activate()`/
+    `begin_cleanup()`/`complete()` (as the string names) so a test can
+    assert ordering directly, and raises the *real*
+    `codeagent.lifecycle_owner.OwnerStatePublicationError` type when a
+    failure is injected, so `RunController`'s exact catch/fold-into-
+    precedence logic is exercised identically to how it would be
+    against the real `LifecycleOwnerStatePublisher`."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.activate_error: OwnerStatePublicationError | None = None
+        self.begin_cleanup_error: OwnerStatePublicationError | None = None
+        self.complete_error: OwnerStatePublicationError | None = None
+
+    def activate(self) -> None:
+        self.calls.append("activate")
+        if self.activate_error is not None:
+            raise self.activate_error
+
+    def begin_cleanup(self) -> None:
+        self.calls.append("begin_cleanup")
+        if self.begin_cleanup_error is not None:
+            raise self.begin_cleanup_error
+
+    def complete(self) -> None:
+        self.calls.append("complete")
+        if self.complete_error is not None:
+            raise self.complete_error
 
 
 class FakeEvidenceSink:

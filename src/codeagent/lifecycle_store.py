@@ -77,6 +77,7 @@ from .checkpoint_session import CheckpointPublicationError, CheckpointPublicatio
 from .container_lifecycle import ContainerIntent
 from .container_lifecycle import ContainerPublicationError, ContainerPublicationFailure
 from .container_lifecycle import ContainerRole
+from .lifecycle_owner import OwnerStatePublicationError, OwnerStatePublicationFailure
 from .repo_identity import discover_repository_identity_and_context, load_or_create_repo_json
 from .state_locks import LockError, LockKind, LockScope, acquire_lifecycle_lock, acquire_repository_lock
 from .state_root import init_state_root, open_or_create_canonical_root, validate_state_root_containment
@@ -1705,29 +1706,126 @@ class LifecycleContainerPublisher:
         return self._cursor.refresh()
 
 
+# Milestone 3 Slice 3C-1 (ADR 0004 Amendment 8): the complete, explicit
+# translation from every `LifecycleStoreFailure` member to an
+# `OwnerStatePublicationFailure` reachable from
+# `LifecycleProjectionCursor.advance_state()`'s own call path. Identical
+# shape and reachability analysis to `_CONTAINER_PUBLICATION_FAILURE_MAP`/
+# `_CHECKPOINT_PUBLICATION_FAILURE_MAP` — `advance_lifecycle_state()`
+# shares the same authoritative-read/stale-comparison/publish pipeline
+# those two resource methods use. `LIFECYCLE_ID_COLLISION`/
+# `RECONCILIATION_BLOCKED` are `prepare_lifecycle()`-only and unreachable
+# here too. Subscript access only, never `.get(..., default)` —
+# `tests/unit/test_lifecycle_store.py` asserts this dict's keys equal
+# the complete real `LifecycleStoreFailure` enum.
+_OWNER_STATE_PUBLICATION_FAILURE_MAP: dict[LifecycleStoreFailure, OwnerStatePublicationFailure] = {
+    LifecycleStoreFailure.SUBSTRATE_UNAVAILABLE: OwnerStatePublicationFailure.SUBSTRATE_UNAVAILABLE,
+    LifecycleStoreFailure.LIFECYCLE_ID_COLLISION: OwnerStatePublicationFailure.UNCLASSIFIED,
+    LifecycleStoreFailure.OVERSIZED: OwnerStatePublicationFailure.OVERSIZED,
+    LifecycleStoreFailure.SCHEMA_INVALID: OwnerStatePublicationFailure.SCHEMA_INVALID,
+    LifecycleStoreFailure.CLEANUP_UNCONFIRMED: OwnerStatePublicationFailure.CLEANUP_UNCONFIRMED,
+    LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED: OwnerStatePublicationFailure.NOT_INSTALLED,
+    LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED: OwnerStatePublicationFailure.DURABILITY_UNCONFIRMED,
+    LifecycleStoreFailure.RECONCILIATION_BLOCKED: OwnerStatePublicationFailure.UNCLASSIFIED,
+    LifecycleStoreFailure.WRONG_LOCK_SCOPE: OwnerStatePublicationFailure.WRONG_LOCK_SCOPE,
+    LifecycleStoreFailure.STALE_EXPECTED_PROJECTION: OwnerStatePublicationFailure.STALE_EXPECTATION,
+    LifecycleStoreFailure.ILLEGAL_TRANSITION: OwnerStatePublicationFailure.ILLEGAL_TRANSITION,
+}
+
+
+class LifecycleOwnerStatePublisher:
+    """Adapts a `_LifecycleProjectionWriter` (via a
+    `LifecycleProjectionCursor`) to `controller.LifecycleOwnerPublisher`'s
+    structural `activate()`/`begin_cleanup()`/`complete()` boundary
+    (Slice 3C-1, ADR 0004 Amendment 8) — the *only* place a
+    `LifecycleStoreError` from an owner-state transition is ever caught
+    and translated into an `OwnerStatePublicationError`.
+
+    Each semantic method hides `LifecycleState` entirely from the caller
+    — `controller.py` never needs to import or reference it.
+    `complete()` needs no separate pre-check of
+    `is_projection_fully_absent_shape()`: it simply requests
+    `LifecycleState.COMPLETE` and lets the writer's own existing
+    `CLEANING -> COMPLETE` clean-final gate (Amendment 3 section 5)
+    raise `ILLEGAL_TRANSITION` naturally when the shape isn't actually
+    absent, translated like any other failure.
+
+    **Isolated use only** when constructed via `__init__` directly —
+    see `LifecycleCheckpointRefPublisher`'s identical warning. Use
+    `create_shared_lifecycle_publishers()` for any scenario touching
+    more than one facade against one lease.
+
+    `current` advances only after a confirmed successful write; on any
+    failure it is left exactly as it was before the failed call — never
+    retried automatically, and `PROJECTION_DURABILITY_UNCONFIRMED` is
+    never treated as success. Call `refresh()` (never automatic) to
+    recover the currently installed authoritative projection after a
+    durability-unconfirmed result."""
+
+    def __init__(self, writer: "_LifecycleProjectionWriter", initial_projection: LifecycleProjection) -> None:
+        self._cursor = LifecycleProjectionCursor(writer, initial_projection)
+
+    @classmethod
+    def _from_cursor(cls, cursor: LifecycleProjectionCursor) -> "LifecycleOwnerStatePublisher":
+        """Private: the only sanctioned coordinated-construction path is
+        `create_shared_lifecycle_publishers()`."""
+        obj = cls.__new__(cls)
+        obj._cursor = cursor
+        return obj
+
+    @property
+    def current(self) -> LifecycleProjection:
+        return self._cursor.current
+
+    def _advance(self, state: LifecycleState) -> None:
+        try:
+            self._cursor.advance_state(state)
+        except LifecycleStoreError as exc:
+            raise OwnerStatePublicationError(
+                _OWNER_STATE_PUBLICATION_FAILURE_MAP[exc.reason],
+                "owner-state lifecycle transition could not be published",
+            ) from exc
+
+    def activate(self) -> None:
+        self._advance(LifecycleState.ACTIVE)
+
+    def begin_cleanup(self) -> None:
+        self._advance(LifecycleState.CLEANING)
+
+    def complete(self) -> None:
+        self._advance(LifecycleState.COMPLETE)
+
+    def refresh(self) -> LifecycleProjection:
+        """Explicit, never-automatic recovery operation — delegates to
+        the shared cursor, un-staling every facade sharing it."""
+        return self._cursor.refresh()
+
+
 @dataclass(frozen=True)
 class SharedLifecyclePublishers:
     """The bundle `create_shared_lifecycle_publishers()` returns (Slice
-    3B-7, ADR 0004 Amendment 7): one shared `LifecycleProjectionCursor`
-    plus a `LifecycleCheckpointRefPublisher` and a
-    `LifecycleContainerPublisher` both constructed against that exact
-    same cursor — never against independent private ones. A named bundle
-    rather than a positional tuple, so a call site can never confuse
-    which field is which."""
+    3B-7/3C-1, ADR 0004 Amendments 7-8): one shared
+    `LifecycleProjectionCursor` plus a `LifecycleCheckpointRefPublisher`,
+    a `LifecycleContainerPublisher`, and a `LifecycleOwnerStatePublisher`
+    all constructed against that exact same cursor — never against
+    independent private ones. A named bundle rather than a positional
+    tuple, so a call site can never confuse which field is which."""
 
     cursor: LifecycleProjectionCursor
     checkpoint_ref_publisher: LifecycleCheckpointRefPublisher
     container_publisher: LifecycleContainerPublisher
+    owner_publisher: LifecycleOwnerStatePublisher
 
 
 def create_shared_lifecycle_publishers(
     writer: "_LifecycleProjectionWriter", initial: LifecycleProjection
 ) -> SharedLifecyclePublishers:
-    """The one sanctioned way to obtain a `LifecycleCheckpointRefPublisher`
-    and a `LifecycleContainerPublisher` safe to use together against the
-    same lease (Slice 3B-7, ADR 0004 Amendment 7). Both facades share the
-    single `LifecycleProjectionCursor` returned alongside them, so a
-    write through either one keeps the other's own next write correctly
+    """The one sanctioned way to obtain a `LifecycleCheckpointRefPublisher`,
+    a `LifecycleContainerPublisher`, and a `LifecycleOwnerStatePublisher`
+    safe to use together against the same lease (Slice 3B-7/3C-1, ADR
+    0004 Amendments 7-8). All three facades share the single
+    `LifecycleProjectionCursor` returned alongside them, so a write
+    through any one keeps the others' own next write correctly
     synchronized — the independent-`_current`-per-facade staleness bug
     this slice fixes is structurally unreachable through this factory."""
     cursor = LifecycleProjectionCursor(writer, initial)
@@ -1735,6 +1833,7 @@ def create_shared_lifecycle_publishers(
         cursor=cursor,
         checkpoint_ref_publisher=LifecycleCheckpointRefPublisher._from_cursor(cursor),
         container_publisher=LifecycleContainerPublisher._from_cursor(cursor),
+        owner_publisher=LifecycleOwnerStatePublisher._from_cursor(cursor),
     )
 
 

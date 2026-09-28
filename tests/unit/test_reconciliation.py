@@ -195,6 +195,32 @@ def test_terminal_absent_shape_is_skipped_with_zero_calls(harness, monkeypatch):
     assert not result.blocked
 
 
+def test_complete_absent_shape_is_skipped_with_zero_calls(harness, monkeypatch):
+    """The owner-state `COMPLETE` state (Milestone 3 Slice 3C-1, ADR
+    0004 Amendment 8's `LifecycleOwnerStatePublisher.complete()`) is
+    clean-final identically to `RECONCILED` --
+    `reconciliation.py`'s own clean-final check
+    (`peek.state in (LifecycleState.COMPLETE, LifecycleState.RECONCILED)`)
+    treats them via the same code path, but this is the one test that
+    exercises `COMPLETE` specifically rather than only `RECONCILED`."""
+    lifecycle_id = "a" * 32
+    projection = dataclasses.replace(_initial_projection(harness, lifecycle_id), state=ls.LifecycleState.COMPLETE)
+    _seed_run_dir(harness, lifecycle_id, projection)
+
+    def _boom(*a, **k):
+        raise AssertionError("must not be called for a terminal entry")
+
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _boom)
+    monkeypatch.setattr(rc, "_worktree_registered_paths", _boom)
+    monkeypatch.setattr(rc.CheckpointRef, "observe", _boom)
+    monkeypatch.setattr(sl, "acquire_lock_nonblocking_at", _boom)
+
+    result = harness.reconcile()
+    assert len(result.entries) == 1
+    assert result.entries[0].outcome is rc.ReconciliationEntryOutcome.SKIPPED_TERMINAL
+    assert not result.blocked
+
+
 def test_terminal_with_non_absent_attribution_is_refused(harness):
     lifecycle_id = "a" * 32
     projection = _initial_projection(harness, lifecycle_id)

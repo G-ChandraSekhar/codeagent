@@ -252,6 +252,21 @@ class ErrorCode(str, Enum):
     # remains available in-process for logging/debugging without
     # widening this stable, serialized taxonomy.
     CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED = "checkpoint_lifecycle_publication_failed"
+    # Milestone 3 Slice 3C-1 (ADR 0004 Amendment 8): a confirmed failure
+    # to publish the run's owner-state lifecycle transition to ACTIVE at
+    # run start (`lifecycle_owner.OwnerStatePublicationError` from
+    # `RunController.run()`'s `activate()` call). `RunStarted` was
+    # already emitted and the RUN_STARTED domain transition already
+    # occurred before this call -- this code does not mean the run never
+    # started; it means normal baseline/model/tool execution never began
+    # because the run's lifecycle projection could not be confirmed
+    # ACTIVE. Deliberately distinct from LIFECYCLE_CLEANUP_UNCONFIRMED,
+    # which covers terminal-path resource cleanup or lifecycle-projection
+    # bookkeeping (`begin_cleanup()`/`complete()`) that could not be
+    # confirmed: this code instead means the ACTIVE projection transition
+    # itself could not be confirmed before normal baseline/model/tool
+    # execution began.
+    LIFECYCLE_STATE_PUBLICATION_FAILED = "lifecycle_state_publication_failed"
 
 
 ERROR_DOMAIN_BY_CODE: dict[ErrorCode, ErrorDomain] = {
@@ -284,6 +299,7 @@ ERROR_DOMAIN_BY_CODE: dict[ErrorCode, ErrorDomain] = {
     ErrorCode.WORKSPACE_ENTRY_GATE_FAILED: ErrorDomain.LIFECYCLE,
     ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED: ErrorDomain.LIFECYCLE,
     ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED: ErrorDomain.LIFECYCLE,
+    ErrorCode.LIFECYCLE_STATE_PUBLICATION_FAILED: ErrorDomain.LIFECYCLE,
 }
 
 

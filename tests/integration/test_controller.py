@@ -28,10 +28,12 @@ from codeagent.controller import (
     VerificationResult,
 )
 from codeagent.errors import ErrorCode, OperationalError
+from codeagent.lifecycle_owner import OwnerStatePublicationError, OwnerStatePublicationFailure
 from tests.support.fakes import (
     FakeApprovalProvider,
     FakeCheckpointSession,
     FakeEvidenceSink,
+    FakeLifecycleOwnerPublisher,
     FakeModel,
     FakePatchApplier,
     FakeRepositoryReader,
@@ -68,6 +70,7 @@ def _build(
     workspace: object | None = None,
     session: object | None = None,
     evidence_sink: object | None = None,
+    lifecycle_owner: object | None = None,
 ) -> RunController:
     config = RunConfig(
         run_id=run_id,
@@ -88,6 +91,7 @@ def _build(
         session if session is not None else FakeCheckpointSession(),
         evidence_sink if evidence_sink is not None else FakeEvidenceSink(),
         clock=SteppingClock(),
+        lifecycle_owner=lifecycle_owner,
     )
 
 
@@ -1012,3 +1016,316 @@ def test_delete_time_publication_error_still_maps_to_lifecycle_cleanup_unconfirm
     assert finished.error is not None
     assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
     assert session.delete_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3 Slice 3C-1 (ADR 0004 Amendment 8): the optional
+# `lifecycle_owner` collaborator and its exact ordering/precedence.
+# ---------------------------------------------------------------------------
+
+
+def test_omitted_lifecycle_owner_preserves_existing_behavior() -> None:
+    """The default (no `lifecycle_owner`) must behave byte-for-byte as
+    before this slice: no activate()/begin_cleanup()/complete() call is
+    ever attempted, and the happy path is completely unaffected."""
+    controller = _build("r-no-lifecycle-owner")
+    assert controller._lifecycle_owner is None
+    assert controller._lifecycle_owner_active is False
+
+    finished = controller.run()
+
+    assert finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED
+    assert finished.error is None
+    _assert_no_stray_errors(controller)
+
+
+def test_activation_precedes_baseline_and_all_other_run_work() -> None:
+    owner = FakeLifecycleOwnerPublisher()
+    order: list[str] = []
+    real_activate = owner.activate
+
+    def _activate() -> None:
+        order.append("activate")
+        real_activate()
+
+    owner.activate = _activate  # type: ignore[method-assign]
+
+    original_run_baseline = FakeVerifier.run_baseline
+
+    def _run_baseline(self):  # type: ignore[no-untyped-def]
+        order.append("run_baseline")
+        return original_run_baseline(self)
+
+    try:
+        FakeVerifier.run_baseline = _run_baseline  # type: ignore[assignment]
+        controller = _build("r-activate-first", lifecycle_owner=owner)
+        controller.run()
+    finally:
+        FakeVerifier.run_baseline = original_run_baseline  # type: ignore[assignment]
+
+    assert order == ["activate", "run_baseline"]
+    assert controller._lifecycle_owner_active is True
+
+
+def test_activation_failure_performs_no_begin_cleanup_or_complete() -> None:
+    owner = FakeLifecycleOwnerPublisher()
+    owner.activate_error = OwnerStatePublicationError(
+        OwnerStatePublicationFailure.NOT_INSTALLED, "forced-injected-detail-that-must-not-leak"
+    )
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    controller = _build(
+        "r-activate-fails", lifecycle_owner=owner, workspace=workspace, session=session
+    )
+
+    finished = controller.run()
+
+    assert owner.calls == ["activate"]
+    assert controller._lifecycle_owner_active is False
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.LIFECYCLE_STATE_PUBLICATION_FAILED
+    assert finished.error.message == "the run's lifecycle projection could not be confirmed active"
+    assert "forced-injected-detail-that-must-not-leak" not in finished.error.message
+    assert "NOT_INSTALLED" not in finished.error.message
+    assert "not_installed" not in finished.error.message
+    # Ordinary teardown still ran (evidence capture, dispose, delete) --
+    # activation failing does not skip real resource cleanup.
+    assert workspace.disposed is True
+    assert session.delete_calls == 1
+    # No PatchApplied/CheckpointCreated -- nothing but activate() was
+    # ever attempted.
+    assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
+    assert not any(isinstance(e, events.BaselineRecorded) for e in controller.log.events)
+
+
+def test_begin_cleanup_precedes_resource_teardown() -> None:
+    order: list[str] = []
+    owner = FakeLifecycleOwnerPublisher()
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+
+    real_begin_cleanup = owner.begin_cleanup
+    real_dispose = workspace.dispose
+    real_delete = session.delete
+
+    def _begin_cleanup() -> None:
+        order.append("begin_cleanup")
+        real_begin_cleanup()
+
+    def _dispose() -> None:
+        order.append("dispose")
+        real_dispose()
+
+    def _delete() -> None:
+        order.append("delete")
+        real_delete()
+
+    owner.begin_cleanup = _begin_cleanup  # type: ignore[method-assign]
+    workspace.dispose = _dispose  # type: ignore[method-assign]
+    session.delete = _delete  # type: ignore[method-assign]
+
+    controller = _build(
+        "r-begin-cleanup-order", lifecycle_owner=owner, workspace=workspace, session=session
+    )
+    controller.run()
+
+    assert order == ["begin_cleanup", "dispose", "delete"]
+
+
+def test_begin_cleanup_failure_does_not_stop_subsequent_cleanup() -> None:
+    owner = FakeLifecycleOwnerPublisher()
+    owner.begin_cleanup_error = OwnerStatePublicationError(
+        OwnerStatePublicationFailure.DURABILITY_UNCONFIRMED, "forced-injected-detail-that-must-not-leak"
+    )
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink()
+    controller = _build(
+        "r-begin-cleanup-fails",
+        lifecycle_owner=owner,
+        workspace=workspace,
+        session=session,
+        evidence_sink=evidence_sink,
+    )
+
+    finished = controller.run()
+
+    assert owner.calls == ["activate", "begin_cleanup"]  # complete() never attempted
+    assert evidence_sink.capture_calls == 1
+    assert workspace.disposed is True
+    assert session.delete_calls == 1
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+    assert finished.error.message == (
+        "a verifier container, worktree, or checkpoint-ref cleanup step, "
+        "or the run's lifecycle-projection bookkeeping, could not be confirmed"
+    )
+    assert "forced-injected-detail-that-must-not-leak" not in finished.error.message
+    assert "DURABILITY_UNCONFIRMED" not in finished.error.message
+    assert "durability_unconfirmed" not in finished.error.message
+
+
+def test_complete_occurs_only_after_confirmed_resource_cleanup() -> None:
+    """A confirmed worktree-disposal failure must prevent `complete()`
+    from ever being attempted -- an unconfirmed owned resource means
+    the projection genuinely cannot reach `COMPLETE`."""
+    owner = FakeLifecycleOwnerPublisher()
+    workspace = FakeWorkspace()
+    workspace.dispose_error = RuntimeError("disposal failed")
+    session = FakeCheckpointSession()
+    controller = _build(
+        "r-complete-gated-on-cleanup", lifecycle_owner=owner, workspace=workspace, session=session
+    )
+
+    finished = controller.run()
+
+    assert owner.calls == ["activate", "begin_cleanup"]
+    assert "complete" not in owner.calls
+    assert session.delete_calls == 0  # skipped: worktree disposal unconfirmed
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+
+
+def test_evidence_failure_does_not_block_complete() -> None:
+    """Corrected rule (ADR 0004 Amendment 8): `lifecycle.json` is an
+    operational resource-recovery projection, not the audit/evidence
+    record. Evidence-capture failure must never prevent `complete()`
+    from being attempted once `begin_cleanup()` and all owned-resource
+    cleanup are confirmed."""
+    owner = FakeLifecycleOwnerPublisher()
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink(raise_error=RuntimeError("sink exploded"))
+    controller = _build(
+        "r-evidence-fails-complete-ok",
+        lifecycle_owner=owner,
+        workspace=workspace,
+        session=session,
+        evidence_sink=evidence_sink,
+    )
+
+    finished = controller.run()
+
+    assert owner.calls == ["activate", "begin_cleanup", "complete"]
+    assert workspace.disposed is True
+    assert session.delete_calls == 1
+    # complete() genuinely succeeded -- the lifecycle projection reaches
+    # COMPLETE -- while RunFinished still carries the evidence error, not
+    # LIFECYCLE_CLEANUP_UNCONFIRMED. The two facts coexist and must never
+    # be conflated.
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+
+
+def test_evidence_failure_and_complete_failure_together_are_dominated_by_lifecycle_cleanup_unconfirmed() -> None:
+    """Load-bearing combined-failure dominance test: when both an
+    evidence-capture failure AND a `complete()` publication failure
+    occur together, `LIFECYCLE_CLEANUP_UNCONFIRMED` must dominate the
+    evidence error under the existing precedence -- the evidence
+    failure is not lost, merely outranked."""
+    owner = FakeLifecycleOwnerPublisher()
+    owner.complete_error = OwnerStatePublicationError(
+        OwnerStatePublicationFailure.ILLEGAL_TRANSITION, "forced"
+    )
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink(raise_error=RuntimeError("sink exploded"))
+    controller = _build(
+        "r-evidence-and-complete-fail",
+        lifecycle_owner=owner,
+        workspace=workspace,
+        session=session,
+        evidence_sink=evidence_sink,
+    )
+
+    finished = controller.run()
+
+    assert owner.calls == ["activate", "begin_cleanup", "complete"]
+    assert evidence_sink.capture_calls == 1
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+
+
+def test_original_run_failure_combined_with_lifecycle_publication_failure_is_dominated() -> None:
+    """An original, non-UNRECOVERABLE_ERROR terminal reason
+    (`BUDGET_EXCEEDED`) occurring together with a terminal-path
+    lifecycle-publication failure must still be overridden by
+    `LIFECYCLE_CLEANUP_UNCONFIRMED`, exactly as it already is for
+    verifier/worktree/ref cleanup failures today."""
+    owner = FakeLifecycleOwnerPublisher()
+    owner.complete_error = OwnerStatePublicationError(
+        OwnerStatePublicationFailure.SUBSTRATE_UNAVAILABLE, "forced"
+    )
+    controller = _build(
+        "r-budget-exceeded-and-lifecycle-fail",
+        approval_decisions=(domain.ApprovalDecision.REVISION_REQUESTED,),
+        max_plan_revisions=2,
+        lifecycle_owner=owner,
+    )
+
+    finished = controller.run()
+
+    assert owner.calls == ["activate", "begin_cleanup", "complete"]
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [OwnerStatePublicationFailure.NOT_INSTALLED, OwnerStatePublicationFailure.DURABILITY_UNCONFIRMED],
+)
+def test_activate_failure_maps_identically_regardless_of_underlying_reason(
+    reason: OwnerStatePublicationFailure,
+) -> None:
+    """The controller never differentiates by `OwnerStatePublicationFailure.
+    reason` in `RunFinished` -- every reason folds into the same
+    `LIFECYCLE_STATE_PUBLICATION_FAILED` code, whether the underlying
+    write was never installed or installed-but-durability-unconfirmed."""
+    owner = FakeLifecycleOwnerPublisher()
+    owner.activate_error = OwnerStatePublicationError(reason, "forced")
+    controller = _build("r-activate-reason-parity", lifecycle_owner=owner)
+
+    finished = controller.run()
+
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.LIFECYCLE_STATE_PUBLICATION_FAILED
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [OwnerStatePublicationFailure.NOT_INSTALLED, OwnerStatePublicationFailure.DURABILITY_UNCONFIRMED],
+)
+def test_complete_failure_maps_identically_regardless_of_underlying_reason(
+    reason: OwnerStatePublicationFailure,
+) -> None:
+    owner = FakeLifecycleOwnerPublisher()
+    owner.complete_error = OwnerStatePublicationError(reason, "forced")
+    controller = _build("r-complete-reason-parity", lifecycle_owner=owner)
+
+    finished = controller.run()
+
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+
+
+def test_no_automatic_refresh_or_retry() -> None:
+    """`RunController` never calls a collaborator method more than once
+    per opportunity -- no automatic retry after any owner-state
+    publication failure, and no `refresh()` call at all (the
+    `LifecycleOwnerPublisher` Protocol has no `refresh()` method,
+    structurally preventing the controller from ever calling it)."""
+    owner = FakeLifecycleOwnerPublisher()
+    controller = _build("r-no-retry", lifecycle_owner=owner)
+
+    controller.run()
+
+    # Each transition attempted at most once across the whole run.
+    assert owner.calls.count("activate") == 1
+    assert owner.calls.count("begin_cleanup") == 1
+    assert owner.calls.count("complete") == 1

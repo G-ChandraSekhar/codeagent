@@ -15,6 +15,7 @@ from codeagent import _git_safety as gs
 from codeagent import _lifecycle_fs as lf
 from codeagent import checkpoint_ref as cr
 from codeagent import checkpoint_session as cs
+from codeagent import lifecycle_owner as lo
 from codeagent import lifecycle_store as ls
 from codeagent import repo_identity as ri
 from codeagent import state_locks as sl
@@ -3038,6 +3039,284 @@ def test_checkpoint_publisher_translates_lifecycle_store_error(tmp_path, monkeyp
     assert "WRONG_LOCK_SCOPE" not in str(excinfo.value)
 
 
+# ---------------------------------------------------------------------------
+# Slice 3C-1 (ADR 0004 Amendment 8): LifecycleOwnerStatePublisher --
+# activate()/begin_cleanup()/complete() and their exhaustive failure
+# translation, mirroring the container/checkpoint precedents exactly.
+# ---------------------------------------------------------------------------
+
+
+def test_owner_state_publication_failure_map_is_exhaustive():
+    """Every current `LifecycleStoreFailure` member must have an
+    explicit mapping entry — mirrors the container/checkpoint-side
+    exhaustiveness tests exactly."""
+    assert set(ls._OWNER_STATE_PUBLICATION_FAILURE_MAP.keys()) == set(ls.LifecycleStoreFailure)
+
+
+def test_owner_state_publication_failure_map_only_classifies_prepare_lifecycle_only_reasons_as_unclassified():
+    """`UNCLASSIFIED` is reserved exclusively for
+    `LIFECYCLE_ID_COLLISION`/`RECONCILIATION_BLOCKED` (both
+    `prepare_lifecycle()`-only, confirmed unreachable from
+    `advance_lifecycle_state()`) — every other member gets its own
+    precise, non-catch-all reason."""
+    unclassified_keys = {
+        reason
+        for reason, mapped in ls._OWNER_STATE_PUBLICATION_FAILURE_MAP.items()
+        if mapped is lo.OwnerStatePublicationFailure.UNCLASSIFIED
+    }
+    assert unclassified_keys == {
+        ls.LifecycleStoreFailure.LIFECYCLE_ID_COLLISION,
+        ls.LifecycleStoreFailure.RECONCILIATION_BLOCKED,
+    }
+
+
+def test_owner_state_publisher_activate_begin_cleanup_complete_happy_path(tmp_path, monkeypatch):
+    """All three semantic transitions succeed in the accepted owner
+    state graph and thread the returned projection forward through the
+    shared cursor — `RunController` never needs to see `LifecycleState`
+    itself."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleOwnerStatePublisher(writer, current)
+
+        publisher.activate()
+        assert publisher.current.state is ls.LifecycleState.ACTIVE
+
+        publisher.begin_cleanup()
+        assert publisher.current.state is ls.LifecycleState.CLEANING
+
+        publisher.complete()
+        assert publisher.current.state is ls.LifecycleState.COMPLETE
+    finally:
+        lease.close()
+
+
+def test_owner_state_publisher_does_not_hide_stale_expectation(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleOwnerStatePublisher(writer, current)
+        # A second, independent writer publishes behind the adapter's back.
+        real_current = writer.record_checkpoint_ref_transition(
+            expected=current, transition=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1"))
+        )
+        assert real_current != current
+
+        with pytest.raises(lo.OwnerStatePublicationError) as excinfo:
+            publisher.activate()
+        assert excinfo.value.reason is lo.OwnerStatePublicationFailure.STALE_EXPECTATION
+        assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.STALE_EXPECTED_PROJECTION
+        assert publisher.current == current
+    finally:
+        lease.close()
+
+
+def test_owner_state_publisher_pre_installation_failure_leaves_expected_unchanged(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleOwnerStatePublisher(writer, current)
+
+        def _boom(fd, data):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.IO_FAILED, "forced")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "write_all_eintr_safe", _boom)
+            with pytest.raises(lo.OwnerStatePublicationError) as excinfo:
+                publisher.activate()
+            assert excinfo.value.reason is lo.OwnerStatePublicationFailure.NOT_INSTALLED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED
+        # No write attempt landed: the cursor's belief and the installed
+        # projection both remain exactly the pre-call PREPARING value.
+        assert publisher.current == current
+    finally:
+        lease.close()
+
+
+def test_owner_state_publisher_activate_durability_unconfirmed_installed_vs_cursor_split(tmp_path, monkeypatch):
+    """`PROJECTION_DURABILITY_UNCONFIRMED` means `os.replace` already
+    installed the new (ACTIVE) projection on disk; only the trailing
+    directory-fsync confirmation failed. The adapter's own `current`
+    belief must NOT advance (it stays PREPARING, per the cursor's
+    "update only after a confirmed successful write" rule), but an
+    explicit `refresh()` proves the installed value really is ACTIVE --
+    the installed-on-disk state and the cursor's belief genuinely
+    diverge until refresh() is called. `RunController` must never call
+    refresh() automatically; this test proves only that the adapter
+    itself supports the divergence and its explicit recovery. This is
+    the `activate()` phase only -- see the sibling `begin_cleanup()`/
+    `complete()` tests immediately below for the other two phases; no
+    single test here proves all three."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleOwnerStatePublisher(writer, current)
+
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_last_fsync(fd):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced directory fsync failure")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
+            with pytest.raises(lo.OwnerStatePublicationError) as excinfo:
+                publisher.activate()
+            assert excinfo.value.reason is lo.OwnerStatePublicationFailure.DURABILITY_UNCONFIRMED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+
+        # No automatic refresh or retry: the cursor never silently
+        # treats this as success.
+        assert publisher.current == current
+        assert publisher.current.state is ls.LifecycleState.PREPARING
+
+        # But the installed-on-disk projection genuinely is ACTIVE --
+        # only an explicit, never-automatic refresh() reveals this.
+        refreshed = publisher.refresh()
+        assert refreshed.state is ls.LifecycleState.ACTIVE
+        assert publisher.current is refreshed
+    finally:
+        lease.close()
+
+
+def test_owner_state_publisher_begin_cleanup_durability_unconfirmed_installed_vs_cursor_split(
+    tmp_path, monkeypatch
+):
+    """Same divergence as the `activate()` test above, for the
+    `begin_cleanup()` phase: the cursor stays at ACTIVE (the pre-call
+    state) while the installed-on-disk projection genuinely advances to
+    CLEANING. `activate()` is called for real, unfaulted, first, so the
+    starting point is genuinely ACTIVE rather than assumed."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleOwnerStatePublisher(writer, current)
+        publisher.activate()
+        assert publisher.current.state is ls.LifecycleState.ACTIVE
+        active_projection = publisher.current
+
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_last_fsync(fd):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced directory fsync failure")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
+            with pytest.raises(lo.OwnerStatePublicationError) as excinfo:
+                publisher.begin_cleanup()
+            assert excinfo.value.reason is lo.OwnerStatePublicationFailure.DURABILITY_UNCONFIRMED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+
+        # No automatic refresh or retry.
+        assert publisher.current == active_projection
+        assert publisher.current.state is ls.LifecycleState.ACTIVE
+
+        refreshed = publisher.refresh()
+        assert refreshed.state is ls.LifecycleState.CLEANING
+        assert publisher.current is refreshed
+    finally:
+        lease.close()
+
+
+def test_owner_state_publisher_complete_durability_unconfirmed_installed_vs_cursor_split(tmp_path, monkeypatch):
+    """Same divergence as the two tests above, for the `complete()`
+    phase: the cursor stays at CLEANING (the pre-call state) while the
+    installed-on-disk projection genuinely reaches COMPLETE.
+    `activate()`/`begin_cleanup()` are called for real, unfaulted,
+    first. Additionally proves the installed COMPLETE projection is a
+    genuinely valid clean-final shape
+    (`is_projection_fully_absent_shape()`) -- the same predicate the
+    writer's own `CLEANING -> COMPLETE` gate and reconciliation's
+    terminal recognition both depend on. The COMPLETE-specific
+    reconciliation `SKIPPED_TERMINAL` behavior itself is proven
+    separately, without duplicating this real-writer fixture, by
+    `tests/unit/test_reconciliation.py::
+    test_complete_absent_shape_is_skipped_with_zero_calls`."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleOwnerStatePublisher(writer, current)
+        publisher.activate()
+        publisher.begin_cleanup()
+        assert publisher.current.state is ls.LifecycleState.CLEANING
+        cleaning_projection = publisher.current
+
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_last_fsync(fd):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced directory fsync failure")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
+            with pytest.raises(lo.OwnerStatePublicationError) as excinfo:
+                publisher.complete()
+            assert excinfo.value.reason is lo.OwnerStatePublicationFailure.DURABILITY_UNCONFIRMED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+
+        # No automatic refresh or retry.
+        assert publisher.current == cleaning_projection
+        assert publisher.current.state is ls.LifecycleState.CLEANING
+
+        refreshed = publisher.refresh()
+        assert refreshed.state is ls.LifecycleState.COMPLETE
+        assert publisher.current is refreshed
+        # Genuinely valid clean-final: the installed COMPLETE projection
+        # really does satisfy the same absent-shape predicate
+        # CLEANING -> COMPLETE's own writer-side gate required to accept
+        # it in the first place.
+        assert ls.is_projection_fully_absent_shape(refreshed)
+    finally:
+        lease.close()
+
+
+def test_owner_state_publisher_wrong_lock_scope_is_translated(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    writer, current = lease.open_projection_writer()
+    lease.close()
+    publisher = ls.LifecycleOwnerStatePublisher(writer, current)
+
+    with pytest.raises(lo.OwnerStatePublicationError) as excinfo:
+        publisher.activate()
+    assert excinfo.value.reason is lo.OwnerStatePublicationFailure.WRONG_LOCK_SCOPE
+    assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+    assert publisher.current == current
+
+
+def test_owner_state_publisher_illegal_transition_is_translated(tmp_path, monkeypatch):
+    """`COMPLETE` is not a legal edge directly from `ACTIVE` (only
+    `CLEANING` is) -- `ILLEGAL_TRANSITION` is translated, never
+    propagated unchanged as a raw `LifecycleStoreError`, and the
+    original is preserved as `__cause__`."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleOwnerStatePublisher(writer, current)
+        publisher.activate()
+
+        with pytest.raises(lo.OwnerStatePublicationError) as excinfo:
+            publisher.complete()
+
+        assert excinfo.value.reason is lo.OwnerStatePublicationFailure.ILLEGAL_TRANSITION
+        assert isinstance(excinfo.value.__cause__, ls.LifecycleStoreError)
+        assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+        assert "ILLEGAL_TRANSITION" not in str(excinfo.value)
+        assert publisher.current.state is ls.LifecycleState.ACTIVE
+    finally:
+        lease.close()
+
+
 # --- The staleness bug (documentation regression, not a target to preserve) ---
 
 
@@ -3056,6 +3335,7 @@ def test_standalone_adapters_must_never_be_combined_against_one_writer(tmp_path,
         writer, current = lease.open_projection_writer()
         checkpoint_pub = ls.LifecycleCheckpointRefPublisher(writer, current)
         container_pub = ls.LifecycleContainerPublisher(writer, current)
+        owner_pub = ls.LifecycleOwnerStatePublisher(writer, current)
 
         # A write through the container publisher moves the real
         # projection; the checkpoint publisher's own `_current` still
@@ -3067,6 +3347,12 @@ def test_standalone_adapters_must_never_be_combined_against_one_writer(tmp_path,
                 cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_sha("1"))
             )
         assert excinfo.value.reason is cs.CheckpointPublicationFailure.STALE_EXPECTATION
+
+        # The owner-state publisher's own private `_current` is stale
+        # too, for the identical reason.
+        with pytest.raises(lo.OwnerStatePublicationError) as owner_excinfo:
+            owner_pub.activate()
+        assert owner_excinfo.value.reason is lo.OwnerStatePublicationFailure.STALE_EXPECTATION
     finally:
         lease.close()
 
@@ -3086,7 +3372,13 @@ def test_shared_publishers_have_no_shadow_current(tmp_path, monkeypatch):
 
         assert set(vars(bundle.checkpoint_ref_publisher).keys()) == {"_cursor"}
         assert set(vars(bundle.container_publisher).keys()) == {"_cursor"}
-        assert bundle.checkpoint_ref_publisher._cursor is bundle.container_publisher._cursor is bundle.cursor
+        assert set(vars(bundle.owner_publisher).keys()) == {"_cursor"}
+        assert (
+            bundle.checkpoint_ref_publisher._cursor
+            is bundle.container_publisher._cursor
+            is bundle.owner_publisher._cursor
+            is bundle.cursor
+        )
     finally:
         lease.close()
 
@@ -3100,11 +3392,15 @@ def test_standalone_constructor_still_works_and_is_source_compatible(tmp_path, m
         writer, current = lease.open_projection_writer()
         checkpoint_pub = ls.LifecycleCheckpointRefPublisher(writer, current)
         container_pub = ls.LifecycleContainerPublisher(writer, current)
+        owner_pub = ls.LifecycleOwnerStatePublisher(writer, current)
         assert set(vars(checkpoint_pub).keys()) == {"_cursor"}
         assert set(vars(container_pub).keys()) == {"_cursor"}
-        assert checkpoint_pub._cursor is not container_pub._cursor
+        assert set(vars(owner_pub).keys()) == {"_cursor"}
+        assert checkpoint_pub._cursor is not container_pub._cursor is not owner_pub._cursor
+        assert checkpoint_pub._cursor is not owner_pub._cursor
         assert checkpoint_pub.current == current
         assert container_pub.current == current
+        assert owner_pub.current == current
     finally:
         lease.close()
 
@@ -3222,5 +3518,41 @@ def test_shared_bundle_realistic_interleaving_no_spurious_staleness(tmp_path, mo
         with pytest.raises(cl.ContainerPublicationError) as excinfo:
             container_pub.publish(role=ls.ContainerRole.VERIFICATION, intent=ls.ContainerIntent.CREATING, id=None)
         assert excinfo.value.reason is cl.ContainerPublicationFailure.STALE_EXPECTATION
+    finally:
+        lease.close()
+
+
+def test_shared_bundle_owner_publisher_reaches_preparing_active_cleaning_complete(tmp_path, monkeypatch):
+    """Slice 3C-1's own real-writer, real-lease, no-Docker proof: the
+    owner-state publisher genuinely drives
+    `PREPARING -> ACTIVE -> CLEANING -> COMPLETE` through the shared
+    bundle once every other owned resource (both containers, the
+    checkpoint ref) has independently reached its own absent shape --
+    exactly what `is_projection_fully_absent_shape()`'s `CLEANING ->
+    COMPLETE` clean-final gate requires. No composition API is
+    introduced here -- this exercises the existing
+    `create_shared_lifecycle_publishers()` factory directly, the same
+    one `RunController`'s own (unbuilt) future composition layer would
+    use."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        bundle = ls.create_shared_lifecycle_publishers(writer, current)
+        cursor = bundle.cursor
+        owner_pub = bundle.owner_publisher
+
+        assert cursor.current.state is ls.LifecycleState.PREPARING
+
+        owner_pub.activate()
+        assert cursor.current.state is ls.LifecycleState.ACTIVE
+
+        owner_pub.begin_cleanup()
+        assert cursor.current.state is ls.LifecycleState.CLEANING
+
+        # The initial projection's containers/worktree/checkpoint-ref
+        # are already at their absent shape (nothing else in this test
+        # ever touched them), so the clean-final gate is satisfied.
+        owner_pub.complete()
+        assert cursor.current.state is ls.LifecycleState.COMPLETE
     finally:
         lease.close()

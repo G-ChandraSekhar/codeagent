@@ -107,6 +107,7 @@ def test_domain_of_matches_the_fixed_mapping(code: ErrorCode) -> None:
         (ErrorCode.WORKSPACE_ENTRY_GATE_FAILED, ErrorDomain.LIFECYCLE),
         (ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED, ErrorDomain.LIFECYCLE),
         (ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED, ErrorDomain.LIFECYCLE),
+        (ErrorCode.LIFECYCLE_STATE_PUBLICATION_FAILED, ErrorDomain.LIFECYCLE),
     ],
 )
 def test_specific_code_to_domain_assignments(
@@ -167,6 +168,7 @@ def test_error_code_values_are_pinned() -> None:
         "workspace_entry_gate_failed",
         "lifecycle_cleanup_unconfirmed",
         "checkpoint_lifecycle_publication_failed",
+        "lifecycle_state_publication_failed",
     }
 
 

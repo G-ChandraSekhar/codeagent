@@ -50,6 +50,7 @@ from codeagent.checkpoint_ref import (
 from codeagent.checkpoint_session import CheckpointIntent, CheckpointPublicationError, CheckpointSessionError
 from codeagent.errors import ErrorCode, OperationalError
 from codeagent.evidence import EvidenceReceipt, EvidenceSink
+from codeagent.lifecycle_owner import OwnerStatePublicationError
 
 
 def _canonical_json(payload: dict[str, object]) -> str:
@@ -321,6 +322,24 @@ class CheckpointSessionLike(Protocol):
     def delete(self) -> None: ...
 
 
+class LifecycleOwnerPublisher(Protocol):
+    """Optional collaborator (Milestone 3 Slice 3C-1, ADR 0004
+    Amendment 8). Publishes this run's owner-state lifecycle
+    transitions at the exact moments this controller already tracks
+    internally: `activate()` once, immediately after `RunStarted`,
+    before any EXPLORE/model/tool work begins; `begin_cleanup()` and
+    `complete()` inside `_terminate()`. Raises only
+    `codeagent.lifecycle_owner.OwnerStatePublicationError` — never
+    exposes `lifecycle_store.LifecycleState`, `LifecycleProjection`, or
+    any other persistence-stack type. A fake implementing this Protocol
+    never touches a filesystem or Git ref at all — see
+    `tests.support.fakes.FakeLifecycleOwnerPublisher`."""
+
+    def activate(self) -> None: ...
+    def begin_cleanup(self) -> None: ...
+    def complete(self) -> None: ...
+
+
 class PatchApplier(Protocol):
     """Applies whatever patch the implementation is configured with and
     reports what actually happened. Deliberately does not take the full
@@ -442,6 +461,7 @@ class RunController:
         evidence_sink: EvidenceSink,
         clock: Clock | None = None,
         event_log: EventLog | None = None,
+        lifecycle_owner: LifecycleOwnerPublisher | None = None,
     ) -> None:
         self._c = config
         self._model = model
@@ -466,6 +486,15 @@ class RunController:
         # any verification attempt — forces the workspace/ref to be
         # preserved at terminal teardown, per ADR 0003 Amendment 2.
         self._any_verifier_cleanup_unconfirmed = False
+        # Milestone 3 Slice 3C-1 (ADR 0004 Amendment 8): an optional
+        # owner-state lifecycle-projection publisher. `None` (the
+        # default) preserves every existing caller's behavior exactly —
+        # no activate()/begin_cleanup()/complete() call is ever made.
+        self._lifecycle_owner = lifecycle_owner
+        # True only once activate() has been confirmed to succeed —
+        # begin_cleanup()/complete() are never attempted otherwise,
+        # since PREPARING -> CLEANING is not a legal owner-state edge.
+        self._lifecycle_owner_active = False
 
     def _now(self) -> datetime:
         return self._clock.now()
@@ -552,6 +581,35 @@ class RunController:
             )
         )
         self._transition(0, domain.Trigger.RUN_STARTED)
+
+        # Milestone 3 Slice 3C-1 (ADR 0004 Amendment 8): confirm the
+        # run's lifecycle projection is ACTIVE before any baseline,
+        # model, or tool work begins. No controller-driven baseline,
+        # Docker verification, patch, or checkpoint-ref mutation has
+        # begun yet at this point -- but the physical workspace (the
+        # entered GitWorktree a future composition layer constructs
+        # before RunController itself) may already exist, since this
+        # controller is always handed an already-entered Workspace, not
+        # one it enters itself. That is precisely why routing a failure
+        # here through the ordinary _terminate() sequence is safe rather
+        # than skipping it: _terminate() still disposes or preserves
+        # that workspace and invokes the checkpoint session's cleanup,
+        # the same early-abort pattern already used for a failed initial
+        # READ_FILE.
+        if self._lifecycle_owner is not None:
+            try:
+                self._lifecycle_owner.activate()
+                self._lifecycle_owner_active = True
+            except OwnerStatePublicationError:
+                return self._terminate(
+                    0,
+                    domain.Trigger.UNRECOVERABLE_ERROR,
+                    error=OperationalError(
+                        code=ErrorCode.LIFECYCLE_STATE_PUBLICATION_FAILED,
+                        error_id=f"{c.run_id}-lifecycle-activate",
+                        message="the run's lifecycle projection could not be confirmed active",
+                    ),
+                )
 
         baseline_result = self._verifier.run_baseline()
         self._total_duration += baseline_result.duration_seconds
@@ -1175,16 +1233,41 @@ class RunController:
            and emit `RunFinished` last.
 
         Precedence for `RunFinished.error`: any verifier/worktree/ref
-        cleanup unconfirmed > evidence incomplete > evidence durability
-        unconfirmed > evidence artifact collision > evidence capture
-        failure > the original result. A cleanup-unconfirmed or evidence
-        failure always overrides `trigger` to `UNRECOVERABLE_ERROR`,
-        since domain.py's `TerminalReason` has no separate slot for "the
+        cleanup unconfirmed, or any owner-state lifecycle-publication
+        failure (`begin_cleanup()`/`complete()`, Milestone 3 Slice
+        3C-1) > evidence incomplete > evidence durability unconfirmed >
+        evidence artifact collision > evidence capture failure > the
+        original result. A cleanup-unconfirmed or evidence failure
+        always overrides `trigger` to `UNRECOVERABLE_ERROR`, since
+        domain.py's `TerminalReason` has no separate slot for "the
         original outcome succeeded but teardown did not" — the original
         `error` (if any) stays exactly where it was already recorded
         (e.g. on the `ToolCompleted` that reported it); only
         `RunFinished.error` is replaced.
+
+        Owner-state publication (Slice 3C-1): `begin_cleanup()` is
+        attempted first, before evidence capture — its failure is
+        recorded but never skips evidence capture or the resource-
+        cleanup steps below, which always run regardless.  `complete()`
+        is attempted once `begin_cleanup()` succeeded and all owned-
+        resource cleanup (verifier/worktree/ref) is confirmed —
+        deliberately independent of `evidence_receipt.success`: a
+        `lifecycle.json` operational-recovery projection reaching
+        `COMPLETE` and an `EvidenceSink` audit-capture failure are
+        reported through separate channels and must never be
+        conflated. Both `begin_cleanup()`/`complete()` are only ever
+        attempted when `self._lifecycle_owner_active` is true (i.e.
+        `activate()` was already confirmed) — `PREPARING -> CLEANING`
+        is not a legal owner-state edge. Neither call is ever retried
+        or followed by an automatic `refresh()`.
         """
+        lifecycle_publication_unconfirmed = False
+        if self._lifecycle_owner_active and self._lifecycle_owner is not None:
+            try:
+                self._lifecycle_owner.begin_cleanup()
+            except OwnerStatePublicationError:
+                lifecycle_publication_unconfirmed = True
+
         evidence_receipt = self._capture_evidence(pass_index)
 
         worktree_cleanup_unconfirmed = False
@@ -1205,10 +1288,24 @@ class RunController:
                 except Exception:  # noqa: BLE001 — CheckpointRefError or a fake's own type
                     ref_cleanup_unconfirmed = True
 
+        if (
+            self._lifecycle_owner_active
+            and self._lifecycle_owner is not None
+            and not lifecycle_publication_unconfirmed
+            and not self._any_verifier_cleanup_unconfirmed
+            and not worktree_cleanup_unconfirmed
+            and not ref_cleanup_unconfirmed
+        ):
+            try:
+                self._lifecycle_owner.complete()
+            except OwnerStatePublicationError:
+                lifecycle_publication_unconfirmed = True
+
         cleanup_unconfirmed = (
             self._any_verifier_cleanup_unconfirmed
             or worktree_cleanup_unconfirmed
             or ref_cleanup_unconfirmed
+            or lifecycle_publication_unconfirmed
         )
 
         final_trigger = trigger
@@ -1218,8 +1315,8 @@ class RunController:
             final_error = OperationalError(
                 code=ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED,
                 error_id=f"{self._c.run_id}-cleanup-{pass_index}",
-                message="a verifier container, worktree, or checkpoint-ref cleanup step "
-                "could not be confirmed",
+                message="a verifier container, worktree, or checkpoint-ref cleanup step, "
+                "or the run's lifecycle-projection bookkeeping, could not be confirmed",
             )
         elif not evidence_receipt.success:
             final_trigger = domain.Trigger.UNRECOVERABLE_ERROR

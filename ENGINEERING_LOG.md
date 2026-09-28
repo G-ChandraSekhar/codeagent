@@ -3972,3 +3972,190 @@ diff; only `CLAUDE.md`, this file, and the ADR changed — no production
 code, test, workflow, configuration, or dependency file touched;
 nothing staged. No test run or Docker session was needed for this pass
 — the independently re-verified, completed CI run is the evidence.
+
+## 2026-09-28 — Milestone 3 Slice 3C-1: dependency-light owner-state lifecycle-publication boundary and a RunController terminal hook
+
+Three planning-only passes preceded implementation (not narrated here
+in detail — see the plan file this session tracked), converging on a
+deliberately narrow slice after review found the originally-proposed
+"real composition helper" plan contained three real defects
+(mischaracterizing worktree-attribution deferral as permanent,
+overclaiming an unbuilt composition helper as a "real application
+execution path" that "mitigates T-E1," and an impossible construction
+order constructing `DockerVerifier` before `GitWorktree`) and under-
+specified three real design gaps (dependency inversion for owner-state
+publication, lease-close timing versus an already-emitted `RunFinished`,
+and the size of a real composition function's input surface). The
+corrected, accepted boundary — an owner-state publication abstraction,
+a shared-cursor adapter, and an optional `RunController` terminal hook,
+with all composition/lease-ownership work explicitly deferred — is what
+this entry implements.
+
+**Production**: `src/codeagent/lifecycle_owner.py` (new, stdlib-only):
+`OwnerStatePublicationFailure` (exactly the 10 members
+`ContainerPublicationFailure`/`CheckpointPublicationFailure` already
+use) and `OwnerStatePublicationError`. `src/codeagent/lifecycle_store.py`:
+`LifecycleOwnerStatePublisher` (the concrete adapter — `activate()`/
+`begin_cleanup()`/`complete()` map to `cursor.advance_state(ACTIVE/
+CLEANING/COMPLETE)`, hiding `LifecycleState` from the caller entirely;
+`complete()` relies on the writer's own existing `CLEANING -> COMPLETE`
+clean-final gate rather than duplicating the shape check), an exhaustive
+`_OWNER_STATE_PUBLICATION_FAILURE_MAP`, and a new third field,
+`owner_publisher`, on `SharedLifecyclePublishers`/
+`create_shared_lifecycle_publishers()`. `src/codeagent/controller.py`:
+a new local `LifecycleOwnerPublisher` Protocol beside `Workspace`/
+`CheckpointSessionLike`, one new optional `RunController.__init__`
+parameter, an `activate()` call in `run()` immediately after
+`RunStarted` (before any baseline/model/tool work — routed through the
+existing `_terminate()` early-abort machinery on failure, the same
+pattern already used for a failed initial `READ_FILE`), and
+`begin_cleanup()`/`complete()` calls inside `_terminate()` folded into
+the existing `cleanup_unconfirmed` precedence tier.
+`src/codeagent/errors.py`: one new `ErrorCode.
+LIFECYCLE_STATE_PUBLICATION_FAILED` (`ErrorDomain.LIFECYCLE`), used
+only for a confirmed `activate()` failure at run start — distinct from
+the existing `LIFECYCLE_CLEANUP_UNCONFIRMED`, which now also covers a
+terminal-path `begin_cleanup()`/`complete()` failure (message text
+widened, code value unchanged). Confirmed and left unmodified:
+`src/codeagent/events.py` needs no change, since `RunFinished.
+_UNRECOVERABLE_ERROR_CODES` is computed dynamically as
+`set(ErrorCode) - {POLICY_VIOLATION_SEVERE}`.
+
+**A corrected design decision applied before implementation** (caught
+during the final planning pass, not found as a bug afterward): the
+prior draft's failure table wrongly claimed evidence-capture failure
+alone skips `complete()`. The accepted, implemented rule instead makes
+`complete()` attempted whenever `begin_cleanup()` and all owned-resource
+cleanup are confirmed, regardless of `evidence_receipt.success` —
+`lifecycle.json` is an operational resource-recovery projection, not
+the audit/evidence record, and the two must never be conflated. When
+both an evidence failure and a `complete()` failure occur together,
+`LIFECYCLE_CLEANUP_UNCONFIRMED` dominates the evidence error under the
+existing, unchanged precedence — proved by a dedicated, load-bearing
+test (`test_evidence_failure_and_complete_failure_together_are_
+dominated_by_lifecycle_cleanup_unconfirmed`).
+
+**Tests**: `tests/support/fakes.py` gained `FakeLifecycleOwnerPublisher`
+(records exact call order; raises the real `OwnerStatePublicationError`
+type on injected failure, exercising `RunController`'s catch/fold logic
+identically to the real adapter). `tests/unit/test_lifecycle_store.py`
+gained the map-completeness and `UNCLASSIFIED`-scope tests, all three
+transitions' happy path, stale-expectation/pre-installation/wrong-lock-
+scope/illegal-transition translation tests (mirroring the container/
+checkpoint precedents' exact fault-injection techniques —
+`lf.write_all_eintr_safe` for pre-installation, `lf.fsync_fd`'s second
+call for durability-unconfirmed, a second independent writer for
+staleness), a dedicated durability-unconfirmed installed-vs-cursor
+split test using `refresh()` to prove the divergence, and updates to
+the existing shared-bundle structural tests (`test_shared_publishers_
+have_no_shadow_current`, `test_standalone_constructor_still_works_and_
+is_source_compatible`, `test_standalone_adapters_must_never_be_combined_
+against_one_writer`) to include the third publisher, plus a new,
+focused real-writer/real-lease (no Docker) test proving
+`PREPARING -> ACTIVE -> CLEANING -> COMPLETE` through the shared bundle
+via `create_shared_lifecycle_publishers()` directly — no composition API
+introduced. `tests/unit/test_errors.py` pins the new code's value and
+domain. `tests/integration/test_controller.py` gained thirteen new
+tests covering: omitted-collaborator behavior preservation, activation-
+precedes-baseline ordering, activation-failure-skips-begin_cleanup/
+complete, begin_cleanup-precedes-teardown ordering, begin_cleanup-
+failure-does-not-stop-cleanup, complete-gated-on-confirmed-cleanup,
+evidence-failure-does-not-block-complete, the combined-failure
+dominance test, an original-run-failure (`BUDGET_EXCEEDED`) combined
+with a terminal lifecycle-publication failure (also dominated), reason-
+parity parametrized tests for both `activate()`/`complete()` failure
+paths, and a no-automatic-retry test.
+
+**A correction pass (2026-09-28, before this slice was considered
+final) fixed two overclaims and one test-coverage gap**: (1) a comment
+in `controller.py`'s `run()` and this ADR's own Amendment 8 section 2
+wrongly said nothing had touched "Docker, Git, the worktree, or the
+checkpoint ref" by the time `activate()` runs — false, since
+`RunController` is always handed an already-entered `Workspace`
+(`GitWorktree`), never one it enters itself, so a physical workspace
+may already exist at this point; corrected to state precisely that no
+*controller-driven* baseline/Docker verification/patch/checkpoint-ref
+*mutation* has begun, and that this is exactly why `_terminate()` still
+disposes/preserves the workspace and invokes session cleanup on an
+activation failure. (2) `errors.py`'s comment on the new
+`LIFECYCLE_STATE_PUBLICATION_FAILED` code wrongly said "the run never
+got started" — false, since `RunStarted` and the `RUN_STARTED` domain
+transition had already occurred by the time `activate()` runs;
+corrected to say normal baseline/model/tool execution never began, not
+that no run event exists. (3) only `activate()`'s installed-vs-cursor
+durability-unconfirmed split had a real-writer fault-injection test;
+`begin_cleanup()` and `complete()` each gained their own dedicated test
+using the identical trailing-directory-`fsync` technique (driving the
+real preceding transitions first), and the `complete()` case gained a
+new, independent `tests/unit/test_reconciliation.py` test proving a
+real reconciliation pass classifies a seeded `COMPLETE`-plus-absent-
+shape entry as `SKIPPED_TERMINAL` with zero lock/inspection calls (the
+same code path `RECONCILED` already exercised). `OwnerStatePublicationError`'s
+docstring was also corrected from "raised only by
+`LifecycleOwnerStatePublisher`" to the established Slice 3B-7 wording
+pattern (`CheckpointPublicationError`'s own docstring): a public
+exception any conforming `LifecycleOwnerPublisher` implementation may
+raise, with `LifecycleOwnerStatePublisher` named as the sole current
+production translation boundary. Two integration-test messages were
+also strengthened to assert the exact sanitized text (see below) rather
+than only a negative "detail does not leak" check.
+
+**Verified** (macOS, real Docker daemon already running,
+`CODEAGENT_REQUIRE_DOCKER=1`, post-correction-pass totals): `py_compile`
+on all changed/new files; the four directly affected files
+(`test_errors.py`, `test_lifecycle_store.py`, `test_reconciliation.py`,
+`test_controller.py`) collected and passed together, 500 passed, in
+both forward and reverse file order; the established sixteen-file
+focused Milestone-3 set collected and passed together, 1,843 passed, in
+both forward and reverse file order; the complete suite, 2,690 passed,
+0 skipped; `git diff --check` clean; no leftover `codeagent-*`
+containers (`docker ps -a` checked directly), extra `git worktree list`
+entries, `refs/codeagent` refs, or temp state roots afterward — the
+default macOS state-root location
+(`~/Library/Application Support/CodeAgent`) was directly checked and
+confirmed absent. No production path this slice introduces calls
+`prepare_lifecycle()` at all; the real-writer tests that do call it do
+so only through `_prepared_lease()`/`CODEAGENT_STATE_DIR`, redirected to
+an isolated per-test `tmp_path` state root, never the default location.
+
+**Exact sanitized messages, pinned by test**:
+`LIFECYCLE_STATE_PUBLICATION_FAILED` — `"the run's lifecycle projection
+could not be confirmed active"`; `LIFECYCLE_CLEANUP_UNCONFIRMED` (now
+covering owner-state terminal publication failures too) — `"a verifier
+container, worktree, or checkpoint-ref cleanup step, or the run's
+lifecycle-projection bookkeeping, could not be confirmed"`. Both
+integration tests assert the exact string and separately assert neither
+the injected fake's detail text nor the categorical
+`OwnerStatePublicationFailure` reason string (upper- or lower-case)
+appears anywhere in the message.
+`git status --short` shows only the intended files modified/added,
+nothing staged. `docs/threat-model.md` is unchanged — T-E1 remains
+explicitly unmitigated by this slice, and no existing statement there
+became inaccurate. **Not implemented, by explicit design** (Slice
+3C-2): any `prepare_lifecycle()` call from production orchestration,
+any `RunController` composition/entry-point wiring, and who owns/closes
+a `LifecycleLease` and what a lease-close failure does to the outer
+operation's result — this slice never constructs or closes a lease.
+Left unstaged and uncommitted for joint review, per this session's
+explicit instruction. GitHub-hosted Linux CI has not yet run for this
+slice — it has not been committed or pushed.
+
+**A brief follow-up wording pass (2026-09-28, same day, before this
+slice was committed)** found the prior correction's own replacement
+text still overreached in one place: the same `errors.py` comment's
+final sentence, comparing `LIFECYCLE_STATE_PUBLICATION_FAILED` to
+`LIFECYCLE_CLEANUP_UNCONFIRMED`, said "this one means no real work
+happened at all" — still too broad, since `RunStarted`/`RUN_STARTED`
+had already occurred and an already-entered physical workspace may
+exist and later require disposal or preservation. Replaced with
+phase-accurate wording: `LIFECYCLE_CLEANUP_UNCONFIRMED` covers
+terminal-path resource cleanup or lifecycle-bookkeeping that could not
+be confirmed; `LIFECYCLE_STATE_PUBLICATION_FAILED` means the ACTIVE
+projection transition itself could not be confirmed before normal
+baseline/model/tool execution began. A repository-wide search for the
+same phrase and its equivalents ("nothing was touched," "no work
+happened") found no other occurrence in current, unsuperseded code
+comments or documentation. This is wording-only: no control flow,
+schema, test, or behavior changed; `py_compile` on `src/codeagent/
+errors.py` and `git diff --check` both passed; the full suite was not
+rerun, since nothing executable changed.
