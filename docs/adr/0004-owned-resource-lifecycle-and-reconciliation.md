@@ -391,7 +391,15 @@ reconciliation remains unimplemented (the "Owned only if..."/"Removal
 only via..." bullets above remain a specified design, not yet
 production code), and no new amendment is introduced: this note
 records that the layout this section already accepted is implemented,
-not a new decision.
+not a new decision. Confirmed on GitHub-hosted Linux CI (commit
+`7ec1fd2ce892c123491492c95ef6a990f841cbd2`, run
+[36642099820](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36642099820),
+`ubuntu-24.04` x86_64, Python 3.12, conclusion `success` — see
+`CLAUDE.md`'s Slice 3C-2 entry for the full evidence detail); this is
+implementation/automated-test evidence only, not a security review, and
+is `ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+ARM64 claim. It does not claim any production composition/entry-point
+wiring or T-E1 mitigation — Slice 3C-2 remains an unwired prerequisite.
 
 Checkpoint ref `refs/codeagent/runs/<lifecycle_id>/checkpoint`
 (reachability semantics: ADR 0003 Amendment 1, Accepted). Dead-run

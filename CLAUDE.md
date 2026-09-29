@@ -2053,10 +2053,54 @@ Stage 2 (of the four-stage planning process in
   mock. **Explicitly not claimed by this slice**: worktree write-ahead
   publication or removal during reconciliation (both remain
   unimplemented, unchanged from every prior slice's own stated scope),
-  any `RunController`/CLI/composition wiring, concurrent-live-run
-  mitigation, and Linux CI evidence — this work has not yet been pushed.
-  `docs/threat-model.md`'s T-E1 entry is **unchanged**: nothing here is
-  wired into a real entry point yet.
+  any `RunController`/CLI/composition wiring, and concurrent-live-run
+  mitigation — both remain unchanged and unimplemented.
+
+  **Confirmed on GitHub-hosted Linux CI** (commit
+  `7ec1fd2ce892c123491492c95ef6a990f841cbd2`, run
+  [36642099820](https://github.com/G-ChandraSekhar/codeagent/actions/runs/36642099820),
+  `ubuntu-24.04` x86_64 — confirmed directly in the log: "Operating
+  System: Ubuntu 24.04.5 LTS," "Runner Image: ubuntu-24.04" — Python
+  3.12, conclusion `success`, every step succeeded): the mandatory
+  Docker preflight succeeded (Docker Engine - Community, version
+  `28.0.4`, directly present in the log); the pinned verification image
+  (`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`)
+  was pulled and confirmed `linux/amd64`. The dedicated "Run real Docker
+  verification tests" step ran only `python -m pytest
+  tests/integration/test_slice_c.py -v` (`CODEAGENT_REQUIRE_DOCKER=1`
+  confirmed present in that step's own logged environment): `3 passed
+  in 1.69s`, 0 skipped — this is this file's own legacy Milestone-1
+  suite, exactly, and is **not** specific evidence for Slice 3C-2, which
+  adds no real-Docker test of its own. The separate "Run complete test
+  suite" step (`python -m pytest -q`, `CODEAGENT_REQUIRE_DOCKER=1` also
+  confirmed present in that step's own logged environment) reported
+  `2730 passed, 3 skipped in 39.17s`; `2730 + 3` equals the local
+  collected total of 2,733. The run used `pytest -q`, which prints no
+  test identities, so these 3 skips are not identified from the log and
+  are not guessed here — they are not evidence of Docker unavailability,
+  since the daemon, the pulled image, and `CODEAGENT_REQUIRE_DOCKER=1`
+  were all already confirmed for that same step. Source inspection —
+  not CI-log evidence — continues to identify the same three
+  Linux-unconditional, platform/host-specific skips named in every
+  earlier slice's own entry (`test_evidence.py`'s Darwin-only
+  ambient-`/tmp`-symlink test, `test_lifecycle_fs.py`'s Darwin-only
+  case-canonicalization test, and `test_repo_identity.py`'s
+  case-insensitive-filesystem-dependent alias test) as the likely
+  candidates; this is stated separately as source-based inference, not
+  something this run's own log proves. The final leftover-container
+  check ran the anchored `grep -E
+  '^codeagent-(verify-|baseline-|verification-)'` pattern over a
+  complete, unfiltered `docker ps -a --format '{{.Names}}'` listing,
+  covering all three CodeAgent container families; its captured output
+  was empty and the step succeeded. This is implementation/automated-test
+  evidence only — it does not constitute or substitute for a security
+  review, and is GitHub-hosted `ubuntu-24.04` x86_64 evidence
+  specifically, not a general Linux or ARM64 portability claim. It does
+  not claim `RunController`/CLI/composition-root wiring, lifecycle-
+  projection worktree attribution, or any new T-E1 mitigation exists —
+  Slice 3C-2 remains an unwired prerequisite; none of that is part of
+  this slice. `docs/threat-model.md`'s T-E1 entry is **unchanged**:
+  nothing here is wired into a real entry point yet.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
