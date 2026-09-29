@@ -348,6 +348,67 @@ def test_present_worktree_causes_refused_no_projection_write(harness, monkeypatc
     assert payload["state"] == ls.LifecycleState.PREPARING.value
 
 
+def test_real_deterministic_worktree_registered_and_present_causes_refused_blocked(harness):
+    """Milestone 3 Slice 3C-2's own motivating regression test, using no
+    mocking of `_worktree_registered_paths`/Git at all: a *real*
+    `state_root.reserve_worktree_leaf()` + real
+    `workspace.GitWorktree(reservation=...)` entry (left registered, as a
+    crash before disposal would leave it) is placed at exactly the
+    deterministic path this module's own `_reconcile_locked_entry` already
+    expects. Before Slice 3C-2, no production code ever placed a real
+    worktree there, so this exact scenario could not previously be
+    constructed with real Git — only simulated via the mock above."""
+    lifecycle_id = "a" * 32
+    projection = _initial_projection(harness, lifecycle_id)
+    run_dir = _seed_run_dir(harness, lifecycle_id, projection)
+
+    from codeagent import workspace as ws
+
+    # The reservation's own context manager is still used (so its
+    # parent/leaf descriptors are never leaked past this test, matching
+    # this slice's own ownership rules), but nothing inside the `with`
+    # body disposes the worktree -- preserving the exact simulated-crash
+    # condition (a real, registered, materialized worktree left behind)
+    # for the `harness.reconcile()` call in the middle of the block.
+    with harness.state_root.reserve_worktree_leaf(harness.identity.repo_key, lifecycle_id) as reservation:
+        expected_path = reservation.path
+        wt = ws.GitWorktree(harness.repo, run_id="crashed-run", reservation=reservation)
+        wt.__enter__()  # deliberately never disposed -- simulates a crash before teardown
+        try:
+            result = harness.reconcile()
+            entry = result.entries[0]
+            assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+            assert result.blocked
+            payload = _read_projection_dict(run_dir)
+            assert payload["state"] == ls.LifecycleState.PREPARING.value
+            # Reconciliation never mutated the real worktree it found.
+            assert expected_path.exists()
+        finally:
+            wt.dispose()
+
+
+def test_real_present_but_unregistered_worktree_directory_causes_refused(harness):
+    """A directory physically present at the exact deterministic path but
+    never registered with Git at all (e.g. a crash between this slice's
+    exclusive leaf reservation and `git worktree add` ever running) is
+    still refused — `_reconcile_locked_entry`'s own check is `path in
+    registered_paths OR os.path.lexists(path)`, so presence alone (with
+    no Git registration) is sufficient, proven here with a real,
+    unregistered directory rather than a mock."""
+    lifecycle_id = "a" * 32
+    projection = _initial_projection(harness, lifecycle_id)
+    _seed_run_dir(harness, lifecycle_id, projection)
+
+    reservation = harness.state_root.reserve_worktree_leaf(harness.identity.repo_key, lifecycle_id)
+    try:
+        result = harness.reconcile()
+        entry = result.entries[0]
+        assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+        assert result.blocked
+    finally:
+        reservation.__exit__(None, None, None)
+
+
 def test_present_checkpoint_ref_causes_refused_no_projection_write(harness, monkeypatch):
     lifecycle_id = "a" * 32
     projection = _initial_projection(harness, lifecycle_id)

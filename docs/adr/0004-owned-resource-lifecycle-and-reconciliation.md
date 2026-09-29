@@ -379,6 +379,20 @@ Worktree, at the recomputed path `<root>/worktrees/<repo-key>/<lifecycle-id>`:
   <path>`, confirmed by exact registration absence and directory
   absence. No recursive filesystem deletion fallback.
 
+**Implementation status note (Milestone 3 Slice 3C-2, 2026-09-29):** the
+recomputed path `<root>/worktrees/<repo-key>/<lifecycle-id>` this
+section already specifies is now real, for the first time, as a
+placement primitive: `StateRoot.reserve_worktree_leaf()` and
+`GitWorktree`'s optional `reservation` parameter
+(`src/codeagent/state_root.py`, `src/codeagent/workspace.py`) place a
+real worktree at exactly this path. This is a placement capability
+only — no production caller exists yet, worktree *removal* during
+reconciliation remains unimplemented (the "Owned only if..."/"Removal
+only via..." bullets above remain a specified design, not yet
+production code), and no new amendment is introduced: this note
+records that the layout this section already accepted is implemented,
+not a new decision.
+
 Checkpoint ref `refs/codeagent/runs/<lifecycle_id>/checkpoint`
 (reachability semantics: ADR 0003 Amendment 1, Accepted). Dead-run
 reconciliation observes the exact recomputed ref through structured

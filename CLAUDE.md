@@ -1882,6 +1882,181 @@ Stage 2 (of the four-stage planning process in
   entry-point composition exists. `docs/threat-model.md`'s T-E1 entry
   is unchanged and remains unmitigated by this slice — nothing here
   calls `prepare_lifecycle()` or constructs a real entry point.
+- **Milestone 3 Slice 3C-2** (deterministic lifecycle-scoped worktree
+  placement), the smallest correct prerequisite identified during joint
+  Codex/Claude planning review for what would otherwise be an unsafe
+  "3C-2" production-composition slice, **is implemented and locally
+  validated on macOS (2026-09-29)**. `reconciliation.py` already
+  hard-codes the expected deterministic worktree path
+  (`state_root.path/worktrees/<repo_key>/<lifecycle_id>`) in its own
+  crash-recovery check, but nothing in production ever placed a real
+  worktree there — `GitWorktree` only ever used an unpredictable
+  `tempfile.TemporaryDirectory()`. Composing a real run on top of that
+  gap would have made reconciliation's own worktree-absence check
+  silently meaningless (always "confirmed absent," since it was checking
+  a path nothing ever wrote to), a false-clean result exactly of the
+  kind ADR 0004 exists to prevent. This slice closes that gap alone,
+  with no `RunController`, Docker, checkpoint-session, or lifecycle-
+  projection-schema change of any kind.
+  `src/codeagent/state_root.py` gains `StateRoot.reserve_worktree_leaf()`
+  (opens/creates the idempotently-reopenable `worktrees/<repo_key>/`
+  parent chain via the existing managed-directory-chain primitive, then
+  exclusively creates the `<lifecycle_id>` leaf via the existing
+  `create_exclusive_directory_at` — never reopened or adopted) and a new
+  private `_WorktreeLeafReservation` class, mintable only through that
+  method (matching `lifecycle_store._LifecycleProjectionWriter`'s own
+  "the only sanctioned way to obtain one" idiom): a context manager
+  owning both the parent and leaf descriptors for its lifetime, with an
+  explicit `RESERVED -> CLAIMED -> CONSUMED` single-consumer state
+  machine (added in a same-day correction pass — see below) whose
+  `__exit__` only ever removes the leaf when the reservation is not
+  `CONSUMED`, and only after re-verifying by fd (`os.fstat`/`os.stat(...,
+  dir_fd=..., follow_symlinks=False)`/`os.path.samestat`) that the
+  pathname still names the exact inode it created — never a bare
+  "it's empty, so remove it" pathname-only check, which a same-user
+  process could defeat by swapping in a different, also-empty directory
+  at the identical name. `src/codeagent/workspace.py`'s `GitWorktree`
+  gains an optional, keyword-only `reservation` parameter (default
+  `None`, fully backward compatible — every existing tempdir-based
+  caller and test is unaffected, and any non-`None`, non-genuine value
+  is rejected by an `isinstance` check before any reservation access or
+  Git call); when given, `__enter__` first atomically `claim()`s the
+  reservation (refusing before any Git mutation if already claimed by
+  another instance), then performs the same fd-based identity check both
+  immediately before `git worktree add` is ever invoked (a mismatch
+  means zero Git mutation is attempted) and again immediately after the
+  full worktree materialization succeeds (a mismatch here means the
+  pathname may now name a foreign, same-user-swapped directory, so the
+  run refuses to proceed) — only a full, doubly-reconfirmed success calls
+  `reservation.consume()`.
+
+  A same-day, pre-finalization review round (Codex) raised, and this
+  slice incorporates, two safety constraints beyond the originally
+  planned design: (1) a pathname-only `rmdir` for an unused reservation's
+  cleanup is unsafe against a same-user directory swap — fixed by holding
+  the parent directory's own descriptor for the reservation's whole
+  lifetime and removing the leaf only via `os.rmdir(name,
+  dir_fd=parent_fd)` after a fresh fd-relative identity re-check, never a
+  bare path string; (2) an enter-time failure must never run the existing
+  unconditional `git worktree remove --force <path>` cleanup against a
+  pathname whose inode identity can no longer be reconfirmed after a full
+  materialization — fixed by gating that removal on a fresh identity
+  check first, and refusing to touch the pathname at all (leaving it as
+  evidence, raising a categorical cleanup-unconfirmed error) when
+  identity is lost or uninspectable. Both were verified against real code
+  and real git/POSIX behavior (a disposable `/tmp` experiment) before
+  being incorporated, not accepted on assertion; verification is pinned
+  in the automated test suite
+  (`test_git_accepts_the_real_pre_created_empty_directory`), not merely a
+  comment.
+
+  A second, same-day correction pass (also Codex) raised four further
+  findings, all confirmed against real code and fixed before this slice
+  was considered final: (a) the `reservation` parameter's bare type
+  annotation was never enforced at runtime — a duck-typed impostor
+  exposing the same surface could have been accepted; fixed with an
+  explicit `isinstance` check in `GitWorktree.__init__`, rejected with a
+  fixed, sanitized message that never echoes the rejected object's own
+  repr; (b) `consume()` alone, set only at the very end of a successful
+  entry, could not stop two `GitWorktree` instances from both being
+  handed the same reservation and both reaching `git worktree add` — the
+  second instance's own enter-time failure cleanup would then
+  identity-verify successfully (the path is still the same inode) and
+  run `git worktree remove --force` against the *first* instance's real,
+  live worktree; fixed with the explicit `RESERVED -> CLAIMED -> CONSUMED`
+  state machine above, `claim()` protected by an internal lock (proven
+  atomic against genuinely concurrent threads by a real two-thread
+  barrier test, not merely reasoned about) so only one caller can ever
+  succeed, called before any Git mutation is attempted; (c)
+  `_remove_unconsumed_leaf_if_safe()` trusted `os.rmdir`'s own reported
+  success without the independent post-mutation observation this
+  project's cleanup discipline otherwise always requires — fixed with a
+  fresh, fd-relative, no-follow re-observation after `rmdir`, where only
+  a confirmed `FileNotFoundError` counts as success and any entry still
+  present (even a new, unrelated inode) is reported cleanup-unconfirmed
+  and left untouched; (d) one of this slice's own new tests leaked a
+  reservation's descriptors past its own scope by never calling
+  `reservation.__exit__()`, and one used an overly broad
+  `pytest.raises((RuntimeError, Exception))` assertion and a private
+  `_consumed = True` mutation to paper over the leak — both corrected
+  (the test now uses the reservation context manager while preserving
+  the exact simulated-crash condition; the broad assertion now checks
+  the exact `LifecycleFsError`/`CLEANUP_UNCONFIRMED` reason; the private
+  mutation is removed entirely, relying instead on the real "confirmed
+  absent" cleanup path exercised by finding (c)'s own fix).
+
+  A third, same-day correction pass (also Codex) raised and this slice
+  incorporates two further findings at `GitWorktree`'s own public
+  boundary, plus one wording correction: (e) `claim()`'s refusal let a
+  raw `LifecycleFsError` escape `GitWorktree.__enter__()` directly — the
+  second-claimant tests had been written to expect exactly that
+  storage-layer type, which is itself the defect, since this module
+  never exposes `state_root`/`_lifecycle_fs` exception types to its own
+  callers anywhere else; fixed by translating a refused claim into a
+  fixed, sanitized `GitWorktreeError` chained `from` the
+  `LifecycleFsError`, with no worktree-level cleanup attempted for the
+  refused claimant (that reservation was never claimed by *this*
+  instance, so its Git registration and directory belong entirely to
+  whichever instance actually holds the claim); the sequential- and
+  preserved-first-worktree second-claimant tests now assert the public
+  `GitWorktreeError`, its `__cause__`, and the exact categorical
+  reason, while the private reservation's own direct `claim()`/
+  `consume()` tests continue to assert the raw `LifecycleFsError`,
+  since that boundary is `GitWorktree`'s alone; (f) the ownership
+  transfer (`reservation.consume()`) was called *after* `self.path`/
+  `self._initial_commit` were already published and *outside* the
+  guarded try/except that handles cleanup — a `consume()` failure there
+  would have both leaked a raw `LifecycleFsError` and left the instance
+  claiming a completed entry it never actually finished; fixed by
+  moving `consume()` inside the guarded path, immediately after
+  post-Git verification and before either field is published, with its
+  own failure translated and routed through the same reservation-aware
+  exact-cleanup path as any other post-materialization failure — proven
+  by a new load-bearing fault-injection test forcing `consume()` to
+  fail after a real worktree was fully created and verified,
+  confirming the public exception type and cause, exact registration/
+  directory cleanup, and that `self.path`/`initial_commit` stay
+  unpublished; (g) one stale comment claimed `claim()` refuses "before
+  any Git call," when `_rev_parse("HEAD")` against the source
+  repository already runs first — corrected throughout to "before any
+  Git mutation," which is the property that actually holds and the one
+  this mechanism actually protects.
+
+  A related, out-of-scope-for-this-slice finding surfaced during the
+  first review round — `RunController.run()` has no top-level exception
+  handler, so `_terminate()` (and therefore checkpoint-session/
+  owner-state cleanup) never runs on a fully unexpected exception — is
+  recorded as an explicit, unsettled review item for Milestone 3 Slice
+  3C-3's own planning, not decided or touched here; it intersects ADR
+  0005's still-unimplemented cancellation semantics.
+
+  Verified (macOS, real Docker daemon, `CODEAGENT_REQUIRE_DOCKER=1`,
+  post-third-correction-pass totals): the fourteen-file focused set
+  (`test_lifecycle_fs`, `test_repo_identity`, `test_state_locks`,
+  `test_state_root`, `test_lifecycle_store`, `test_checkpoint_session`,
+  `test_checkpoint_ref`, `test_reconciliation`, `test_bounded_subprocess`,
+  `test_container_lifecycle`, `test_docker_ownership`, `test_executor`,
+  `test_ci_container_leftover_check`, `test_workspace`) collected and
+  passed together, 1,160 passed (up from 1,159), in both forward and
+  reverse file order; the complete suite, 2,733 passed (up from 2,732), 0
+  skipped; `git diff --check` clean; no leftover `codeagent-*`
+  containers, extra worktrees, `refs/codeagent` refs, or temp state roots
+  afterward; the real default macOS state-root location (`~/Library/
+  Application Support/CodeAgent`) confirmed never created by this
+  slice's tests. Docker was already running before all three review
+  passes; it was never started or restarted, and no administrator-access
+  dialog appeared. A real (non-Docker) regression test in `test_reconciliation.py`
+  proves `reconcile_repository()` genuinely refuses/blocks when a real,
+  deterministically-placed worktree is found registered and present
+  (simulating a crash before disposal) — a scenario that could not
+  previously be constructed with real Git at all, only simulated via a
+  mock. **Explicitly not claimed by this slice**: worktree write-ahead
+  publication or removal during reconciliation (both remain
+  unimplemented, unchanged from every prior slice's own stated scope),
+  any `RunController`/CLI/composition wiring, concurrent-live-run
+  mitigation, and Linux CI evidence — this work has not yet been pushed.
+  `docs/threat-model.md`'s T-E1 entry is **unchanged**: nothing here is
+  wired into a real entry point yet.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

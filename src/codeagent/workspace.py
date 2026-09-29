@@ -95,6 +95,8 @@ from types import TracebackType
 from typing import Literal
 
 from codeagent import _git_safety
+from codeagent._lifecycle_fs import LifecycleFsError
+from codeagent.state_root import _WorktreeLeafReservation
 
 _WORKTREE_TEMPDIR_PREFIX = "codeagent-worktree-"
 
@@ -153,9 +155,38 @@ class GitWorktree:
     """Context manager: `with GitWorktree(source_repo, run_id) as path:`
     creates a detached worktree at a fresh temporary location and
     removes it on exit, success or failure.
+
+    Milestone 3 Slice 3C-2: an optional `reservation` (a
+    `state_root._WorktreeLeafReservation`, mintable only via
+    `StateRoot.reserve_worktree_leaf()`) places the worktree at a
+    deterministic, lifecycle-scoped location instead of an unpredictable
+    tempdir — see that class's own docstring for the exact, honestly-scoped
+    provenance guarantee this provides, and this class's `__enter__` for
+    the pre-Git/post-Git identity re-verification around it. `GitWorktree`
+    never accepts a bare caller-controlled pathname for this mode — only
+    the private reservation type, never a `Path`/`str`.
     """
 
-    def __init__(self, source_repo_path: Path | str, run_id: str) -> None:
+    def __init__(
+        self,
+        source_repo_path: Path | str,
+        run_id: str,
+        *,
+        reservation: _WorktreeLeafReservation | None = None,
+    ) -> None:
+        # Slice 3C-2 correction pass: a bare type annotation is not
+        # enforced by Python — an arbitrary duck-typed object exposing
+        # `verify_identity()`/`path`/`consume()` could otherwise be
+        # accepted and trusted exactly like a real reservation, defeating
+        # the ordinary-programmer-error/external-string boundary this
+        # class's documented guarantee actually depends on. Checked
+        # first, before the Git preflight or any other access, and never
+        # echoes the rejected object's repr or type name (which could
+        # embed arbitrary, uncontrolled text).
+        if reservation is not None and not isinstance(reservation, _WorktreeLeafReservation):
+            raise GitWorktreeError(
+                "reservation must be a genuine worktree-leaf reservation object"
+            )
         # ADR 0006 section 6: a one-time capability check, before any
         # repository access at all.
         try:
@@ -181,6 +212,13 @@ class GitWorktree:
         self.cleanup_error: GitWorktreeCleanupError | None = None
         self._tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._initial_commit: str | None = None
+        # None (default): legacy unpredictable-tempdir placement, fully
+        # unchanged. A _WorktreeLeafReservation: deterministic
+        # lifecycle-scoped placement (Slice 3C-2) — this object is never
+        # constructed by GitWorktree itself, only consumed. GitWorktree
+        # never touches its descriptors directly; it calls only
+        # `verify_identity()` and, on full success, `consume()`.
+        self._reservation = reservation
         # "active": ordinary state, not yet disposed or preserved.
         # "disposed": dispose() has confirmed exact removal.
         # "preserved": the controller deliberately retained this
@@ -299,15 +337,69 @@ class GitWorktree:
         # stale cleanup_error from that earlier attempt.
         self.cleanup_error = None
         source_head = self._rev_parse("HEAD")
-        try:
-            self._tempdir = tempfile.TemporaryDirectory(prefix=_WORKTREE_TEMPDIR_PREFIX)
-        except OSError:
-            # `from None`: the raw OSError's message can embed a
-            # filesystem path (e.g. a permissions failure naming the
-            # parent temp directory) and must never resurface via
-            # __cause__/__context__ in a traceback.
-            raise GitWorktreeError("a temporary directory could not be created") from None
-        worktree_path = Path(self._tempdir.name) / "worktree"
+
+        if self._reservation is None:
+            try:
+                self._tempdir = tempfile.TemporaryDirectory(prefix=_WORKTREE_TEMPDIR_PREFIX)
+            except OSError:
+                # `from None`: the raw OSError's message can embed a
+                # filesystem path (e.g. a permissions failure naming the
+                # parent temp directory) and must never resurface via
+                # __cause__/__context__ in a traceback.
+                raise GitWorktreeError("a temporary directory could not be created") from None
+            worktree_path = Path(self._tempdir.name) / "worktree"
+        else:
+            # Slice 3C-2 correction pass: claim the reservation before any
+            # Git mutation is even considered. `verify_identity()` alone
+            # cannot prevent two GitWorktree instances sharing the same
+            # reservation from both reaching `git worktree add` — identity
+            # would still agree for both, since nothing has mutated the
+            # path yet. `claim()` raises immediately (before any Git
+            # mutation, before the pre-Git identity check below) if this
+            # reservation was already claimed by an earlier or concurrent
+            # instance — never silently proceeding as a second,
+            # unauthorized user of the same deterministic location.
+            #
+            # A refused claim is translated to a sanitized
+            # `GitWorktreeError` here — `GitWorktree` never exposes
+            # `state_root`/`_lifecycle_fs` exception types to its own
+            # callers anywhere else in this module, and a refused claim is
+            # no exception (the private reservation type's own tests cover
+            # its raw `LifecycleFsError` directly). No worktree-level
+            # cleanup is attempted for a refused claim: this reservation
+            # was never claimed by *this* instance, so its Git registration
+            # and directory (if any) belong entirely to whichever instance
+            # actually holds the claim — touching either here would be
+            # exactly the cross-claimant mutation this whole mechanism
+            # exists to prevent.
+            try:
+                self._reservation.claim()
+            except LifecycleFsError as exc:
+                # Fixed, categorical wording only — `claim()` refuses from
+                # any state but `RESERVED`, which also includes a retry of
+                # this very entry after an earlier failed attempt on this
+                # same instance, or a reservation already `consumed`, not
+                # only a genuinely distinct concurrent claimant. Never
+                # assert who (or what) holds the claim.
+                raise GitWorktreeError(
+                    "the reserved worktree location has already been claimed and cannot be reused"
+                ) from exc
+            # Pre-Git identity check: before `git worktree add` is ever
+            # invoked, reconfirm the deterministic pathname still names
+            # the exact inode the reservation exclusively created. This
+            # closes the window between reservation-creation and this
+            # check — nothing more; see the reservation's own
+            # `verify_identity()` docstring for the honestly-scoped
+            # residual limitation of Git's pathname-only interface. A
+            # failure here leaves the reservation `claimed`, never
+            # `consumed` — permanently refusing any further claim, per
+            # this slice's "no reusable-state reset" rule — while its own
+            # `__exit__` still safely cleans up the still-empty leaf.
+            if not self._reservation.verify_identity():
+                raise GitWorktreeError(
+                    "the reserved worktree location could not be confirmed before use"
+                )
+            worktree_path = self._reservation.path
 
         # From here on, `git worktree add` is treated as potentially
         # mutating no matter how it concludes — a nonzero result, an
@@ -359,17 +451,59 @@ class GitWorktree:
             checkout_result = _run(worktree_path, "checkout", "--", ".")
             if checkout_result.returncode != 0:
                 raise GitWorktreeError("materializing the worktree's files failed")
+
+            if self._reservation is not None:
+                # Step 5 (Slice 3C-2, still inside this try so a
+                # disagreement routes through the same cleanup handling
+                # below, never through the unconditional legacy path):
+                # reconfirm both that Git's own registration still
+                # resolves to exactly this path AND that the pathname
+                # still names the exact inode reserved — a mismatch in
+                # either means the run must not proceed with this
+                # worktree.
+                if not self._verify_post_git_reservation(worktree_path):
+                    raise GitWorktreeError(
+                        "the worktree's registered location could not be reconfirmed after creation"
+                    )
+                # Step 6 (Slice 3C-2 correction pass): the ownership
+                # transfer itself must happen inside this same guarded
+                # try, before `self.path`/`self._initial_commit` are ever
+                # published below — not after the try/except, where a
+                # `consume()` failure would both leak a raw
+                # `LifecycleFsError` (this module never exposes
+                # `state_root`/`_lifecycle_fs` exception types to its own
+                # callers) and leave this instance claiming a successful
+                # entry it never actually completed. A `consume()`
+                # failure here is translated to a sanitized
+                # `GitWorktreeError` and falls straight into the
+                # `except BaseException` handler immediately below,
+                # running the same reservation-aware exact cleanup path
+                # as any other post-materialization failure. `consume()`
+                # only ever raises before mutating state (it checks
+                # `CLAIMED` first), so a failure here leaves the
+                # reservation exactly `claimed`, never `consumed` — its
+                # own outer context still performs the correct
+                # confirmed-absence handling via `__exit__`.
+                try:
+                    self._reservation.consume()
+                except LifecycleFsError as exc:
+                    raise GitWorktreeError(
+                        "the reserved worktree could not be confirmed transferred"
+                    ) from exc
         except BaseException as failure:
-            # Both cleanup steps are always attempted, regardless of
-            # whether the first one failed, and regardless of whether
-            # `add` itself is what failed: a nonzero add result is
-            # never assumed to mean nothing was created, so the same
-            # exact-removal-plus-observation applies whether the
-            # failure came from `add`, `read-tree`, the filter-safety
-            # check, or `checkout`.
-            registration_error = self._cleanup_failed_worktree(worktree_path)
-            tempdir_error = self._cleanup_failed_tempdir()
-            cleanup_error = self._combine_cleanup_errors(registration_error, tempdir_error)
+            if self._reservation is None:
+                # Both cleanup steps are always attempted, regardless of
+                # whether the first one failed, and regardless of whether
+                # `add` itself is what failed: a nonzero add result is
+                # never assumed to mean nothing was created, so the same
+                # exact-removal-plus-observation applies whether the
+                # failure came from `add`, `read-tree`, the filter-safety
+                # check, or `checkout`.
+                registration_error = self._cleanup_failed_worktree(worktree_path)
+                tempdir_error = self._cleanup_failed_tempdir()
+                cleanup_error = self._combine_cleanup_errors(registration_error, tempdir_error)
+            else:
+                cleanup_error = self._cleanup_failed_reservation_worktree(worktree_path)
             if cleanup_error is not None:
                 # Fail closed: a cleanup problem after a refusal is
                 # itself surfaced, not merely recorded — but the
@@ -379,9 +513,70 @@ class GitWorktree:
                 raise cleanup_error from failure
             raise
 
+        # Reached only once every check above has passed, including (in
+        # reservation mode) the ownership transfer itself — publishing
+        # this state any earlier, or transferring ownership any later,
+        # would each let a caller observe a `GitWorktree` claiming success
+        # it hasn't actually earned yet.
         self.path = worktree_path
         self._initial_commit = source_head
         return self.path
+
+    def _verify_post_git_reservation(self, worktree_path: Path) -> bool:
+        """Slice 3C-2: after a full, successful worktree materialization
+        in reservation mode, reconfirm both that Git's own registration
+        still resolves to exactly this path (`_registration_status`) and
+        that the pathname still names the exact inode the reservation
+        exclusively created (`verify_identity`). Returns `False` — never
+        raises — on any disagreement or inspection failure; both are
+        equally untrustworthy and neither is distinguished further here."""
+        assert self._reservation is not None
+        if self._registration_status(worktree_path) is not True:
+            return False
+        return self._reservation.verify_identity()
+
+    def _cleanup_failed_reservation_worktree(
+        self, worktree_path: Path
+    ) -> GitWorktreeCleanupError | None:
+        """Reservation-mode counterpart to `_cleanup_failed_worktree`.
+
+        Never runs `git worktree remove --force` against a pathname whose
+        inode identity can no longer be reconfirmed as the reservation's
+        own leaf: doing so unconditionally (as the legacy path safely
+        does, since its tempdir location is unpredictable and therefore
+        never a plausible target for this specific race) could instead
+        operate on, or force-remove, a foreign directory a same-user
+        process swapped into this exact, deterministic path. If identity
+        is still proven, Git's own registration cleanup is exactly as
+        safe as the legacy path's and is attempted identically. If
+        identity disagrees or cannot be inspected, no destructive Git
+        operation is attempted at all — the ambiguous pathname and
+        registration are left exactly as they are, as evidence, and a
+        cleanup-unconfirmed result is returned instead of ever claiming
+        a foreign resource was safely cleaned up.
+
+        The reservation's own directory-level cleanup (a separate,
+        identity-reverified, empty-directory-only `rmdir`) remains
+        entirely the reservation's own `__exit__` responsibility — this
+        method never touches the reservation's descriptors or attempts
+        that removal itself, avoiding a second, potentially-diverging
+        copy of the same safety logic.
+        """
+        assert self._reservation is not None
+        if not self._reservation.verify_identity():
+            return GitWorktreeCleanupError(
+                "the reserved worktree's identity could not be reconfirmed; "
+                "no destructive Git operation was attempted against it"
+            )
+        try:
+            _run(self.source_repo_path, "worktree", "remove", "--force", str(worktree_path))
+        except GitWorktreeError:
+            pass
+        if self._registration_status(worktree_path) is not False:
+            return GitWorktreeCleanupError(
+                "the worktree created for this failed attempt could not be confirmed removed"
+            )
+        return None
 
     def entry_gate(self, expected_commit: str) -> None:
         """ADR 0003 Amendment 2's workspace entry gate: before

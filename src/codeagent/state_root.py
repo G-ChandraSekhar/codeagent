@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import secrets
 import stat
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum, unique
@@ -41,6 +42,7 @@ from ._lifecycle_fs import (
     canonical_json_loads_strict,
     canonicalize_directory,
     close_confirmed,
+    create_exclusive_directory_at,
     ensure_bounded_ancestor,
     fsync_fd,
     is_within_or_equal,
@@ -294,6 +296,51 @@ class StateRoot:
         validate_hex32(repo_key, field_name="repo_key")
         return open_existing_directory_chain_if_present(self.root_fd, ["worktrees", repo_key])
 
+    def reserve_worktree_leaf(self, repo_key: str, lifecycle_id: str) -> "_WorktreeLeafReservation":
+        """Milestone 3 Slice 3C-2 (ADR 0004 sections 8/16's already-accepted
+        deterministic worktree layout, made real for the first time by this
+        method). Opens/creates `worktrees/<repo_key>/` via the same managed,
+        idempotently-reopenable directory-chain primitive every other
+        managed parent directory in this module already uses (mirrors
+        `open_repo_dir`), then exclusively creates the `<lifecycle_id>` leaf
+        via `create_exclusive_directory_at` — refusing collision, wrong
+        type, or a pre-existing symlink at that exact name; `FileExistsError`
+        propagates unmodified on a collision, exactly like every other
+        exclusive-creation call site in this codebase (e.g.
+        `runs/<lifecycle_id>/`), so a caller can distinguish a genuine
+        collision from any other failure. The leaf is never reopened or
+        adopted by this method — it is exclusive-create-only, with no
+        idempotent variant, since no code path in this system ever needs to
+        re-create the same lifecycle's worktree leaf twice (ADR 0003's
+        discard-and-recreate model operates within an already-registered
+        worktree, never by re-entering this creation primitive).
+
+        Returns a `_WorktreeLeafReservation` — the only sanctioned way for a
+        caller to obtain one; see that class's own docstring for the exact,
+        honestly-scoped guarantee this provides and the ownership contract
+        `GitWorktree(reservation=...)` relies on. This method never closes a
+        descriptor it did not itself open, and if the exclusive leaf
+        creation fails after the parent chain was successfully opened, the
+        parent descriptor is closed before the original failure propagates
+        (chained `from` it if that close itself fails — never silently
+        discarded, never masking the original failure).
+        """
+        validate_hex32(repo_key, field_name="repo_key")
+        validate_hex32(lifecycle_id, field_name="lifecycle_id")
+        parent_fd = open_managed_directory_chain(self.root_fd, ["worktrees", repo_key])
+        try:
+            leaf_fd = create_exclusive_directory_at(parent_fd, lifecycle_id)
+        except BaseException as exc:
+            try:
+                close_confirmed([parent_fd])
+            except LifecycleFsError as cleanup_exc:
+                raise cleanup_exc from exc
+            raise
+        path = Path(self.path) / "worktrees" / repo_key / lifecycle_id
+        return _WorktreeLeafReservation(
+            path=path, parent_fd=parent_fd, leaf_fd=leaf_fd, leaf_name=lifecycle_id
+        )
+
     def close(self) -> None:
         if self._close_state is _CloseState.CLOSED:
             return
@@ -308,6 +355,346 @@ class StateRoot:
             self._close_state = _CloseState.FAILED
             raise
         self._close_state = _CloseState.CLOSED
+
+
+@unique
+class _ReservationState(str, Enum):
+    """`_WorktreeLeafReservation`'s single-consumer state machine (Slice
+    3C-2 correction pass). `RESERVED` is the initial state immediately
+    after `StateRoot.reserve_worktree_leaf()` returns; `claim()` alone
+    transitions `RESERVED -> CLAIMED`; `consume()` alone transitions
+    `CLAIMED -> CONSUMED`. No transition ever moves backward."""
+
+    RESERVED = "reserved"
+    CLAIMED = "claimed"
+    CONSUMED = "consumed"
+
+
+class _WorktreeLeafReservation:
+    """An exclusively-created, currently-empty worktree-leaf directory and
+    its two open, non-inheritable fd-relative descriptors — mintable in
+    practice only via `StateRoot.reserve_worktree_leaf()` (Milestone 3
+    Slice 3C-2).
+
+    Not a public constructor for ordinary use: nothing outside this module
+    and `workspace.py`'s consumption of the returned instance should ever
+    construct one directly. This is the same leading-underscore, "the only
+    sanctioned way to obtain one" idiom `lifecycle_store._LifecycleProjectionWriter`
+    already establishes for the identical problem elsewhere in this
+    codebase — Python does not and cannot prevent a determined caller in
+    the same process from importing this class and misusing it, and this
+    class makes no such claim. The actual, honestly-scoped guarantee is
+    narrower and different in kind: no string sourced from outside this
+    reservation mechanism (a CLI argument, a config value, an externally
+    supplied path) can, on its own, ever become the path `GitWorktree`
+    treats as this trusted deterministic location — producing a colliding
+    `(descriptor, path)` pair that also survives `GitWorktree`'s own
+    independent same-inode re-verification requires already holding a
+    real, currently-valid descriptor to a real directory at that exact
+    path, which is not obtainable from a string alone. Defending against
+    hostile code already running inside this same trusted process is out
+    of scope everywhere in this codebase (`docs/threat-model.md` A4: the
+    host process is part of the trusted computing base).
+
+    Ownership: for the duration of this reservation's own `with` block, it
+    owns both `parent_fd` (an open descriptor to `worktrees/<repo_key>/`)
+    and `leaf_fd` (an open, `O_NOFOLLOW` descriptor to the exclusively
+    created, still-empty `<lifecycle_id>` leaf). `consume()` transfers
+    ownership of the directory/worktree *resource* to whatever called it
+    (in practice, `GitWorktree.__enter__()`, only after a complete,
+    successfully re-verified entry) — it does **not** transfer descriptor-
+    close responsibility: `__exit__` always closes both descriptors,
+    whether or not `consume()` was ever called. What `consume()` changes
+    is only whether `__exit__` *also* attempts to remove the leaf
+    directory: once consumed, it must never do so, since a live or
+    preserved worktree may occupy that path — see `__exit__`'s own
+    docstring for the complete cleanup-ownership state machine.
+
+    Single-consumer state machine (`RESERVED -> CLAIMED -> CONSUMED`,
+    Slice 3C-2 correction pass): `verify_identity()` alone cannot prevent
+    two `GitWorktree` instances from both being handed the same
+    reservation and both reaching `git worktree add` — identity would
+    still agree for both, since nothing has mutated the path yet.
+    `claim()` closes this: only the first caller succeeds, transitioning
+    `RESERVED -> CLAIMED` under an internal lock (not a plain check-then-set
+    on an attribute, which is not safe against a genuine thread switch
+    between the check and the set); every later claim attempt — from a
+    second `GitWorktree` instance, sequential or concurrent — is refused
+    *before* any Git mutation is ever attempted, and specifically before
+    that second instance could reach its own enter-time failure cleanup,
+    which would otherwise identity-verify successfully (the path is still
+    the same inode) and remove the *first* instance's real, live worktree.
+    `consume()` is legal only from `CLAIMED` (transitioning to `CONSUMED`);
+    a failed entry after a successful claim leaves the reservation
+    `CLAIMED`, never `CONSUMED` — indistinguishable from "never claimed"
+    for `__exit__`'s cleanup purposes (both attempt the same
+    identity-reverified removal) but permanently refusing any further
+    claim, matching the "a failed entry cannot reset the reservation into
+    a reusable state" requirement (an explicit, proven-safe retry
+    contract is deliberately not designed in this slice).
+    """
+
+    def __init__(self, *, path: Path, parent_fd: int, leaf_fd: int, leaf_name: str) -> None:
+        self._path = path
+        self._parent_fd = parent_fd
+        self._leaf_fd = leaf_fd
+        self._leaf_name = leaf_name
+        self._state = _ReservationState.RESERVED
+        self._claim_lock = threading.Lock()
+        self._descriptors_closed = False
+        self.cleanup_error: LifecycleFsError | None = None
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def fileno(self) -> int:
+        """Read-only access to the open leaf descriptor, for an
+        fd-relative identity check (`os.fstat`). Raises `LifecycleFsError`
+        if the descriptor has already been closed."""
+        if self._descriptors_closed:
+            raise LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the worktree-leaf reservation's descriptor is no longer open",
+            )
+        return self._leaf_fd
+
+    def claim(self) -> None:
+        """Atomically transition `RESERVED -> CLAIMED`. Only ever succeeds
+        once, across any number of sequential or concurrent callers —
+        protected by an internal lock so the check-and-set is a single
+        indivisible operation, not two separately-scheduled bytecode
+        steps a thread switch could interleave. Must be called by
+        `GitWorktree.__enter__()` before any Git mutation is attempted
+        against this reservation's path. Raises `LifecycleFsError` on any
+        state other than `RESERVED` — including a second claim from the
+        same caller — never silently granting or sharing a claim."""
+        with self._claim_lock:
+            if self._state is not _ReservationState.RESERVED:
+                raise LifecycleFsError(
+                    LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                    "the worktree-leaf reservation has already been claimed",
+                )
+            self._state = _ReservationState.CLAIMED
+
+    def verify_identity(self) -> bool:
+        """fd-relative re-check: does `<leaf_name>` under `parent_fd` still
+        refer to the exact inode this reservation exclusively created?
+        Used both pre-Git (before any `git worktree add` is ever invoked)
+        and post-Git (immediately after `git worktree add` reports
+        success, before `consume()`). Deliberately never follows a
+        symlink at the leaf name (`follow_symlinks=False`) — a hostile
+        replacement is exactly as untrustworthy whether or not it happens
+        to be a symlink. Returns `False` on any stat failure (an
+        uninspectable identity is exactly as untrustworthy as a confirmed
+        mismatch) — never raises.
+        """
+        if self._descriptors_closed:
+            return False
+        try:
+            current = os.stat(self._leaf_name, dir_fd=self._parent_fd, follow_symlinks=False)
+            reserved = os.fstat(self._leaf_fd)
+        except OSError:
+            return False
+        return os.path.samestat(current, reserved)
+
+    def consume(self) -> None:
+        """Called exactly once, only by `GitWorktree.__enter__()`, only
+        after a successful `claim()` and only after `git worktree add`
+        has succeeded **and** post-Git identity/registration
+        re-verification has confirmed the registered path still
+        corresponds to this exact reservation. Transitions
+        `CLAIMED -> CONSUMED` so `__exit__` will never attempt to remove
+        the (now real, Git-registered) directory — descriptor closure is
+        unaffected and remains `__exit__`'s own responsibility
+        regardless. A descriptor-close failure occurring later must never
+        retroactively un-consume this reservation: `consume()`'s effect is
+        permanent from the moment it returns. Legal only from `CLAIMED` —
+        `consume()` without a prior `claim()`, or a second `consume()`
+        call, are both refused categorically."""
+        if self._state is not _ReservationState.CLAIMED:
+            raise LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "a worktree-leaf reservation can only be consumed from the claimed state",
+            )
+        self._state = _ReservationState.CONSUMED
+
+    def __enter__(self) -> "_WorktreeLeafReservation":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> None:
+        """Cleanup-ownership state machine (Slice 3C-2):
+
+        - Not in the `CONSUMED` state (whether never claimed, or claimed
+          but the entry failed before `consume()`): attempts a safe,
+          identity-reverified removal of the still-empty leaf directory
+          first (never a plain "it's empty, remove it" — see
+          `_remove_unconsumed_leaf_if_safe`).
+        - `CONSUMED`: never attempts removal, under any circumstance —
+          including a later descriptor-close failure, which must never
+          be misread as "this reservation was unused."
+        - Both branches always then attempt to close both descriptors,
+          regardless of whether removal was attempted or what its outcome
+          was.
+        - If both removal and descriptor closure fail, that is reported
+          as one combined, sanitized `LifecycleFsError` rather than
+          silently discarding either failure.
+        - Matching `GitWorktree.__exit__`'s own existing convention
+          (rather than `LifecycleLease.__exit__`'s "always raise, chained"
+          convention — a deliberate choice, since this reservation is
+          used nested inside `GitWorktree`'s own `with` block and should
+          not clobber a more significant in-flight exception with a
+          leftover-cleanup complaint): the combined failure is raised
+          only if nothing else is already propagating (`exc_type is
+          None`); otherwise it is recorded on `self.cleanup_error` and the
+          in-flight exception continues unmasked.
+        """
+        removal_error: LifecycleFsError | None = None
+        if self._state is not _ReservationState.CONSUMED:
+            removal_error = self._remove_unconsumed_leaf_if_safe()
+
+        close_error: LifecycleFsError | None = None
+        try:
+            close_confirmed([self._leaf_fd, self._parent_fd])
+        except LifecycleFsError as exc2:
+            close_error = exc2
+        self._descriptors_closed = True
+
+        combined = self._combine_cleanup_errors(removal_error, close_error)
+        if combined is not None:
+            self.cleanup_error = combined
+            if exc_type is None:
+                raise combined
+
+    def _remove_unconsumed_leaf_if_safe(self) -> LifecycleFsError | None:
+        """Never a pathname-only "it is empty, therefore remove it" check
+        (a same-user process could have replaced the lifecycle pathname
+        with a different, also-empty directory since this reservation was
+        created — a pathname-only check cannot distinguish the two).
+        Instead: (1) confirm the leaf name is either still exactly this
+        reservation's own inode or genuinely, confirmedly absent — a
+        `GitWorktree` enter-time failure may already have removed the
+        entire directory via Git's own exact-registration cleanup before
+        this ever runs, and that must be recognized as a clean no-op, not
+        conflated with a hostile same-name replacement; anything else
+        (present but a different inode, or uninspectable) refuses to
+        touch anything; (2) inspect emptiness through the already-open
+        leaf descriptor, not a fresh path lookup; (3) remove by name
+        relative to the held parent descriptor (`dir_fd=parent_fd`),
+        anchoring every ancestor component to an already-open,
+        already-verified descriptor rather than a fresh full-pathname
+        resolution. This does not, and cannot, eliminate the residual
+        window between step (1)'s check and step (3)'s removal — no
+        POSIX interface makes directory removal atomic against a prior
+        stat — but it closes the much larger, structurally avoidable gap
+        a plain path-string `rmdir` would leave open. Returns `None` on
+        confirmed removal or confirmed pre-existing absence; a sanitized
+        `LifecycleFsError` (never raised directly) on any disagreement or
+        failure, with nothing removed."""
+        if self._descriptors_closed:
+            return LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the worktree-leaf reservation's identity could not be reconfirmed; "
+                "no removal was attempted",
+            )
+        try:
+            current = os.stat(self._leaf_name, dir_fd=self._parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            # Confirmed absent: most plausibly GitWorktree's own
+            # enter-time failure cleanup already ran `git worktree
+            # remove --force` and removed the whole directory. Nothing
+            # left to remove — a clean, confirmed no-op, not an error.
+            return None
+        except OSError:
+            return LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the worktree-leaf reservation's identity could not be reconfirmed; "
+                "no removal was attempted",
+            )
+        try:
+            reserved = os.fstat(self._leaf_fd)
+        except OSError:
+            return LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the worktree-leaf reservation's identity could not be reconfirmed; "
+                "no removal was attempted",
+            )
+        if not os.path.samestat(current, reserved):
+            return LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the worktree-leaf reservation's identity could not be reconfirmed; "
+                "no removal was attempted",
+            )
+        try:
+            entries = list_directory_entries(self._leaf_fd)
+        except LifecycleFsError:
+            return LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the worktree-leaf reservation's contents could not be inspected before removal",
+            )
+        if entries:
+            return LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the worktree-leaf reservation is not empty and was not removed",
+            )
+        try:
+            os.rmdir(self._leaf_name, dir_fd=self._parent_fd)
+        except OSError:
+            return LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the worktree-leaf reservation could not be removed",
+            )
+        # This project's cleanup discipline never trusts a mutating
+        # syscall's own reported success as the final word (matching
+        # `GitWorktree.dispose()`'s own "only the independent final
+        # observation... decides whether disposal succeeded" rule) — a
+        # fresh, independent, fd-relative, no-follow observation is
+        # required after `rmdir` before this is reported as confirmed.
+        # Success requires exactly `FileNotFoundError`; the name being
+        # present again — even as a genuinely new, unrelated inode a
+        # same-user process created in the interim — is refused, not
+        # silently treated as "someone else's problem now," and nothing
+        # is touched a second time. This does not, and cannot, eliminate
+        # the unavoidable residual race after this final observation
+        # itself (no POSIX interface makes "remove, then observe" atomic
+        # against a subsequent recreation) — it only narrows the window
+        # this method can detect and refuse to compound.
+        try:
+            os.stat(self._leaf_name, dir_fd=self._parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the worktree-leaf reservation's removal could not be confirmed",
+            )
+        return LifecycleFsError(
+            LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+            "the worktree-leaf reservation's removal could not be confirmed; "
+            "an entry still exists at that name",
+        )
+
+    @staticmethod
+    def _combine_cleanup_errors(
+        removal_error: LifecycleFsError | None,
+        close_error: LifecycleFsError | None,
+    ) -> LifecycleFsError | None:
+        """Combine the two independent `__exit__` cleanup outcomes into at
+        most one error — neither is silently discarded in favor of the
+        other, matching `workspace.GitWorktree._combine_cleanup_errors`'s
+        identical role for the same class of problem."""
+        if removal_error is not None and close_error is not None:
+            return LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "neither the worktree-leaf reservation's removal nor its descriptor "
+                "closure could be confirmed",
+            )
+        return removal_error or close_error
 
 
 def _build_state_root(root_fd: int, canonical_path: str, payload: dict) -> StateRoot:

@@ -7,17 +7,31 @@ whole point is proving real worktree/cleanup/protection behavior.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import traceback
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import pytest
 
 from codeagent import _git_safety
+from codeagent import _lifecycle_fs as lf
+from codeagent import state_root as sr
 from codeagent.workspace import GitWorktree, GitWorktreeCleanupError, GitWorktreeError
 from tests.support.fixture_repo import FIXTURE_SOURCE, real_fixture_repo
+
+_WT_REPO_KEY = "a" * 32
+_WT_LIFECYCLE_ID = "b" * 32
+
+
+def _real_state_root(tmp_path):
+    root_dir = tmp_path / "state-root"
+    root_dir.mkdir(mode=0o700)
+    root_fd = os.open(root_dir, os.O_RDONLY | os.O_DIRECTORY)
+    return sr.init_state_root(root_fd, str(root_dir))
 
 
 def _status(repo) -> str:
@@ -1717,6 +1731,552 @@ def test_exceptional_exit_before_teardown_still_disposes_exactly() -> None:
             check=True,
         ).stdout
         assert str(captured_path) not in listing
+
+
+@pytest.fixture
+def reservation_repo(tmp_path):
+    """A real fixture repo plus a real StateRoot, for Milestone 3 Slice
+    3C-2's deterministic-worktree-placement tests. Yields (repo_path,
+    state_root); the state root is closed on teardown."""
+    with real_fixture_repo() as repo:
+        state_root = _real_state_root(tmp_path)
+        try:
+            yield repo, state_root
+        finally:
+            state_root.close()
+
+
+def test_reservation_none_is_accepted(reservation_repo) -> None:
+    repo, _state_root = reservation_repo
+    GitWorktree(repo, run_id="r-none-reservation")  # must not raise
+
+
+def test_reservation_genuine_private_type_is_accepted(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        GitWorktree(repo, run_id="r-genuine-reservation", reservation=reservation)  # must not raise
+
+
+def test_reservation_rejects_a_path_string(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        with pytest.raises(GitWorktreeError, match="genuine worktree-leaf reservation object"):
+            GitWorktree(repo, run_id="r-string-reservation", reservation=str(reservation.path))
+
+
+def test_reservation_rejects_a_path_object(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        with pytest.raises(GitWorktreeError, match="genuine worktree-leaf reservation object"):
+            GitWorktree(repo, run_id="r-path-reservation", reservation=reservation.path)
+
+
+def test_reservation_rejects_a_duck_typed_impostor(reservation_repo) -> None:
+    """An arbitrary object exposing the same surface
+    (`verify_identity()`/`path`/`consume()`) as the real reservation must
+    still be refused — the boundary this class provides is an `isinstance`
+    check against the genuine private type, not structural duck typing."""
+    repo, _state_root = reservation_repo
+
+    class _Impostor:
+        path = Path("/tmp/impostor")
+
+        def verify_identity(self) -> bool:
+            return True
+
+        def consume(self) -> None:
+            pass
+
+        def claim(self) -> None:
+            pass
+
+    with pytest.raises(GitWorktreeError, match="genuine worktree-leaf reservation object"):
+        GitWorktree(repo, run_id="r-impostor-reservation", reservation=_Impostor())
+
+
+def test_reservation_wrong_type_rejection_performs_zero_git_mutation(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        import codeagent.workspace as workspace_module
+
+        invoked = []
+        real_run = workspace_module._run
+
+        def spy(repo_path, *args, **kw):
+            invoked.append(args)
+            return real_run(repo_path, *args, **kw)
+
+        with mock.patch("codeagent.workspace._run", side_effect=spy):
+            with pytest.raises(GitWorktreeError, match="genuine worktree-leaf reservation object"):
+                GitWorktree(repo, run_id="r-wrong-type", reservation=str(reservation.path))
+        assert invoked == [], "a wrong-type reservation must never reach any Git invocation"
+
+
+def test_reservation_wrong_type_error_never_echoes_repr(reservation_repo) -> None:
+    repo, _state_root = reservation_repo
+
+    class _SecretBearingImpostor:
+        def __repr__(self) -> str:
+            return "SECRET-TOKEN-should-never-appear"
+
+    try:
+        GitWorktree(repo, run_id="r-secret", reservation=_SecretBearingImpostor())
+    except GitWorktreeError as exc:
+        assert "SECRET-TOKEN" not in str(exc)
+    else:
+        pytest.fail("expected GitWorktreeError")
+
+
+def test_second_gitworktree_sharing_same_reservation_refused_before_any_git_mutation(
+    reservation_repo,
+) -> None:
+    """The exact race this correction pass exists to close: two
+    GitWorktree instances handed the same reservation. Without claim(),
+    the second instance's own verify_identity() would still agree (the
+    path is still the same inode, since nothing has mutated it yet), so
+    it would reach `git worktree add`, fail (the directory is no longer
+    empty), and then its own enter-time failure cleanup would
+    identity-verify successfully and run `git worktree remove --force`
+    against the *first* instance's real, live worktree. claim() must
+    refuse the second instance before any of that happens."""
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        wt1 = GitWorktree(repo, run_id="r-first-claimant", reservation=reservation)
+        with wt1 as path1:
+            import codeagent.workspace as workspace_module
+
+            mutating_calls = []
+            real_run = workspace_module._run
+
+            def spy(repo_path, *args, **kw):
+                if args[:1] == ("worktree",) and args[1:2] in (("add",), ("remove",)):
+                    mutating_calls.append(args)
+                return real_run(repo_path, *args, **kw)
+
+            wt2 = GitWorktree(repo, run_id="r-second-claimant", reservation=reservation)
+            with mock.patch("codeagent.workspace._run", side_effect=spy):
+                with pytest.raises(GitWorktreeError) as excinfo:
+                    wt2.__enter__()
+            # GitWorktree never exposes state_root/_lifecycle_fs exception
+            # types to its own callers -- a refused claim is translated to
+            # a fixed, sanitized GitWorktreeError, with the raw
+            # LifecycleFsError preserved only as __cause__. Exact equality,
+            # not a substring: the message is fixed, categorical text, and
+            # must never assert *who* holds the claim (it could just as
+            # well be the same instance retrying after an earlier failed
+            # entry as a genuinely distinct concurrent claimant).
+            assert (
+                str(excinfo.value)
+                == "the reserved worktree location has already been claimed and cannot be reused"
+            )
+            assert isinstance(excinfo.value.__cause__, lf.LifecycleFsError)
+            assert excinfo.value.__cause__.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+            # wt2's own __enter__() resolves `_rev_parse("HEAD")` against
+            # the *source* repository to completion *before* the
+            # reservation branch (and therefore claim()) is ever reached --
+            # claim() does not refuse before that read-only call. The
+            # load-bearing property this test actually proves is narrower
+            # and still holds: no `git worktree add`/`remove` *mutation*
+            # against the *target* path is ever attempted by the refused
+            # second claimant.
+            assert mutating_calls == [], "a refused second claimant must never mutate the worktree"
+            # The first instance's real worktree is completely untouched.
+            assert path1.exists()
+            listing = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert str(path1.resolve()) in listing
+
+
+def test_second_claim_after_first_worktree_preserved_performs_no_mutation(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        wt1 = GitWorktree(repo, run_id="r-preserved-first", reservation=reservation)
+        with wt1 as path1:
+            wt1.preserve()
+        import codeagent.workspace as workspace_module
+
+        mutating_calls = []
+        real_run = workspace_module._run
+
+        def spy(repo_path, *args, **kw):
+            if args[:1] == ("worktree",) and args[1:2] in (("add",), ("remove",)):
+                mutating_calls.append(args)
+            return real_run(repo_path, *args, **kw)
+
+        wt2 = GitWorktree(repo, run_id="r-second-after-preserve", reservation=reservation)
+        with mock.patch("codeagent.workspace._run", side_effect=spy):
+            with pytest.raises(GitWorktreeError) as excinfo:
+                wt2.__enter__()
+        # Exact equality, not a substring -- the fixed, categorical message
+        # never asserts who holds the claim.
+        assert (
+            str(excinfo.value)
+            == "the reserved worktree location has already been claimed and cannot be reused"
+        )
+        assert isinstance(excinfo.value.__cause__, lf.LifecycleFsError)
+        assert excinfo.value.__cause__.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+        assert mutating_calls == [], "a refused second claimant must never mutate the worktree"
+        assert path1.exists()
+        listing = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert str(path1.resolve()) in listing
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "remove", "--force", str(path1)],
+            capture_output=True,
+        )
+
+
+def test_claim_twice_is_refused_categorically(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        reservation.claim()
+        with pytest.raises(lf.LifecycleFsError) as excinfo:
+            reservation.claim()
+        assert excinfo.value.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+
+
+def test_consume_without_claim_is_refused(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        with pytest.raises(lf.LifecycleFsError) as excinfo:
+            reservation.consume()
+        assert excinfo.value.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+
+
+def test_entry_failure_after_claim_leaves_reservation_for_outer_cleanup(reservation_repo) -> None:
+    """A claimed-but-never-consumed reservation (the pre-Git identity
+    check failed after a successful claim) is left exactly where the
+    "not CONSUMED" branch of __exit__ already handles it -- claimed and
+    consumed are deliberately treated identically by cleanup, since both
+    mean "this reservation's directory/worktree resource was never
+    transferred."""
+    repo, state_root = reservation_repo
+    reservation = state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID)
+    path = reservation.path
+    path.rmdir()
+    path.mkdir()  # forces the pre-Git identity check to fail, after claim() succeeds
+    wt = GitWorktree(repo, run_id="r-claimed-not-consumed", reservation=reservation)
+    with pytest.raises(GitWorktreeError, match="could not be confirmed before use"):
+        wt.__enter__()
+    assert reservation._state is sr._ReservationState.CLAIMED
+
+    # The outer context is left responsible for cleanup, exactly as the
+    # test name states -- and correctly refuses: since the leaf was never
+    # genuinely reserved-then-untouched (it's the swapped-in directory,
+    # still present, still empty, but a different inode), cleanup refuses
+    # to remove it rather than silently deleting a same-user replacement.
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        reservation.__exit__(None, None, None)
+    assert excinfo.value.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+    assert path.exists()
+    path.rmdir()
+
+
+def test_claim_state_transitions_under_a_real_thread_barrier(reservation_repo) -> None:
+    """Proves claim()'s lock-protected check-and-set is genuinely atomic
+    against real concurrent threads, not merely single-threaded-safe by
+    accident: two real OS threads race to claim the same reservation at
+    the exact same moment (synchronized by a barrier), and exactly one
+    succeeds."""
+    import threading
+
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        barrier = threading.Barrier(2)
+        results: list[str] = []
+        lock = threading.Lock()
+
+        def attempt_claim():
+            barrier.wait(timeout=5)
+            try:
+                reservation.claim()
+                outcome = "claimed"
+            except lf.LifecycleFsError:
+                outcome = "refused"
+            with lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=attempt_claim) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert sorted(results) == ["claimed", "refused"]
+        assert reservation._state is sr._ReservationState.CLAIMED
+
+
+def test_consume_failure_after_successful_entry_translates_and_cleans_up(
+    reservation_repo,
+) -> None:
+    """Load-bearing fault injection for Slice 3C-2's correction pass
+    (finding 2): forces `reservation.consume()` to fail *after* a real
+    `git worktree add`/`read-tree`/filter-check/checkout has fully
+    succeeded and post-Git identity/registration verification has
+    already passed. Proves: the raw `LifecycleFsError` never escapes
+    `GitWorktree.__enter__()`; the real Git registration and directory
+    are still exactly, confirmedly cleaned up (the reservation's own
+    identity is still genuinely intact -- nothing foreign was ever
+    touched); and `self.path`/`self._initial_commit` are never
+    published for an entry that never actually completed."""
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        wt = GitWorktree(repo, run_id="r-consume-fails", reservation=reservation)
+
+        forced_cause = lf.LifecycleFsError(
+            lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED, "forced consume failure"
+        )
+        with mock.patch.object(reservation, "consume", side_effect=forced_cause):
+            with pytest.raises(GitWorktreeError) as excinfo:
+                wt.__enter__()
+
+        assert excinfo.value.__cause__ is forced_cause
+        assert isinstance(excinfo.value.__cause__, lf.LifecycleFsError)
+        assert excinfo.value.__cause__.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+
+        # Never published: this entry never actually completed.
+        assert wt.path is None
+        with pytest.raises(GitWorktreeError):
+            wt.initial_commit
+
+        # Exact, confirmed cleanup: the real worktree Git actually
+        # created (before consume() was ever reached) is genuinely gone
+        # -- the reservation's own identity was never actually lost here
+        # (only consume() was fault-injected), so this is the "identity
+        # still proven, exact cleanup attempted and confirmed" path, not
+        # the "identity lost, refuse to touch it" path.
+        assert not reservation.path.exists()
+        listing = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert str(reservation.path.resolve()) not in listing
+
+        # The reservation itself is left claimed-but-not-consumed: its
+        # own outer __exit__ (about to run as this `with` block ends)
+        # performs the confirmed-absence handling naturally, since the
+        # directory is already gone.
+        assert reservation._state is sr._ReservationState.CLAIMED
+
+
+def test_git_accepts_the_real_pre_created_empty_directory(reservation_repo) -> None:
+    """Pins the exact behavior this slice's design depends on: `git
+    worktree add` succeeds against a pre-existing, exclusively-created
+    empty directory — an automated regression for the disposable `/tmp`
+    experiment this review round verified manually."""
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        expected = Path(state_root.path) / "worktrees" / _WT_REPO_KEY / _WT_LIFECYCLE_ID
+        assert reservation.path == expected
+        with GitWorktree(repo, run_id="r-reservation", reservation=reservation) as wpath:
+            assert wpath == expected
+            assert (wpath / ".git").exists()
+            listing = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert str(wpath.resolve()) in listing
+
+
+def test_legacy_reservation_none_path_remains_unchanged(reservation_repo) -> None:
+    repo, _state_root = reservation_repo
+    with GitWorktree(repo, run_id="r-legacy") as path:
+        assert "codeagent-worktree-" in str(path.parent)
+        assert (path / ".git").exists()
+
+
+def test_successful_disposal_confirms_registration_and_directory_absence(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        path = reservation.path
+        with GitWorktree(repo, run_id="r-dispose", reservation=reservation):
+            pass
+        assert not path.exists()
+        listing = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert str(path.resolve()) not in listing
+
+
+def test_preserve_plus_outer_context_exit_retains_reservation_worktree(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        path = reservation.path
+        wt = GitWorktree(repo, run_id="r-preserve", reservation=reservation)
+        with wt:
+            wt.preserve()
+        assert path.exists(), "a preserved worktree must survive the outer context exit"
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "remove", "--force", str(path)],
+            capture_output=True,
+        )
+
+
+def test_unexpected_with_body_exception_disposes_reservation_worktree(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    captured_path = None
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        wt = GitWorktree(repo, run_id="r-exc", reservation=reservation)
+        with pytest.raises(RuntimeError, match="boom"):
+            with wt as path:
+                captured_path = path
+                raise RuntimeError("boom")
+        assert not captured_path.exists()
+
+
+def test_reservation_descriptors_close_without_leaf_removal_after_consume(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        with GitWorktree(repo, run_id="r-consumed", reservation=reservation) as path:
+            assert path.exists()
+        # After GitWorktree's own dispose() removed the (consumed,
+        # now-disposed) worktree, the reservation's own __exit__ must
+        # never attempt to remove anything (consumed path) and must not
+        # raise merely because the directory is already gone.
+        assert not reservation.path.exists()
+
+
+def test_pre_git_inode_mismatch_performs_zero_git_worktree_add(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    reservation = state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID)
+    path = reservation.path
+    path.rmdir()
+    path.mkdir()  # same-user swap before GitWorktree ever runs
+    assert reservation.verify_identity() is False
+
+    import codeagent.workspace as workspace_module
+
+    add_invoked = []
+    real_run = workspace_module._run
+
+    def spy(repo_path, *args, **kw):
+        if args[:2] == ("worktree", "add"):
+            add_invoked.append(args)
+        return real_run(repo_path, *args, **kw)
+
+    with mock.patch("codeagent.workspace._run", side_effect=spy):
+        with pytest.raises(GitWorktreeError, match="could not be confirmed before use"):
+            GitWorktree(repo, run_id="r-mismatch", reservation=reservation).__enter__()
+    assert add_invoked == [], "git worktree add must never run on a pre-Git identity mismatch"
+
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        # The reservation itself also refuses to touch the foreign
+        # directory during its own cleanup — confirms it, doesn't mask it.
+        reservation.__exit__(None, None, None)
+    assert excinfo.value.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+    assert path.exists(), "the swapped-in foreign directory must never be removed"
+    path.rmdir()
+
+
+def test_registration_disagreement_with_inode_still_owned_uses_exact_cleanup(reservation_repo) -> None:
+    """A registration-level disagreement (Git's own bookkeeping) while
+    the pathname's inode identity is still provably the reservation's own
+    is safe to clean up via the ordinary exact Git removal — this is
+    fundamentally different from an inode-identity loss (the next test),
+    where the pathname itself may no longer be trustworthy."""
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        wt = GitWorktree(repo, run_id="r-registration-mismatch", reservation=reservation)
+
+        real_registration_status = wt._registration_status
+        call_count = {"n": 0}
+
+        def fake_registration_status(path):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # The post-Git check's own registration lookup (Step 5):
+                # force a disagreement even though the real Git
+                # registration and the reservation's inode identity are
+                # both still genuinely intact.
+                return False
+            return real_registration_status(path)
+
+        with mock.patch.object(wt, "_registration_status", side_effect=fake_registration_status):
+            # The original entry failure (a reported disagreement) still
+            # propagates as GitWorktreeError -- NOT a GitWorktreeCleanupError,
+            # since cleanup itself succeeds and is confirmed: this is the
+            # "exact cleanup may be attempted and must be confirmed" case,
+            # distinct from the next test's "cleanup must never be
+            # attempted at all" case.
+            with pytest.raises(
+                GitWorktreeError, match="could not be reconfirmed after creation"
+            ):
+                wt.__enter__()
+        # Exact Git-level cleanup was attempted and is confirmed: the real
+        # registration and the directory itself are both genuinely gone --
+        # proving identity-proven cleanup is safe and was really performed,
+        # not merely not-refused.
+        assert real_registration_status(reservation.path) is False
+        assert not reservation.path.exists()
+        assert wt.cleanup_error is None
+
+
+def test_inode_disagreement_after_git_mutation_never_runs_destructive_removal(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        wt = GitWorktree(repo, run_id="r-inode-lost", reservation=reservation)
+
+        call_count = {"n": 0}
+        real_verify = reservation.verify_identity
+
+        def fake_verify():
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return True  # pre-Git check: pass
+            return False  # post-Git check: identity lost (simulated same-user swap)
+
+        import codeagent.workspace as workspace_module
+
+        remove_calls = []
+        real_run = workspace_module._run
+
+        def spy(repo_path, *args, **kw):
+            if args[:2] == ("worktree", "remove"):
+                remove_calls.append(args)
+            return real_run(repo_path, *args, **kw)
+
+        with mock.patch.object(reservation, "verify_identity", side_effect=fake_verify):
+            with mock.patch("codeagent.workspace._run", side_effect=spy):
+                with pytest.raises(
+                    GitWorktreeCleanupError, match="no destructive Git operation was attempted"
+                ):
+                    wt.__enter__()
+        assert remove_calls == [], "git worktree remove must never run once inode identity is lost"
+
+        # Evidence (the real, now-materialized worktree Git actually
+        # created) is left exactly as it is -- never silently adopted or
+        # removed by production code. This test cleans it up for real, via
+        # the real git command, so the test itself doesn't leak it -- no
+        # private-state mutation is used to suppress the fixture's own
+        # cleanup: by the time this line runs, both `mock.patch` context
+        # managers above have already exited, so `reservation.verify_identity`
+        # is back to its real implementation, and the directory is now
+        # genuinely, confirmedly absent (this `worktree remove` really
+        # deleted it). The outer `with` block's own `reservation.__exit__`,
+        # which runs naturally after this test function returns, will
+        # therefore observe a confirmed-absent leaf and treat it as the
+        # clean no-op it actually is (see `_remove_unconsumed_leaf_if_safe`'s
+        # own "confirmed absent" branch) -- proving that branch is exercised
+        # for real here, not merely asserted in isolation elsewhere.
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "remove", "--force", str(reservation.path)],
+            capture_output=True,
+        )
 
 
 def test_no_rmtree_or_prune_reference_exists_in_workspace_module() -> None:
