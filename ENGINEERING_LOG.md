@@ -4979,3 +4979,112 @@ unimplemented and out of scope as the original 3C-3 entry above states.
 in this correction pass alters T-E1 or any other listed threat. All
 changes remain unstaged and uncommitted; Linux CI has not run for any
 of this.
+
+## 2026-10-02 — Milestone 3 Slice 3C-3: Linux CI evidence reconciliation
+
+Slice 3C-3 (including its same-day correction pass) was committed
+(`bd90a992a001a2f9e9aed42ea65138802065f5cb`) and pushed to `main` as an
+ordinary fast-forward (`07a0231..bd90a99`, no force). This is a
+documentation-only pass reconciling `CLAUDE.md`'s and ADR 0004
+Amendment 9's "not yet committed, pushed, or Linux-CI-confirmed" /
+"Linux CI confirmation is pending ... nothing has been pushed"
+placeholders against the real, independently re-verified run. No
+production code, test, workflow, configuration, dependency, accepted
+behavior, or `docs/threat-model.md` status was changed.
+
+GitHub Actions run [37052793645](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37052793645)
+was independently re-fetched — fresh run metadata via
+`gh api repos/.../actions/runs/37052793645`, a fresh per-job/per-step
+breakdown via `gh api repos/.../actions/runs/37052793645/jobs`, and the
+complete raw step logs via `gh run view --log`, all freshly re-queried
+rather than reused from the prior commit-finalization report — and
+every fact below was verified directly against those fresh results.
+
+Verified: `head_sha` exactly `bd90a992a001a2f9e9aed42ea65138802065f5cb`;
+`conclusion` `success`; `status` `completed`; exactly one job ("Test
+(ubuntu-24.04, Python 3.12)"), itself `success`, with exactly 13
+API-reported steps, every one `success` (Set up job; Check out
+repository; Set up Python 3.12; Install project and test dependencies;
+Docker preflight (mandatory); Resolve pinned verification image; Pull
+pinned verification image and confirm linux/amd64; Run real Docker
+verification tests (must execute, not skip); Run complete test suite;
+Verify no leftover CodeAgent verification containers (legacy and
+lifecycle-aware families); Post Set up Python 3.12; Post Check out
+repository; Complete job). GitHub-hosted `ubuntu-24.04` x86_64, Python
+3.12, confirmed directly from the job name and the raw log's own
+"Operating System: Ubuntu 24.04.5 LTS" line. Docker preflight: Docker
+Engine - Community, version `28.0.4`, directly present in the raw log;
+step succeeded. Pinned verification image resolved as
+`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`
+and, after `docker pull`, `docker inspect --format '{{.Os}}/{{.Architecture}}'`
+reported exactly `linux/amd64`. The dedicated "Run real Docker
+verification tests (must execute, not skip)" step ran exactly
+`python -m pytest tests/integration/test_slice_c.py -v` with
+`CODEAGENT_REQUIRE_DOCKER=1` confirmed present in that step's own
+logged environment, and the verbose output shows all three of its own
+tests individually `PASSED` (no `SKIPPED` line anywhere in that step),
+concluding `3 passed in 2.37s` — this is this file's own legacy
+Milestone-1 suite, exactly, and is explicitly **not** Slice-3C-3-specific
+evidence, since this slice adds no real-Docker test of its own. The
+separate "Run complete test suite" step ran exactly
+`python -m pytest -q` with `CODEAGENT_REQUIRE_DOCKER=1` also confirmed
+present in that step's own logged environment, concluding
+`2744 passed, 3 skipped in 49.20s`. `pytest -q` prints no test
+identities anywhere in this log, so these 3 skips are not identified or
+guessed from the log — source inspection (not CI-log evidence)
+separately continues to identify the same three Linux-unconditional,
+platform/host-specific skips named in every earlier slice's own entry
+(`test_evidence.py`'s Darwin-only ambient-`/tmp`-symlink test,
+`test_lifecycle_fs.py`'s Darwin-only case-canonicalization test, and
+`test_repo_identity.py`'s case-insensitive-filesystem-dependent alias
+test) as the likely candidates, labeled explicitly as inference, not
+something this run's own log proves. `2744 + 3` equals the local
+macOS collected total of 2,747 reported in the correction-pass entry
+above. The final leftover-container-check step ran the anchored
+`grep -E '^codeagent-(verify-|baseline-|verification-)'` pattern over a
+complete, unfiltered `docker ps -a --format '{{.Names}}'` listing,
+covering all three CodeAgent container families (the legacy
+`codeagent-verify-*` and the deterministic lifecycle-aware
+`codeagent-baseline-*`/`codeagent-verification-*` families); its
+captured output was empty, and the step succeeded.
+
+`CLAUDE.md`'s Slice 3C-3 bullet (previously ending "...is implemented
+and locally verified on macOS (2026-10-02); **not yet committed,
+pushed, or Linux-CI-confirmed**" at its opening, and "Still not
+committed, pushed, or Linux-CI-confirmed; scope and
+`docs/threat-model.md`'s unchanged status are unaffected" at its
+correction-pass closing) and `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+Amendment 9 evidence text (previously "Linux CI confirmation is pending
+as of this commit (not yet pushed)" after the first pass's own evidence
+paragraph, and "Linux CI confirmation remains pending; nothing has been
+pushed" at the correction pass's own closing) are all updated in place
+with the verified evidence above, following this project's established
+convention (see, e.g., the 2026-09-29 Slice 3C-2 Linux CI evidence
+reconciliation entry above) of correcting a now-stale present-tense
+status statement in these two living documents, as distinct from
+`ENGINEERING_LOG.md` itself. No other prose in either file — the
+control-flow structure, the exception/precedence semantics, the
+lifecycle-owner-cleanup and precedence tests, the chaining-regression
+strengthening, or the milestone/scope boundaries — was touched.
+
+Every earlier `ENGINEERING_LOG.md` entry, including this slice's own
+two same-day entries above (which correctly stated "Linux CI has not
+run for any of this" and "nothing has been pushed," respectively, *at
+the time each was written*), is left unmodified, per this project's
+own established convention of never rewriting historical entries to
+match later state.
+
+`docs/threat-model.md` was inspected and contains no Slice-3C-3-specific
+statement of any kind (stale or otherwise) to correct — it remains
+unchanged. No threat is claimed newly mitigated by this pass: Slice
+3C-3 remains a controller-internal correctness change (an ordinary-
+exception terminalization boundary inside `RunController`), not
+production lifecycle composition or concurrent-run protection, and
+T-E1's existing partial-mitigation status is unaffected.
+
+Verified: `git diff --check` clean on the resulting documentation-only
+diff; only `CLAUDE.md`, the ADR, and this file changed — no production
+code, test, workflow, configuration, or dependency file touched;
+nothing staged. No test run or Docker session was needed for this
+pass — the independently re-verified, completed CI run is the
+evidence.

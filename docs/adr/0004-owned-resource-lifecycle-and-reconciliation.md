@@ -3139,8 +3139,7 @@ provably fires; it no longer escapes raw, which is the amendment's own
 intended effect, not an accommodation of a regression.
 
 This is implementation/automated-test evidence only — it does not
-constitute or substitute for a security review. Linux CI confirmation
-is pending as of this commit (not yet pushed).
+constitute or substitute for a security review.
 
 ### Correction pass (2026-10-02)
 
@@ -3193,4 +3192,48 @@ from 2,744), 0 skipped, with `CODEAGENT_REQUIRE_DOCKER=1`; `git diff
 `refs/codeagent` refs, lingering processes, or temp/default state
 roots afterward. No scope change from the amendment as originally
 accepted above. This is implementation/automated-test evidence only.
-Linux CI confirmation remains pending; nothing has been pushed.
+
+**Confirmed on GitHub-hosted Linux CI** (commit
+`bd90a992a001a2f9e9aed42ea65138802065f5cb`, run
+[37052793645](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37052793645),
+`ubuntu-24.04` x86_64, Python 3.12, conclusion `success`, 1 job, 13
+steps, every step `success`): the mandatory Docker preflight step
+succeeded (Docker Engine - Community, version `28.0.4`); the pinned
+verification image
+(`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`)
+was pulled and confirmed `linux/amd64`. The dedicated "Run real Docker
+verification tests" step ran only `python -m pytest
+tests/integration/test_slice_c.py -v`
+(`CODEAGENT_REQUIRE_DOCKER=1` confirmed present in that step's own
+logged environment): `3 passed in 2.37s`, 0 skipped — this is this
+file's own legacy Milestone-1 suite, exactly, and is **not** specific
+evidence for Slice 3C-3, which adds no real-Docker test of its own. The
+separate "Run complete test suite" step (`python -m pytest -q`,
+`CODEAGENT_REQUIRE_DOCKER=1` also confirmed present in that step's own
+logged environment) reported `2744 passed, 3 skipped in 49.20s`;
+`2744 + 3` equals the local collected total of 2,747 reported just
+above. The run used `pytest -q`, which prints no test identities, so
+these 3 skips are **not identified from this run's own log** and are
+not guessed here — they are not evidence of Docker unavailability,
+since the daemon, the pulled image, and `CODEAGENT_REQUIRE_DOCKER=1`
+were all already confirmed for that same step. Source inspection — not
+CI-log evidence — continues to identify the same three
+Linux-unconditional, platform/host-specific skips named in every
+earlier amendment's own evidence paragraph as the likely candidates;
+this is stated separately as source-based inference, not something
+this run's own log proves. The final leftover-container check ran the
+anchored `grep -E '^codeagent-(verify-|baseline-|verification-)'`
+pattern, covering all three CodeAgent container families, over a
+complete, unfiltered `docker ps -a --format '{{.Names}}'` listing; its
+captured output was empty and the step succeeded. This is
+implementation/automated-test evidence only — it does not constitute
+or substitute for a security review, and is GitHub-hosted
+`ubuntu-24.04` x86_64 evidence specifically, not a general Linux or
+ARM64 portability claim. It does not claim any composition root,
+worktree lifecycle-projection table, `LifecycleLease` ownership
+decision, CLI/UI, or signal/cancellation implementation exists, and
+changes no cleanup precedence or exception semantics beyond what this
+amendment already states above. `docs/threat-model.md`'s T-E1 entry
+remains unaffected — this amendment is a controller-internal
+correctness change, not production lifecycle composition or
+concurrent-run protection.
