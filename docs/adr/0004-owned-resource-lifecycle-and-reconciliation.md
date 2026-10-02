@@ -2982,3 +2982,215 @@ not claim `prepare_lifecycle()`, `LifecycleLease` ownership/closure, CLI
 wiring, or any production entry-point composition exists — none of that
 is part of this slice, unchanged from the "Explicitly deferred" section
 above.
+
+## Amendment 9 (Accepted 2026-10-02): Milestone 3 Slice 3C-3 — `RunController` ordinary-exception terminalization boundary
+
+### Context
+
+Slice 3C-2 closed the deterministic-worktree-placement gap but left an
+independently-discovered correctness gap unresolved, flagged explicitly
+in that slice's own review for 3C-3's planning: `RunController.run()`
+has no top-level exception boundary. An unexpected, ordinary `Exception`
+from any collaborator (model, approval provider, verifier, patch
+applier, reader, or a lifecycle publisher) propagates straight out of
+`run()`, never reaching `_terminate()` — skipping evidence capture,
+worktree disposal, checkpoint-ref deletion, and owner-state
+`begin_cleanup()`/`complete()` entirely. This is a real, present gap in
+already-shipped code, independent of the still-undecided worktree
+transition table or `LifecycleLease` ownership/close-timing questions
+(both remain open — see Amendment 8's own unresolved items, unchanged
+by this amendment).
+
+### Decision
+
+An ordinary `Exception` that escapes normal run execution, after
+`RunStarted` is emitted and `RUN_STARTED` is recorded, is routed exactly
+once through `_terminate()`, producing
+`RunFinished(terminal_reason=UNRECOVERABLE_ERROR,
+error.code=ErrorCode.UNCLASSIFIED_FAILURE)` with one fixed, sanitized
+message: `"the run terminated due to an unanticipated internal error"`.
+No new `ErrorCode` is introduced — `UNCLASSIFIED_FAILURE`'s own existing
+contract (`errors.py`) already permits exactly this use: "Permitted only
+as `RunFinished.error` when `terminal_reason` is `UNRECOVERABLE_ERROR`
+... there is no legitimate case for using this code anywhere but the
+run's final, single terminal report."
+
+**Deliberately narrow — explicitly NOT covered by this amendment:**
+- Any `BaseException` that is not an `Exception`
+  (`KeyboardInterrupt`/`SystemExit`/`GeneratorExit`) — these propagate
+  untouched by construction, since `except Exception:` cannot intercept
+  them; no special-case code exists or is added.
+- Signal-driven cancellation — remains entirely ADR 0005's domain
+  (accepted, unimplemented). This amendment makes no cancellation-safety
+  claim and does not touch ADR 0005.
+- A failure during the initial `RunStarted` emission or `RUN_STARTED`
+  transition, which remain outside the guarded region — the event
+  contract does not establish whether terminalization is even valid
+  before `RunStarted` exists in the log, and this amendment does not
+  invent an answer.
+- A failure arising inside `_terminate()` itself. `_terminate()` gains a
+  genuine one-shot guard — a check-and-raise, not a bare flag write —
+  as its first two lines:
+  ```python
+  if self._termination_started:
+      raise RuntimeError("run termination has already started")
+  self._termination_started = True
+  ```
+  If an exception escapes an already-started `_terminate()`, it
+  propagates unchanged; `_terminate()` is never invoked a second time,
+  and no cleanup, lifecycle publication, transition, or event emission
+  is ever duplicated.
+
+### Mechanism (why no `__context__`/`__cause__` leak)
+
+`run()`'s fallback `_terminate()` call is placed strictly *after* the
+`except Exception:` block exits, never inside it, and the caught
+exception is never bound to a name:
+
+```python
+try:
+    return self._run_after_start()
+except Exception:
+    if self._termination_started:
+        raise
+    # falls through; the exception is retained nowhere
+
+return self._terminate(
+    self._pass_index,
+    domain.Trigger.UNRECOVERABLE_ERROR,
+    error=OperationalError(
+        code=ErrorCode.UNCLASSIFIED_FAILURE,
+        error_id=f"{c.run_id}-unclassified-failure",
+        message="the run terminated due to an unanticipated internal error",
+    ),
+)
+```
+
+Once Python exits an `except` block without re-raising, the "currently
+being handled" exception state is cleared. Because the fallback
+`_terminate()` call sits outside that block, a failure inside it starts
+with a clean `__context__`/`__cause__` — never implicitly chained to the
+discarded, uncontrolled collaborator exception. This was verified
+directly, not merely asserted: a real end-to-end regression (an
+unexpected collaborator exception combined with a second, independent
+teardown failure) confirms the escaping exception's `__context__` and
+`__cause__` are both `None`, and that the original collaborator
+exception's text/type appears nowhere in it or in any emitted event.
+
+No type, message, repr, traceback, marker, or other uncontrolled detail
+derived from the caught exception is ever persisted, emitted, logged,
+interpolated, or chained by this mechanism. This is narrower than a
+claim that nothing from the run reaches persisted events: ordinary
+events emitted *before* the exception occurred (e.g. `RunStarted`,
+`BaselineRecorded`, a prior `ToolCompleted`) still carry their normal,
+schema-approved run/plan/tool data exactly as they always have — this
+amendment sanitizes only the caught exception itself, not the run's
+otherwise-ordinary event trace.
+
+### What is unaffected
+
+Every existing recognized-failure path is preserved exactly: checkpoint-
+ref/lifecycle-publication error mappings, patch/read/verifier typed
+`OperationalError` returns, evidence-capture and cleanup-unconfirmed
+precedence inside `_terminate()`, and every normal
+REJECTED/REVISION_REQUESTED/budget-exceeded/PASSED/TEST_FAILURE outcome.
+This amendment adds exactly one new catch-all at exactly one point; it
+changes no existing `_terminate()` ordering or precedence rule.
+
+### Explicitly out of scope
+
+`prepare_lifecycle()` production wiring; any composition root; the
+worktree transition/combination table (or a decision to omit worktree
+attribution); `LifecycleLease` ownership/close-timing; CLI/UI; signal
+handling/cancellation; Docker behavior changes; reconciliation changes;
+abandonment; any `ErrorCode`/`ErrorDomain`/events-schema change beyond
+reusing the existing `UNCLASSIFIED_FAILURE`. `docs/threat-model.md` is
+unchanged — this is a controller-internal correctness fix, not a new
+concurrent-run or lifecycle-attribution mitigation; it does not alter
+T-E1's status.
+
+### Evidence
+
+Verified locally (macOS, real Docker daemon,
+`CODEAGENT_REQUIRE_DOCKER=1`): the directly affected files
+(`src/codeagent/controller.py`, `tests/integration/test_controller.py`)
+compile cleanly; `test_controller.py` alone, 60 passed; the directly
+affected set (`test_controller.py` + `test_errors.py` + `test_events.py`)
+collected and passed together, 806 passed, in both forward and reverse
+file order; the established fifteen-file focused Milestone-3 set
+(the fourteen-file set established since Slice 3A-1, plus
+`test_controller.py`) collected and passed together, 1,220 passed, in
+both forward and reverse file order; the complete suite, 2,744 passed,
+0 skipped, with `CODEAGENT_REQUIRE_DOCKER=1`; `git diff --check` clean;
+no leftover `codeagent-*` containers, extra worktrees,
+`refs/codeagent` refs, lingering processes, or temp/default state
+roots afterward.
+
+One pre-existing test required a correction, not a weakening:
+`test_fake_model_gate_actually_fails_without_the_marker` had asserted
+that `MarkerGatedFakeModel`'s internal `AssertionError` (itself an
+ordinary `Exception`) propagated out of `run()` raw — true only because
+no boundary previously existed. It now asserts the new, correct
+behavior: the same `AssertionError` is caught by this amendment's
+boundary and surfaces as a terminalized
+`UNCLASSIFIED_FAILURE`/`UNRECOVERABLE_ERROR` `RunFinished`, exactly like
+any other unanticipated collaborator exception. The gate still
+provably fires; it no longer escapes raw, which is the amendment's own
+intended effect, not an accommodation of a regression.
+
+This is implementation/automated-test evidence only — it does not
+constitute or substitute for a security review. Linux CI confirmation
+is pending as of this commit (not yet pushed).
+
+### Correction pass (2026-10-02)
+
+A targeted review found four gaps between the acceptance criteria above
+and what this amendment's first pass actually tested or documented, all
+closed with no change to the production control flow described above:
+
+1. No test had proved the fallback path drives lifecycle-owner cleanup
+   (`begin_cleanup()`/`complete()`) to completion when activation had
+   already succeeded — only the activation-*failure* case (where those
+   two calls are correctly never attempted) was covered. Added a test
+   asserting `owner.calls == ["activate", "begin_cleanup", "complete"]`
+   for a fallback triggered after confirmed activation.
+2. No precedence test exercised the new fallback path specifically —
+   every pre-existing evidence-failure/cleanup-unconfirmed precedence
+   test triggers through one of the controller's own typed-result
+   returns, never through the new `except Exception:` catch-all. Added
+   two: an evidence-capture failure and a workspace-disposal failure,
+   each triggered by an unexpected collaborator exception, each
+   asserting the existing, unchanged precedence rule still overrides
+   `UNCLASSIFIED_FAILURE` correctly (`EVIDENCE_CAPTURE_FAILED` and
+   `LIFECYCLE_CLEANUP_UNCONFIRMED` respectively, with their exact
+   existing sanitized messages, and neither injected exception's text
+   leaking anywhere). The previously-unused permissive
+   `allow_override_codes` test-helper parameter is removed in favor of
+   these two tests' fully explicit, exact assertions.
+3. The fallback teardown-chaining regression had inferred "`_terminate()`
+   entered exactly once" from side effects rather than measuring it
+   directly, never checked escaping-instance identity, and only
+   scanned the escaped exception's own `str()` for the discarded
+   collaborator exception's text — not every already-emitted event.
+   Strengthened with a direct call-count spy, an identity assertion
+   against the exact sentinel instance raised, and a scan of every
+   emitted event's `repr()`.
+4. This section's own "no persistence... of collaborator input"
+   wording (above) was an overclaim, corrected in place: it does not
+   and cannot mean the run's otherwise-ordinary events (emitted before
+   the unexpected exception) stop carrying their normal, schema-
+   approved data — only that nothing *derived from the caught
+   exception itself* is ever persisted, emitted, logged, interpolated,
+   or chained.
+
+Verified (macOS, real Docker daemon, `CODEAGENT_REQUIRE_DOCKER=1`):
+`test_controller.py` alone, 63 passed (up from 60); the directly
+affected set, 809 passed (up from 806), forward and reverse file order;
+the fifteen-file focused Milestone-3 set, 1,223 passed (up from 1,220),
+forward and reverse file order; the complete suite, 2,747 passed (up
+from 2,744), 0 skipped, with `CODEAGENT_REQUIRE_DOCKER=1`; `git diff
+--check` clean; no leftover `codeagent-*` containers, extra worktrees,
+`refs/codeagent` refs, lingering processes, or temp/default state
+roots afterward. No scope change from the amendment as originally
+accepted above. This is implementation/automated-test evidence only.
+Linux CI confirmation remains pending; nothing has been pushed.

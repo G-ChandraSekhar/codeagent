@@ -2101,6 +2101,93 @@ Stage 2 (of the four-stage planning process in
   Slice 3C-2 remains an unwired prerequisite; none of that is part of
   this slice. `docs/threat-model.md`'s T-E1 entry is **unchanged**:
   nothing here is wired into a real entry point yet.
+- **Milestone 3 Slice 3C-3** (`RunController` ordinary-exception
+  terminalization boundary), per
+  `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  "Amendment 9 (Accepted 2026-10-02)", is implemented and locally
+  verified on macOS (2026-10-02); **not yet committed, pushed, or
+  Linux-CI-confirmed**. Closes an independently-discovered, present gap
+  flagged during Slice 3C-2's own review: `RunController.run()` had no
+  top-level exception boundary, so an unexpected ordinary `Exception`
+  from any collaborator propagated straight out of `run()`, skipping
+  evidence capture, worktree disposal, checkpoint-ref deletion, and
+  owner-state cleanup entirely. `run()`'s post-start body is extracted
+  into `_run_after_start()` and wrapped in a `try/except Exception:`
+  whose fallback — placed strictly *after* the `except` block exits,
+  never inside it, with the caught exception never bound to a name —
+  calls `_terminate()` exactly once, producing
+  `RunFinished(terminal_reason=UNRECOVERABLE_ERROR,
+  error.code=ErrorCode.UNCLASSIFIED_FAILURE)` (no new `ErrorCode`; its
+  existing contract already permits exactly this use) with one fixed,
+  sanitized message. `_terminate()` itself gains a genuine one-shot
+  guard (a check-and-raise, not a bare flag write) as its first two
+  lines, so an exception escaping an already-started `_terminate()`
+  propagates unchanged and is never re-terminalized. Deliberately
+  narrow: `BaseException` subclasses that are not `Exception`
+  (`KeyboardInterrupt`/`SystemExit`/`GeneratorExit`) pass through
+  untouched by construction; signal/cancellation semantics remain ADR
+  0005's domain (accepted, unimplemented); the initial `RunStarted`
+  emission and `RUN_STARTED` transition stay outside the guarded
+  region; every existing recognized-failure path, and every existing
+  `_terminate()` cleanup/precedence rule, is unchanged. New tests in
+  `tests/integration/test_controller.py` cover unexpected exceptions
+  from lifecycle-owner activation, baseline verification, the model/
+  read-plan phase, approval, patch application (after a real checkpoint
+  ref is established), and non-baseline verification; `KeyboardInterrupt`/
+  `SystemExit` propagation; a direct second-`_terminate()`-call
+  regression; and a real end-to-end regression proving a fallback
+  teardown failure's `__context__`/`__cause__` are both `None` — the
+  discarded collaborator exception is never implicitly chained. One
+  pre-existing test, `test_fake_model_gate_actually_fails_without_the_
+  marker`, required a correction (not a weakening): it had asserted an
+  `AssertionError` (itself an ordinary `Exception`) escaped `run()` raw,
+  true only because no boundary previously existed; it now asserts the
+  new, correct, intended behavior. Verified: `test_controller.py` alone,
+  60 passed; the directly affected set (`test_controller.py` +
+  `test_errors.py` + `test_events.py`), 806 passed, forward and reverse
+  file order; the established fifteen-file focused Milestone-3 set (the
+  prior fourteen-file set plus `test_controller.py`), 1,220 passed,
+  forward and reverse file order; the complete suite with
+  `CODEAGENT_REQUIRE_DOCKER=1`, 2,744 passed, 0 skipped; `git diff
+  --check` clean; no leftover `codeagent-*` containers, extra
+  worktrees, `refs/codeagent` refs, lingering processes, or temp/
+  default state roots afterward. **Not implemented** (unchanged scope):
+  `prepare_lifecycle()` production wiring, any composition root, the
+  worktree transition table, `LifecycleLease` ownership/close-timing,
+  CLI/UI, signal handling. `docs/threat-model.md`'s T-E1 entry is
+  **unchanged** — this is a controller-internal correctness fix, not a
+  new concurrent-run or lifecycle-attribution mitigation.
+  **A same-day correction pass (2026-10-02)** found and closed four
+  gaps between the reviewed acceptance criteria and what the first pass
+  actually tested/documented, with no change to the production control
+  flow above: added a test proving the fallback path drives the
+  identical `activate()`→`begin_cleanup()`→`complete()` owner-state
+  sequence to completion when activation itself had already succeeded
+  (distinct from the activation-failure test, which correctly keeps
+  `begin_cleanup()`/`complete()` never attempted); added two precedence
+  tests specific to the new fallback path (an evidence-capture failure
+  and a workspace-disposal failure, each overriding
+  `UNCLASSIFIED_FAILURE` exactly per the existing, unchanged precedence
+  rules) and removed the previously-unused permissive
+  `allow_override_codes` helper parameter in favor of fully explicit
+  assertions in those two tests; strengthened the fallback
+  teardown-chaining regression with a direct `_terminate()` call-count
+  spy, escaping-instance identity assertion, and a scan of every
+  already-emitted event (not only the escaped exception's own `str()`)
+  for the discarded collaborator exception's text/type; and corrected
+  an unqualified claim in Amendment 9 that no "collaborator input" is
+  ever persisted — the accurate, narrower claim is that no detail
+  *derived from the caught exception itself* is ever persisted,
+  emitted, logged, interpolated, or chained, which does not and cannot
+  claim anything about ordinary events emitted before the exception
+  occurred. Verified: `test_controller.py` alone, 63 passed (up from
+  60); the directly affected set, 809 passed (up from 806), forward and
+  reverse file order; the fifteen-file focused Milestone-3 set, 1,223
+  passed (up from 1,220), forward and reverse file order; the complete
+  suite with `CODEAGENT_REQUIRE_DOCKER=1`, 2,747 passed (up from
+  2,744), 0 skipped; `git diff --check` clean; no leftover resources.
+  Still not committed, pushed, or Linux-CI-confirmed; scope and
+  `docs/threat-model.md`'s unchanged status are unaffected.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

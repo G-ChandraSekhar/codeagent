@@ -495,6 +495,12 @@ class RunController:
         # begin_cleanup()/complete() are never attempted otherwise,
         # since PREPARING -> CLEANING is not a legal owner-state edge.
         self._lifecycle_owner_active = False
+        # Milestone 3 Slice 3C-3 (ADR 0004 Amendment 9): a one-shot guard
+        # against _terminate() ever running twice for one run, and the
+        # last-known pass index for run()'s ordinary-exception fallback —
+        # see _run_after_start() and _terminate() below.
+        self._termination_started = False
+        self._pass_index = 0
 
     def _now(self) -> datetime:
         return self._clock.now()
@@ -565,6 +571,28 @@ class RunController:
         )
 
     def run(self) -> events.RunFinished:
+        """Emit `RunStarted` and record `RUN_STARTED`, then run the rest
+        of the run through `_run_after_start()` behind a single ordinary-
+        exception terminalization boundary (Milestone 3 Slice 3C-3, ADR
+        0004 Amendment 9): an unanticipated `Exception` escaping normal
+        run execution is routed exactly once through `_terminate()`,
+        producing `RunFinished(terminal_reason=UNRECOVERABLE_ERROR,
+        error.code=ErrorCode.UNCLASSIFIED_FAILURE)`.
+
+        Deliberately narrow. Not covered: any `BaseException` that is not
+        an `Exception` (`KeyboardInterrupt`/`SystemExit`/`GeneratorExit`
+        propagate untouched by construction — they don't inherit from
+        `Exception`); signal-driven cancellation, which remains ADR
+        0005's domain (accepted, unimplemented); a failure during the
+        `RunStarted` emission or `RUN_STARTED` transition above (outside
+        this boundary — the event contract doesn't yet say whether
+        terminalization is even valid before `RunStarted` exists in the
+        log, so this method doesn't invent an answer); and a failure
+        arising inside `_terminate()` itself, which the one-shot
+        `_termination_started` guard (see `_terminate()`) ensures is
+        never converted into a second terminalization attempt — it
+        propagates unchanged instead.
+        """
         c = self._c
 
         self._emit(
@@ -581,6 +609,35 @@ class RunController:
             )
         )
         self._transition(0, domain.Trigger.RUN_STARTED)
+
+        try:
+            return self._run_after_start()
+        except Exception:
+            if self._termination_started:
+                raise
+            # Fall through to the fallback _terminate() call below,
+            # outside this handler. The exception is never bound to a
+            # name anywhere in this block, so nothing here retains it.
+
+        # Reached only when an ordinary Exception escaped
+        # _run_after_start() and _terminate() had not yet started.
+        # Deliberately outside the `except` block: no exception is
+        # "currently being handled" at this point, so if this fallback
+        # _terminate() call itself raises, that new exception starts
+        # with a clean __context__/__cause__ — never chained to the
+        # exception that was just discarded above.
+        return self._terminate(
+            self._pass_index,
+            domain.Trigger.UNRECOVERABLE_ERROR,
+            error=OperationalError(
+                code=ErrorCode.UNCLASSIFIED_FAILURE,
+                error_id=f"{c.run_id}-unclassified-failure",
+                message="the run terminated due to an unanticipated internal error",
+            ),
+        )
+
+    def _run_after_start(self) -> events.RunFinished:
+        c = self._c
 
         # Milestone 3 Slice 3C-1 (ADR 0004 Amendment 8): confirm the
         # run's lifecycle projection is ACTIVE before any baseline,
@@ -648,6 +705,7 @@ class RunController:
         plan_revisions_used = 0
 
         while True:
+            self._pass_index = pass_index
             plan, read_error = self._explore_and_propose_plan(pass_index)
             if plan is None:
                 # The read the model requested before proposing a plan
@@ -1260,7 +1318,21 @@ class RunController:
         `activate()` was already confirmed) — `PREPARING -> CLEANING`
         is not a legal owner-state edge. Neither call is ever retried
         or followed by an automatic `refresh()`.
+
+        Milestone 3 Slice 3C-3 (ADR 0004 Amendment 9): a genuine one-shot
+        guard, checked and set before any of the above — not a bare flag
+        write. A second call (a logic bug, never expected under normal
+        control flow, since every existing call site is an immediate
+        `return self._terminate(...)`) is refused outright, before any
+        additional evidence capture, resource cleanup, lifecycle
+        publication, transition, or event emission. This method's own
+        cleanup order and precedence are otherwise unchanged by this
+        guard.
         """
+        if self._termination_started:
+            raise RuntimeError("run termination has already started")
+        self._termination_started = True
+
         lifecycle_publication_unconfirmed = False
         if self._lifecycle_owner_active and self._lifecycle_owner is not None:
             try:

@@ -4769,3 +4769,213 @@ code, test, workflow, configuration, or dependency file touched;
 nothing staged. No test run or Docker session was needed for this
 pass — the independently re-verified, completed CI run is the
 evidence.
+
+## 2026-10-02 — Milestone 3 Slice 3C-3: RunController ordinary-exception terminalization boundary
+
+Implemented per ADR 0004's new "Amendment 9 (Accepted 2026-10-02)."
+Closes a real, present gap flagged during Slice 3C-2's own review (not
+the still-open worktree-transition-table or `LifecycleLease`
+ownership/close-timing questions, both left exactly as deferred):
+`RunController.run()` had no top-level exception boundary, so an
+unexpected ordinary `Exception` from any collaborator propagated
+straight out of `run()`, skipping evidence capture, worktree disposal,
+checkpoint-ref deletion, and owner-state cleanup entirely.
+
+Two planning/review passes preceded implementation (both prior to this
+entry, same joint-review cadence as prior slices) and corrected the
+mechanism before any code was written: (1) the fallback `_terminate()`
+call must sit strictly after the `except Exception:` block exits, never
+inside it, with the caught exception never bound to a name — otherwise
+a teardown failure there would implicitly chain the discarded,
+uncontrolled collaborator exception as `__context__`; (2) the "one-shot
+guard" needed to be an actual check-and-raise
+(`if self._termination_started: raise RuntimeError(...)`) at the top of
+`_terminate()`, not a bare flag write with nothing checking it; (3) the
+teardown-failure-escape tests must inject at `_capture_evidence` itself
+(replacing the whole method), since the sink/workspace-level injection
+points originally proposed are already caught internally and only
+exercise existing precedence, not escape.
+
+`src/codeagent/controller.py`: added `_termination_started`/
+`_pass_index` instance fields; extracted the existing post-`RUN_STARTED`
+body into `_run_after_start()` verbatim (no existing recognized-result
+branch changed); `run()` now wraps that call in
+`try: ... except Exception: if self._termination_started: raise` with
+the fallback `_terminate(...)` call placed after the handler, using the
+existing `ErrorCode.UNCLASSIFIED_FAILURE`/`ErrorDomain.INTERNAL` and a
+fixed message, `"the run terminated due to an unanticipated internal
+error"`; the loop body now sets `self._pass_index = pass_index` at the
+top of each iteration; `_terminate()` gained its check-and-set guard as
+its first two lines, otherwise unchanged.
+
+`tests/integration/test_controller.py`: `_build()` gained optional
+`verifier`/`approval`/`patch_applier` override parameters (mirroring the
+existing `model`/`reader`/`workspace`/`session`/`evidence_sink`
+pattern) so the new tests can inject a plain, uncategorized exception
+from any collaborator method. Twelve new tests: unexpected-exception
+terminalization from lifecycle-owner activation, baseline verification,
+the model/read-plan phase, approval, patch application (confirmed to
+occur after the checkpoint ref is genuinely established and the
+worktree entry gate has passed — not "before any resource exists"),
+and non-baseline verification (confirmed to occur after a real
+checkpoint already exists from the same pass's patch application);
+`KeyboardInterrupt`/`SystemExit` propagating unconverted; a direct
+second-`_terminate()`-invocation regression proving the guard refuses
+re-entry before any additional cleanup or event emission; a direct
+teardown-failure-escape regression (via a replaced `_capture_evidence`)
+proving no re-entry and no `RunFinished`; and a real end-to-end
+regression combining an unexpected collaborator exception with a
+second, independent teardown failure, proving the escaping exception's
+`__context__` and `__cause__` are both `None` and the discarded
+collaborator exception's text/type appears nowhere in it or in any
+emitted event — all twelve passed on first run, confirming the
+chaining-safety reasoning held in practice, not only on paper.
+
+One pre-existing test required a correction, found only by running the
+full file after implementation: `test_fake_model_gate_actually_fails_
+without_the_marker` had asserted `pytest.raises(AssertionError)` around
+`controller.run()`, relying on the fact that no boundary previously
+existed to let `MarkerGatedFakeModel`'s internal `AssertionError` (an
+ordinary `Exception`, used as that fake's own sanity-check mechanism)
+escape raw. This is not a regression to paper over — it is the new
+boundary behaving exactly as specified on a real exception-raising
+fixture. The test now asserts the new, correct, intended shape: the
+same `AssertionError` is caught and terminalized as
+`UNCLASSIFIED_FAILURE`/`UNRECOVERABLE_ERROR`. The gate still provably
+fires; it no longer escapes raw. No other existing test in the file
+required any change.
+
+Verified (macOS, real Docker daemon, `CODEAGENT_REQUIRE_DOCKER=1`):
+`py_compile` on all three changed files; `test_controller.py` alone, 60
+passed; the directly affected set (`test_controller.py` +
+`test_errors.py` + `test_events.py`) collected and passed together, 806
+passed, in both forward and reverse file order; the established
+fifteen-file focused Milestone-3 set (the prior fourteen-file set
+established since Slice 3A-1, plus `test_controller.py`) collected and
+passed together, 1,220 passed, in both forward and reverse file order;
+the complete suite, 2,744 passed, 0 skipped, identical with
+`CODEAGENT_REQUIRE_DOCKER=1` set; `git diff --check` clean; no leftover
+`codeagent-*` containers (confirmed via `docker ps -a`), extra
+worktrees (`git worktree list`), `refs/codeagent` refs, lingering
+processes, or temp/default state roots (`~/Library/Application
+Support/CodeAgent` confirmed absent) afterward. Docker was already
+running before this work began; it was never started or restarted, and
+no administrator-access dialog appeared.
+
+Not implemented, unchanged scope from every prior slice:
+`prepare_lifecycle()` production wiring, any composition root, the
+worktree transition/combination table (or a decision to omit worktree
+attribution), `LifecycleLease` ownership/close-timing, CLI/UI, signal
+handling/cancellation, any Docker behavior change, reconciliation
+change, or abandonment. `docs/threat-model.md` was inspected and left
+unchanged — this is a controller-internal correctness fix, not a new
+concurrent-run or lifecycle-attribution mitigation, and T-E1's status is
+unaffected.
+
+All changes (`src/codeagent/controller.py`,
+`tests/integration/test_controller.py`,
+`docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`,
+`CLAUDE.md`, this entry) are left unstaged and uncommitted for joint
+review, per instruction. Linux CI has not run for any of this.
+
+### 2026-10-02 — Milestone 3 Slice 3C-3: correction pass (lifecycle-owner cleanup, fallback precedence, chaining-regression completeness, one documentation overclaim)
+
+A targeted review of the above found four real gaps between the
+reviewed acceptance criteria and what the first implementation pass
+actually tested or documented, all fixed before this slice is
+considered final; none required any further change to
+`src/codeagent/controller.py`'s production control flow itself.
+
+1. **No test proved lifecycle-owner cleanup runs to completion on the
+   new fallback path.** Every prior unexpected-exception test either
+   had no `lifecycle_owner` at all, or was the activation-failure case
+   (where `begin_cleanup()`/`complete()` are correctly never attempted,
+   since `ACTIVE` was never confirmed). Added
+   `test_unexpected_exception_after_activation_still_completes_
+   lifecycle_owner_cleanup`: activation succeeds, a subsequent
+   unexpected exception from the patch applier (after a real checkpoint
+   ref is established) triggers the fallback, and
+   `owner.calls == ["activate", "begin_cleanup", "complete"]` is
+   asserted directly — proving the fallback path drives the identical
+   owner-state sequence every other terminal path already did.
+
+2. **No precedence test existed for the new fallback path
+   specifically.** Every existing evidence-failure/cleanup-unconfirmed
+   precedence test predates this slice and only ever triggers through
+   one of the controller's own typed-result returns, never through the
+   new `except Exception:` fallback. Added two tests:
+   `test_evidence_capture_failure_overrides_unclassified_failure_on_
+   fallback_path` (an unexpected collaborator exception triggers the
+   fallback; `FakeEvidenceSink.capture` raises through its existing
+   `raise_error` constructor parameter; the existing, unchanged
+   `_capture_evidence()` internal catch converts it to the existing
+   `EVIDENCE_CAPTURE_FAILED` receipt, which overrides
+   `UNCLASSIFIED_FAILURE` exactly as the existing precedence rule
+   already specified) and
+   `test_workspace_dispose_failure_overrides_unclassified_failure_on_
+   fallback_path` (same trigger; `FakeWorkspace.dispose` raises; final
+   error becomes `LIFECYCLE_CLEANUP_UNCONFIRMED` with its exact
+   existing sanitized message; checkpoint-ref deletion is skipped;
+   `begin_cleanup()` is attempted but `complete()` is skipped; evidence
+   capture still runs exactly once). Both assert neither injected
+   exception's text leaks into `finished.error.message` or any emitted
+   event. The previously-unused `allow_override_codes` parameter on the
+   shared phase-test helper (never actually passed a non-empty tuple
+   anywhere) is removed; the helper is renamed
+   `_assert_unclassified_fallback` and asserts only the plain,
+   non-overridden shape, since the two precedence cases above now get
+   fully explicit, exact assertions of their own instead of a
+   permissive parameter that could have silently accepted the wrong
+   override.
+
+3. **The fallback teardown-chain regression inferred "exactly one
+   termination entry" rather than measuring it, and never scanned
+   already-emitted events for the collaborator marker/type, and never
+   checked escaping-instance identity.**
+   `test_fallback_terminate_teardown_failure_has_no_chained_
+   collaborator_context` now wraps `controller._terminate` with a
+   direct call-count spy (asserted `== 1`), records the exact sentinel
+   instance `_raise_sentinel` creates and asserts the exception that
+   escapes `run()` `is` that same instance, and iterates every event in
+   `controller.log.events` asserting neither
+   `"boom-collaborator-should-never-be-chained"` nor `"RuntimeError"`
+   appears in any event's `repr()` — not only in the escaped exception's
+   own `str()`, as the prior version checked.
+
+4. **Documentation overclaim.** Amendment 9's "Mechanism" section had
+   stated, unqualified, that no "collaborator input" is ever persisted
+   — read literally, this contradicts the fact that ordinary events
+   emitted *before* the unexpected exception (e.g. `RunStarted`,
+   `BaselineRecorded`, a prior successful `ToolCompleted`) still carry
+   their normal, schema-approved run/plan/tool data exactly as before;
+   this slice never touches those. Corrected to the precise, narrower
+   claim this mechanism actually guarantees: no type, message, repr,
+   traceback, marker, or other uncontrolled detail *derived from the
+   caught exception itself* is ever persisted, emitted, logged,
+   interpolated, or chained — explicitly distinguished from the run's
+   otherwise-ordinary event trace. No other file (`CLAUDE.md`,
+   `src/codeagent/controller.py`'s own comments/docstrings) was found to
+   contain the same overclaim on inspection.
+
+Verified (macOS, real Docker daemon, `CODEAGENT_REQUIRE_DOCKER=1`;
+Docker was already running and was not started or restarted; no
+administrator-access dialog appeared): `test_controller.py` alone, 63
+passed (up from 60 — three new tests; the fourth change was a
+pre-existing test's regression, now more thorough, not a new test
+count); the directly affected set (`test_controller.py` +
+`test_errors.py` + `test_events.py`), 809 passed (up from 806), in both
+forward and reverse file order; the fifteen-file focused Milestone-3
+set, 1,223 passed (up from 1,220), in both forward and reverse file
+order; the complete suite, 2,747 passed (up from 2,744), 0 skipped,
+with `CODEAGENT_REQUIRE_DOCKER=1`; `git diff --check` clean; no
+leftover `codeagent-*` containers, extra worktrees, `refs/codeagent`
+refs, lingering processes, or temp/default state roots afterward.
+
+No scope change: `prepare_lifecycle()` production wiring, any
+composition root, the worktree transition table, `LifecycleLease`
+ownership/close-timing, CLI/UI, and signal handling remain exactly as
+unimplemented and out of scope as the original 3C-3 entry above states.
+`docs/threat-model.md` was re-inspected and remains unchanged — nothing
+in this correction pass alters T-E1 or any other listed threat. All
+changes remain unstaged and uncommitted; Linux CI has not run for any
+of this.

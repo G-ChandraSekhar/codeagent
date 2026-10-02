@@ -66,6 +66,9 @@ def _build(
     patch_failure_code: ErrorCode = ErrorCode.PATCH_VALIDATION_FAILED,
     approval_mode: domain.ApprovalMode = domain.ApprovalMode.INTERACTIVE,
     model: ModelClient | None = None,
+    approval: object | None = None,
+    verifier: object | None = None,
+    patch_applier: object | None = None,
     reader: object | None = None,
     workspace: object | None = None,
     session: object | None = None,
@@ -83,9 +86,13 @@ def _build(
     return RunController(
         config,
         model if model is not None else FakeModel(PLAN),
-        FakeApprovalProvider(approval_decisions),
-        FakeVerifier(verification_outcomes, baseline_outcome=baseline_outcome),
-        FakePatchApplier(patch_should_fail, failure_code=patch_failure_code),
+        approval if approval is not None else FakeApprovalProvider(approval_decisions),
+        verifier
+        if verifier is not None
+        else FakeVerifier(verification_outcomes, baseline_outcome=baseline_outcome),
+        patch_applier
+        if patch_applier is not None
+        else FakePatchApplier(patch_should_fail, failure_code=patch_failure_code),
         reader if reader is not None else FakeRepositoryReader(),
         workspace if workspace is not None else FakeWorkspace(),
         session if session is not None else FakeCheckpointSession(),
@@ -753,7 +760,19 @@ def test_fake_model_derives_plan_only_after_seeing_real_read_evidence() -> None:
 def test_fake_model_gate_actually_fails_without_the_marker() -> None:
     """Sanity check for the test above: MarkerGatedFakeModel must
     actually be capable of failing when evidence is missing — otherwise
-    the "proves evidence was passed" claim is vacuous."""
+    the "proves evidence was passed" claim is vacuous.
+
+    Updated by Milestone 3 Slice 3C-3 (ADR 0004 Amendment 9): before
+    this slice, MarkerGatedFakeModel's internal AssertionError (an
+    ordinary Exception) propagated out of `run()` raw, since nothing
+    caught it. Now `run()`'s ordinary-exception terminalization
+    boundary catches exactly this kind of unanticipated Exception and
+    converts it into a terminalized UNCLASSIFIED_FAILURE RunFinished —
+    this is the new boundary behaving correctly on a real
+    exception-raising fixture, not a weakened assertion: the gate still
+    provably fires (the run still never passes), it just now surfaces
+    through the same sanitized terminal path every other unanticipated
+    collaborator exception does, instead of escaping raw."""
     gated_model = MarkerGatedFakeModel(
         read_path="jobs/worker.py", marker="MARKER_NOT_PRESENT", plan=PLAN
     )
@@ -763,8 +782,14 @@ def test_fake_model_gate_actually_fails_without_the_marker() -> None:
         reader=FakeRepositoryReader(content="content without the marker"),
     )
 
-    with pytest.raises(AssertionError):
-        controller.run()
+    finished = controller.run()
+
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.UNCLASSIFIED_FAILURE
+    assert finished.error.message == (
+        "the run terminated due to an unanticipated internal error"
+    )
 
 
 def test_illegal_read_path_aborts_the_run_without_reading_host_content() -> None:
@@ -1329,3 +1354,509 @@ def test_no_automatic_refresh_or_retry() -> None:
     assert owner.calls.count("activate") == 1
     assert owner.calls.count("begin_cleanup") == 1
     assert owner.calls.count("complete") == 1
+
+
+# --------------------------------------------------------------------
+# Milestone 3 Slice 3C-3 (ADR 0004 Amendment 9): RunController
+# ordinary-exception terminalization boundary.
+#
+# An unanticipated `Exception` escaping normal run execution after
+# RunStarted/RUN_STARTED is routed exactly once through `_terminate()`,
+# producing RunFinished(terminal_reason=UNRECOVERABLE_ERROR,
+# error.code=ErrorCode.UNCLASSIFIED_FAILURE). BaseException subclasses
+# that are not Exception (KeyboardInterrupt/SystemExit/GeneratorExit),
+# signal/cancellation semantics (ADR 0005, still unimplemented), and a
+# failure inside _terminate() itself are explicitly NOT covered.
+# --------------------------------------------------------------------
+
+_UNCLASSIFIED_MESSAGE = "the run terminated due to an unanticipated internal error"
+
+
+class _UnexpectedCollaboratorFailure(Exception):
+    """A plain, uncategorized exception type -- never any of this
+    taxonomy's own typed errors -- standing in for a genuine,
+    unanticipated bug in a collaborator."""
+
+
+class _SentinelTeardownFailure(Exception):
+    """A plain, uncategorized exception type used only to prove a
+    failure escaping _terminate() itself is never swallowed, converted,
+    or re-terminalized."""
+
+
+_INJECTED_MARKER = "fixture-injected-unexpected-collaborator-failure"
+
+
+def _raise_unexpected(*_args: object, **_kwargs: object) -> None:
+    raise _UnexpectedCollaboratorFailure(_INJECTED_MARKER)
+
+
+def _assert_exactly_one_terminal_pair(controller: RunController) -> None:
+    finishes = [e for e in controller.log.events if isinstance(e, events.RunFinished)]
+    assert len(finishes) == 1
+    terminal_transitions = [
+        e
+        for e in controller.log.events
+        if isinstance(e, events.StateTransitioned) and e.to_state is domain.RunState.DONE
+    ]
+    assert len(terminal_transitions) == 1
+
+
+def _assert_no_marker_leak(controller: RunController) -> None:
+    for event in controller.log.events:
+        text = repr(event)
+        assert _INJECTED_MARKER not in text
+        assert "_UnexpectedCollaboratorFailure" not in text
+        assert "RuntimeError" not in text
+
+
+def _assert_unclassified_fallback(finished: events.RunFinished) -> None:
+    """Asserts the plain fallback shape: no existing cleanup/evidence
+    precedence override fired, so the terminal error is exactly
+    UNCLASSIFIED_FAILURE with the fixed message. The precedence-override
+    cases (evidence-capture failure, cleanup-unconfirmed) get their own
+    tests below with fully explicit, exact assertions instead of a
+    permissive "allow this other code too" parameter here -- a
+    permissive helper could silently accept the wrong override."""
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.UNCLASSIFIED_FAILURE
+    assert finished.error.message == _UNCLASSIFIED_MESSAGE
+
+
+def test_unexpected_exception_from_lifecycle_owner_activate_is_terminalized() -> None:
+    """Phase: lifecycle-owner activation, before normal baseline/model/
+    tool execution begins. A non-OwnerStatePublicationError from
+    activate() is not caught by the existing narrow handler and must
+    reach the new fallback boundary instead."""
+    owner = FakeLifecycleOwnerPublisher()
+    owner.activate_error = _UnexpectedCollaboratorFailure(_INJECTED_MARKER)
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink()
+    controller = _build(
+        "r-unexpected-activate",
+        lifecycle_owner=owner,
+        workspace=workspace,
+        session=session,
+        evidence_sink=evidence_sink,
+    )
+
+    finished = controller.run()
+
+    assert owner.calls == ["activate"]
+    assert controller._lifecycle_owner_active is False
+    _assert_unclassified_fallback(finished)
+    assert evidence_sink.capture_calls == 1
+    assert workspace.disposed is True
+    assert session.delete_calls == 1
+    _assert_exactly_one_terminal_pair(controller)
+    _assert_no_marker_leak(controller)
+    assert not any(isinstance(e, events.BaselineRecorded) for e in controller.log.events)
+
+
+def test_unexpected_exception_from_baseline_verifier_is_terminalized() -> None:
+    """Phase: baseline verification."""
+    verifier = FakeVerifier((events.VerificationOutcome.PASSED,))
+    verifier.run_baseline = _raise_unexpected  # type: ignore[method-assign]
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink()
+    controller = _build(
+        "r-unexpected-baseline",
+        verifier=verifier,
+        workspace=workspace,
+        session=session,
+        evidence_sink=evidence_sink,
+    )
+
+    finished = controller.run()
+
+    _assert_unclassified_fallback(finished)
+    assert evidence_sink.capture_calls == 1
+    assert workspace.disposed is True
+    assert session.delete_calls == 1
+    _assert_exactly_one_terminal_pair(controller)
+    _assert_no_marker_leak(controller)
+    assert not any(isinstance(e, events.BaselineRecorded) for e in controller.log.events)
+
+
+def test_unexpected_exception_from_model_propose_plan_is_terminalized() -> None:
+    """Phase: explore/plan (the model's propose_plan call, after a
+    successful read)."""
+    model = FakeModel(PLAN)
+    model.propose_plan = _raise_unexpected  # type: ignore[method-assign]
+    controller = _build("r-unexpected-plan", model=model)
+
+    finished = controller.run()
+
+    _assert_unclassified_fallback(finished)
+    _assert_exactly_one_terminal_pair(controller)
+    _assert_no_marker_leak(controller)
+
+
+def test_unexpected_exception_from_approval_provider_is_terminalized() -> None:
+    """Phase: approval."""
+    approval = FakeApprovalProvider((domain.ApprovalDecision.APPROVED,))
+    approval.decide = _raise_unexpected  # type: ignore[method-assign]
+    controller = _build("r-unexpected-approval", approval=approval)
+
+    finished = controller.run()
+
+    _assert_unclassified_fallback(finished)
+    _assert_exactly_one_terminal_pair(controller)
+    _assert_no_marker_leak(controller)
+    assert not any(isinstance(e, events.ApprovalRecorded) for e in controller.log.events)
+
+
+def test_unexpected_exception_from_patch_applier_after_checkpoint_establishment_is_terminalized() -> (
+    None
+):
+    """Phase: patch application, after the entry gate has passed and
+    the checkpoint ref has already been established (intent now
+    PRESENT) against the already-materialized worktree, but before
+    advance() -- mid-patch with a real established checkpoint ref and
+    an existing worktree, not "before any resource exists."""
+    patch_applier = FakePatchApplier()
+    patch_applier.apply = _raise_unexpected  # type: ignore[method-assign]
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink()
+    establish_calls: list[str] = []
+    real_establish = session.establish
+
+    def _establish(initial_sha: str) -> None:
+        establish_calls.append(initial_sha)
+        real_establish(initial_sha)
+
+    session.establish = _establish  # type: ignore[method-assign]
+
+    controller = _build(
+        "r-unexpected-patch",
+        patch_applier=patch_applier,
+        workspace=workspace,
+        session=session,
+        evidence_sink=evidence_sink,
+    )
+
+    finished = controller.run()
+
+    # The checkpoint ref was genuinely established and the worktree
+    # entry gate passed before the patch applier's injected failure.
+    assert establish_calls == [workspace.initial_commit]
+    assert workspace.entry_gate_calls == [workspace.initial_commit]
+    _assert_unclassified_fallback(finished)
+    assert evidence_sink.capture_calls == 1
+    assert workspace.disposed is True
+    # Since the ref was established (intent moved off ABSENT), the
+    # existing teardown order disposes the worktree and then deletes
+    # the now-PRESENT checkpoint ref exactly once -- no new precedence
+    # introduced by this slice.
+    assert session.delete_calls == 1
+    _assert_exactly_one_terminal_pair(controller)
+    _assert_no_marker_leak(controller)
+    assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
+
+
+def test_unexpected_exception_from_verification_after_a_checkpoint_exists_is_terminalized() -> None:
+    """Phase: verification (non-baseline), after the preceding patch
+    application in this same loop pass has already established and
+    advanced a real checkpoint."""
+    verifier = FakeVerifier((events.VerificationOutcome.PASSED,))
+    verifier.run = _raise_unexpected  # type: ignore[method-assign]
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink()
+    controller = _build(
+        "r-unexpected-verify",
+        verifier=verifier,
+        workspace=workspace,
+        session=session,
+        evidence_sink=evidence_sink,
+    )
+
+    finished = controller.run()
+
+    assert any(isinstance(e, events.PatchApplied) for e in controller.log.events)
+    _assert_unclassified_fallback(finished)
+    assert evidence_sink.capture_calls == 1
+    assert workspace.disposed is True
+    assert session.delete_calls == 1
+    _assert_exactly_one_terminal_pair(controller)
+    _assert_no_marker_leak(controller)
+
+
+def test_unexpected_exception_after_activation_still_completes_lifecycle_owner_cleanup() -> None:
+    """Activation succeeds (ACTIVE confirmed) and is followed by an
+    unexpected ordinary Exception from the patch applier, after the
+    checkpoint ref has already been established -- confirming that the
+    fallback-terminalization path exercises the SAME owner-state
+    sequence as every other terminal path: activate() first, then
+    begin_cleanup() and (since every owned resource's cleanup is
+    confirmed here -- no injected workspace/session/evidence failure)
+    complete() last, each exactly once. This is distinct from
+    `test_unexpected_exception_from_lifecycle_owner_activate_is_
+    terminalized`, which keeps that test's own existing expectation
+    that begin_cleanup()/complete() are never attempted when activate()
+    itself is what failed (ACTIVE was never confirmed)."""
+    owner = FakeLifecycleOwnerPublisher()
+    patch_applier = FakePatchApplier()
+    patch_applier.apply = _raise_unexpected  # type: ignore[method-assign]
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink()
+    controller = _build(
+        "r-unexpected-patch-with-owner",
+        lifecycle_owner=owner,
+        patch_applier=patch_applier,
+        workspace=workspace,
+        session=session,
+        evidence_sink=evidence_sink,
+    )
+
+    finished = controller.run()
+
+    assert owner.calls == ["activate", "begin_cleanup", "complete"]
+    assert controller._lifecycle_owner_active is True
+    _assert_unclassified_fallback(finished)
+    assert evidence_sink.capture_calls == 1
+    assert workspace.disposed is True
+    assert session.delete_calls == 1
+    _assert_exactly_one_terminal_pair(controller)
+    _assert_no_marker_leak(controller)
+
+
+def test_evidence_capture_failure_overrides_unclassified_failure_on_fallback_path() -> None:
+    """Precedence test for the new fallback path specifically: an
+    unexpected collaborator Exception triggers fallback termination,
+    and FakeEvidenceSink.capture raises an ordinary Exception through
+    its existing `raise_error` mechanism. `_capture_evidence()`'s
+    existing internal catch converts that into the existing
+    EVIDENCE_CAPTURE_FAILED receipt, which -- per `_terminate()`'s
+    existing, unchanged precedence -- overrides the fallback's own
+    UNCLASSIFIED_FAILURE. No new precedence rule is introduced by this
+    slice; this proves the existing rule still applies correctly when
+    the triggering failure is the new fallback path rather than one of
+    the controller's own typed-result returns."""
+    model = FakeModel(PLAN)
+    model.propose_plan = _raise_unexpected  # type: ignore[method-assign]
+    evidence_sink = FakeEvidenceSink(raise_error=RuntimeError("sink-boom-should-never-leak"))
+    workspace = FakeWorkspace()
+    session = FakeCheckpointSession()
+    controller = _build(
+        "r-fallback-evidence-failure",
+        model=model,
+        evidence_sink=evidence_sink,
+        workspace=workspace,
+        session=session,
+    )
+
+    finished = controller.run()
+
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+    assert finished.error.message == "the evidence capture step failed unexpectedly (sink-raised)"
+    assert evidence_sink.capture_calls == 1
+    assert workspace.disposed is True
+    assert session.delete_calls == 1
+    _assert_exactly_one_terminal_pair(controller)
+    _assert_no_marker_leak(controller)
+    assert "sink-boom-should-never-leak" not in finished.error.message
+    for event in controller.log.events:
+        assert "sink-boom-should-never-leak" not in repr(event)
+
+
+def test_workspace_dispose_failure_overrides_unclassified_failure_on_fallback_path() -> None:
+    """Precedence test for the new fallback path specifically: an
+    unexpected collaborator Exception triggers fallback termination,
+    and FakeWorkspace.dispose then raises. Per `_terminate()`'s
+    existing, unchanged precedence, the final error becomes
+    LIFECYCLE_CLEANUP_UNCONFIRMED (overriding the fallback's own
+    UNCLASSIFIED_FAILURE); checkpoint-ref deletion is skipped (an
+    unconfirmed worktree may still reference it); a lifecycle owner's
+    begin_cleanup() is still attempted, but complete() is skipped
+    (cleanup wasn't confirmed); evidence capture is still attempted
+    exactly once regardless."""
+    owner = FakeLifecycleOwnerPublisher()
+    model = FakeModel(PLAN)
+    model.propose_plan = _raise_unexpected  # type: ignore[method-assign]
+    workspace = FakeWorkspace()
+    workspace.dispose_error = RuntimeError("dispose-boom-should-never-leak")
+    session = FakeCheckpointSession()
+    evidence_sink = FakeEvidenceSink()
+    controller = _build(
+        "r-fallback-dispose-failure",
+        lifecycle_owner=owner,
+        model=model,
+        workspace=workspace,
+        session=session,
+        evidence_sink=evidence_sink,
+    )
+
+    finished = controller.run()
+
+    assert owner.calls == ["activate", "begin_cleanup"]  # complete() skipped
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error is not None
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+    assert finished.error.message == (
+        "a verifier container, worktree, or checkpoint-ref cleanup step, "
+        "or the run's lifecycle-projection bookkeeping, could not be confirmed"
+    )
+    assert evidence_sink.capture_calls == 1
+    assert workspace.disposed is False
+    assert session.delete_calls == 0  # skipped: disposal unconfirmed
+    _assert_exactly_one_terminal_pair(controller)
+    _assert_no_marker_leak(controller)
+    assert "dispose-boom-should-never-leak" not in finished.error.message
+    for event in controller.log.events:
+        assert "dispose-boom-should-never-leak" not in repr(event)
+
+
+@pytest.mark.parametrize("exc_cls", [KeyboardInterrupt, SystemExit])
+def test_base_exception_not_an_exception_propagates_unconverted(exc_cls: type[BaseException]) -> None:
+    """KeyboardInterrupt/SystemExit do not inherit from Exception, so
+    `except Exception:` cannot intercept them by construction -- no
+    special-case code exists or is needed. ADR 0005 (accepted,
+    unimplemented) remains the sole owner of cancellation semantics;
+    this slice makes no claim about them."""
+    model = FakeModel(PLAN)
+
+    def _raise_base(*_a: object, **_kw: object) -> None:
+        raise exc_cls()
+
+    model.propose_plan = _raise_base  # type: ignore[method-assign]
+    controller = _build("r-base-exception", model=model)
+
+    with pytest.raises(exc_cls):
+        controller.run()
+
+    assert not any(isinstance(e, events.RunFinished) for e in controller.log.events)
+
+
+def test_second_terminate_invocation_is_refused_before_any_additional_cleanup() -> None:
+    """A genuine one-shot guard: the check-and-raise at the top of
+    `_terminate()` refuses a second call before any additional evidence
+    capture, resource cleanup, lifecycle publication, transition, or
+    event emission -- not merely before returning."""
+    controller = _build("r-double-terminate")
+    controller._terminate(
+        0,
+        domain.Trigger.UNRECOVERABLE_ERROR,
+        error=OperationalError(
+            code=ErrorCode.UNCLASSIFIED_FAILURE,
+            error_id="r-double-terminate-first",
+            message=_UNCLASSIFIED_MESSAGE,
+        ),
+    )
+
+    evidence_sink = controller._evidence_sink
+    workspace = controller._workspace
+    session = controller._session
+    calls_before = (evidence_sink.capture_calls, workspace.disposed, session.delete_calls)
+    finishes_before = sum(1 for e in controller.log.events if isinstance(e, events.RunFinished))
+
+    with pytest.raises(RuntimeError, match="run termination has already started"):
+        controller._terminate(
+            0,
+            domain.Trigger.UNRECOVERABLE_ERROR,
+            error=OperationalError(
+                code=ErrorCode.UNCLASSIFIED_FAILURE,
+                error_id="r-double-terminate-second",
+                message=_UNCLASSIFIED_MESSAGE,
+            ),
+        )
+
+    calls_after = (evidence_sink.capture_calls, workspace.disposed, session.delete_calls)
+    finishes_after = sum(1 for e in controller.log.events if isinstance(e, events.RunFinished))
+    assert calls_after == calls_before
+    assert finishes_after == finishes_before == 1
+
+
+def test_direct_terminate_teardown_failure_propagates_without_reentry() -> None:
+    """A failure arising inside `_terminate()` itself (simulated here by
+    replacing `_capture_evidence` entirely, since the real method
+    already catches and sanitizes every sink/event-construction failure
+    internally -- the only way to simulate a genuine bug in
+    `_terminate()`'s own teardown logic is to bypass that internal catch
+    completely) propagates unchanged: no RunFinished, no re-entry."""
+    controller = _build("r-teardown-sentinel-direct")
+
+    def _raise_sentinel(_pass_index: int) -> None:
+        raise _SentinelTeardownFailure("sentinel-teardown-failure")
+
+    controller._capture_evidence = _raise_sentinel  # type: ignore[method-assign]
+
+    with pytest.raises(_SentinelTeardownFailure):
+        controller._terminate(
+            0,
+            domain.Trigger.UNRECOVERABLE_ERROR,
+            error=OperationalError(
+                code=ErrorCode.UNCLASSIFIED_FAILURE,
+                error_id="r-teardown-sentinel-direct",
+                message=_UNCLASSIFIED_MESSAGE,
+            ),
+        )
+
+    assert controller._termination_started is True
+    assert not any(isinstance(e, events.RunFinished) for e in controller.log.events)
+    assert controller._workspace.disposed is False
+    assert controller._session.delete_calls == 0
+
+
+def test_fallback_terminate_teardown_failure_has_no_chained_collaborator_context() -> None:
+    """Proves the chaining fix directly: when an unexpected collaborator
+    exception triggers run()'s fallback _terminate() call, and that
+    fallback call's own teardown then fails (again via a replaced
+    `_capture_evidence`), the escaping teardown failure must not carry
+    the discarded collaborator exception as __context__/__cause__, and
+    the collaborator exception's own text/type must not appear anywhere
+    in the escaping exception or in any already-emitted event.
+    `_terminate()`'s entry count is measured directly with a call-count
+    spy, not inferred from side effects, and escaping-instance identity
+    is checked explicitly against the exact sentinel object raised."""
+    patch_applier = FakePatchApplier()
+
+    def _raise_collaborator(*_a: object, **_kw: object) -> None:
+        raise RuntimeError("boom-collaborator-should-never-be-chained")
+
+    patch_applier.apply = _raise_collaborator  # type: ignore[method-assign]
+    controller = _build("r-teardown-sentinel-fallback", patch_applier=patch_applier)
+
+    created_sentinels: list[_SentinelTeardownFailure] = []
+
+    def _raise_sentinel(_pass_index: int) -> None:
+        sentinel = _SentinelTeardownFailure("sentinel-teardown-failure")
+        created_sentinels.append(sentinel)
+        raise sentinel
+
+    controller._capture_evidence = _raise_sentinel  # type: ignore[method-assign]
+
+    terminate_call_count = {"n": 0}
+    original_terminate = controller._terminate
+
+    def _counting_terminate(*args: object, **kwargs: object) -> events.RunFinished:
+        terminate_call_count["n"] += 1
+        return original_terminate(*args, **kwargs)  # type: ignore[arg-type]
+
+    controller._terminate = _counting_terminate  # type: ignore[method-assign]
+
+    with pytest.raises(_SentinelTeardownFailure) as excinfo:
+        controller.run()
+
+    escaped = excinfo.value
+    assert len(created_sentinels) == 1
+    assert escaped is created_sentinels[0]
+    assert escaped.__context__ is None
+    assert escaped.__cause__ is None
+    assert terminate_call_count["n"] == 1
+    assert "boom-collaborator-should-never-be-chained" not in str(escaped)
+    assert controller._termination_started is True
+    assert not any(isinstance(e, events.RunFinished) for e in controller.log.events)
+    assert controller._workspace.disposed is False
+    assert controller._session.delete_calls == 0
+    for event in controller.log.events:
+        text = repr(event)
+        assert "boom-collaborator-should-never-be-chained" not in text
+        assert "RuntimeError" not in text
