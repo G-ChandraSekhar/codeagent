@@ -78,6 +78,8 @@ from .container_lifecycle import ContainerIntent
 from .container_lifecycle import ContainerPublicationError, ContainerPublicationFailure
 from .container_lifecycle import ContainerRole
 from .lifecycle_owner import OwnerStatePublicationError, OwnerStatePublicationFailure
+from .worktree_lifecycle import ABSENT_WORKTREE_TRANSITION, WorktreeIntent, WorktreeTransition
+from .worktree_lifecycle import WorktreePublicationError, WorktreePublicationFailure
 from .repo_identity import discover_repository_identity_and_context, load_or_create_repo_json
 from .state_locks import LockError, LockKind, LockScope, acquire_lifecycle_lock, acquire_repository_lock
 from .state_root import init_state_root, open_or_create_canonical_root, validate_state_root_containment
@@ -122,13 +124,11 @@ class LifecycleState(str, Enum):
 # reference to `lifecycle_store.ContainerIntent` in this module and in
 # `reconciliation.py`/tests keeps working unchanged.
 
-
-@unique
-class WorktreeIntent(str, Enum):
-    ABSENT = "absent"
-    CREATING = "creating"
-    PRESENT = "present"
-    DISPOSING = "disposing"
+# `WorktreeIntent` is no longer defined here (worktree-attribution
+# substrate slice, ADR 0004 Amendment 10): it is now
+# `worktree_lifecycle.py`'s own canonical definition, imported above
+# under this exact same name for source compatibility — every existing
+# reference to `lifecycle_store.WorktreeIntent` keeps working unchanged.
 
 
 @dataclass(frozen=True)
@@ -137,11 +137,30 @@ class ContainerAttribution:
     id: str | None = None
 
 
-@dataclass(frozen=True)
-class WorktreeAttribution:
-    intent: WorktreeIntent
-    expected_head: str | None = None
-
+# `WorktreeAttribution` is no longer *defined* here (same slice):
+# `worktree_lifecycle.WorktreeTransition`, imported above, now serves
+# both as the worktree's write-ahead transition record and its
+# persisted-attribution field type — the identical choice
+# `checkpoint_session.CheckpointTransition` already made for
+# `checkpoint_ref` (see that type's own comment immediately below),
+# applied for the same reason: the worktree's combination rule (every
+# non-`absent` intent requires a non-null `expected_head`) is a real
+# cross-field invariant, not a simple per-intent-nullable value like a
+# container's `id`. The name itself is kept as a compatibility alias —
+# `WorktreeAttribution` was a public, non-underscored class, and a
+# repository-wide grep finding only one internal reference cannot prove
+# no external caller imports it. `WorktreeAttribution is
+# WorktreeTransition` (exact identity, never a second dataclass or a
+# wrapper), so there is no duplicated validation to maintain. This does
+# make construction deliberately **stricter** than the retired
+# dataclass was: `WorktreeAttribution(intent=PRESENT,
+# expected_head=None)` was previously constructible (the old dataclass
+# had no `__post_init__`); the same call now raises `ValueError`,
+# since `WorktreeTransition.__post_init__` enforces the real combination
+# rule. Any code relying on the old, unvalidated construction behavior
+# — none is known to exist — would need updating; merely importing the
+# name continues to work unchanged.
+WorktreeAttribution = WorktreeTransition
 
 # `checkpoint_ref`'s attribution type is deliberately *not* redefined
 # here: `checkpoint_session.CheckpointIntent`/`CheckpointTransition`
@@ -182,7 +201,7 @@ class LifecycleProjection:
     state: LifecycleState
     baseline: ContainerAttribution
     verification: ContainerAttribution
-    worktree: WorktreeAttribution
+    worktree: WorktreeTransition
     checkpoint_ref: CheckpointTransition
     failure: FailureDetail | None
     reconciliation: ReconciliationSummary
@@ -260,7 +279,7 @@ def build_initial_preparing_projection(
         state=LifecycleState.PREPARING,
         baseline=ContainerAttribution(intent=ContainerIntent.ABSENT, id=None),
         verification=ContainerAttribution(intent=ContainerIntent.ABSENT, id=None),
-        worktree=WorktreeAttribution(intent=WorktreeIntent.ABSENT, expected_head=None),
+        worktree=ABSENT_WORKTREE_TRANSITION,
         checkpoint_ref=ABSENT_TRANSITION,
         failure=None,
         reconciliation=ReconciliationSummary(attempts_total=0, recent_failures=()),
@@ -312,7 +331,7 @@ def _container_to_dict(container: ContainerAttribution) -> dict:
     return {"intent": container.intent.value, "id": container.id}
 
 
-def _worktree_to_dict(worktree: WorktreeAttribution) -> dict:
+def _worktree_to_dict(worktree: WorktreeTransition) -> dict:
     return {"intent": worktree.intent.value, "expected_head": worktree.expected_head}
 
 
@@ -394,29 +413,33 @@ def _validate_container_shape(payload: object, *, role: str) -> None:
             raise _invalid()
 
 
-def _validate_worktree_shape(payload: object) -> None:
-    """Narrowed to the one shape ADR 0004 section 5 pins with full
-    confidence for this slice: worktree `absent`, no `expected_head`.
-    Unlike containers (section 7's own explicit combination table) and
-    `checkpoint_ref` (section 5's own explicit table, reused directly
-    from `checkpoint_session.CheckpointTransition`), the ADR gives no
-    formal per-field combination table for the `creating`/`present`/
-    `disposing` worktree shapes — only prose describing when they are
-    considered *owned* during reconciliation (section 8), which is not
-    the same as a persisted-schema validity rule. Rather than invent
-    and silently ship an unreviewed rule for those shapes (including
-    what `expected_head` format they would require), this validator
-    refuses every non-`absent` worktree shape categorically. A later
-    slice that actually produces those shapes must extend this
-    validator deliberately, against its own accepted design — at which
-    point `expected_head` must be validated as an exact object-format
-    OID the same way `checkpoint_ref` already is below."""
+def _validate_worktree_shape(payload: object, *, object_format: ObjectFormat) -> None:
+    """ADR 0004 Amendment 10's exact persisted-combination table,
+    reusing `worktree_lifecycle.WorktreeTransition` directly rather than
+    a second copy of that table — the identical move
+    `_validate_checkpoint_ref_shape` already makes for `checkpoint_ref`
+    below. `expected_head` is the immutable materialization/origin
+    commit for one worktree incarnation (never the worktree's live,
+    continuously-advancing `HEAD` — see `WorktreeTransition`'s own
+    docstring for why a live-`HEAD` equality rule would be wrong); this
+    function enforces only the persisted shape, not any ownership or
+    removal condition (ADR 0004 section 8's own, unchanged, non-`HEAD`-
+    based rule governs that, entirely out of this slice's scope)."""
     if not isinstance(payload, dict) or set(payload.keys()) != {"intent", "expected_head"}:
         raise _invalid()
-    if payload.get("intent") != WorktreeIntent.ABSENT.value:
+    intent_value = payload.get("intent")
+    valid_intents = {member.value for member in WorktreeIntent}
+    if intent_value not in valid_intents:
         raise _invalid()
-    if payload.get("expected_head") is not None:
+
+    expected_head = payload.get("expected_head")
+    if expected_head is not None and not _is_valid_oid_for_format(expected_head, object_format=object_format):
         raise _invalid()
+
+    try:
+        WorktreeTransition(intent=WorktreeIntent(intent_value), expected_head=expected_head)
+    except ValueError:
+        raise _invalid() from None
 
 
 def _is_valid_oid_for_format(value: object, *, object_format: ObjectFormat) -> bool:
@@ -497,22 +520,23 @@ def _validate_reconciliation_shape(payload: object) -> None:
 
 def validate_lifecycle_json_schema(payload: object, *, object_format: str) -> dict:
     """Schema validation for a `lifecycle.json` document, narrowed to
-    the shapes ADR 0004 section 5 pins with full confidence: exact
-    top-level and nested key sets (unknown fields refused everywhere),
-    type/format checks, the ADR's exact container and checkpoint-ref
-    valid-combination tables (the latter reusing
-    `checkpoint_session.CheckpointTransition` rather than a second
-    copy), and object-format-aware exact-hex validation of every
-    non-null persisted Git object id (`checkpoint_ref`'s three SHA
-    fields). `object_format` is the repository's actual object format
-    (`"sha1"` or `"sha256"`, e.g. from that repository's own
-    `repo.json`) — the projection itself carries no such field, so a
-    caller must supply it. `worktree` and `failure` are narrowed to
-    only their initial (`absent`/`null`) shape: the ADR does not yet
-    give either one a combination table as complete as containers' or
-    checkpoint_ref's, so this validator refuses every other shape
-    categorically rather than guessing an unreviewed one (see
-    `_validate_worktree_shape`/`_validate_failure_shape`). A pure
+    the shapes ADR 0004 pins with full confidence: exact top-level and
+    nested key sets (unknown fields refused everywhere), type/format
+    checks, the ADR's exact container, worktree (Amendment 10), and
+    checkpoint-ref valid-combination tables (worktree and checkpoint-ref
+    both reusing a validated value object — `worktree_lifecycle.
+    WorktreeTransition`/`checkpoint_session.CheckpointTransition` —
+    rather than a second copy of either table), and object-format-aware
+    exact-hex validation of every non-null persisted Git object id
+    (`worktree.expected_head`, `checkpoint_ref`'s three SHA fields).
+    `object_format` is the repository's actual object format (`"sha1"`
+    or `"sha256"`, e.g. from that repository's own `repo.json`) — the
+    projection itself carries no such field, so a caller must supply it.
+    `failure` remains narrowed to only its initial `null` shape: the ADR
+    does not yet give it a combination table as complete as containers',
+    worktree's, or checkpoint_ref's, so this validator refuses every
+    other shape categorically rather than guessing an unreviewed one
+    (see `_validate_failure_shape`). A pure
     function: it validates shape only, never filesystem or lock state,
     and is not yet called by any production read path in this slice
     (3A-2 only ever writes a freshly built projection; a future slice
@@ -569,7 +593,7 @@ def validate_lifecycle_json_schema(payload: object, *, object_format: str) -> di
     _validate_container_shape(containers.get("baseline"), role="baseline")
     _validate_container_shape(containers.get("verification"), role="verification")
 
-    _validate_worktree_shape(payload.get("worktree"))
+    _validate_worktree_shape(payload.get("worktree"), object_format=parsed_object_format)
     _validate_checkpoint_ref_shape(payload.get("checkpoint_ref"), object_format=parsed_object_format)
     _validate_failure_shape(payload.get("failure"))
     _validate_reconciliation_shape(payload.get("reconciliation"))
@@ -617,7 +641,7 @@ def _projection_from_dict(payload: dict) -> LifecycleProjection:
         state=LifecycleState(payload["state"]),
         baseline=ContainerAttribution(intent=ContainerIntent(baseline["intent"]), id=baseline["id"]),
         verification=ContainerAttribution(intent=ContainerIntent(verification["intent"]), id=verification["id"]),
-        worktree=WorktreeAttribution(
+        worktree=WorktreeTransition(
             intent=WorktreeIntent(worktree["intent"]), expected_head=worktree["expected_head"]
         ),
         checkpoint_ref=CheckpointTransition(
@@ -1036,6 +1060,48 @@ def _validate_checkpoint_ref_edge(current: CheckpointTransition, target: Checkpo
     raise _illegal_transition("not a legal checkpoint-ref transition edge")
 
 
+def _validate_worktree_edge(current: WorktreeTransition, target: WorktreeTransition) -> None:
+    """ADR 0004 Amendment 10's legal owner edges plus immutable-OID-
+    continuity: `creating->present` and `present->disposing` must each
+    retain the *exact same* `expected_head` the prior record already
+    carried — the materialization commit never changes once recorded.
+    `absent->creating` pins a fresh commit (no continuity constraint,
+    since the prior record carried none); `creating->absent` and
+    `disposing->absent` clear it to `None`, already enforced by
+    `WorktreeTransition.__post_init__` on the target record itself.
+    `target` is trusted to already be the caller's own decided value —
+    this function never re-derives one.
+
+    `creating->absent` is a caller-confirmed recovery edge only: this
+    writer never performs the Git observation itself (no `git worktree
+    list` call, no filesystem inspection) — the caller must have
+    independently confirmed, by real observation this writer never
+    performs, that the exact deterministic worktree path is absent from
+    Git worktree registration *and* that the filesystem leaf is
+    confirmed absent via the existing fd-safe/no-follow reservation or
+    worktree-cleanup observations. Merely observing an empty directory
+    is never sufficient confirmation. Direct analogy to the container
+    table's own `(CREATING, ABSENT)` edge, whose identical caveat is
+    documented at `_CONTAINER_TRANSITION_EDGES` above."""
+    c, t = current.intent, target.intent
+
+    if c is WorktreeIntent.ABSENT and t is WorktreeIntent.CREATING:
+        return
+    if c is WorktreeIntent.CREATING and t is WorktreeIntent.PRESENT:
+        if target.expected_head == current.expected_head:
+            return
+        raise _illegal_transition("creating->present must retain the exact same materialization commit")
+    if c is WorktreeIntent.CREATING and t is WorktreeIntent.ABSENT:
+        return  # caller-confirmed recovery (see this function's own docstring above, and ADR 0004 Amendment 10)
+    if c is WorktreeIntent.PRESENT and t is WorktreeIntent.DISPOSING:
+        if target.expected_head == current.expected_head:
+            return
+        raise _illegal_transition("present->disposing must retain the exact same materialization commit")
+    if c is WorktreeIntent.DISPOSING and t is WorktreeIntent.ABSENT:
+        return  # confirmed-removal collapse
+    raise _illegal_transition("not a legal worktree transition edge")
+
+
 def _illegal_transition(message: str) -> LifecycleStoreError:
     return LifecycleStoreError(LifecycleStoreFailure.ILLEGAL_TRANSITION, message)
 
@@ -1451,6 +1517,52 @@ class _LifecycleProjectionWriter:
         updated = replace(current_projection, checkpoint_ref=transition)
         return self._publish(updated)
 
+    def record_worktree_transition(
+        self, *, expected: LifecycleProjection, transition: WorktreeTransition
+    ) -> LifecycleProjection:
+        """ADR 0004 Amendment 10's write-ahead worktree edges, with full
+        immutable-OID-continuity (`_validate_worktree_edge`), not merely
+        per-record shape. `transition` is trusted to already be the
+        caller's own decided value -- this method never re-derives one
+        and never performs any Git or filesystem observation itself
+        (not `git worktree list`, not an `os.stat` call) -- in
+        particular, the `creating->absent` recovery edge is legal here
+        purely as a graph edge; confirming that recovery is actually
+        warranted is entirely the caller's own responsibility (see
+        `_validate_worktree_edge`'s docstring). This method is
+        correctness-tested standalone -- `workspace.GitWorktree` has no
+        seam today to call this at any real worktree-lifecycle moment;
+        that integration is explicitly later Milestone 3 work, not this
+        slice.
+
+        Uniform writer-call ordering, identical to
+        `record_checkpoint_ref_transition`: lock scope and authoritative
+        read/stale comparison happen first, then the state gate, then
+        `transition`'s own type is sanitized before any field access --
+        a raw `None` or wrong-type `transition` never reaches an
+        unguarded attribute lookup."""
+        current_projection = self._require_current(expected)
+        self._require_resource_writable_state(current_projection)
+
+        if not isinstance(transition, WorktreeTransition):
+            raise _illegal_transition("transition must be a WorktreeTransition")
+
+        current_transition = current_projection.worktree
+
+        if current_transition == transition:
+            return current_projection
+
+        object_format = ObjectFormat(self._lease.object_format)
+        if transition.expected_head is not None and not _is_valid_oid_for_format(
+            transition.expected_head, object_format=object_format
+        ):
+            raise _illegal_transition("a worktree expected_head does not match the repository's object format")
+
+        _validate_worktree_edge(current_transition, transition)
+
+        updated = replace(current_projection, worktree=transition)
+        return self._publish(updated)
+
 
 class LifecycleProjectionCursor:
     """The one authoritative in-memory belief about the current
@@ -1498,6 +1610,10 @@ class LifecycleProjectionCursor:
 
     def record_checkpoint_ref(self, transition: CheckpointTransition) -> LifecycleProjection:
         self._current = self._writer.record_checkpoint_ref_transition(expected=self._current, transition=transition)
+        return self._current
+
+    def record_worktree(self, transition: WorktreeTransition) -> LifecycleProjection:
+        self._current = self._writer.record_worktree_transition(expected=self._current, transition=transition)
         return self._current
 
     def refresh(self) -> LifecycleProjection:
@@ -1596,6 +1712,101 @@ _CHECKPOINT_PUBLICATION_FAILURE_MAP: dict[LifecycleStoreFailure, CheckpointPubli
     LifecycleStoreFailure.WRONG_LOCK_SCOPE: CheckpointPublicationFailure.WRONG_LOCK_SCOPE,
     LifecycleStoreFailure.STALE_EXPECTED_PROJECTION: CheckpointPublicationFailure.STALE_EXPECTATION,
     LifecycleStoreFailure.ILLEGAL_TRANSITION: CheckpointPublicationFailure.ILLEGAL_TRANSITION,
+}
+
+
+class LifecycleWorktreePublisher:
+    """Adapts a `_LifecycleProjectionWriter` (via a `LifecycleProjectionCursor`)
+    to `worktree_lifecycle.WorktreeTransitionPublisher`'s structural
+    `publish(transition)` boundary (ADR 0004 Amendment 10) -- the
+    identical shape `LifecycleCheckpointRefPublisher` already has, since
+    the worktree, like the checkpoint ref, has exactly one combination-
+    validated record rather than one record per role.
+
+    **Isolated use only** when constructed via `__init__` directly --
+    see `LifecycleCheckpointRefPublisher`'s identical warning. Use
+    `create_shared_lifecycle_publishers()` for any scenario touching
+    more than one facade against one lease.
+
+    `publish()` catches `LifecycleStoreError` and translates it to a
+    `worktree_lifecycle.WorktreePublicationError` -- every failure a
+    bare `record_worktree_transition()` call could raise, including but
+    not limited to a stale expectation, a wrong lock scope, an illegal
+    transition, and a pre-installation, cleanup-unconfirmed, or
+    durability-unconfirmed publication failure. `current` advances only
+    after a confirmed successful write; on any failure it is left
+    exactly as it was before the failed call -- this method never
+    retries automatically, and it never treats
+    `PROJECTION_DURABILITY_UNCONFIRMED` as success.
+
+    Call `refresh()` explicitly to recover after
+    `PROJECTION_DURABILITY_UNCONFIRMED` -- it is never invoked
+    automatically by `publish()`. **This slice constructs no
+    `workspace.GitWorktree` integration** -- `lifecycle_id`/
+    `state_root_id` exist now, mirroring `LifecycleContainerPublisher`'s
+    own identity properties, so the Protocol shape is already correct
+    for whichever later slice adds one.
+    """
+
+    def __init__(self, writer: "_LifecycleProjectionWriter", initial_projection: LifecycleProjection) -> None:
+        self._cursor = LifecycleProjectionCursor(writer, initial_projection)
+
+    @classmethod
+    def _from_cursor(cls, cursor: LifecycleProjectionCursor) -> "LifecycleWorktreePublisher":
+        """Private: the only sanctioned coordinated-construction path is
+        `create_shared_lifecycle_publishers()`."""
+        obj = cls.__new__(cls)
+        obj._cursor = cursor
+        return obj
+
+    @property
+    def current(self) -> LifecycleProjection:
+        return self._cursor.current
+
+    @property
+    def lifecycle_id(self) -> str:
+        return self._cursor.current.lifecycle_id
+
+    @property
+    def state_root_id(self) -> str:
+        return self._cursor.current.state_root_id
+
+    def publish(self, transition: WorktreeTransition) -> None:
+        try:
+            self._cursor.record_worktree(transition)
+        except LifecycleStoreError as exc:
+            raise WorktreePublicationError(
+                _WORKTREE_PUBLICATION_FAILURE_MAP[exc.reason],
+                "worktree transition could not be published",
+            ) from exc
+
+    def refresh(self) -> LifecycleProjection:
+        """Explicit, never-automatic recovery operation — delegates to
+        the shared cursor, un-staling every facade sharing it."""
+        return self._cursor.refresh()
+
+
+# ADR 0004 Amendment 10: the complete, explicit translation from every
+# `LifecycleStoreFailure` member to a `WorktreePublicationFailure`
+# reachable from `record_worktree_transition`'s own call path. Mirrors
+# `_CHECKPOINT_PUBLICATION_FAILURE_MAP`/`_CONTAINER_PUBLICATION_FAILURE_MAP`
+# exactly (same reachability analysis: `LIFECYCLE_ID_COLLISION`/
+# `RECONCILIATION_BLOCKED` are `prepare_lifecycle()`-only and
+# unreachable here too). Subscript access only, never
+# `.get(..., default)` — `tests/unit/test_lifecycle_store.py` asserts
+# this dict's keys equal the complete real `LifecycleStoreFailure` enum.
+_WORKTREE_PUBLICATION_FAILURE_MAP: dict[LifecycleStoreFailure, WorktreePublicationFailure] = {
+    LifecycleStoreFailure.SUBSTRATE_UNAVAILABLE: WorktreePublicationFailure.SUBSTRATE_UNAVAILABLE,
+    LifecycleStoreFailure.LIFECYCLE_ID_COLLISION: WorktreePublicationFailure.UNCLASSIFIED,
+    LifecycleStoreFailure.OVERSIZED: WorktreePublicationFailure.OVERSIZED,
+    LifecycleStoreFailure.SCHEMA_INVALID: WorktreePublicationFailure.SCHEMA_INVALID,
+    LifecycleStoreFailure.CLEANUP_UNCONFIRMED: WorktreePublicationFailure.CLEANUP_UNCONFIRMED,
+    LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED: WorktreePublicationFailure.NOT_INSTALLED,
+    LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED: WorktreePublicationFailure.DURABILITY_UNCONFIRMED,
+    LifecycleStoreFailure.RECONCILIATION_BLOCKED: WorktreePublicationFailure.UNCLASSIFIED,
+    LifecycleStoreFailure.WRONG_LOCK_SCOPE: WorktreePublicationFailure.WRONG_LOCK_SCOPE,
+    LifecycleStoreFailure.STALE_EXPECTED_PROJECTION: WorktreePublicationFailure.STALE_EXPECTATION,
+    LifecycleStoreFailure.ILLEGAL_TRANSITION: WorktreePublicationFailure.ILLEGAL_TRANSITION,
 }
 
 
@@ -1804,9 +2015,10 @@ class LifecycleOwnerStatePublisher:
 @dataclass(frozen=True)
 class SharedLifecyclePublishers:
     """The bundle `create_shared_lifecycle_publishers()` returns (Slice
-    3B-7/3C-1, ADR 0004 Amendments 7-8): one shared
-    `LifecycleProjectionCursor` plus a `LifecycleCheckpointRefPublisher`,
-    a `LifecycleContainerPublisher`, and a `LifecycleOwnerStatePublisher`
+    3B-7/3C-1, ADR 0004 Amendments 7-8, extended by Amendment 10): one
+    shared `LifecycleProjectionCursor` plus a
+    `LifecycleCheckpointRefPublisher`, a `LifecycleContainerPublisher`,
+    a `LifecycleOwnerStatePublisher`, and a `LifecycleWorktreePublisher`
     all constructed against that exact same cursor — never against
     independent private ones. A named bundle rather than a positional
     tuple, so a call site can never confuse which field is which."""
@@ -1815,25 +2027,29 @@ class SharedLifecyclePublishers:
     checkpoint_ref_publisher: LifecycleCheckpointRefPublisher
     container_publisher: LifecycleContainerPublisher
     owner_publisher: LifecycleOwnerStatePublisher
+    worktree_publisher: LifecycleWorktreePublisher
 
 
 def create_shared_lifecycle_publishers(
     writer: "_LifecycleProjectionWriter", initial: LifecycleProjection
 ) -> SharedLifecyclePublishers:
     """The one sanctioned way to obtain a `LifecycleCheckpointRefPublisher`,
-    a `LifecycleContainerPublisher`, and a `LifecycleOwnerStatePublisher`
-    safe to use together against the same lease (Slice 3B-7/3C-1, ADR
-    0004 Amendments 7-8). All three facades share the single
+    a `LifecycleContainerPublisher`, a `LifecycleOwnerStatePublisher`,
+    and a `LifecycleWorktreePublisher` safe to use together against the
+    same lease (Slice 3B-7/3C-1, ADR 0004 Amendments 7-8, extended by
+    Amendment 10). All four facades share the single
     `LifecycleProjectionCursor` returned alongside them, so a write
     through any one keeps the others' own next write correctly
     synchronized — the independent-`_current`-per-facade staleness bug
-    this slice fixes is structurally unreachable through this factory."""
+    Slice 3B-7 fixed is structurally unreachable through this factory,
+    for this fourth facade exactly as for the first three."""
     cursor = LifecycleProjectionCursor(writer, initial)
     return SharedLifecyclePublishers(
         cursor=cursor,
         checkpoint_ref_publisher=LifecycleCheckpointRefPublisher._from_cursor(cursor),
         container_publisher=LifecycleContainerPublisher._from_cursor(cursor),
         owner_publisher=LifecycleOwnerStatePublisher._from_cursor(cursor),
+        worktree_publisher=LifecycleWorktreePublisher._from_cursor(cursor),
     )
 
 

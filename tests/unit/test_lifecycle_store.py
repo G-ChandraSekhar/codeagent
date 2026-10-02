@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import signal
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +20,7 @@ from codeagent import lifecycle_owner as lo
 from codeagent import lifecycle_store as ls
 from codeagent import repo_identity as ri
 from codeagent import state_locks as sl
+from codeagent import worktree_lifecycle as wl
 
 
 def _run(*args, cwd=None, check=True):
@@ -844,8 +846,9 @@ def test_object_format_zero_oid_still_available_for_git_argv():
 
 
 # ---------------------------------------------------------------------------
-# worktree: narrowed to the initial (absent) shape only -- see
-# _validate_worktree_shape's own docstring for why.
+# worktree: ADR 0004 Amendment 10's exact persisted-combination table --
+# updated from this module's prior "absent only" narrowing. See
+# _validate_worktree_shape's own docstring.
 # ---------------------------------------------------------------------------
 
 
@@ -857,21 +860,112 @@ def test_worktree_absent_with_expected_head_refused():
 
 
 @pytest.mark.parametrize("intent", ["creating", "present", "disposing"])
-def test_worktree_non_absent_intent_categorically_refused(intent):
-    # Narrowed validator: any non-absent worktree shape is refused,
-    # regardless of expected_head, because the ADR gives no formal
-    # combination table for these shapes (unlike containers/
-    # checkpoint_ref) -- this is not yet a "future validator" this
-    # module claims to implement completely.
+def test_worktree_non_absent_intent_with_valid_oid_accepted(intent):
+    """ADR 0004 Amendment 10: a non-absent worktree shape with a valid,
+    object-format-matching expected_head is now a genuinely accepted
+    shape -- updated from this module's prior "categorically refused"
+    assertion, which predated the amendment."""
     payload = _valid_payload()
     payload["worktree"] = {"intent": intent, "expected_head": _SHA1_A}
+    validated = ls.validate_lifecycle_json_schema(payload, object_format="sha1")
+    assert validated["worktree"] == {"intent": intent, "expected_head": _SHA1_A}
+
+
+@pytest.mark.parametrize("intent", ["creating", "present", "disposing"])
+def test_worktree_non_absent_intent_without_expected_head_refused(intent):
+    """A non-absent intent with no expected_head remains refused -- the
+    combination rule (non-absent requires non-null expected_head),
+    unchanged by Amendment 10."""
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": intent, "expected_head": None}
     with pytest.raises(ls.LifecycleStoreError):
         ls.validate_lifecycle_json_schema(payload, object_format="sha1")
 
-    payload_no_head = _valid_payload()
-    payload_no_head["worktree"] = {"intent": intent, "expected_head": None}
+
+def test_worktree_present_valid_sha256():
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "present", "expected_head": _SHA256_A}
+    ls.validate_lifecycle_json_schema(payload, object_format="sha256")
+
+
+def test_worktree_sha1_length_refused_against_sha256_repo():
+    # A structurally valid sha1-length hex OID must be refused when the
+    # repository's actual object format is sha256 -- object-format
+    # awareness, not merely "is this some hex string."
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "present", "expected_head": _SHA1_A}
     with pytest.raises(ls.LifecycleStoreError):
-        ls.validate_lifecycle_json_schema(payload_no_head, object_format="sha1")
+        ls.validate_lifecycle_json_schema(payload, object_format="sha256")
+
+
+def test_worktree_sha256_length_refused_against_sha1_repo():
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "present", "expected_head": _SHA256_A}
+    with pytest.raises(ls.LifecycleStoreError):
+        ls.validate_lifecycle_json_schema(payload, object_format="sha1")
+
+
+def test_worktree_uppercase_hex_refused():
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "present", "expected_head": _SHA1_A.upper()}
+    with pytest.raises(ls.LifecycleStoreError):
+        ls.validate_lifecycle_json_schema(payload, object_format="sha1")
+
+
+def test_worktree_non_hex_refused():
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "present", "expected_head": "g" * 40}
+    with pytest.raises(ls.LifecycleStoreError):
+        ls.validate_lifecycle_json_schema(payload, object_format="sha1")
+
+
+def test_worktree_placeholder_sha_refused():
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "present", "expected_head": "A"}
+    with pytest.raises(ls.LifecycleStoreError):
+        ls.validate_lifecycle_json_schema(payload, object_format="sha1")
+
+
+def test_worktree_wrong_length_hex_refused():
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "present", "expected_head": _SHA1_A + "a"}
+    with pytest.raises(ls.LifecycleStoreError):
+        ls.validate_lifecycle_json_schema(payload, object_format="sha1")
+
+
+def test_worktree_zero_oid_refused_as_persisted_value_sha1():
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "present", "expected_head": "0" * 40}
+    with pytest.raises(ls.LifecycleStoreError):
+        ls.validate_lifecycle_json_schema(payload, object_format="sha1")
+
+
+def test_worktree_zero_oid_refused_as_persisted_value_sha256():
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "present", "expected_head": "0" * 64}
+    with pytest.raises(ls.LifecycleStoreError):
+        ls.validate_lifecycle_json_schema(payload, object_format="sha256")
+
+
+def test_worktree_unknown_intent_value_refused():
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "removing", "expected_head": _SHA1_A}
+    with pytest.raises(ls.LifecycleStoreError):
+        ls.validate_lifecycle_json_schema(payload, object_format="sha1")
+
+
+def test_worktree_unknown_key_refused():
+    payload = _valid_payload()
+    payload["worktree"] = {"intent": "absent", "expected_head": None, "extra": "x"}
+    with pytest.raises(ls.LifecycleStoreError):
+        ls.validate_lifecycle_json_schema(payload, object_format="sha1")
+
+
+def test_worktree_wrong_type_refused():
+    payload = _valid_payload()
+    payload["worktree"] = "not-a-dict"
+    with pytest.raises(ls.LifecycleStoreError):
+        ls.validate_lifecycle_json_schema(payload, object_format="sha1")
 
 
 # ---------------------------------------------------------------------------
@@ -1608,25 +1702,26 @@ def _publish_raw(lease, projection: ls.LifecycleProjection) -> None:
     ls.publish_private_file_atomically_at(lease.run_dir_fd, ls.LIFECYCLE_JSON_FILENAME, data, mode=0o600)
 
 
-def test_cleaning_to_complete_worktree_dirty_shape_is_unloadable(tmp_path, monkeypatch):
-    """Non-absent worktree writing is deferred (Slice 3A-2's own
-    narrowing, unchanged): `validate_lifecycle_json_schema` refuses to
-    load a non-absent worktree shape at all, so the durable projection
-    can never become "authoritative and worktree-dirty" through the
-    normal read path in the first place -- the CLEANING->COMPLETE
-    guard's worktree check is correct but currently unreachable in
-    practice, intercepted earlier by the loader's own existing
-    narrowing (SCHEMA_INVALID), not by ILLEGAL_TRANSITION."""
+def test_cleaning_to_complete_worktree_dirty_shape_is_refused_by_clean_final_guard(tmp_path, monkeypatch):
+    """Updated by the worktree-attribution substrate slice (ADR 0004
+    Amendment 10): a non-absent worktree shape with a valid OID is now
+    genuinely loadable (the prior "SCHEMA_INVALID, intercepted before
+    the clean-final guard ever runs" assertion predates Amendment 10),
+    so the CLEANING->COMPLETE clean-final guard's own worktree check is
+    now actually reachable in practice, for the first time, and
+    correctly refuses with ILLEGAL_TRANSITION rather than SCHEMA_INVALID."""
     lease = _prepared_lease(tmp_path, monkeypatch)
     try:
         writer, current = lease.open_projection_writer()
         current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.ACTIVE)
         current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
-        dirty = dataclasses.replace(current, worktree=ls.WorktreeAttribution(intent=ls.WorktreeIntent.PRESENT, expected_head=None))
+        dirty = dataclasses.replace(
+            current, worktree=ls.WorktreeTransition(intent=ls.WorktreeIntent.PRESENT, expected_head=_SHA1_A)
+        )
         _publish_raw(lease, dirty)
         with pytest.raises(ls.LifecycleStoreError) as excinfo:
             writer.advance_lifecycle_state(expected=dirty, state=ls.LifecycleState.COMPLETE)
-        assert excinfo.value.reason is ls.LifecycleStoreFailure.SCHEMA_INVALID
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
     finally:
         lease.close()
 
@@ -3373,10 +3468,12 @@ def test_shared_publishers_have_no_shadow_current(tmp_path, monkeypatch):
         assert set(vars(bundle.checkpoint_ref_publisher).keys()) == {"_cursor"}
         assert set(vars(bundle.container_publisher).keys()) == {"_cursor"}
         assert set(vars(bundle.owner_publisher).keys()) == {"_cursor"}
+        assert set(vars(bundle.worktree_publisher).keys()) == {"_cursor"}
         assert (
             bundle.checkpoint_ref_publisher._cursor
             is bundle.container_publisher._cursor
             is bundle.owner_publisher._cursor
+            is bundle.worktree_publisher._cursor
             is bundle.cursor
         )
     finally:
@@ -3393,14 +3490,20 @@ def test_standalone_constructor_still_works_and_is_source_compatible(tmp_path, m
         checkpoint_pub = ls.LifecycleCheckpointRefPublisher(writer, current)
         container_pub = ls.LifecycleContainerPublisher(writer, current)
         owner_pub = ls.LifecycleOwnerStatePublisher(writer, current)
+        worktree_pub = ls.LifecycleWorktreePublisher(writer, current)
         assert set(vars(checkpoint_pub).keys()) == {"_cursor"}
         assert set(vars(container_pub).keys()) == {"_cursor"}
         assert set(vars(owner_pub).keys()) == {"_cursor"}
+        assert set(vars(worktree_pub).keys()) == {"_cursor"}
         assert checkpoint_pub._cursor is not container_pub._cursor is not owner_pub._cursor
         assert checkpoint_pub._cursor is not owner_pub._cursor
+        assert worktree_pub._cursor is not checkpoint_pub._cursor
+        assert worktree_pub._cursor is not container_pub._cursor
+        assert worktree_pub._cursor is not owner_pub._cursor
         assert checkpoint_pub.current == current
         assert container_pub.current == current
         assert owner_pub.current == current
+        assert worktree_pub.current == current
     finally:
         lease.close()
 
@@ -3556,3 +3659,664 @@ def test_shared_bundle_owner_publisher_reaches_preparing_active_cleaning_complet
         assert cursor.current.state is ls.LifecycleState.COMPLETE
     finally:
         lease.close()
+
+
+# ---------------------------------------------------------------------------
+# Worktree-attribution substrate slice (ADR 0004 Amendment 10):
+# record_worktree_transition(), LifecycleWorktreePublisher, and shared-
+# cursor integration. Mirrors the checkpoint-ref writer/publisher tests
+# above exactly, since both use the identical single-value-object
+# publish(transition) shape.
+# ---------------------------------------------------------------------------
+
+
+def _wt(intent: wl.WorktreeIntent, expected_head: str | None = None) -> wl.WorktreeTransition:
+    return wl.WorktreeTransition(intent=intent, expected_head=expected_head)
+
+
+# --- Correction pass: WorktreeAttribution compatibility alias ---
+
+
+def test_worktree_attribution_is_exact_identity_alias_for_worktree_transition():
+    """`lifecycle_store.WorktreeAttribution` was a public,
+    non-underscored class before this slice; restored as an exact
+    identity alias (never a second dataclass or a wrapper) for source
+    compatibility with any external caller a repository-wide grep
+    cannot rule out."""
+    assert ls.WorktreeAttribution is wl.WorktreeTransition
+
+
+def test_worktree_attribution_construction_is_now_deliberately_stricter():
+    """The retired dataclass had no `__post_init__`, so
+    `WorktreeAttribution(intent=PRESENT, expected_head=None)` was
+    previously constructible. The alias now enforces the real
+    combination rule -- the same call raises `ValueError`."""
+    with pytest.raises(ValueError):
+        ls.WorktreeAttribution(intent=wl.WorktreeIntent.PRESENT, expected_head=None)
+    # The absent shape, and a well-formed non-absent shape, still work.
+    ls.WorktreeAttribution(intent=wl.WorktreeIntent.ABSENT)
+    ls.WorktreeAttribution(intent=wl.WorktreeIntent.PRESENT, expected_head=_sha("1"))
+
+
+def test_worktree_full_happy_path_round_trip(tmp_path, monkeypatch):
+    """Every legal owner edge in sequence: absent -> creating ->
+    present -> disposing -> absent, with the materialization OID
+    retained unchanged through creating/present/disposing and cleared
+    only at disposing->absent."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        origin = _sha("1")
+        current = writer.record_worktree_transition(
+            expected=current, transition=_wt(wl.WorktreeIntent.CREATING, origin)
+        )
+        assert current.worktree == _wt(wl.WorktreeIntent.CREATING, origin)
+
+        current = writer.record_worktree_transition(
+            expected=current, transition=_wt(wl.WorktreeIntent.PRESENT, origin)
+        )
+        assert current.worktree == _wt(wl.WorktreeIntent.PRESENT, origin)
+
+        current = writer.record_worktree_transition(
+            expected=current, transition=_wt(wl.WorktreeIntent.DISPOSING, origin)
+        )
+        assert current.worktree == _wt(wl.WorktreeIntent.DISPOSING, origin)
+
+        current = writer.record_worktree_transition(
+            expected=current, transition=wl.ABSENT_WORKTREE_TRANSITION
+        )
+        assert current.worktree == wl.ABSENT_WORKTREE_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_worktree_creating_to_absent_recovery_edge(tmp_path, monkeypatch):
+    """The caller-confirmed recovery edge: creating -> absent, legal
+    purely as a graph edge (this writer performs no Git/filesystem
+    observation of its own -- the caller's own confirmation discipline
+    is outside this writer's scope, per the writer method's docstring)."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.record_worktree_transition(
+            expected=current, transition=_wt(wl.WorktreeIntent.CREATING, _sha("1"))
+        )
+        current = writer.record_worktree_transition(
+            expected=current, transition=wl.ABSENT_WORKTREE_TRANSITION
+        )
+        assert current.worktree == wl.ABSENT_WORKTREE_TRANSITION
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize(
+    "from_transition,to_transition",
+    [
+        # From absent: only creating is legal.
+        (wl.ABSENT_WORKTREE_TRANSITION, _wt(wl.WorktreeIntent.PRESENT, _sha("1"))),
+        (wl.ABSENT_WORKTREE_TRANSITION, _wt(wl.WorktreeIntent.DISPOSING, _sha("1"))),
+        # From creating: present or absent only -- never disposing directly.
+        (_wt(wl.WorktreeIntent.CREATING, _sha("1")), _wt(wl.WorktreeIntent.DISPOSING, _sha("1"))),
+        # From present: disposing only -- never back to creating, never
+        # straight to absent.
+        (_wt(wl.WorktreeIntent.PRESENT, _sha("1")), _wt(wl.WorktreeIntent.CREATING, _sha("1"))),
+        (_wt(wl.WorktreeIntent.PRESENT, _sha("1")), wl.ABSENT_WORKTREE_TRANSITION),
+        (_wt(wl.WorktreeIntent.PRESENT, _sha("1")), _wt(wl.WorktreeIntent.PRESENT, _sha("2"))),
+        # From disposing: absent only -- never back to present/creating.
+        (_wt(wl.WorktreeIntent.DISPOSING, _sha("1")), _wt(wl.WorktreeIntent.PRESENT, _sha("1"))),
+        (_wt(wl.WorktreeIntent.DISPOSING, _sha("1")), _wt(wl.WorktreeIntent.CREATING, _sha("1"))),
+    ],
+)
+def test_worktree_illegal_edges(tmp_path, monkeypatch, from_transition, to_transition):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        if from_transition.intent is not wl.WorktreeIntent.ABSENT:
+            # Reach the `from_transition` state via whatever legal path
+            # gets there, so the edge under test is isolated from setup.
+            if from_transition.intent is wl.WorktreeIntent.CREATING:
+                current = writer.record_worktree_transition(expected=current, transition=from_transition)
+            elif from_transition.intent is wl.WorktreeIntent.PRESENT:
+                current = writer.record_worktree_transition(
+                    expected=current,
+                    transition=_wt(wl.WorktreeIntent.CREATING, from_transition.expected_head),
+                )
+                current = writer.record_worktree_transition(expected=current, transition=from_transition)
+            elif from_transition.intent is wl.WorktreeIntent.DISPOSING:
+                current = writer.record_worktree_transition(
+                    expected=current,
+                    transition=_wt(wl.WorktreeIntent.CREATING, from_transition.expected_head),
+                )
+                current = writer.record_worktree_transition(
+                    expected=current,
+                    transition=_wt(wl.WorktreeIntent.PRESENT, from_transition.expected_head),
+                )
+                current = writer.record_worktree_transition(expected=current, transition=from_transition)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_worktree_transition(expected=current, transition=to_transition)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_worktree_creating_to_present_oid_change_refused(tmp_path, monkeypatch):
+    """Immutable-OID continuity: creating->present must retain the
+    exact same materialization commit -- a different OID is refused
+    even though (creating, present) is otherwise a legal edge pair."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.record_worktree_transition(
+            expected=current, transition=_wt(wl.WorktreeIntent.CREATING, _sha("1"))
+        )
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_worktree_transition(
+                expected=current, transition=_wt(wl.WorktreeIntent.PRESENT, _sha("2"))
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_worktree_present_to_disposing_oid_change_refused(tmp_path, monkeypatch):
+    """Immutable-OID continuity: present->disposing must also retain
+    the exact same materialization commit."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        origin = _sha("1")
+        current = writer.record_worktree_transition(expected=current, transition=_wt(wl.WorktreeIntent.CREATING, origin))
+        current = writer.record_worktree_transition(expected=current, transition=_wt(wl.WorktreeIntent.PRESENT, origin))
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_worktree_transition(
+                expected=current, transition=_wt(wl.WorktreeIntent.DISPOSING, _sha("2"))
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_worktree_exact_tuple_no_op_zero_publication_io(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+
+        def _boom(*a, **k):
+            raise AssertionError("must not publish for a no-op")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ls, "publish_private_file_atomically_at", _boom)
+            result = writer.record_worktree_transition(expected=current, transition=wl.ABSENT_WORKTREE_TRANSITION)
+        assert result == current
+    finally:
+        lease.close()
+
+
+def test_worktree_wrong_object_format_length_is_illegal(tmp_path, monkeypatch):
+    """The writer re-validates `expected_head` against the repository's
+    *actual* object format, even though `WorktreeTransition.__post_init__`
+    already accepted the generic 40-or-64 shape -- a sha256-length OID
+    offered to a sha1 repository must be refused here too."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_worktree_transition(
+                expected=current, transition=_wt(wl.WorktreeIntent.CREATING, _sha256("1"))
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def _sha256(seed: str) -> str:
+    return (seed * 64)[:64]
+
+
+@pytest.mark.parametrize(
+    "reconciler_state",
+    [ls.LifecycleState.RECONCILING, ls.LifecycleState.RECONCILED, ls.LifecycleState.RECONCILIATION_FAILED],
+)
+def test_worktree_transition_refused_from_reconciler_owned_states(tmp_path, monkeypatch, reconciler_state):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, initial = lease.open_projection_writer()
+        reconciler_owned = dataclasses.replace(initial, state=reconciler_state)
+        _publish_raw(lease, reconciler_owned)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_worktree_transition(
+                expected=reconciler_owned, transition=_wt(wl.WorktreeIntent.CREATING, _sha("1"))
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+        # Even an exact no-op is refused.
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.record_worktree_transition(expected=reconciler_owned, transition=wl.ABSENT_WORKTREE_TRANSITION)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_worktree_and_checkpoint_ref_transitions_still_legal_in_active_and_cleaning(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.ACTIVE)
+        current = writer.record_worktree_transition(
+            expected=current, transition=_wt(wl.WorktreeIntent.CREATING, _sha("1"))
+        )
+        current = writer.record_worktree_transition(expected=current, transition=wl.ABSENT_WORKTREE_TRANSITION)
+
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+        current = writer.record_worktree_transition(
+            expected=current, transition=_wt(wl.WorktreeIntent.CREATING, _sha("2"))
+        )
+        current = writer.record_worktree_transition(expected=current, transition=wl.ABSENT_WORKTREE_TRANSITION)
+        assert current.state == ls.LifecycleState.CLEANING
+        assert current.worktree == wl.ABSENT_WORKTREE_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_worktree_transition_invalid_type_on_released_lock_gives_wrong_lock_scope(tmp_path, monkeypatch):
+    """Uniform writer-call ordering: a wrong lock scope is detected
+    before a wrong-type `transition` is ever inspected."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    writer, current = lease.open_projection_writer()
+    lease.close()
+    with pytest.raises(ls.LifecycleStoreError) as excinfo:
+        writer.record_worktree_transition(expected=current, transition="not-a-transition")
+    assert excinfo.value.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+
+
+def test_worktree_transition_none_is_illegal_not_raw_error(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+
+        def _boom(*a, **k):
+            raise AssertionError("must not publish for an invalid transition")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ls, "publish_private_file_atomically_at", _boom)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                writer.record_worktree_transition(expected=current, transition=None)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+def test_worktree_transition_wrong_type_is_illegal_not_raw_error(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+
+        def _boom(*a, **k):
+            raise AssertionError("must not publish for an invalid transition")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ls, "publish_private_file_atomically_at", _boom)
+            with pytest.raises(ls.LifecycleStoreError) as excinfo:
+                writer.record_worktree_transition(expected=current, transition={"intent": "absent"})
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+# --- LifecycleWorktreePublisher adapter ---
+
+
+def test_worktree_publisher_adapter_success_threads_returned_projection_forward(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleWorktreePublisher(writer, current)
+
+        publisher.publish(_wt(wl.WorktreeIntent.CREATING, _sha("1")))
+
+        assert publisher.current.worktree.intent is wl.WorktreeIntent.CREATING
+        assert publisher.current != current
+    finally:
+        lease.close()
+
+
+def test_worktree_publisher_adapter_does_not_hide_stale_expectation(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleWorktreePublisher(writer, current)
+        real_current = writer.record_container_transition(
+            expected=current, role="baseline", intent=ls.ContainerIntent.CREATING, id=None
+        )
+        assert real_current != current
+
+        with pytest.raises(wl.WorktreePublicationError) as excinfo:
+            publisher.publish(_wt(wl.WorktreeIntent.CREATING, _sha("1")))
+        assert excinfo.value.reason is wl.WorktreePublicationFailure.STALE_EXPECTATION
+        assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.STALE_EXPECTED_PROJECTION
+        assert publisher.current == current
+    finally:
+        lease.close()
+
+
+def test_worktree_publisher_adapter_durability_unconfirmed_installed_vs_cursor_split_and_refresh(
+    tmp_path, monkeypatch
+):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleWorktreePublisher(writer, current)
+
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_last_fsync(fd):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced directory fsync failure")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
+            with pytest.raises(wl.WorktreePublicationError) as excinfo:
+                publisher.publish(_wt(wl.WorktreeIntent.CREATING, _sha("1")))
+            assert excinfo.value.reason is wl.WorktreePublicationFailure.DURABILITY_UNCONFIRMED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+
+        # Never silently treated as success: the adapter's own belief
+        # (the "cursor" side of the split) is unchanged even though the
+        # write was actually installed (the "installed" side).
+        assert publisher.current == current
+
+        # Explicit, never-automatic refresh() recovers.
+        refreshed = publisher.refresh()
+        assert refreshed.worktree.intent is wl.WorktreeIntent.CREATING
+        assert publisher.current is refreshed
+
+        # No automatic retry happened above -- only this explicit call
+        # to publish() again, now with the correct expectation, succeeds.
+        publisher.publish(_wt(wl.WorktreeIntent.PRESENT, _sha("1")))
+        assert publisher.current.worktree.intent is wl.WorktreeIntent.PRESENT
+    finally:
+        lease.close()
+
+
+def test_worktree_publisher_adapter_cleanup_unconfirmed_remains_distinct_and_propagates(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleWorktreePublisher(writer, current)
+
+        def _fail_write(fd, data):
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.IO_FAILED, "forced write failure")
+
+        def _fail_unlink(path, *, dir_fd):
+            raise OSError("forced temp-cleanup failure")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "write_all_eintr_safe", _fail_write)
+            scoped.setattr(lf.os, "unlink", _fail_unlink)
+            with pytest.raises(wl.WorktreePublicationError) as excinfo:
+                publisher.publish(_wt(wl.WorktreeIntent.CREATING, _sha("1")))
+            assert excinfo.value.reason is wl.WorktreePublicationFailure.CLEANUP_UNCONFIRMED
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.CLEANUP_UNCONFIRMED
+        assert publisher.current == current
+    finally:
+        lease.close()
+
+
+def test_worktree_publisher_adapter_wrong_lock_scope_propagates_unchanged(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    writer, current = lease.open_projection_writer()
+    lease.close()
+    publisher = ls.LifecycleWorktreePublisher(writer, current)
+
+    with pytest.raises(wl.WorktreePublicationError) as excinfo:
+        publisher.publish(_wt(wl.WorktreeIntent.CREATING, _sha("1")))
+    assert excinfo.value.reason is wl.WorktreePublicationFailure.WRONG_LOCK_SCOPE
+
+
+def test_worktree_publication_failure_map_is_exhaustive():
+    """Every current `LifecycleStoreFailure` member must have an
+    explicit mapping entry — mirrors the container/checkpoint/owner-
+    side exhaustiveness tests exactly."""
+    assert set(ls._WORKTREE_PUBLICATION_FAILURE_MAP.keys()) == set(ls.LifecycleStoreFailure)
+
+
+def test_worktree_publication_failure_map_only_classifies_prepare_lifecycle_only_reasons_as_unclassified():
+    unclassified_keys = {
+        reason
+        for reason, mapped in ls._WORKTREE_PUBLICATION_FAILURE_MAP.items()
+        if mapped is wl.WorktreePublicationFailure.UNCLASSIFIED
+    }
+    assert unclassified_keys == {
+        ls.LifecycleStoreFailure.LIFECYCLE_ID_COLLISION,
+        ls.LifecycleStoreFailure.RECONCILIATION_BLOCKED,
+    }
+
+
+def test_worktree_publisher_translates_lifecycle_store_error(tmp_path, monkeypatch):
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    writer, current = lease.open_projection_writer()
+    publisher = ls.LifecycleWorktreePublisher(writer, current)
+    lease.close()  # forces WRONG_LOCK_SCOPE on the next publish
+
+    with pytest.raises(wl.WorktreePublicationError) as excinfo:
+        publisher.publish(_wt(wl.WorktreeIntent.CREATING, _sha("1")))
+    assert excinfo.value.reason is wl.WorktreePublicationFailure.WRONG_LOCK_SCOPE
+    assert isinstance(excinfo.value.__cause__, ls.LifecycleStoreError)
+    assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+    assert "WRONG_LOCK_SCOPE" not in str(excinfo.value)
+
+
+def test_worktree_publisher_identity_properties_match_cursor_projection(tmp_path, monkeypatch):
+    """`lifecycle_id`/`state_root_id` are read directly from the
+    publisher's own cursor, matching `LifecycleContainerPublisher`'s
+    identical identity-property contract -- not an independently
+    supplied or stale value."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleWorktreePublisher(writer, current)
+        assert publisher.lifecycle_id == current.lifecycle_id == lease.lifecycle_id
+        assert publisher.state_root_id == current.state_root_id
+
+        publisher.publish(_wt(wl.WorktreeIntent.CREATING, _sha("1")))
+        # Identity is unaffected by an ordinary resource transition --
+        # it is still derived from the (now-advanced) cursor projection.
+        assert publisher.lifecycle_id == publisher.current.lifecycle_id == lease.lifecycle_id
+        assert publisher.state_root_id == publisher.current.state_root_id
+    finally:
+        lease.close()
+
+
+def test_worktree_publication_error_message_never_leaks_cause_detail_or_enum_spelling(tmp_path, monkeypatch):
+    """The fixed, sanitized production message must never contain the
+    injected `LifecycleStoreError`'s own detail text, nor the
+    categorical enum member's own spelling (upper- or lower-case) --
+    only `__cause__`, inspected explicitly, carries that information."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    writer, current = lease.open_projection_writer()
+    publisher = ls.LifecycleWorktreePublisher(writer, current)
+    lease.close()  # forces WRONG_LOCK_SCOPE, whose own LifecycleStoreError
+    # message text is "a projection write requires an already-held
+    # lifecycle lock on a fully identified lease" -- none of that, and
+    # no "wrong_lock_scope"/"WRONG_LOCK_SCOPE" spelling, may appear in
+    # the translated public message.
+    with pytest.raises(wl.WorktreePublicationError) as excinfo:
+        publisher.publish(_wt(wl.WorktreeIntent.CREATING, _sha("1")))
+    message = str(excinfo.value)
+    assert message == "worktree transition could not be published"
+    assert "lifecycle lock" not in message
+    assert "wrong_lock_scope" not in message.lower()
+    assert "WRONG_LOCK_SCOPE" not in message
+    assert isinstance(excinfo.value.__cause__, ls.LifecycleStoreError)
+    assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.WRONG_LOCK_SCOPE
+
+
+def test_worktree_publisher_wrong_type_transition_translated_without_raw_leakage(tmp_path, monkeypatch):
+    """A wrong-type `transition` passed through the publisher is
+    translated to `WorktreePublicationError`/`ILLEGAL_TRANSITION` --
+    never a raw `AttributeError`/`TypeError` escaping from an unguarded
+    attribute access on a non-`WorktreeTransition` value."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        publisher = ls.LifecycleWorktreePublisher(writer, current)
+
+        for bad_transition in (None, "not-a-transition", {"intent": "absent"}, 123, object()):
+            with pytest.raises(wl.WorktreePublicationError) as excinfo:
+                publisher.publish(bad_transition)  # type: ignore[arg-type]
+            assert excinfo.value.reason is wl.WorktreePublicationFailure.ILLEGAL_TRANSITION
+            assert isinstance(excinfo.value.__cause__, ls.LifecycleStoreError)
+            assert excinfo.value.__cause__.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        lease.close()
+
+
+# --- Unchanged clean-final / reconciliation-eligibility behavior for absent worktrees ---
+
+
+def test_is_projection_fully_absent_shape_still_true_for_absent_worktree():
+    projection = ls.build_initial_preparing_projection(
+        lifecycle_id="a" * 32,
+        state_root_id="b" * 32,
+        repo_key="c" * 32,
+        run_id="r",
+        source_repo_path="/tmp/x",
+    )
+    assert ls.is_projection_fully_absent_shape(projection)
+    assert ls.is_projection_reconciliation_eligible_shape(projection)
+
+
+def test_is_projection_fully_absent_shape_false_for_non_absent_worktree():
+    """New behavior this slice introduces: a non-absent worktree shape
+    now genuinely exists and is correctly recognized as NOT fully
+    absent / NOT reconciliation-eligible -- both predicates' own
+    worktree check, previously unreachable (no non-absent shape could
+    ever be loaded), is now exercised for real."""
+    projection = ls.build_initial_preparing_projection(
+        lifecycle_id="a" * 32,
+        state_root_id="b" * 32,
+        repo_key="c" * 32,
+        run_id="r",
+        source_repo_path="/tmp/x",
+    )
+    dirty = dataclasses.replace(
+        projection, worktree=_wt(wl.WorktreeIntent.PRESENT, _sha("1"))
+    )
+    assert not ls.is_projection_fully_absent_shape(dirty)
+    assert not ls.is_projection_reconciliation_eligible_shape(dirty)
+
+
+def test_cleaning_to_complete_requires_absent_worktree(tmp_path, monkeypatch):
+    """The CLEANING->COMPLETE clean-final guard genuinely refuses a
+    durably-installed non-absent worktree shape via the normal writer
+    path (not only via `_publish_raw` bypass, as the schema-interception
+    test above exercises) -- reached here by establishing a real
+    `creating` worktree transition through the writer itself."""
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.ACTIVE)
+        current = writer.record_worktree_transition(
+            expected=current, transition=_wt(wl.WorktreeIntent.CREATING, _sha("1"))
+        )
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.CLEANING)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.COMPLETE)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+
+        # Disposing it back to absent lets COMPLETE succeed.
+        current = writer.record_worktree_transition(expected=current, transition=wl.ABSENT_WORKTREE_TRANSITION)
+        current = writer.advance_lifecycle_state(expected=current, state=ls.LifecycleState.COMPLETE)
+        assert current.state is ls.LifecycleState.COMPLETE
+    finally:
+        lease.close()
+
+
+# --- Shared-cursor interleaving with checkpoint, container, and owner publishers ---
+
+
+def test_shared_bundle_worktree_interleaving_no_spurious_staleness(tmp_path, monkeypatch):
+    from codeagent import container_lifecycle as cl
+
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    try:
+        writer, current = lease.open_projection_writer()
+        bundle = ls.create_shared_lifecycle_publishers(writer, current)
+        cursor = bundle.cursor
+        checkpoint_pub = bundle.checkpoint_ref_publisher
+        container_pub = bundle.container_publisher
+        owner_pub = bundle.owner_publisher
+        worktree_pub = bundle.worktree_publisher
+
+        owner_pub.activate()
+        assert cursor.current.state is ls.LifecycleState.ACTIVE
+
+        # Worktree creating -> present, interleaved with a container
+        # transition and a checkpoint-ref transition through the SAME
+        # shared cursor -- proving a write through any one facade keeps
+        # every other facade's own next write correctly synchronized,
+        # the identical property Slice 3B-7 established for the first
+        # three facades.
+        origin = _sha("1")
+        worktree_pub.publish(_wt(wl.WorktreeIntent.CREATING, origin))
+        container_pub.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.CREATING, id=None)
+        checkpoint_pub.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=origin))
+        worktree_pub.publish(_wt(wl.WorktreeIntent.PRESENT, origin))
+        container_pub.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.PRESENT, id="a" * 64)
+        checkpoint_pub.publish(cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=origin))
+
+        assert cursor.current.worktree == _wt(wl.WorktreeIntent.PRESENT, origin)
+        assert cursor.current.baseline.intent is ls.ContainerIntent.PRESENT
+        assert cursor.current.checkpoint_ref.accepted_sha == origin
+
+        # Fault-inject a durability-unconfirmed failure on the worktree
+        # write, then prove explicit refresh() re-syncs every facade
+        # sharing this cursor, including the three NOT directly involved
+        # in the failed call.
+        real_fsync_fd = lf.fsync_fd
+        call_count = {"n": 0}
+
+        def _fail_last_fsync(fd):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "forced directory fsync failure")
+            return real_fsync_fd(fd)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(lf, "fsync_fd", _fail_last_fsync)
+            with pytest.raises(wl.WorktreePublicationError) as excinfo:
+                worktree_pub.publish(_wt(wl.WorktreeIntent.DISPOSING, origin))
+            assert excinfo.value.reason is wl.WorktreePublicationFailure.DURABILITY_UNCONFIRMED
+
+        assert cursor.current.worktree == _wt(wl.WorktreeIntent.PRESENT, origin)
+        cursor.refresh()
+        assert cursor.current.worktree == _wt(wl.WorktreeIntent.DISPOSING, origin)
+
+        # The next write through a DIFFERENT facade (container) now
+        # succeeds immediately -- no spurious staleness introduced by
+        # the worktree facade's own prior fault.
+        container_pub.publish(role=ls.ContainerRole.BASELINE, intent=ls.ContainerIntent.REMOVING, id="a" * 64)
+        assert cursor.current.baseline.intent is ls.ContainerIntent.REMOVING
+
+        # And the worktree facade's own next write succeeds too.
+        worktree_pub.publish(wl.ABSENT_WORKTREE_TRANSITION)
+        assert cursor.current.worktree == wl.ABSENT_WORKTREE_TRANSITION
+    finally:
+        lease.close()
+
+
+# --- Static proof: no production workspace/controller/reconciliation integration ---
+
+
+def test_no_workspace_controller_or_reconciliation_integration_exists():
+    """Static source-level proof that this slice wires nothing into
+    `workspace.py`, `controller.py`, or `reconciliation.py` -- a direct
+    analogy to the existing `test_no_container_worktree_or_checkpoint_ref_mutation_reachable`
+    static proof already covering 3A-2's own scope boundary."""
+    for module_name in ("workspace", "controller", "reconciliation"):
+        source = Path(f"src/codeagent/{module_name}.py").read_text()
+        assert "worktree_lifecycle" not in source, f"{module_name}.py must not import worktree_lifecycle"
+        assert "LifecycleWorktreePublisher" not in source
+        assert "record_worktree_transition" not in source

@@ -3237,3 +3237,275 @@ amendment already states above. `docs/threat-model.md`'s T-E1 entry
 remains unaffected — this amendment is a controller-internal
 correctness change, not production lifecycle composition or
 concurrent-run protection.
+
+## Amendment 10 (Accepted 2026-10-02): worktree-attribution substrate — persisted shapes, owner edges, and durable publication
+
+### Context
+
+Amendment 9's own "Explicitly out of scope" list named the one concrete
+remaining question this ADR had left open: "the worktree transition/
+combination table (or a decision to omit worktree attribution)." A
+joint review first identified that the two originally-proposed candidate
+designs for `worktree.expected_head` were both incomplete:
+
+- **Independent re-published field** ("expected_head tracks the
+  worktree's current HEAD, re-published on every checkpoint advance")
+  would require new `RunController`/`CheckpointSession` ordering and
+  failure-interleaving — not an independent substrate change, and out
+  of scope for this amendment.
+- **Cross-field invariant against `checkpoint_ref.accepted_sha`**
+  ("worktree HEAD must equal checkpoint_ref.accepted_sha") is **provably
+  wrong**, confirmed by direct code trace: `controller.py`'s
+  `_dispatch_apply_patch` calls `self._patch_applier.apply(...)` (which
+  commits directly into the worktree, moving its real `HEAD` to a new
+  commit `B`) *before* calling `self._session.advance(result.commit_hash)`.
+  `CheckpointSession.advance()` then durably publishes
+  `ADVANCING(accepted_sha=A, expected_old_sha=A, proposed_new_sha=B)`
+  *before* attempting the Git compare-and-swap. So, on **every single
+  successful patch application** — not merely a crash — there is an
+  entirely ordinary window where `checkpoint_ref.intent == ADVANCING`,
+  `accepted_sha == A`, `proposed_new_sha == B`, while the real worktree
+  `HEAD` is *already* `B`. A rule requiring `HEAD ==
+  checkpoint_ref.accepted_sha` would misclassify this routine window as
+  a conflict. Separately, if the Git CAS fails confirmed-`UNCHANGED`,
+  `advance()` recovers `checkpoint_ref` to `PRESENT(A)` while the real
+  worktree remains contaminated at `B` until disposal — exactly the
+  scenario ADR 0003's own entry/resume gate (checking `HEAD` against
+  `checkpoint_ref.accepted_sha`/`workspace.initial_commit`, not against
+  any worktree-projection field) already exists to catch.
+
+### Decision
+
+**`worktree.expected_head` is the immutable materialization/origin
+commit for one worktree incarnation** — the commit the worktree was
+created from, fixed once at `creating`, retained unchanged through
+`present` and `disposing`, cleared only at `disposing->absent`. It is
+**never** republished on checkpoint advances and is **not** intended to
+equal the worktree's continuously advancing live `HEAD`. The field name
+`expected_head` is kept unchanged. The precise rationale: every existing
+schema-v1 `lifecycle.json` already persists the `worktree` object with
+this exact key (in its `absent`/`null` shape) — renaming the key would
+require reader/writer compatibility handling or a schema-version
+decision for that reason alone, even though no non-absent worktree
+attribution has ever shipped. No migration of non-absent *values* is
+required, since those shapes were previously refused outright and
+therefore never persisted — but the key name itself is not free to
+change without schema-compatibility cost. Keeping `expected_head`
+avoids that unnecessary compatibility work; renaming merely for
+clarity, with no functional benefit, was rejected on that basis — this
+decision instead gives the existing name its exact, narrow, documented
+meaning.
+
+**Exact persisted shapes:**
+
+| `intent` | `expected_head` |
+|---|---|
+| `absent` | `null` |
+| `creating` | required, exact object-format OID — the materialization commit |
+| `present` | required, exact object-format OID — same commit, unchanged |
+| `disposing` | required, exact object-format OID — same commit, unchanged |
+
+Every non-null `expected_head` is validated with the identical rejection
+behavior already applied to `checkpoint_ref`'s own SHA fields:
+lowercase-hex only, exact length for the repository's actual object
+format (40 for sha1, 64 for sha256), the all-zero OID refused, and a
+value of the wrong length or case for this repository's real format (or
+a placeholder like `"A"`) refused even though the generic 40-or-64
+structural check alone would not catch it.
+
+**Legal owner edges** (single live owner, matching the lock-held/state-
+gated discipline every other resource-transition method already uses):
+
+| From | To | Condition |
+|---|---|---|
+| `absent` | `creating` | before any Git mutation; `expected_head` = the pinned materialization commit |
+| `creating` | `present` | after full materialization is confirmed; `expected_head` unchanged (immutable-OID continuity) |
+| `creating` | `absent` | **caller-confirmed recovery only** — this writer performs no Git/filesystem observation itself; the caller must have independently confirmed (a) the exact deterministic worktree path is absent from Git worktree registration, and (b) the filesystem leaf is confirmed absent via the existing fd-safe/no-follow reservation or worktree-cleanup observations — merely observing an empty directory is never sufficient |
+| `present` | `disposing` | `expected_head` unchanged (immutable-OID continuity) |
+| `disposing` | `absent` | only after confirmed removal; `expected_head` cleared to `null` |
+
+No other edge is legal. `creating->present` and `present->disposing`
+each additionally require the *exact same* `expected_head` the prior
+record already carried — the materialization commit never changes once
+recorded. Allowed lifecycle owner states for any worktree write:
+`PREPARING`/`ACTIVE`/`CLEANING` only, identical to every other resource-
+transition method's existing state gate; `RECONCILING`/`RECONCILED`/
+`RECONCILIATION_FAILED` remain refused unconditionally, including an
+exact no-op, since those remain reconciliation's own private write path
+(not implemented by this amendment).
+
+**Ownership and removal eligibility** (a later slice, not this one)
+continue to follow this ADR's own already-accepted section 8 text
+exactly, unchanged: deterministic contained path, safe filesystem
+identity/type, exact `git worktree list --porcelain` registration, and
+persisted non-`absent` intent. **A live `HEAD` mismatch alone is not,
+and must never become, an ownership-conflict or removal-refusal
+condition** — section 8's own text never mentioned `HEAD`-matching, and
+the ADVANCING-window evidence above proves why it would be wrong to add
+one. An earlier, non-accepted exploratory sketch (circulated only during
+this amendment's own review, never published as part of this ADR) had
+proposed a reconciler-table row refusing a `present`/`disposing` worktree
+whenever its live `HEAD` disagreed with `expected_head`; that row does
+**not** survive the ADVANCING-window analysis above and is explicitly
+**not** part of this amendment — any future reconciliation slice must
+derive its own rule from section 8's actual text, not from that
+withdrawn sketch.
+
+**Publication outcomes**: `WorktreePublicationFailure` carries the
+identical 10-member taxonomy already established for containers/owner-
+state (`NOT_INSTALLED`, `DURABILITY_UNCONFIRMED`, `CLEANUP_UNCONFIRMED`,
+`STALE_EXPECTATION`, `WRONG_LOCK_SCOPE`, `ILLEGAL_TRANSITION`,
+`SUBSTRATE_UNAVAILABLE`, `SCHEMA_INVALID`, `OVERSIZED`, `UNCLASSIFIED`).
+`PROJECTION_DURABILITY_UNCONFIRMED` is never treated as success; explicit
+`refresh()` is the sole recovery operation, never invoked automatically.
+
+### Explicit non-claims
+
+This amendment does **not** claim: that `workspace.GitWorktree` publishes
+any worktree transition (no production integration exists); that
+`reconciliation.py` observes, writes, or removes anything based on this
+table (worktree removal during reconciliation remains entirely
+unimplemented, unchanged from every prior slice's own scope); that
+`LifecycleLease` ownership/close-timing is resolved (unchanged, still
+open); that `docs/threat-model.md`'s T-E1 or T-F2 entries are newly
+mitigated (both explicitly remain "not implemented"/"none yet" for
+worktree removal, unaffected by a substrate with no production wiring);
+or that any `RunController`, CLI, signal-handling, Docker, or checkpoint-
+session behavior changed.
+
+### Scope
+
+**Implemented**: `src/codeagent/worktree_lifecycle.py` (new,
+dependency-light leaf module: `WorktreeIntent`, `WorktreeTransition`,
+`WorktreeTransitionPublisher`, `WorktreePublicationFailure`,
+`WorktreePublicationError`); `src/codeagent/lifecycle_store.py` (schema
+validator extended to the table above; `LifecycleWorktreePublisher`;
+`SharedLifecyclePublishers`/`create_shared_lifecycle_publishers` extended
+to a 4th facade sharing the existing cursor; `_LifecycleProjectionWriter.
+record_worktree_transition()`).
+
+**Explicitly not implemented by this amendment** (all later, separately-
+scoped Milestone 3 work): any `workspace.py`/`GitWorktree` publication
+call; any `RunController`/composition-root wiring; any
+`checkpoint_session.py` change; any `reconciliation.py` change or
+worktree removal; the `StateRoot.reserve_worktree_leaf()`/lifecycle-
+projection crash-gap interaction (a crash between reservation creation
+and the first `creating` publish leaves a reservation leaf directory
+with no corresponding projection record — named, not resolved, by this
+amendment); CLI, signal handling, abandonment, maintenance trace, model,
+or UI work.
+
+### Evidence
+
+Verified locally (macOS, real Docker daemon,
+`CODEAGENT_REQUIRE_DOCKER=1`): `test_worktree_lifecycle.py` (new), 27
+passed; `test_lifecycle_store.py`, 256 passed (up from 210); the
+established sixteen-file focused set (the fifteen-file set established
+since Slice 3A-1, plus the new `test_worktree_lifecycle.py`), 1,299
+passed, in both forward and reverse file order; the complete suite,
+2,823 passed, 0 skipped, with `CODEAGENT_REQUIRE_DOCKER=1`; `git diff
+--check` clean; no leftover `codeagent-*` containers, extra worktrees,
+`refs/codeagent` refs, lingering processes, or temp/default state roots
+afterward.
+
+Four pre-existing tests required correction, not weakening, since this
+amendment's whole point is to stop categorically refusing non-absent
+worktree shapes: `test_worktree_non_absent_intent_categorically_refused`
+split into `test_worktree_non_absent_intent_with_valid_oid_accepted`
+(now correctly asserting acceptance) and
+`test_worktree_non_absent_intent_without_expected_head_refused`
+(preserving the still-correct combination-rule refusal); and
+`test_cleaning_to_complete_worktree_dirty_shape_is_unloadable` was
+renamed `..._is_refused_by_clean_final_guard` and updated to assert
+`ILLEGAL_TRANSITION` (the clean-final guard's own worktree check, now
+genuinely reachable for the first time) rather than `SCHEMA_INVALID`
+(which predated this amendment). `lifecycle_store.WorktreeAttribution`
+— a public, non-underscored class — is kept as an exact identity alias
+for `worktree_lifecycle.WorktreeTransition` (`WorktreeAttribution is
+WorktreeTransition`, never a second dataclass or a wrapper), since a
+repository-wide grep finding only one internal reference cannot prove
+no external caller imports the name. Construction is now deliberately
+**stricter** than the retired dataclass was: the old type had no
+`__post_init__`, so `WorktreeAttribution(intent=PRESENT,
+expected_head=None)` was previously constructible; the identical call
+through the alias now raises `ValueError`, since
+`WorktreeTransition.__post_init__` enforces the real combination rule.
+
+This is implementation/automated-test evidence only — it does not
+constitute or substitute for a security review. Linux CI confirmation
+is pending as of this commit; nothing has been pushed.
+
+### Correction pass (2026-10-02)
+
+A targeted review found five issues in this amendment's first pass, all
+confirmed against the actual code before any fix was made:
+
+1. `lifecycle_store.WorktreeAttribution`'s retirement (above) was too
+   aggressive for a public, non-underscored class — restored as an
+   exact identity alias, with construction now deliberately stricter
+   (see above) and a dedicated identity test.
+2. `worktree_lifecycle.WorktreePublicationError`'s docstring said
+   "Raised only by `LifecycleWorktreePublisher.publish()`," too strong
+   for a public exception belonging to a structural Protocol (a test
+   double or a future alternate publisher may raise it directly).
+   Rewritten to mirror `CheckpointPublicationError`/
+   `OwnerStatePublicationError`'s own already-correct wording exactly.
+   No behavior change.
+3. `_validate_worktree_edge()`'s `creating->absent` comment referenced
+   `_WORKTREE_TRANSITION_EDGES`, a constant that does not exist (this
+   function is an explicit conditional chain, with no separate edge-set
+   constant, unlike the container table). Corrected to point to the
+   function's own docstring and this amendment instead of inventing a
+   redundant constant merely to satisfy the stale comment.
+4. This amendment's own evidence text, and `CLAUDE.md`'s/
+   `ENGINEERING_LOG.md`'s matching Milestone-3 entries, had claimed this
+   slice's direct writer/publisher tests use "real Git-derived SHAs."
+   Confirmed false by direct inspection: the test helpers (`_sha`,
+   `_sha256`) construct object-format-shape-valid *synthetic* OIDs from
+   repeated hex characters (e.g. `("1" * 40)[:40]`), never from `git
+   rev-parse` or a real repository. Corrected in all three locations to
+   "object-format-valid synthetic SHA-1/SHA-256 OIDs." No new real-Git
+   tests were added to preserve the inaccurate phrase — none of this
+   slice's own claimed behavioral properties actually require one; this
+   remains, accurately, not real `GitWorktree` integration or crash-
+   ordering evidence.
+5. This amendment's own field-naming rationale (above, now corrected in
+   place) had said retaining `expected_head` meant "there is no
+   migration cost either way" — false: every existing schema-v1
+   `lifecycle.json` already persists the `worktree` object with this
+   exact key (in its `absent`/`null` shape), so renaming the key itself
+   would require reader/writer compatibility handling or a schema-
+   version decision, independent of whether any non-absent *value* has
+   ever shipped. Corrected to state the precise rationale: the key
+   already exists in every v1 document; keeping it avoids unnecessary
+   schema-compatibility work; no migration of non-absent values is
+   needed only because those shapes were previously refused outright.
+
+Five new tests added, narrowly:
+
+1. `test_worktree_attribution_is_exact_identity_alias_for_worktree_transition`
+   — `WorktreeAttribution is WorktreeTransition` identity.
+2. `test_worktree_attribution_construction_is_now_deliberately_stricter`
+   — the now-stricter construction behavior.
+3. `test_worktree_publisher_identity_properties_match_cursor_projection`
+   — `LifecycleWorktreePublisher.lifecycle_id`/`state_root_id` matching
+   the cursor's own projection identity.
+4. `test_worktree_publication_error_message_never_leaks_cause_detail_or_enum_spelling`
+   — the fixed production message never leaking the injected
+   `LifecycleStoreError`'s own detail text or categorical enum spelling.
+5. `test_worktree_publisher_wrong_type_transition_translated_without_raw_leakage`
+   — a wrong-type `transition` (five representative bad values)
+   translating to `WorktreePublicationError`/`ILLEGAL_TRANSITION` with
+   no raw `AttributeError`/`TypeError` leakage.
+
+No change to the accepted `expected_head` semantics, the persisted-
+shape table, or the legal owner-edge table above — this pass is
+corrective only. `workspace.py`, `controller.py`,
+`checkpoint_session.py`, `reconciliation.py`, `StateRoot` behavior,
+Docker behavior, and `docs/threat-model.md` remain untouched, as before.
+
+Verified (macOS, real Docker daemon, `CODEAGENT_REQUIRE_DOCKER=1`):
+`test_worktree_lifecycle.py` + `test_lifecycle_store.py` together, 288
+passed (up from 283 before this pass's five new tests); see
+`ENGINEERING_LOG.md`'s dated correction-pass entry for the complete
+focused-set and full-suite totals.

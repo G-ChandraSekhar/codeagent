@@ -2237,6 +2237,99 @@ Stage 2 (of the four-stage planning process in
   already states. `docs/threat-model.md`'s T-E1 entry remains
   unaffected — this is a controller-internal correctness change, not
   production lifecycle composition or concurrent-run protection.
+- **Milestone 3 worktree-attribution substrate slice** (`worktree_lifecycle.py`
+  and `lifecycle_store.py` extensions), per
+  `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  "Amendment 10 (Accepted 2026-10-02)", is implemented and locally
+  verified on macOS (2026-10-02); **not yet committed, pushed, or
+  Linux-CI-confirmed**. Resolves Amendment 9's own named remaining open
+  question — the worktree transition/combination table — after a joint
+  review found both originally-proposed `expected_head` designs
+  incomplete: an independently-republished field would require new
+  `RunController`/`CheckpointSession` ordering (not substrate-only), and
+  a cross-field rule requiring live `HEAD == checkpoint_ref.accepted_sha`
+  is provably wrong, confirmed by direct code trace —
+  `GitPatchApplier.apply()` commits directly into the worktree (moving
+  real `HEAD` to `B`) *before* `CheckpointSession.advance()` is ever
+  called, and `advance()` durably publishes `ADVANCING(A, A, B)`
+  *before* the Git CAS runs, so `checkpoint_ref.accepted_sha == A` while
+  real worktree `HEAD` is already `B` is the **normal window on every
+  successful patch**, not a crash edge case. **Resolved interpretation**:
+  `worktree.expected_head` is the immutable materialization/origin
+  commit for one worktree incarnation — fixed at `creating`, retained
+  unchanged through `present`/`disposing`, cleared at `disposing->absent`
+  — never republished on checkpoint advances, never compared against
+  live `HEAD` for ownership (ADR 0004 section 8's own already-accepted
+  text never required `HEAD`-matching). `src/codeagent/
+  worktree_lifecycle.py` (new, dependency-light, stdlib-only, mirroring
+  `container_lifecycle.py`/`lifecycle_owner.py` exactly): `WorktreeIntent`
+  (moved here from `lifecycle_store.py`, re-imported there for source
+  compatibility), `WorktreeTransition` (a validated value object now
+  used as `LifecycleProjection.worktree`'s own field type — the
+  identical consolidation `checkpoint_session.CheckpointTransition`
+  already made for `checkpoint_ref`), `WorktreeTransitionPublisher`
+  Protocol, `WorktreePublicationFailure`/`WorktreePublicationError`
+  (identical 10-member taxonomy to the container/owner-state precedent).
+  **Correction pass**: the old `lifecycle_store.WorktreeAttribution`
+  class — public, non-underscored — is kept as an exact identity alias
+  (`WorktreeAttribution is WorktreeTransition`), not retired, since a
+  repository-wide grep finding only one internal reference cannot prove
+  no external caller imports it; construction through the alias is now
+  deliberately stricter than the old unvalidated dataclass was (see
+  `ENGINEERING_LOG.md`'s dated correction-pass entry for the full list
+  of fixes this pass made, including a corrected "real Git-derived
+  SHAs" claim below, now "object-format-valid synthetic SHA-1/SHA-256
+  OIDs").
+  `lifecycle_store.py`: `_validate_worktree_shape` extended to the full
+  four-shape table with object-format-aware OID validation (reusing the
+  existing `_is_valid_oid_for_format` helper, identical rejection
+  behavior to `checkpoint_ref`'s own fields); `_validate_worktree_edge`
+  implementing the legal owner edges plus immutable-OID continuity;
+  `_LifecycleProjectionWriter.record_worktree_transition()` with the
+  identical lock/stale/state-gate/shape/edge/publish ordering every other
+  resource-transition method already uses; `LifecycleWorktreePublisher`
+  (identical `__init__`/`_from_cursor`/`publish`/`refresh` shape to
+  `LifecycleCheckpointRefPublisher`, with `lifecycle_id`/`state_root_id`
+  identity properties mirroring `LifecycleContainerPublisher`'s own, for
+  a future integration's benefit) with its own exhaustive
+  `_WORKTREE_PUBLICATION_FAILURE_MAP`; `SharedLifecyclePublishers`/
+  `create_shared_lifecycle_publishers` extended to a 4th
+  `worktree_publisher` field sharing the existing `LifecycleProjectionCursor`
+  — avoiding the Slice 3B-7 independent-stale-cursor bug by construction,
+  for this 4th facade exactly as for the first three. **Deliberately
+  out of scope, all later, separately-scoped Milestone 3 work**: any
+  `workspace.py`/`GitWorktree` publication call (no production
+  integration — this slice is a substrate only, proven via direct
+  writer/publisher calls using object-format-valid synthetic SHA-1/
+  SHA-256 OIDs, not real `git rev-parse`-derived commits and not a real
+  worktree), any `RunController`/composition-root wiring, any
+  `checkpoint_session.py` change, any `reconciliation.py` change or
+  worktree removal (the eligibility predicate `is_projection_
+  reconciliation_eligible_shape` still requires worktree `ABSENT`,
+  unchanged), the `StateRoot.reserve_worktree_leaf()`/lifecycle-
+  projection crash-gap interaction (named, not resolved), CLI, signal
+  handling, abandonment, or model/UI work. An earlier, non-accepted
+  exploratory sketch — a reconciler-table row refusing a `present`/
+  `disposing` worktree on live-`HEAD` disagreement — was raised only
+  during review, never published, and does not survive the ADVANCING-
+  window analysis; it is explicitly not part of this slice or ADR
+  Amendment 10. Four pre-existing tests required correction (not
+  weakening), since stopping the categorical refusal of non-absent
+  worktree shapes is this slice's entire point — see
+  `ENGINEERING_LOG.md`'s dated entry for the exact four and their
+  rationale. Verified (post-correction-pass totals): `test_worktree_
+  lifecycle.py` (new), 27 passed; `test_lifecycle_store.py`, 261 passed
+  (up from 210 before this slice; 256 after the first implementation
+  pass; 261 after the same-day correction pass's own five new tests —
+  see `ENGINEERING_LOG.md`'s dated correction-pass entry for the exact
+  list); both files together, 288 passed; the sixteen-file focused
+  Milestone-3 set (the fifteen-file set established since Slice 3A-1,
+  plus the new file), 1,304 passed, forward and reverse file order; the
+  complete suite with `CODEAGENT_REQUIRE_DOCKER=1`, 2,828 passed, 0
+  skipped; `git diff --check` clean; no leftover resources.
+  `docs/threat-model.md` is **unchanged** — this slice adds no
+  production wiring, so T-E1/T-F2 remain exactly as stated ("not
+  implemented"/"none yet" for worktree removal), unaffected.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
