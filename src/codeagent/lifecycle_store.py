@@ -327,6 +327,23 @@ def is_projection_reconciliation_eligible_shape(projection: LifecycleProjection)
     )
 
 
+def is_projection_creating_worktree_reconciliation_shape(projection: LifecycleProjection) -> bool:
+    """ADR 0004 Amendment 12: the one non-absent worktree shape automatic
+    reconciliation may act on -- worktree `creating` (with its origin
+    commit), checkpoint ref absent, `failure` null, and both container
+    records absent. `present`/`disposing` are never admitted here."""
+    return (
+        projection.worktree.intent is WorktreeIntent.CREATING
+        and projection.worktree.expected_head is not None
+        and projection.checkpoint_ref == ABSENT_TRANSITION
+        and projection.failure is None
+        and projection.baseline.intent is ContainerIntent.ABSENT
+        and projection.baseline.id is None
+        and projection.verification.intent is ContainerIntent.ABSENT
+        and projection.verification.id is None
+    )
+
+
 def _container_to_dict(container: ContainerAttribution) -> dict:
     return {"intent": container.intent.value, "id": container.id}
 
@@ -1286,6 +1303,43 @@ def _publish_reconciler_container_transition(
         state=LifecycleState.RECONCILING,
         reconciliation=replace(updated.reconciliation, attempts_total=attempts_total),
     )
+    data = _encode_and_bound_projection(updated)
+    try:
+        publish_private_file_atomically_at(run_dir_fd, LIFECYCLE_JSON_FILENAME, data, mode=0o600)
+    except LifecycleFsError as exc:
+        raise _classify_publication_failure(exc) from exc
+    return updated
+
+
+# ADR 0004 Amendment 12: reconciler-only worktree edges, distinct from the
+# live owner's `_validate_worktree_edge` (unchanged). `creating -> absent`
+# here means only that, at the time of the check, the exact deterministic
+# path was unregistered, had no Git admin entry, and its name lookup was
+# ENOENT -- never the live owner's historical claim.
+_RECONCILER_WORKTREE_TRANSITION_EDGES: frozenset[tuple[WorktreeIntent, WorktreeIntent]] = frozenset(
+    {(WorktreeIntent.CREATING, WorktreeIntent.ABSENT)}
+)
+
+
+def _publish_reconciler_worktree_transition(
+    run_dir_fd: int,
+    projection: LifecycleProjection,
+    *,
+    attempts_total: int,
+) -> LifecycleProjection:
+    """Record the reconciler-owned `creating -> absent` worktree collapse
+    (ADR 0004 Amendment 12). Requires the entry to already be
+    `RECONCILING` (the caller entered it before mutating anything) with
+    `attempts_total` unchanged -- never an increment. Every other field is
+    carried forward unchanged; one atomic publish, classified exactly like
+    every other projection write."""
+    if projection.state is not LifecycleState.RECONCILING:
+        raise _illegal_transition("the reconciler worktree transition requires RECONCILING")
+    if attempts_total != projection.reconciliation.attempts_total:
+        raise _illegal_transition("the reconciler worktree transition never changes attempts_total")
+    if (projection.worktree.intent, WorktreeIntent.ABSENT) not in _RECONCILER_WORKTREE_TRANSITION_EDGES:
+        raise _illegal_transition("not a legal reconciler-owned worktree transition edge")
+    updated = replace(projection, worktree=ABSENT_WORKTREE_TRANSITION)
     data = _encode_and_bound_projection(updated)
     try:
         publish_private_file_atomically_at(run_dir_fd, LIFECYCLE_JSON_FILENAME, data, mode=0o600)

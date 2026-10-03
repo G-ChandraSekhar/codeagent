@@ -19,6 +19,7 @@ onward.
 
 from __future__ import annotations
 
+import errno
 import os
 import secrets
 import stat
@@ -37,6 +38,8 @@ from ._lifecycle_fs import (
     StateRootOrigin,
     _assert_cloexec,
     _cloexec_flag,
+    _directory_flag,
+    _dominant_cleanup,
     _nofollow_flag,
     canonical_json_dumps,
     canonical_json_loads_strict,
@@ -295,6 +298,19 @@ class StateRoot:
         Returns `None` if any component of the chain does not exist."""
         validate_hex32(repo_key, field_name="repo_key")
         return open_existing_directory_chain_if_present(self.root_fd, ["worktrees", repo_key])
+
+    def open_abandoned_worktree_leaf(self, repo_key: str, lifecycle_id: str) -> "AbandonedLeafOpenResult":
+        """ADR 0004 Amendment 12: observe (never create) a dead lifecycle's
+        deterministic worktree leaf. Returns `EMPTY_PRIVATE_DIRECTORY` with
+        an owned handle only for a real, current-user-owned, mode-0700,
+        empty directory whose no-follow name lookup and opened descriptor
+        are the same inode; otherwise `ABSENT`/`CONFLICT`/`UNKNOWN` with
+        every locally opened descriptor already closed exactly once. Raises
+        `LifecycleFsError(CLEANUP_UNCONFIRMED)` if that close fails (never
+        reported as `UNKNOWN`), or the `_assert_cloexec` capability error."""
+        validate_hex32(repo_key, field_name="repo_key")
+        validate_hex32(lifecycle_id, field_name="lifecycle_id")
+        return _open_abandoned_leaf(self, repo_key, lifecycle_id)
 
     def reserve_worktree_leaf(self, repo_key: str, lifecycle_id: str) -> "_WorktreeLeafReservation":
         """Milestone 3 Slice 3C-2 (ADR 0004 sections 8/16's already-accepted
@@ -675,82 +691,14 @@ class _WorktreeLeafReservation:
                 "the worktree-leaf reservation's identity could not be reconfirmed; "
                 "no removal was attempted",
             )
-        try:
-            current = os.stat(self._leaf_name, dir_fd=self._parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            # Confirmed absent: most plausibly GitWorktree's own
-            # enter-time failure cleanup already ran `git worktree
-            # remove --force` and removed the whole directory. Nothing
-            # left to remove — a clean, confirmed no-op, not an error.
-            return None
-        except OSError:
-            return LifecycleFsError(
-                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
-                "the worktree-leaf reservation's identity could not be reconfirmed; "
-                "no removal was attempted",
-            )
-        try:
-            reserved = os.fstat(self._leaf_fd)
-        except OSError:
-            return LifecycleFsError(
-                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
-                "the worktree-leaf reservation's identity could not be reconfirmed; "
-                "no removal was attempted",
-            )
-        if not os.path.samestat(current, reserved):
-            return LifecycleFsError(
-                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
-                "the worktree-leaf reservation's identity could not be reconfirmed; "
-                "no removal was attempted",
-            )
-        try:
-            entries = list_directory_entries(self._leaf_fd)
-        except LifecycleFsError:
-            return LifecycleFsError(
-                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
-                "the worktree-leaf reservation's contents could not be inspected before removal",
-            )
-        if entries:
-            return LifecycleFsError(
-                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
-                "the worktree-leaf reservation is not empty and was not removed",
-            )
-        try:
-            os.rmdir(self._leaf_name, dir_fd=self._parent_fd)
-        except OSError:
-            return LifecycleFsError(
-                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
-                "the worktree-leaf reservation could not be removed",
-            )
-        # This project's cleanup discipline never trusts a mutating
-        # syscall's own reported success as the final word (matching
-        # `GitWorktree.dispose()`'s own "only the independent final
-        # observation... decides whether disposal succeeded" rule) — a
-        # fresh, independent, fd-relative, no-follow observation is
-        # required after `rmdir` before this is reported as confirmed.
-        # Success requires exactly `FileNotFoundError`; the name being
-        # present again — even as a genuinely new, unrelated inode a
-        # same-user process created in the interim — is refused, not
-        # silently treated as "someone else's problem now," and nothing
-        # is touched a second time. This does not, and cannot, eliminate
-        # the unavoidable residual race after this final observation
-        # itself (no POSIX interface makes "remove, then observe" atomic
-        # against a subsequent recreation) — it only narrows the window
-        # this method can detect and refuse to compound.
-        try:
-            os.stat(self._leaf_name, dir_fd=self._parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return None
-        except OSError:
-            return LifecycleFsError(
-                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
-                "the worktree-leaf reservation's removal could not be confirmed",
-            )
-        return LifecycleFsError(
-            LifecycleFsFailure.CLEANUP_UNCONFIRMED,
-            "the worktree-leaf reservation's removal could not be confirmed; "
-            "an entry still exists at that name",
-        )
+        # ADR 0004 Amendment 12: the identity/emptiness/rmdir/post-
+        # observation sequence is shared with the reconciler's abandoned-
+        # leaf removal. This mapping keeps every externally visible
+        # message exactly as before. An already-absent name (most
+        # plausibly GitWorktree's own enter-time cleanup already ran
+        # `git worktree remove --force`) is a clean, confirmed no-op.
+        result = _remove_empty_leaf_and_confirm(self._parent_fd, self._leaf_name, self._leaf_fd)
+        return _reservation_removal_error(result)
 
     @staticmethod
     def _combine_cleanup_errors(
@@ -768,6 +716,328 @@ class _WorktreeLeafReservation:
                 "closure could be confirmed",
             )
         return removal_error or close_error
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 12: shared empty-leaf removal, and the abandoned-leaf
+# handle a reconciler uses after the original owner's process (and its
+# reservation descriptors) are gone.
+# ---------------------------------------------------------------------------
+
+
+@unique
+class RmdirReport(str, Enum):
+    NOT_CALLED = "not_called"
+    SUCCEEDED = "succeeded"
+    ENOTEMPTY = "enotempty"
+    OTHER_ERROR = "other_error"
+
+
+@unique
+class LeafRemovalKind(str, Enum):
+    ALREADY_ABSENT = "already_absent"
+    PRE_CONFLICT = "pre_conflict"
+    PRE_INSPECTION_FAILED = "pre_inspection_failed"
+    NOT_EMPTY_AT_RMDIR = "not_empty_at_rmdir"
+    POST_ABSENT = "post_absent"
+    ORIGINAL_STILL_PRESENT = "original_still_present"
+    REPLACEMENT_CONFLICT = "replacement_conflict"
+    POST_INSPECTION_FAILED = "post_inspection_failed"
+
+
+@unique
+class LeafRemovalStage(str, Enum):
+    IDENTITY = "identity"
+    LISTING = "listing"
+    RMDIR = "rmdir"
+    POST_OBSERVATION = "post_observation"
+
+
+@dataclass(frozen=True)
+class _LeafRemovalResult:
+    kind: LeafRemovalKind
+    stage: LeafRemovalStage
+    rmdir: RmdirReport
+    # True if the post-removal lstat found an entry; None if not reached.
+    post_name_present: bool | None = None
+
+
+def _directory_has_any_entry(fd: int) -> bool:
+    """Bounded emptiness check: stops at the first entry. `os.scandir(fd)`
+    duplicates `fd`, so the caller's descriptor stays open. `OSError`
+    propagates for the caller to classify."""
+    with os.scandir(fd) as it:
+        for _ in it:
+            return True
+    return False
+
+
+def _remove_empty_leaf_and_confirm(parent_fd: int, name: str, leaf_fd: int) -> _LeafRemovalResult:
+    """Remove the empty directory `name` beneath `parent_fd` only while it
+    is still the exact inode `leaf_fd` refers to, then confirm by a fresh,
+    no-follow, fd-relative observation (ADR 0004 Amendment 12). Never
+    closes a descriptor; never raises for an OS failure.
+
+    `rmdir` is non-recursive and refuses a symlink, a non-directory, and a
+    non-empty directory, but it still acts on a *name* relative to
+    `parent_fd`: it proves neither ownership nor (when it reports success)
+    absence. The same-user replacement race between the final re-check and
+    `rmdir` remains; a held `leaf_fd` keeps its inode from being reused, so
+    the post-removal same-inode comparison is reliable against inode reuse
+    — not a guarantee against a hostile same-user process."""
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return _LeafRemovalResult(LeafRemovalKind.ALREADY_ABSENT, LeafRemovalStage.IDENTITY, RmdirReport.NOT_CALLED)
+    except OSError:
+        return _LeafRemovalResult(
+            LeafRemovalKind.PRE_INSPECTION_FAILED, LeafRemovalStage.IDENTITY, RmdirReport.NOT_CALLED
+        )
+    try:
+        held = os.fstat(leaf_fd)
+    except OSError:
+        return _LeafRemovalResult(
+            LeafRemovalKind.PRE_INSPECTION_FAILED, LeafRemovalStage.IDENTITY, RmdirReport.NOT_CALLED
+        )
+    if not stat.S_ISDIR(current.st_mode) or not os.path.samestat(current, held):
+        return _LeafRemovalResult(LeafRemovalKind.PRE_CONFLICT, LeafRemovalStage.IDENTITY, RmdirReport.NOT_CALLED)
+
+    try:
+        has_entry = _directory_has_any_entry(leaf_fd)
+    except OSError:
+        return _LeafRemovalResult(
+            LeafRemovalKind.PRE_INSPECTION_FAILED, LeafRemovalStage.LISTING, RmdirReport.NOT_CALLED
+        )
+    if has_entry:
+        return _LeafRemovalResult(LeafRemovalKind.PRE_CONFLICT, LeafRemovalStage.LISTING, RmdirReport.NOT_CALLED)
+
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+        report = RmdirReport.SUCCEEDED
+    except OSError as exc:
+        if exc.errno == errno.ENOTEMPTY:
+            # rmdir never removes a non-empty directory: nothing removed.
+            return _LeafRemovalResult(
+                LeafRemovalKind.NOT_EMPTY_AT_RMDIR, LeafRemovalStage.RMDIR, RmdirReport.ENOTEMPTY
+            )
+        report = RmdirReport.OTHER_ERROR
+
+    # A successful syscall report is never taken as proof of absence.
+    try:
+        after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return _LeafRemovalResult(
+            LeafRemovalKind.POST_ABSENT, LeafRemovalStage.POST_OBSERVATION, report, post_name_present=False
+        )
+    except OSError:
+        return _LeafRemovalResult(
+            LeafRemovalKind.POST_INSPECTION_FAILED, LeafRemovalStage.POST_OBSERVATION, report
+        )
+    try:
+        held_after = os.fstat(leaf_fd)
+    except OSError:
+        return _LeafRemovalResult(
+            LeafRemovalKind.POST_INSPECTION_FAILED,
+            LeafRemovalStage.POST_OBSERVATION,
+            report,
+            post_name_present=True,
+        )
+    kind = (
+        LeafRemovalKind.ORIGINAL_STILL_PRESENT
+        if stat.S_ISDIR(after.st_mode) and os.path.samestat(after, held_after)
+        else LeafRemovalKind.REPLACEMENT_CONFLICT
+    )
+    return _LeafRemovalResult(kind, LeafRemovalStage.POST_OBSERVATION, report, post_name_present=True)
+
+
+def _reservation_removal_error(result: _LeafRemovalResult) -> LifecycleFsError | None:
+    """Map a shared-primitive result back to `_WorktreeLeafReservation`'s
+    exact pre-Amendment-12 messages (Slice 3C-2)."""
+    kind, stage = result.kind, result.stage
+    if kind is LeafRemovalKind.ALREADY_ABSENT:
+        return None
+    if stage is LeafRemovalStage.IDENTITY:
+        message = "the worktree-leaf reservation's identity could not be reconfirmed; no removal was attempted"
+    elif stage is LeafRemovalStage.LISTING:
+        if kind is LeafRemovalKind.PRE_INSPECTION_FAILED:
+            message = "the worktree-leaf reservation's contents could not be inspected before removal"
+        else:
+            message = "the worktree-leaf reservation is not empty and was not removed"
+    elif result.rmdir is not RmdirReport.SUCCEEDED:
+        # Any rmdir error was always reported, whatever was observed after.
+        message = "the worktree-leaf reservation could not be removed"
+    elif kind is LeafRemovalKind.POST_ABSENT:
+        return None
+    elif result.post_name_present:
+        message = "the worktree-leaf reservation's removal could not be confirmed; an entry still exists at that name"
+    else:
+        message = "the worktree-leaf reservation's removal could not be confirmed"
+    return LifecycleFsError(LifecycleFsFailure.CLEANUP_UNCONFIRMED, message)
+
+
+@unique
+class AbandonedLeafObservation(str, Enum):
+    ABSENT = "absent"
+    EMPTY_PRIVATE_DIRECTORY = "empty_private_directory"
+    CONFLICT = "conflict"
+    UNKNOWN = "unknown"  # inspection failure only, never a close failure
+
+
+@dataclass(frozen=True)
+class AbandonedLeafOpenResult:
+    observation: AbandonedLeafObservation
+    leaf: "_AbandonedWorktreeLeaf | None"  # non-None iff EMPTY_PRIVATE_DIRECTORY
+
+
+class _LeafObservationDiagnostic(Exception):
+    """Private, categorical-only cause for a setup-cleanup failure: carries
+    the observation the open was about to return, never raw OS text."""
+
+    def __init__(self, observation: AbandonedLeafObservation) -> None:
+        super().__init__(observation.value)
+        self.observation = observation
+
+
+@unique
+class _LeafCloseState(str, Enum):
+    OPEN = "open"
+    CLOSED_CONFIRMED = "closed_confirmed"
+    CLOSE_FAILED = "close_failed"
+
+
+class _AbandonedWorktreeLeaf:
+    """An empty, private, current-user-owned directory found at a dead
+    lifecycle's deterministic worktree leaf (ADR 0004 Amendment 12), with
+    the two descriptors it was inspected through. Mintable only by
+    `StateRoot.open_abandoned_worktree_leaf()`.
+
+    Close state machine: the first close attempts both descriptors exactly
+    once. After an unconfirmed close the descriptor numbers are never
+    touched again (either may already have been reused); the one latched
+    sanitized error is re-raised unchanged by every later `close()`/
+    `__exit__`. Chain on that first failure: latched error ->
+    `close_confirmed`'s error -> the in-flight body exception, if any."""
+
+    def __init__(self, *, parent_fd: int, leaf_fd: int, leaf_name: str) -> None:
+        self._parent_fd = parent_fd
+        self._leaf_fd = leaf_fd
+        self._leaf_name = leaf_name
+        self._close_state = _LeafCloseState.OPEN
+        self._close_error: LifecycleFsError | None = None
+        self._removal_attempted = False
+
+    def remove_if_still_empty(self) -> _LeafRemovalResult:
+        if self._close_state is not _LeafCloseState.OPEN or self._removal_attempted:
+            raise LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the abandoned worktree leaf is no longer eligible for removal",
+            )
+        self._removal_attempted = True
+        return _remove_empty_leaf_and_confirm(self._parent_fd, self._leaf_name, self._leaf_fd)
+
+    def _close_once(self, in_flight: BaseException | None) -> None:
+        if self._close_state is _LeafCloseState.CLOSED_CONFIRMED:
+            return
+        if self._close_state is _LeafCloseState.CLOSE_FAILED:
+            assert self._close_error is not None
+            raise self._close_error
+        try:
+            _dominant_cleanup([self._leaf_fd, self._parent_fd], in_flight)
+        except LifecycleFsError as close_exc:
+            error = LifecycleFsError(
+                LifecycleFsFailure.CLEANUP_UNCONFIRMED,
+                "the abandoned worktree-leaf descriptors could not be confirmed closed",
+            )
+            error.__cause__ = close_exc
+            self._close_error = error
+            self._close_state = _LeafCloseState.CLOSE_FAILED
+            raise error
+        self._close_state = _LeafCloseState.CLOSED_CONFIRMED
+
+    def close(self) -> None:
+        self._close_once(None)
+
+    def __enter__(self) -> "_AbandonedWorktreeLeaf":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        self._close_once(exc_value)
+        return False
+
+
+def _open_abandoned_leaf(state_root: "StateRoot", repo_key: str, lifecycle_id: str) -> AbandonedLeafOpenResult:
+    try:
+        parent_fd = open_existing_directory_chain_if_present(state_root.root_fd, ["worktrees", repo_key])
+    except LifecycleFsError as exc:
+        if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED:
+            raise
+        if exc.reason in (
+            LifecycleFsFailure.SYMLINK_REFUSED,
+            LifecycleFsFailure.NOT_A_DIRECTORY,
+            LifecycleFsFailure.UNSAFE_PERMISSIONS,
+        ):
+            return AbandonedLeafOpenResult(AbandonedLeafObservation.CONFLICT, None)
+        return AbandonedLeafOpenResult(AbandonedLeafObservation.UNKNOWN, None)
+    if parent_fd is None:
+        return AbandonedLeafOpenResult(AbandonedLeafObservation.ABSENT, None)
+
+    opened = [parent_fd]
+
+    def finish(observation: AbandonedLeafObservation) -> AbandonedLeafOpenResult:
+        # Every locally owned descriptor, attempted exactly once.
+        _dominant_cleanup(opened, _LeafObservationDiagnostic(observation))
+        return AbandonedLeafOpenResult(observation, None)
+
+    try:
+        try:
+            st = os.stat(lifecycle_id, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return finish(AbandonedLeafObservation.ABSENT)
+        except OSError:
+            return finish(AbandonedLeafObservation.UNKNOWN)
+        if not stat.S_ISDIR(st.st_mode):
+            return finish(AbandonedLeafObservation.CONFLICT)
+        flags = os.O_RDONLY | _directory_flag() | _nofollow_flag() | _cloexec_flag()
+        try:
+            leaf_fd = os.open(lifecycle_id, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                return finish(AbandonedLeafObservation.CONFLICT)
+            return finish(AbandonedLeafObservation.UNKNOWN)
+        opened.append(leaf_fd)
+        _assert_cloexec(leaf_fd)
+        try:
+            held = os.fstat(leaf_fd)
+        except OSError:
+            return finish(AbandonedLeafObservation.UNKNOWN)
+        if (
+            not os.path.samestat(st, held)
+            or held.st_uid != os.getuid()
+            or stat.S_IMODE(held.st_mode) != 0o700
+        ):
+            return finish(AbandonedLeafObservation.CONFLICT)
+        try:
+            has_entry = _directory_has_any_entry(leaf_fd)
+        except OSError:
+            return finish(AbandonedLeafObservation.UNKNOWN)
+        if has_entry:
+            return finish(AbandonedLeafObservation.CONFLICT)
+    except LifecycleFsError as exc:
+        # `_assert_cloexec` failure (a platform-capability failure, raised
+        # rather than returned), or a `finish()` cleanup failure that has
+        # already closed what it could — re-raise after closing anything
+        # not yet attempted.
+        if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED:
+            raise
+        _dominant_cleanup(opened, exc)
+        raise
+    except BaseException as exc:
+        _dominant_cleanup(opened, exc)
+        raise
+    return AbandonedLeafOpenResult(
+        AbandonedLeafObservation.EMPTY_PRIVATE_DIRECTORY,
+        _AbandonedWorktreeLeaf(parent_fd=parent_fd, leaf_fd=leaf_fd, leaf_name=lifecycle_id),
+    )
 
 
 def _build_state_root(root_fd: int, canonical_path: str, payload: dict) -> StateRoot:

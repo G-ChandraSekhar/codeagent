@@ -3,9 +3,11 @@ real `GitWorktree`, end to end, against a real `prepare_lifecycle()` lease.
 
 This is an optional, *unwired* producer seam: no production composition
 path supplies a worktree publisher. The SIGKILL tests prove the honest
-current outcome of a crash -- fail-closed blocking of new-run admission
-(`RECONCILIATION_BLOCKED`), not recovery. Worktree reconciliation and
-removal do not exist yet.
+outcome of a crash. A crash after a durable `creating` (empty, unregistered
+reserved leaf) is now reconciled by the next admission (ADR 0004 Amendment
+12), including when the reconciler itself is killed mid-row. A crash after
+a durable `present` still blocks admission (`RECONCILIATION_BLOCKED`):
+removal of a materialized worktree does not exist yet.
 """
 
 from __future__ import annotations
@@ -201,14 +203,118 @@ def _teardown_crashed(repo: Path, leaf: Path) -> None:
     assert not os.path.lexists(leaf)
 
 
-def test_real_sigkill_after_durable_creating_blocks_admission(tmp_path, monkeypatch):
+def _no_containers(monkeypatch):
+    """This row never involves a container; the Docker listing is patched
+    so the test does not depend on a local Docker daemon."""
+    from codeagent import reconciliation as rc
+
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: ({}, {}))
+
+
+def _dead_projection(state_dir: Path, lifecycle_id: str) -> dict:
+    projections = [p for p in state_dir.rglob("lifecycle.json") if lifecycle_id in p.parts]
+    assert len(projections) == 1
+    return json.loads(projections[0].read_text())
+
+
+def _admit_and_close(repo) -> None:
+    lease = ls.prepare_lifecycle(str(repo), run_id="wt-after-crash")
+    lease.close()
+
+
+def test_real_sigkill_after_durable_creating_is_reconciled_by_next_admission(tmp_path, monkeypatch):
+    """ADR 0004 Amendment 12: before Amendment 12 this blocked admission."""
     repo, leaf, payload = _crash_and_inspect(tmp_path, monkeypatch, "creating")
     try:
         assert payload["worktree"] == {"intent": "creating", "expected_head": _head(repo)}
         # Before any Git mutation: the empty reserved leaf, unregistered.
         assert leaf.is_dir() and not any(leaf.iterdir())
         assert not _is_registered(repo, leaf)
-        _blocked(repo)
+        _no_containers(monkeypatch)
+        _admit_and_close(repo)
+        dead = _dead_projection(tmp_path / "state-root", leaf.name)
+        assert dead["state"] == "RECONCILED"
+        assert dead["worktree"] == {"intent": "absent", "expected_head": None}
+        assert dead["reconciliation"]["attempts_total"] == 1
+        assert not os.path.lexists(leaf)
+    finally:
+        _teardown_crashed(repo, leaf)
+
+
+def _reconcile_and_sigkill(repo_path: str, state_dir: str, point: str) -> None:
+    """Module-level (picklable) child: runs a real admission whose
+    reconciliation pass self-SIGKILLs at `point` in the creating row --
+    after M1 (durable RECONCILING), after M2 (the leaf's rmdir), or after
+    M5 (durable creating -> absent)."""
+    os.environ["CODEAGENT_STATE_DIR"] = state_dir
+    import codeagent.lifecycle_store as ls_child
+    import codeagent.reconciliation as rc_child
+    import codeagent.state_root as sr_child
+
+    rc_child._docker_ps_all_id_name_pairs = lambda: ({}, {})
+
+    def die():
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    if point in ("after_m1", "after_m5"):
+        real_publish = ls_child.publish_private_file_atomically_at
+        seen = {"n": 0}
+        stop_at = 1 if point == "after_m1" else 2
+
+        def publish(*a, **k):
+            real_publish(*a, **k)
+            seen["n"] += 1
+            if seen["n"] == stop_at:
+                die()
+
+        ls_child.publish_private_file_atomically_at = publish
+    else:
+        real_rmdir = os.rmdir
+
+        def rmdir(path, *a, dir_fd=None, **k):
+            real_rmdir(path, *a, dir_fd=dir_fd, **k)
+            if dir_fd is not None and len(str(path)) == 32:
+                die()
+
+        sr_child.os.rmdir = rmdir
+    ls_child.prepare_lifecycle(repo_path, run_id="wt-reconciler-killed")
+    die()  # unreachable
+
+
+@pytest.mark.parametrize(
+    "point, disk_worktree, leaf_present",
+    [("after_m1", "creating", True), ("after_m2", "creating", False), ("after_m5", "absent", False)],
+)
+def test_real_sigkill_inside_reconciler_resumes_without_reincrement(tmp_path, monkeypatch, point, disk_worktree, leaf_present):
+    """Resume cases A (after M1), B (after M2), and C (after M5): a fresh
+    admission completes the dead entry to RECONCILED with exactly one
+    attempt counted across the crash."""
+    repo, leaf, _ = _crash_and_inspect(tmp_path, monkeypatch, "creating")
+    state_dir = tmp_path / "state-root"
+    try:
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(target=_reconcile_and_sigkill, args=(str(repo), str(state_dir), point))
+        proc.start()
+        proc.join(timeout=60)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=10)
+            pytest.fail("reconciler child did not self-SIGKILL within the timeout")
+        assert proc.exitcode == -signal.SIGKILL
+
+        crashed = _dead_projection(state_dir, leaf.name)
+        assert crashed["state"] == "RECONCILING"
+        assert crashed["worktree"]["intent"] == disk_worktree
+        assert crashed["reconciliation"]["attempts_total"] == 1
+        assert os.path.lexists(leaf) is leaf_present
+
+        _no_containers(monkeypatch)
+        _admit_and_close(repo)
+        dead = _dead_projection(state_dir, leaf.name)
+        assert dead["state"] == "RECONCILED"
+        assert dead["worktree"] == {"intent": "absent", "expected_head": None}
+        assert dead["reconciliation"]["attempts_total"] == 1
+        assert not os.path.lexists(leaf)
     finally:
         _teardown_crashed(repo, leaf)
 

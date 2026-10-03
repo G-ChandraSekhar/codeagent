@@ -5634,3 +5634,79 @@ specifically, not a general Linux or ARM64 claim.
 stale statement (its one "Linux CI validation is pending" sentence
 concerns ADR 0006's `patch.py` hardening), so it is unchanged; T-E1/
 T-F2 are not newly mitigated. `uv.lock` untouched.
+
+## 2026-10-02 — Milestone 3: reconciling a dead `creating` worktree with an empty reservation (ADR 0004 Amendment 12)
+
+The first narrow worktree reconciliation row. A dead lifecycle whose
+worktree record is `creating` and whose deterministic leaf is an empty,
+private, unregistered directory with no Git admin entry is now removed by
+automatic pre-run reconciliation and recorded `RECONCILED`. Everything else
+about worktrees still blocks admission. Unwired to any CLI or controller
+path; T-E1 unchanged; T-F2 partially addressed at the reconciler level only.
+
+Trade-offs decided during planning (several review rounds):
+- **Narrow row, not ADR-only or primitive-only.** A removal primitive with no
+  consumer would prove nothing; the attribution evidence (record, locks,
+  Git) lives in reconciliation.
+- **Bounded Git admin scan.** A scratch probe showed `git worktree list`
+  omits an admin directory whose `gitdir` file was never written, so the
+  listing alone can't prove Git holds nothing for the path. The scan reads
+  names only, is bounded (4,096 entries, 262,144 bytes), and refuses any
+  `<lifecycle_id>[0-9]*` match.
+- **Mode exactly 0700, and containers absent** both in the record and in a
+  live listing.
+- **Post-removal observation compared with the held descriptor.** A
+  successful `rmdir` report never proves absence; the result distinguishes
+  the original still present (`FAILED`) from a replacement (`REFUSED`).
+  A held descriptor keeps its inode from being reused (probe-confirmed), but
+  the same-user swap race before `rmdir` remains (A4 scope).
+- **Post-mutation `REFUSED`/`SUBSTRATE_UNAVAILABLE`** follow the container
+  reconciler's precedent; `leaf_outcome` in the trace records what actually
+  happened.
+- **Close-once descriptor handling.** After an unconfirmed close, descriptor
+  numbers are never touched again (they may be reused); one latched error is
+  re-raised, chained latched → `close_confirmed` error → body exception.
+- **Trace stays `schema_version` 1**, with additive fields; no consumer
+  exists.
+
+Implementation notes:
+- The shared removal primitive replaced `_WorktreeLeafReservation`'s inline
+  sequence; a mapping keeps its messages identical. All existing reservation
+  and workspace tests passed unmodified.
+- `reconciliation.py` imports `WorktreeIntent` through `lifecycle_store`, so
+  the Amendment 10/11 static test forbidding `worktree_lifecycle` there still
+  holds unchanged. Its static ban on filesystem-removal calls also still
+  holds: the `rmdir` lives in `state_root.py`.
+- One existing integration test changed by design:
+  `test_real_sigkill_after_durable_creating_blocks_admission` became
+  `…_is_reconciled_by_next_admission`. Blocking admission was the honest
+  outcome before this row existed; the kill-after-`present` test still
+  asserts blocking.
+
+Verified (macOS, Docker 29.8.0 already running, not started or restarted,
+`CODEAGENT_REQUIRE_DOCKER=1`): `test_state_root.py` 116 (66 existing + 50);
+`test_lifecycle_store.py` 275 (261 + 14); `test_reconciliation.py` 207
+(138 + 69); `test_worktree_publication.py` 7 (4 + 3); the 17-file focused set
+1,516 passed forward and reverse; full suite 3,040 passed, 0 skipped (up
+from 2,904). No leftover containers, worktrees, `refs/codeagent` refs, Git
+admin directories, processes, or default state root; `git diff --check`
+clean. Linux CI pending (not pushed). `uv.lock` untouched (checksum
+unchanged).
+
+Same-day correction pass (before commit), two real defects in the admin scan
+plus one documentation contradiction:
+- A failed `_assert_cloexec` on either scan descriptor was converted to
+  `INSPECTION_FAILED`, contrary to the accepted contract and losing the error
+  from the cause chain when cleanup also failed. It now propagates; every
+  opened descriptor is closed once via `_dominant_cleanup`, so the exact
+  CLOEXEC error surfaces, or `CLEANUP_UNCONFIRMED` dominates chained from it.
+- The lifecycle-id match ran before the entry-count and byte bounds, so a
+  matching entry at the first over-limit position bypassed `LIMIT_EXCEEDED`.
+  Bounds are now enforced before any name is interpreted.
+- T-F2's residual-risk paragraph still said the threat stays open "until the
+  mechanisms are implemented"; it now says why it stays open (the row is
+  unwired; `present`/`disposing`/general orphan cleanup are unimplemented).
+11 new regressions (4 CLOEXEC propagation, 1 entry-level, 6 bounds); a
+temporary revert of the fixes made the bound-crossing and common-directory
+CLOEXEC regressions fail, then the fixed file was restored byte-for-byte.
+The totals above are the post-correction ones.

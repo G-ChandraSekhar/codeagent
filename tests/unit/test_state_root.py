@@ -4,6 +4,7 @@ Amendment 1 sections 2, 6, 7, 15; Slice 3C-2's `reserve_worktree_leaf`/
 
 from __future__ import annotations
 
+import errno
 import json
 import multiprocessing
 import os
@@ -1037,3 +1038,573 @@ def test_observe_leaf_unknown_after_descriptors_closed_even_if_fd_numbers_reused
         for fd in reopened:
             os.close(fd)
         state_root.close()
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 12: open_abandoned_worktree_leaf, the shared removal
+# primitive, the reservation's unchanged messages, and the close state
+# machine.
+# ---------------------------------------------------------------------------
+
+
+def _open_fd_count() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+def _abandoned_leaf_path(state_root) -> Path:
+    return Path(state_root.path) / "worktrees" / _REPO_KEY / _LIFECYCLE_ID
+
+
+def _make_parent(state_root) -> Path:
+    parent = Path(state_root.path) / "worktrees" / _REPO_KEY
+    parent.mkdir(parents=True, exist_ok=True)
+    (Path(state_root.path) / "worktrees").chmod(0o700)
+    parent.chmod(0o700)
+    return parent
+
+
+def _make_empty_leaf(state_root, mode: int = 0o700) -> Path:
+    _make_parent(state_root)
+    leaf = _abandoned_leaf_path(state_root)
+    leaf.mkdir()
+    leaf.chmod(mode)
+    return leaf
+
+
+@pytest.fixture
+def abandoned_root(tmp_path):
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    try:
+        yield state_root
+    finally:
+        leaf = _abandoned_leaf_path(state_root)
+        if leaf.is_symlink() or leaf.is_file():
+            leaf.unlink()
+        elif leaf.is_dir():
+            leaf.chmod(0o700)
+            for child in leaf.iterdir():
+                child.unlink() if not child.is_dir() else child.rmdir()
+            leaf.rmdir()
+        state_root.close()
+
+
+def test_open_abandoned_leaf_parent_chain_absent(abandoned_root):
+    before = _open_fd_count()
+    result = abandoned_root.open_abandoned_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+    assert result.observation is sr.AbandonedLeafObservation.ABSENT
+    assert result.leaf is None
+    assert _open_fd_count() == before
+
+
+def test_open_abandoned_leaf_parent_present_leaf_absent(abandoned_root):
+    _make_parent(abandoned_root)
+    before = _open_fd_count()
+    result = abandoned_root.open_abandoned_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+    assert result.observation is sr.AbandonedLeafObservation.ABSENT
+    assert result.leaf is None
+    assert _open_fd_count() == before
+
+
+def test_open_abandoned_leaf_empty_private_directory_returns_owned_handle(abandoned_root):
+    _make_empty_leaf(abandoned_root)
+    before = _open_fd_count()
+    result = abandoned_root.open_abandoned_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+    assert result.observation is sr.AbandonedLeafObservation.EMPTY_PRIVATE_DIRECTORY
+    assert result.leaf is not None
+    assert _open_fd_count() == before + 2
+    result.leaf.close()
+    assert _open_fd_count() == before
+
+
+@pytest.mark.parametrize(
+    "setup",
+    ["dangling_symlink", "dir_symlink", "regular_file", "mode_0755", "mode_0500", "nonempty"],
+)
+def test_open_abandoned_leaf_conflicts(abandoned_root, tmp_path, setup):
+    leaf = _abandoned_leaf_path(abandoned_root)
+    _make_parent(abandoned_root)
+    if setup == "dangling_symlink":
+        os.symlink(tmp_path / "nowhere", leaf)
+    elif setup == "dir_symlink":
+        target = tmp_path / "elsewhere"
+        target.mkdir(mode=0o700)
+        os.symlink(target, leaf)
+    elif setup == "regular_file":
+        leaf.write_text("x")
+    elif setup == "mode_0755":
+        _abandoned_leaf_path(abandoned_root).mkdir()
+        leaf.chmod(0o755)
+    elif setup == "mode_0500":
+        leaf.mkdir()
+        leaf.chmod(0o500)
+    elif setup == "nonempty":
+        leaf.mkdir(mode=0o700)
+        (leaf / "f").write_text("x")
+    before = _open_fd_count()
+    result = abandoned_root.open_abandoned_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+    assert result.observation is sr.AbandonedLeafObservation.CONFLICT
+    assert result.leaf is None
+    assert _open_fd_count() == before
+
+
+def test_open_abandoned_leaf_symlinked_parent_is_conflict(abandoned_root, tmp_path):
+    worktrees = Path(abandoned_root.path) / "worktrees"
+    worktrees.mkdir(mode=0o700)
+    target = tmp_path / "other-parent"
+    target.mkdir(mode=0o700)
+    os.symlink(target, worktrees / _REPO_KEY)
+    try:
+        result = abandoned_root.open_abandoned_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+        assert result.observation is sr.AbandonedLeafObservation.CONFLICT
+    finally:
+        (worktrees / _REPO_KEY).unlink()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="permission checks are bypassed for root")
+def test_open_abandoned_leaf_unreadable_parent_is_unknown(abandoned_root):
+    parent = _make_parent(abandoned_root)
+    parent.chmod(0o000)
+    try:
+        result = abandoned_root.open_abandoned_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+        assert result.observation is sr.AbandonedLeafObservation.UNKNOWN
+        assert result.leaf is None
+    finally:
+        parent.chmod(0o700)
+
+
+def _failing_dominant_cleanup(calls):
+    """Really closes every descriptor (so nothing leaks), then reports the
+    cleanup as unconfirmed exactly like `_dominant_cleanup` would."""
+
+    def fake(fds, primary):
+        calls.append(list(fds))
+        lf.close_confirmed(fds)
+        err = lf.LifecycleFsError(lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED, "simulated")
+        if primary is not None:
+            raise err from primary
+        raise err
+
+    return fake
+
+
+@pytest.mark.parametrize("setup", ["absent_leaf", "conflict", "unknown"])
+def test_open_abandoned_leaf_setup_close_failure_raises_never_unknown(abandoned_root, monkeypatch, setup):
+    leaf = _abandoned_leaf_path(abandoned_root)
+    _make_parent(abandoned_root)
+    expected = {
+        "absent_leaf": sr.AbandonedLeafObservation.ABSENT,
+        "conflict": sr.AbandonedLeafObservation.CONFLICT,
+        "unknown": sr.AbandonedLeafObservation.UNKNOWN,
+    }[setup]
+    if setup == "conflict":
+        leaf.write_text("x")
+    if setup == "unknown":
+        real_stat = os.stat
+
+        def failing_stat(path, *a, **k):
+            if path == _LIFECYCLE_ID and k.get("dir_fd") is not None:
+                raise PermissionError(13, "denied")
+            return real_stat(path, *a, **k)
+
+        monkeypatch.setattr(sr.os, "stat", failing_stat)
+    calls: list = []
+    monkeypatch.setattr(sr, "_dominant_cleanup", _failing_dominant_cleanup(calls))
+    before = _open_fd_count()
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        abandoned_root.open_abandoned_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+    assert excinfo.value.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+    assert isinstance(excinfo.value.__cause__, sr._LeafObservationDiagnostic)
+    assert excinfo.value.__cause__.observation is expected
+    assert len(calls) == 1 and len(calls[0]) == 1  # the parent, attempted exactly once
+    assert _open_fd_count() == before
+
+
+def test_open_abandoned_leaf_cloexec_failure_closes_both_and_raises(abandoned_root, monkeypatch):
+    _make_empty_leaf(abandoned_root)
+
+    def failing_assert(fd):
+        raise lf.LifecycleFsError(lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE, "no cloexec")
+
+    monkeypatch.setattr(sr, "_assert_cloexec", failing_assert)
+    before = _open_fd_count()
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        abandoned_root.open_abandoned_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+    assert excinfo.value.reason is lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE
+    assert _open_fd_count() == before
+
+
+def test_open_abandoned_leaf_cloexec_failure_plus_cleanup_failure_dominates(abandoned_root, monkeypatch):
+    _make_empty_leaf(abandoned_root)
+    cloexec_error = lf.LifecycleFsError(lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE, "no cloexec")
+
+    def failing_assert(fd):
+        raise cloexec_error
+
+    calls: list = []
+    monkeypatch.setattr(sr, "_assert_cloexec", failing_assert)
+    monkeypatch.setattr(sr, "_dominant_cleanup", _failing_dominant_cleanup(calls))
+    before = _open_fd_count()
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        abandoned_root.open_abandoned_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+    assert excinfo.value.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+    assert excinfo.value.__cause__ is cloexec_error
+    assert len(calls) == 1 and len(calls[0]) == 2  # parent and leaf, each attempted once
+    assert _open_fd_count() == before
+
+
+def _open_handle(state_root):
+    _make_empty_leaf(state_root)
+    result = state_root.open_abandoned_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+    assert result.observation is sr.AbandonedLeafObservation.EMPTY_PRIVATE_DIRECTORY
+    return result.leaf
+
+
+def _patch_rmdir(monkeypatch, behavior):
+    real_rmdir = os.rmdir
+
+    def fake(path, *a, dir_fd=None, **k):
+        if path == _LIFECYCLE_ID and dir_fd is not None:
+            return behavior(real_rmdir, path, dir_fd)
+        return real_rmdir(path, *a, dir_fd=dir_fd, **k)
+
+    monkeypatch.setattr(sr.os, "rmdir", fake)
+
+
+def _patch_post_stat_failure(monkeypatch):
+    """Fail the second fd-relative lstat of the leaf name (the post-removal
+    observation); the first (identity) succeeds."""
+    real_stat = os.stat
+    seen = {"n": 0}
+
+    def fake(path, *a, **k):
+        if path == _LIFECYCLE_ID and k.get("dir_fd") is not None:
+            seen["n"] += 1
+            if seen["n"] == 2:
+                raise PermissionError(13, "denied")
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(sr.os, "stat", fake)
+
+
+def _real_then(after):
+    def behavior(real_rmdir, path, dir_fd):
+        real_rmdir(path, dir_fd=dir_fd)
+        after(path, dir_fd)
+
+    return behavior
+
+
+def _replace_with_dir(path, dir_fd):
+    os.mkdir(path, 0o700, dir_fd=dir_fd)
+
+
+def _replace_with_symlink(path, dir_fd):
+    os.symlink("/nonexistent-target", path, dir_fd=dir_fd)
+
+
+def _raise_eio(*_):
+    raise OSError(errno.EIO, "simulated")
+
+
+def _real_then_raise(real_rmdir, path, dir_fd):
+    real_rmdir(path, dir_fd=dir_fd)
+    raise OSError(errno.EIO, "simulated")
+
+
+@pytest.mark.parametrize(
+    "case, rmdir_behavior, post_stat_fails, kind, report, name_present",
+    [
+        ("S1", None, False, "POST_ABSENT", "SUCCEEDED", False),
+        ("S2", lambda real, p, fd: None, False, "ORIGINAL_STILL_PRESENT", "SUCCEEDED", True),
+        ("S3-dir", _real_then(_replace_with_dir), False, "REPLACEMENT_CONFLICT", "SUCCEEDED", True),
+        ("S3-symlink", _real_then(_replace_with_symlink), False, "REPLACEMENT_CONFLICT", "SUCCEEDED", True),
+        ("S4", None, True, "POST_INSPECTION_FAILED", "SUCCEEDED", None),
+        ("E1", _real_then_raise, False, "POST_ABSENT", "OTHER_ERROR", False),
+        ("E2", lambda real, p, fd: _raise_eio(), False, "ORIGINAL_STILL_PRESENT", "OTHER_ERROR", True),
+        (
+            "E3",
+            lambda real, p, fd: (real(p, dir_fd=fd), _replace_with_dir(p, fd), _raise_eio()),
+            False,
+            "REPLACEMENT_CONFLICT",
+            "OTHER_ERROR",
+            True,
+        ),
+        ("E4", lambda real, p, fd: _raise_eio(), True, "POST_INSPECTION_FAILED", "OTHER_ERROR", None),
+    ],
+)
+def test_removal_post_observation_matrix(
+    abandoned_root, monkeypatch, case, rmdir_behavior, post_stat_fails, kind, report, name_present
+):
+    leaf = _open_handle(abandoned_root)
+    try:
+        if rmdir_behavior is not None:
+            _patch_rmdir(monkeypatch, rmdir_behavior)
+        if post_stat_fails:
+            _patch_post_stat_failure(monkeypatch)
+        result = leaf.remove_if_still_empty()
+        monkeypatch.undo()
+        assert result.kind is sr.LeafRemovalKind[kind], case
+        assert result.rmdir is sr.RmdirReport[report], case
+        assert result.stage is sr.LeafRemovalStage.POST_OBSERVATION
+        assert result.post_name_present is name_present
+    finally:
+        leaf.close()
+
+
+def test_removal_post_inspection_failed_with_entry_present(abandoned_root, monkeypatch):
+    """lstat finds an entry after rmdir, but the held descriptor cannot be
+    fstat'd: POST_INSPECTION_FAILED with `post_name_present=True`."""
+    leaf = _open_handle(abandoned_root)
+    try:
+        _patch_rmdir(monkeypatch, lambda real, p, fd: None)
+        real_fstat = os.fstat
+        seen = {"n": 0}
+
+        def fake_fstat(fd):
+            seen["n"] += 1
+            if seen["n"] == 2:  # the post-observation fstat
+                raise OSError(errno.EIO, "simulated")
+            return real_fstat(fd)
+
+        monkeypatch.setattr(sr.os, "fstat", fake_fstat)
+        result = leaf.remove_if_still_empty()
+        monkeypatch.undo()
+        assert result.kind is sr.LeafRemovalKind.POST_INSPECTION_FAILED
+        assert result.post_name_present is True
+    finally:
+        leaf.close()
+
+
+def test_removal_already_absent_and_pre_conflicts(abandoned_root):
+    leaf = _open_handle(abandoned_root)
+    try:
+        os.rmdir(_abandoned_leaf_path(abandoned_root))
+        result = leaf.remove_if_still_empty()
+        assert result.kind is sr.LeafRemovalKind.ALREADY_ABSENT
+        assert result.rmdir is sr.RmdirReport.NOT_CALLED
+    finally:
+        leaf.close()
+
+    leaf = _open_handle(abandoned_root)
+    try:
+        path = _abandoned_leaf_path(abandoned_root)
+        os.rename(path, path.parent / "moved")
+        path.mkdir(mode=0o700)  # a different inode at the name
+        result = leaf.remove_if_still_empty()
+        assert result.kind is sr.LeafRemovalKind.PRE_CONFLICT
+        assert result.stage is sr.LeafRemovalStage.IDENTITY
+        assert path.is_dir()  # nothing removed
+        (path.parent / "moved").rmdir()
+    finally:
+        leaf.close()
+    _abandoned_leaf_path(abandoned_root).rmdir()
+
+    leaf = _open_handle(abandoned_root)
+    try:
+        (_abandoned_leaf_path(abandoned_root) / "late").write_text("x")
+        result = leaf.remove_if_still_empty()
+        assert result.kind is sr.LeafRemovalKind.PRE_CONFLICT
+        assert result.stage is sr.LeafRemovalStage.LISTING
+        assert result.rmdir is sr.RmdirReport.NOT_CALLED
+    finally:
+        leaf.close()
+
+
+def test_removal_not_empty_at_rmdir_removes_nothing(abandoned_root, monkeypatch):
+    leaf = _open_handle(abandoned_root)
+    path = _abandoned_leaf_path(abandoned_root)
+    try:
+
+        def fill_then_rmdir(real, p, fd):
+            (path / "raced").write_text("x")
+            return real(p, dir_fd=fd)
+
+        _patch_rmdir(monkeypatch, fill_then_rmdir)
+        result = leaf.remove_if_still_empty()
+        monkeypatch.undo()
+        assert result.kind is sr.LeafRemovalKind.NOT_EMPTY_AT_RMDIR
+        assert result.rmdir is sr.RmdirReport.ENOTEMPTY
+        assert (path / "raced").exists()
+    finally:
+        leaf.close()
+
+
+def test_removal_pre_inspection_failures(abandoned_root, monkeypatch):
+    leaf = _open_handle(abandoned_root)
+    try:
+        monkeypatch.setattr(sr, "_directory_has_any_entry", lambda fd: (_ for _ in ()).throw(OSError(errno.EIO, "x")))
+        result = leaf.remove_if_still_empty()
+        monkeypatch.undo()
+        assert result.kind is sr.LeafRemovalKind.PRE_INSPECTION_FAILED
+        assert result.stage is sr.LeafRemovalStage.LISTING
+        assert _abandoned_leaf_path(abandoned_root).is_dir()
+    finally:
+        leaf.close()
+
+
+_RESERVATION_MESSAGES = {
+    "identity": "the worktree-leaf reservation's identity could not be reconfirmed; no removal was attempted",
+    "contents": "the worktree-leaf reservation's contents could not be inspected before removal",
+    "nonempty": "the worktree-leaf reservation is not empty and was not removed",
+    "rmdir": "the worktree-leaf reservation could not be removed",
+    "still": "the worktree-leaf reservation's removal could not be confirmed; an entry still exists at that name",
+    "unconfirmed": "the worktree-leaf reservation's removal could not be confirmed",
+}
+
+
+@pytest.mark.parametrize(
+    "kind, stage, report, present, expected",
+    [
+        ("ALREADY_ABSENT", "IDENTITY", "NOT_CALLED", None, None),
+        ("PRE_CONFLICT", "IDENTITY", "NOT_CALLED", None, "identity"),
+        ("PRE_INSPECTION_FAILED", "IDENTITY", "NOT_CALLED", None, "identity"),
+        ("PRE_INSPECTION_FAILED", "LISTING", "NOT_CALLED", None, "contents"),
+        ("PRE_CONFLICT", "LISTING", "NOT_CALLED", None, "nonempty"),
+        ("NOT_EMPTY_AT_RMDIR", "RMDIR", "ENOTEMPTY", None, "rmdir"),
+        ("POST_ABSENT", "POST_OBSERVATION", "OTHER_ERROR", False, "rmdir"),
+        ("ORIGINAL_STILL_PRESENT", "POST_OBSERVATION", "OTHER_ERROR", True, "rmdir"),
+        ("POST_INSPECTION_FAILED", "POST_OBSERVATION", "OTHER_ERROR", None, "rmdir"),
+        ("POST_ABSENT", "POST_OBSERVATION", "SUCCEEDED", False, None),
+        ("ORIGINAL_STILL_PRESENT", "POST_OBSERVATION", "SUCCEEDED", True, "still"),
+        ("REPLACEMENT_CONFLICT", "POST_OBSERVATION", "SUCCEEDED", True, "still"),
+        ("POST_INSPECTION_FAILED", "POST_OBSERVATION", "SUCCEEDED", True, "still"),
+        ("POST_INSPECTION_FAILED", "POST_OBSERVATION", "SUCCEEDED", None, "unconfirmed"),
+    ],
+)
+def test_reservation_mapping_preserves_exact_existing_messages(kind, stage, report, present, expected):
+    result = sr._LeafRemovalResult(
+        sr.LeafRemovalKind[kind], sr.LeafRemovalStage[stage], sr.RmdirReport[report], post_name_present=present
+    )
+    error = sr._reservation_removal_error(result)
+    if expected is None:
+        assert error is None
+    else:
+        assert error.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+        assert str(error) == _RESERVATION_MESSAGES[expected]
+
+
+def test_reservation_exit_reports_entry_still_exists_when_rmdir_is_a_noop(tmp_path, monkeypatch):
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    try:
+        reservation = state_root.reserve_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+        _patch_rmdir(monkeypatch, lambda real, p, fd: None)
+        with pytest.raises(lf.LifecycleFsError) as excinfo:
+            reservation.__exit__(None, None, None)
+        monkeypatch.undo()
+        assert str(excinfo.value) == _RESERVATION_MESSAGES["still"]
+        reservation.path.rmdir()
+    finally:
+        state_root.close()
+
+
+# --- close state machine -----------------------------------------------------
+
+
+def _spy_close(monkeypatch, fail_fds=()):
+    """Spy on os.close as used by close_confirmed. A descriptor in
+    `fail_fds` is really closed, then reported as failed."""
+    real_close = os.close
+    calls: list[int] = []
+
+    def fake(fd):
+        calls.append(fd)
+        real_close(fd)
+        if fd in fail_fds:
+            raise OSError(errno.EIO, "simulated")
+
+    monkeypatch.setattr(lf.os, "close", fake)
+    return calls
+
+
+def test_close_attempts_both_once_then_never_again(abandoned_root, monkeypatch):
+    leaf = _open_handle(abandoned_root)
+    fds = {leaf._leaf_fd, leaf._parent_fd}
+    calls = _spy_close(monkeypatch)
+    leaf.close()
+    assert set(calls) == fds and len(calls) == 2
+    leaf.close()
+    with leaf:
+        pass
+    assert len(calls) == 2  # CLOSED_CONFIRMED: no OS call ever again
+
+
+def test_close_failure_is_latched_and_reraised_identically_without_reclose(abandoned_root, monkeypatch):
+    leaf = _open_handle(abandoned_root)
+    calls = _spy_close(monkeypatch, fail_fds={leaf._leaf_fd})
+    with pytest.raises(lf.LifecycleFsError) as first:
+        leaf.close()
+    err = first.value
+    assert err.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+    close_exc = err.__cause__
+    assert isinstance(close_exc, lf.LifecycleFsError)
+    assert close_exc.__cause__ is None
+    assert len(calls) == 2
+    for attempt in (leaf.close, lambda: leaf.__exit__(None, None, None)):
+        with pytest.raises(lf.LifecycleFsError) as again:
+            attempt()
+        assert again.value is err
+        assert again.value.__cause__ is close_exc
+        assert close_exc.__cause__ is None
+    assert len(calls) == 2  # never re-closed
+
+
+def test_close_failure_chain_preserves_body_exception_beneath_close_error(abandoned_root, monkeypatch):
+    leaf = _open_handle(abandoned_root)
+    _spy_close(monkeypatch, fail_fds={leaf._parent_fd})
+    body = ValueError("body")
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        with leaf:
+            raise body
+    err = excinfo.value
+    assert isinstance(err.__cause__, lf.LifecycleFsError)  # close_confirmed's error
+    assert err.__cause__.__cause__ is body
+    with pytest.raises(lf.LifecycleFsError) as again:
+        leaf.close()
+    assert again.value is err and err.__cause__.__cause__ is body
+
+
+def test_exit_with_body_exception_and_clean_close_propagates_body(abandoned_root):
+    leaf = _open_handle(abandoned_root)
+    with pytest.raises(ValueError):
+        with leaf:
+            raise ValueError("body")
+    leaf.close()  # CLOSED_CONFIRMED: returns normally
+
+
+def test_remove_refused_after_close_and_on_second_call(abandoned_root, monkeypatch):
+    leaf = _open_handle(abandoned_root)
+    leaf.remove_if_still_empty()
+    with pytest.raises(lf.LifecycleFsError):
+        leaf.remove_if_still_empty()
+    leaf.close()
+    with pytest.raises(lf.LifecycleFsError):
+        leaf.remove_if_still_empty()
+
+
+def test_close_failure_never_touches_reused_descriptor_numbers(abandoned_root, tmp_path, monkeypatch):
+    leaf = _open_handle(abandoned_root)
+    numbers = {leaf._leaf_fd, leaf._parent_fd}
+    _spy_close(monkeypatch, fail_fds=numbers)
+    with pytest.raises(lf.LifecycleFsError):
+        leaf.close()
+    monkeypatch.undo()
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    reopened = []
+    try:
+        for _ in range(64):
+            fd = os.open(decoy, os.O_RDONLY)
+            reopened.append(fd)
+            if numbers <= set(reopened):
+                break
+        assert numbers <= set(reopened)
+        calls = _spy_close(monkeypatch)
+        with pytest.raises(lf.LifecycleFsError):
+            leaf.close()
+        assert calls == []
+        for fd in numbers:
+            os.fstat(fd)  # the decoys reusing those numbers are still open
+    finally:
+        monkeypatch.undo()
+        for fd in reopened:
+            os.close(fd)

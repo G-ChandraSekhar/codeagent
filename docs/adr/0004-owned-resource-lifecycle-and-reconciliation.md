@@ -3709,3 +3709,161 @@ specifically, not a general Linux or ARM64 claim.
 Nothing in this evidence changes the accepted API, binding, ordering,
 failure table, `LeafObservation` contract, crash-gap analysis, or
 scope above; T-E1/T-F2 are not newly mitigated.
+
+## Amendment 12 (Accepted 2026-10-02): reconciling a dead `creating` worktree whose reserved leaf is empty
+
+**Scope.** This refines §8 for exactly one dead-run shape: a worktree record
+`creating(expected_head)` whose deterministic leaf
+`<root>/worktrees/<repo-key>/<lifecycle-id>` is an empty, private,
+unregistered directory with no Git admin entry. Automatic pre-run
+reconciliation now removes that empty leaf and records the entry
+`RECONCILED`. Everything else in §8 is unchanged:
+- `present` and `disposing` worktrees are still `REFUSED`;
+- an `absent` record with a leftover directory or registration is still
+  `REFUSED`;
+- `git worktree remove` and `git worktree prune` are never used by
+  reconciliation;
+- the live owner's worktree transition table is unchanged.
+
+Nothing here is wired to a CLI or controller entry point. T-E1 is unchanged;
+T-F2 is partially addressed at the substrate/reconciler level only and is
+not mitigated end to end. The evidence below is implementation and
+automated-test evidence, not a security review.
+
+### 1. Attribution evidence
+
+"Empty and unregistered" is not ownership proof by itself. All of the
+following are required, under the A4 trust model (the same user and host are
+trusted):
+- **Namespace.** The path derives only from the trusted state root, the
+  trusted `repo_key`, and a validated 128-bit random `lifecycle_id` (I1).
+- **Durable intent.** The record for that lifecycle, loaded under the
+  lifecycle lock, is exactly `creating` with an origin commit, checkpoint ref
+  absent, `failure` null, and both container records absent. By Amendment
+  11's ordering, `creating` is published only after the owner exclusively
+  created that leaf.
+- **No live owner.** The repository lock is held and the lifecycle lock was
+  acquired.
+- **Git holds nothing.** A bounded `git worktree list --porcelain -z` does
+  not register the exact canonical path, and a bounded admin scan (§3) finds
+  no admin entry for this lifecycle.
+- **No container.** A fresh Docker listing shows neither deterministic
+  container name (I4).
+- **The leaf itself.** A no-follow, descriptor-relative open finds a real
+  directory, owned by the current user, mode exactly 0700, with zero
+  entries, whose name lookup and opened descriptor are the same inode.
+
+What this cannot prove: that the inode opened is the one the dead owner
+reserved (no inode is persisted).
+
+### 2. Removal and its limits
+
+The removal is `rmdir(name, dir_fd=parent_fd)`, authorised only after the
+full evidence set and an immediate re-check of identity and emptiness through
+held descriptors. `rmdir` is non-recursive and refuses a symlink, a
+non-directory and a non-empty directory, but it acts on a *name* relative to
+the parent descriptor: it proves neither ownership nor, when it reports
+success, absence. A fresh no-follow lookup always follows it, compared with
+the held leaf descriptor:
+- "not found": absence confirmed;
+- the same directory inode: the original is still present;
+- anything else: a replacement occupies the name;
+- a failed observation: unconfirmed.
+
+A held descriptor keeps its inode from being reused, so that comparison is
+reliable against inode reuse. The same-user race between the final re-check
+and `rmdir` remains: a same-user process could swap a different empty
+directory into our deterministic name inside the private state root, and it
+would be removed. That is within A4's scope; there is no claim of protection
+against a hostile same-user process.
+
+### 3. Bounded Git admin scan
+
+`git worktree list` does not report an admin directory under
+`<common-dir>/worktrees/` whose `gitdir` file was never written, so
+registration absence alone does not prove Git holds nothing for the path.
+The scan:
+- opens the trusted canonical common directory, then its `worktrees` child,
+  each with `O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC` and `_assert_cloexec`;
+- treats an absent `worktrees/` as no admin entry, and a symlink or
+  non-directory there as `REFUSED`;
+- streams names only (never stats, opens, reads or deletes an entry), up to
+  4,096 entries and 262,144 cumulative name bytes; exceeding either is
+  `SUBSTRATE_UNAVAILABLE`;
+- matches `^<32 lowercase hex>[0-9]*$` on bytes, where the hex part must be
+  this lifecycle id. A match is `REFUSED`, including the (safe) false
+  positive of an unrelated entry with that random name;
+- closes each opened descriptor exactly once; a close failure dominates every
+  scan result and is `SUBSTRATE_UNAVAILABLE`.
+
+### 4. Order and outcomes
+
+Inspection mutates nothing: the record, the checkpoint ref, the Git listing,
+the admin scan, the leaf, and the Docker listing. Then:
+1. if not already `RECONCILING`, write `RECONCILING` with
+   `attempts_total + 1` (the worktree stays `creating`; this is the only
+   increment);
+2. remove the empty leaf, if one was found;
+3. close the leaf descriptors — a close failure dominates and stops every
+   later step;
+4. repeat the Git listing and admin scan;
+5. the reconciler-only write `creating → absent`, with the count unchanged;
+6. `RECONCILED`.
+
+The zero-mutation rule (§10, I6) covers inspection only. Once step 1 has run,
+`REFUSED` or `SUBSTRATE_UNAVAILABLE` may follow a real removal — the
+container reconciler's existing convention. A replacement entry, an
+`ENOTEMPTY`, or a registration found after removal is `REFUSED`; the original
+still present, or a failed record write, is `FAILED`; a failed observation or
+close is `SUBSTRATE_UNAVAILABLE`. A durability-unconfirmed write may already
+be installed; every pass reloads the record and follows what it finds.
+
+Resume shapes, none incrementing the count:
+- **A:** `RECONCILING` + `creating` + leaf present → re-inspect everything,
+  remove if still eligible;
+- **B:** `RECONCILING` + `creating` + leaf absent → no `rmdir`; publish
+  `creating → absent`;
+- **C:** `RECONCILING` + worktree absent → the existing absent-worktree path,
+  which completes `RECONCILED` without republishing the worktree edge.
+
+### 5. Maintenance trace
+
+`schema_version` stays 1 (no consumer exists); the entry event's `worktree`
+object gains:
+- `initial_persisted_intent`: from the locked re-read; `null` if the pass
+  stopped before it (never taken from the pre-lock peek);
+- `leaf_outcome`: `not_applicable`, `not_inspected`, `already_absent`,
+  `conflict_not_removed`, `removal_not_attempted`, `removed`,
+  `absent_after_failed_rmdir`, `original_still_present`,
+  `replacement_conflict`, `post_inspection_failed`, or `close_failed`;
+- `removal_observation`: the removal primitive's own result, kept even when
+  `close_failed` dominates;
+- `absent_transition_confirmed_this_pass`: true only when this pass's
+  `creating → absent` write was confirmed (false in resume case C and after a
+  durability-unconfirmed write).
+
+No paths, admin names, raw Git output or exception text are recorded.
+
+### 6. Shared primitive and descriptors
+
+The identity/emptiness/`rmdir`/post-observation sequence is one
+module-level primitive in `state_root.py`, shared with
+`_WorktreeLeafReservation`, whose externally visible messages and behaviour
+are unchanged (all existing reservation and workspace tests pass
+unmodified). The reconciler's leaf handle owns both descriptors only when the
+leaf is an eligible empty directory, and closes them exactly once: after an
+unconfirmed close it never touches those descriptor numbers again and
+re-raises one latched, sanitized error whose chain is that error →
+`close_confirmed`'s error → any body exception in flight. `reconciliation.py`
+still contains no filesystem-removal call.
+
+### 7. Evidence
+
+Local (macOS, Docker already running, `CODEAGENT_REQUIRE_DOCKER=1`): 136 new
+tests (50 state-root, 14 lifecycle-store, 69 reconciliation, 3 integration);
+the 17-file focused set 1,516 passed in forward and reverse order; the full
+suite 3,040 passed, 0 skipped. The SIGKILL tests use real processes: a dead
+owner after a durable `creating` is now reconciled by the next admission, a
+reconciler killed after step 1, step 2 or step 5 resumes (shapes A, B, C)
+with exactly one attempt counted, and a dead owner after a durable `present`
+still blocks admission. Linux CI is pending (not pushed).

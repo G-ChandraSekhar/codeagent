@@ -48,6 +48,7 @@ maintenance-trigger, and any worktree or checkpoint-ref *removal*.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import secrets
@@ -72,6 +73,11 @@ from ._git_safety import GIT_TIMEOUT_SECONDS, GitSafetyError, run_git_bounded
 from ._lifecycle_fs import (
     LifecycleFsError,
     LifecycleFsFailure,
+    _assert_cloexec,
+    _cloexec_flag,
+    _directory_flag,
+    _dominant_cleanup,
+    _nofollow_flag,
     canonical_json_dumps,
     close_confirmed,
     fsync_fd,
@@ -102,13 +108,17 @@ from .lifecycle_store import (
     LifecycleState,
     LifecycleStoreError,
     LifecycleStoreFailure,
+    WorktreeIntent,
     _publish_projection_state,
     _publish_reconciler_container_transition,
+    _publish_reconciler_worktree_transition,
+    is_projection_creating_worktree_reconciliation_shape,
     is_projection_fully_absent_shape,
     is_projection_reconciliation_eligible_shape,
     load_lifecycle_projection,
 )
 from .repo_identity import RepositoryIdentity, TrustedRepositoryContext
+from .state_root import AbandonedLeafObservation, LeafRemovalKind, RmdirReport
 from .state_locks import LockError, LockFailure, LockHandle, LockKind, LockScope, acquire_lifecycle_lock
 
 MAINTENANCE_DIRNAME = "maintenance"
@@ -137,6 +147,14 @@ _WORKTREE_LISTING_MAX_BYTES = 1_048_576
 # a hostile or malformed `Config.Labels` payload is confirmed-terminated
 # on overflow rather than unboundedly captured.
 _INSPECT_OWNERSHIP_MAX_BYTES = 16 * 1024
+
+# ADR 0004 Amendment 12: the bounded, read-only Git admin-directory scan.
+# Only entry names are read (never stat'd, opened, or followed). Git names
+# a linked worktree's admin directory after the worktree directory's own
+# name, appending decimal digits on a collision.
+_ADMIN_SCAN_MAX_ENTRIES = 4096
+_ADMIN_SCAN_MAX_NAME_BYTES = 262_144
+_ADMIN_NAME_RE = re.compile(rb"^(?P<id>[0-9a-f]{32})(?P<suffix>[0-9]+)?$")
 
 # `_CONTAINER_NAME_RE`/`_CONTAINER_ID_HEX_RE`/`CONTAINER_LABEL_*` are no
 # longer defined here (Slice 3B-6): they are now `_docker_ownership.py`'s
@@ -175,6 +193,16 @@ class ReconciliationEntryResult:
     # no well-formed candidate was ever positively observed.
     baseline_id: str | None = None
     verification_id: str | None = None
+    # ADR 0004 Amendment 12 (maintenance-trace `worktree` fields).
+    # `initial_persisted_intent` comes only from the locked authoritative
+    # re-read -- `None` when the pass stopped before it (never the pre-lock
+    # peek). `absent_transition_confirmed_this_pass` is true only when this
+    # pass itself got confirmed success from the reconciler-owned
+    # `creating -> absent` publication.
+    worktree_initial_persisted_intent: str | None = None
+    worktree_leaf_outcome: str = "not_inspected"
+    worktree_removal_observation: str | None = None
+    worktree_absent_transition_confirmed_this_pass: bool = False
 
 
 @dataclass(frozen=True)
@@ -581,6 +609,125 @@ def _worktree_registered_paths(working_tree_root: str) -> set[str]:
     return paths
 
 
+@unique
+class _AdminScanResult(str, Enum):
+    NONE_FOUND = "none_found"
+    MATCH_FOUND = "match_found"
+    UNEXPECTED_SUBSTRATE = "unexpected_substrate"
+    LIMIT_EXCEEDED = "limit_exceeded"
+    INSPECTION_FAILED = "inspection_failed"
+
+
+class _AdminScanDiagnostic(Exception):
+    """Private, categorical-only cause for an admin-scan cleanup failure:
+    carries the scan result already decided, never names or paths."""
+
+    def __init__(self, result: _AdminScanResult) -> None:
+        super().__init__(result.value)
+        self.result = result
+
+
+def _scan_worktree_admin_entries(canonical_common_dir: str, lifecycle_id: str) -> _AdminScanResult:
+    """Bounded, read-only scan of `<common-dir>/worktrees/` for an admin
+    entry Git would have created for this lifecycle's worktree (ADR 0004
+    Amendment 12). `git worktree list` does not report an admin directory
+    whose `gitdir` file was never written, so registration absence alone
+    does not prove Git holds nothing for this path.
+
+    Every locally opened descriptor is closed exactly once; a close
+    failure raises `LifecycleFsError(CLEANUP_UNCONFIRMED)` (chained from a
+    categorical diagnostic of the result already decided) and dominates
+    every result. Never reads admin-file contents, never stats or opens an
+    entry, never follows a symlink, never deletes anything."""
+    opened: list[int] = []
+    try:
+        result = _scan_admin_entries_into(opened, canonical_common_dir, lifecycle_id)
+    except BaseException as exc:
+        _dominant_cleanup(opened, exc)
+        raise
+    _dominant_cleanup(opened, _AdminScanDiagnostic(result))
+    return result
+
+
+def _scan_admin_entries_into(opened: list[int], canonical_common_dir: str, lifecycle_id: str) -> _AdminScanResult:
+    flags = os.O_RDONLY | _directory_flag() | _nofollow_flag() | _cloexec_flag()
+    try:
+        common_fd = os.open(canonical_common_dir, flags)
+    except OSError:
+        return _AdminScanResult.INSPECTION_FAILED
+    opened.append(common_fd)
+    # A failed CLOEXEC check propagates (SUBSTRATE_UNAVAILABLE); the caller
+    # closes every opened descriptor once, chained from that exact error.
+    _assert_cloexec(common_fd)
+    try:
+        worktrees_fd = os.open("worktrees", flags, dir_fd=common_fd)
+    except FileNotFoundError:
+        return _AdminScanResult.NONE_FOUND  # Git creates worktrees/ lazily
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return _AdminScanResult.UNEXPECTED_SUBSTRATE
+        return _AdminScanResult.INSPECTION_FAILED
+    opened.append(worktrees_fd)
+    _assert_cloexec(worktrees_fd)
+
+    target = lifecycle_id.encode("ascii")
+    entries = 0
+    name_bytes = 0
+    try:
+        with os.scandir(worktrees_fd) as it:
+            for entry in it:
+                name = os.fsencode(entry.name)
+                # Bounds are enforced before any name is interpreted, so no
+                # entry -- matching or not -- is ever considered past them.
+                entries += 1
+                name_bytes += len(name)
+                if entries > _ADMIN_SCAN_MAX_ENTRIES or name_bytes > _ADMIN_SCAN_MAX_NAME_BYTES:
+                    return _AdminScanResult.LIMIT_EXCEEDED
+                match = _ADMIN_NAME_RE.fullmatch(name)
+                if match is not None and match["id"] == target:
+                    return _AdminScanResult.MATCH_FOUND
+    except OSError:
+        return _AdminScanResult.INSPECTION_FAILED
+    return _AdminScanResult.NONE_FOUND
+
+
+_ADMIN_SCAN_OUTCOMES = {
+    _AdminScanResult.MATCH_FOUND: (ReconciliationEntryOutcome.REFUSED, "a git worktree admin entry exists for this lifecycle"),
+    _AdminScanResult.UNEXPECTED_SUBSTRATE: (
+        ReconciliationEntryOutcome.REFUSED,
+        "the git worktree admin directory is not a real directory",
+    ),
+    _AdminScanResult.LIMIT_EXCEEDED: (
+        ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+        "the git worktree admin directory exceeded its scan bound",
+    ),
+    _AdminScanResult.INSPECTION_FAILED: (
+        ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+        "the git worktree admin directory could not be inspected",
+    ),
+}
+
+
+def _check_worktree_unregistered(
+    *, lifecycle_id: str, expected_path: str, identity: RepositoryIdentity, context: TrustedRepositoryContext
+) -> tuple[ReconciliationEntryOutcome | None, str | None]:
+    """Fresh bounded Git listing plus bounded admin scan: `(None, None)`
+    only when the exact path is unregistered and no admin entry exists."""
+    try:
+        registered_paths = _worktree_registered_paths(context.working_tree_root)
+    except _GitWorktreeListingError:
+        return ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "worktree listing failed"
+    if expected_path in registered_paths:
+        return ReconciliationEntryOutcome.REFUSED, "the recomputed worktree is registered"
+    try:
+        scan = _scan_worktree_admin_entries(identity.canonical_common_dir, lifecycle_id)
+    except LifecycleFsError as exc:
+        return _classify_entry_fs_failure(exc), "the git worktree admin scan could not be completed"
+    if scan is _AdminScanResult.NONE_FOUND:
+        return None, None
+    return _ADMIN_SCAN_OUTCOMES[scan]
+
+
 def _enumerate_runs(runs_fd: int) -> list[str]:
     """Prevalidate the complete `runs/` namespace, sorted, before any
     legitimate entry is touched. A positively observed malformed name,
@@ -706,6 +853,43 @@ _RECONCILER_ELIGIBLE_STATES = (
 )
 
 
+def _is_reconciliation_eligible(projection: LifecycleProjection) -> bool:
+    """The one eligibility rule used by BOTH the pre-lock peek and the
+    locked authoritative re-read (ADR 0004 Amendment 12): an owner-writable
+    or RECONCILING state, with either the absent-worktree shape (existing;
+    includes a resumed RECONCILING whose worktree was already collapsed) or
+    the narrow `creating`-worktree shape. `present`/`disposing` worktrees
+    are admitted by neither predicate."""
+    return projection.state in _RECONCILER_ELIGIBLE_STATES and (
+        is_projection_reconciliation_eligible_shape(projection)
+        or is_projection_creating_worktree_reconciliation_shape(projection)
+    )
+
+
+def _observe_checkpoint_ref_absent(
+    *, lifecycle_id: str, identity: RepositoryIdentity, context: TrustedRepositoryContext
+) -> tuple[ReconciliationEntryOutcome | None, str | None]:
+    """The recomputed checkpoint ref must be confirmed absent. Returns
+    `(None, None)` on confirmed absence, otherwise the categorical
+    outcome and its sanitized detail. Shared by both worktree paths."""
+    try:
+        ref = CheckpointRef(context.working_tree_root, lifecycle_id)
+    except (ValueError, CheckpointRefError):
+        return ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the checkpoint ref could not be constructed"
+    if ref.object_format.value != identity.object_format:
+        return (
+            ReconciliationEntryOutcome.REFUSED,
+            "the checkpoint ref's discovered object format disagrees with the trusted repository identity",
+        )
+    try:
+        observation = ref.observe()
+    except CheckpointRefError:
+        return ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the checkpoint ref could not be observed"
+    if observation.present:
+        return ReconciliationEntryOutcome.REFUSED, "the recomputed checkpoint ref is present"
+    return None, None
+
+
 def _reconcile_locked_entry(
     *,
     run_dir_fd: int,
@@ -714,19 +898,10 @@ def _reconcile_locked_entry(
     identity: RepositoryIdentity,
     context: TrustedRepositoryContext,
 ) -> ReconciliationEntryResult:
-    """Inspect-before-mutate, per entry: load and validate the
-    projection, confirm the checkpoint ref then the worktree absent
-    (unchanged from Slice 3B-1, still out of removal scope), then
-    inspect both container roles completely (one Docker listing plus
-    every ownership-proof inspect it requires) and compute both roles'
-    complete decisions *before* any mutation of either — a conflict on
-    either role aborts the whole entry with zero mutation attempted.
-    Only once both decisions are known does this function publish any
-    write-ahead transition, and only once both roles' write-ahead
-    writes are durably confirmed does it ever issue a `docker rm`,
-    baseline before verification, stopping before verification's
-    removal if baseline's own resolution did not reach absent this
-    pass."""
+    """Load and validate the projection under the lifecycle lock, then
+    route by its worktree intent: the narrow `creating` row (ADR 0004
+    Amendment 12) or the existing absent-worktree path. Every result after
+    the locked re-read carries the worktree intent that re-read found."""
     try:
         projection = load_lifecycle_projection(
             run_dir_fd,
@@ -742,50 +917,71 @@ def _reconcile_locked_entry(
             "lifecycle.json could not be loaded after acquiring the lifecycle lock",
         )
 
-    if projection.state not in _RECONCILER_ELIGIBLE_STATES or not is_projection_reconciliation_eligible_shape(
-        projection
-    ):
+    initial_intent = projection.worktree.intent.value
+    if not _is_reconciliation_eligible(projection):
         return ReconciliationEntryResult(
             lifecycle_id,
             ReconciliationEntryOutcome.REFUSED,
             "entry is no longer the recognized nonterminal reconciliation-eligible shape",
             run_id=projection.run_id,
             attempt_number=projection.reconciliation.attempts_total,
+            worktree_initial_persisted_intent=initial_intent,
         )
 
-    try:
-        ref = CheckpointRef(context.working_tree_root, lifecycle_id)
-    except (ValueError, CheckpointRefError):
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
-            "the checkpoint ref could not be constructed",
-            run_id=projection.run_id,
-            attempt_number=projection.reconciliation.attempts_total,
+    if projection.worktree.intent is WorktreeIntent.CREATING:
+        result = _reconcile_creating_worktree_entry(
+            run_dir_fd=run_dir_fd,
+            lifecycle_id=lifecycle_id,
+            projection=projection,
+            state_root=state_root,
+            identity=identity,
+            context=context,
         )
-    if ref.object_format.value != identity.object_format:
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.REFUSED,
-            "the checkpoint ref's discovered object format disagrees with the trusted repository identity",
-            run_id=projection.run_id,
-            attempt_number=projection.reconciliation.attempts_total,
+    else:
+        result = replace(
+            _reconcile_absent_worktree_entry(
+                run_dir_fd=run_dir_fd,
+                lifecycle_id=lifecycle_id,
+                projection=projection,
+                state_root=state_root,
+                identity=identity,
+                context=context,
+            ),
+            worktree_leaf_outcome="not_applicable",
         )
-    try:
-        observation = ref.observe()
-    except CheckpointRefError:
+    return replace(result, worktree_initial_persisted_intent=initial_intent)
+
+
+def _reconcile_absent_worktree_entry(
+    *,
+    run_dir_fd: int,
+    lifecycle_id: str,
+    projection: LifecycleProjection,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+) -> ReconciliationEntryResult:
+    """Inspect-before-mutate, per entry: confirm the checkpoint ref then
+    the worktree absent (unchanged from Slice 3B-1, still out of removal
+    scope), then
+    inspect both container roles completely (one Docker listing plus
+    every ownership-proof inspect it requires) and compute both roles'
+    complete decisions *before* any mutation of either — a conflict on
+    either role aborts the whole entry with zero mutation attempted.
+    Only once both decisions are known does this function publish any
+    write-ahead transition, and only once both roles' write-ahead
+    writes are durably confirmed does it ever issue a `docker rm`,
+    baseline before verification, stopping before verification's
+    removal if baseline's own resolution did not reach absent this
+    pass."""
+    ref_outcome, ref_detail = _observe_checkpoint_ref_absent(
+        lifecycle_id=lifecycle_id, identity=identity, context=context
+    )
+    if ref_outcome is not None:
         return ReconciliationEntryResult(
             lifecycle_id,
-            ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
-            "the checkpoint ref could not be observed",
-            run_id=projection.run_id,
-            attempt_number=projection.reconciliation.attempts_total,
-        )
-    if observation.present:
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.REFUSED,
-            "the recomputed checkpoint ref is present",
+            ref_outcome,
+            ref_detail,
             run_id=projection.run_id,
             attempt_number=projection.reconciliation.attempts_total,
         )
@@ -1041,6 +1237,196 @@ def _reconcile_locked_entry(
     )
 
 
+# ADR 0004 Amendment 12: removal-primitive result -> (entry outcome or
+# None to continue, maintenance-trace leaf_outcome).
+_LEAF_REMOVAL_DISPOSITION = {
+    LeafRemovalKind.ALREADY_ABSENT: (None, "already_absent"),
+    LeafRemovalKind.PRE_CONFLICT: (ReconciliationEntryOutcome.REFUSED, "conflict_not_removed"),
+    LeafRemovalKind.NOT_EMPTY_AT_RMDIR: (ReconciliationEntryOutcome.REFUSED, "conflict_not_removed"),
+    LeafRemovalKind.PRE_INSPECTION_FAILED: (ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "removal_not_attempted"),
+    LeafRemovalKind.ORIGINAL_STILL_PRESENT: (ReconciliationEntryOutcome.FAILED, "original_still_present"),
+    LeafRemovalKind.REPLACEMENT_CONFLICT: (ReconciliationEntryOutcome.REFUSED, "replacement_conflict"),
+    LeafRemovalKind.POST_INSPECTION_FAILED: (ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "post_inspection_failed"),
+}
+
+
+def _reconcile_creating_worktree_entry(
+    *,
+    run_dir_fd: int,
+    lifecycle_id: str,
+    projection: LifecycleProjection,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+) -> ReconciliationEntryResult:
+    """ADR 0004 Amendment 12: a dead lifecycle whose worktree record is
+    `creating` and whose deterministic leaf is an empty, private,
+    unregistered directory with no Git admin entry.
+
+    Inspection (I2-I6) mutates nothing. Mutation: enter RECONCILING
+    (attempts +1 only on a fresh cycle) -> remove the empty leaf if one is
+    present -> close the leaf descriptors (a close failure dominates and
+    stops everything after it) -> fresh Git listing and admin scan ->
+    reconciler-owned `creating -> absent` -> RECONCILED. Once mutation has
+    begun, `REFUSED`/`SUBSTRATE_UNAVAILABLE` may follow a real removal (the
+    container reconciler's own convention); `leaf_outcome` records what
+    actually happened."""
+    attempts = projection.reconciliation.attempts_total
+    trace = {"leaf": "not_inspected", "removal": None}
+
+    def result(outcome, detail, **extra) -> ReconciliationEntryResult:
+        return ReconciliationEntryResult(
+            lifecycle_id,
+            outcome,
+            detail,
+            run_id=projection.run_id,
+            attempt_number=attempts,
+            worktree_leaf_outcome=trace["leaf"],
+            worktree_removal_observation=trace["removal"],
+            **extra,
+        )
+
+    # I2: checkpoint ref absent.
+    outcome, detail = _observe_checkpoint_ref_absent(lifecycle_id=lifecycle_id, identity=identity, context=context)
+    if outcome is not None:
+        return result(outcome, detail)
+
+    # I3 + I4: exact path unregistered, no admin entry.
+    expected_path = os.path.normpath(os.path.join(state_root.path, "worktrees", identity.repo_key, lifecycle_id))
+    outcome, detail = _check_worktree_unregistered(
+        lifecycle_id=lifecycle_id, expected_path=expected_path, identity=identity, context=context
+    )
+    if outcome is not None:
+        return result(outcome, detail)
+
+    # I5: the leaf itself.
+    try:
+        opened = state_root.open_abandoned_worktree_leaf(identity.repo_key, lifecycle_id)
+    except LifecycleFsError as exc:
+        if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED:
+            trace["leaf"] = "close_failed"
+        return result(_classify_entry_fs_failure(exc), "the worktree leaf could not be inspected")
+    if opened.observation is AbandonedLeafObservation.CONFLICT:
+        trace["leaf"] = "conflict_not_removed"
+        return result(ReconciliationEntryOutcome.REFUSED, "the worktree leaf is not an empty private directory")
+    if opened.observation is AbandonedLeafObservation.UNKNOWN:
+        return result(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the worktree leaf could not be inspected")
+    leaf = opened.leaf
+    trace["leaf"] = "already_absent" if leaf is None else "removal_not_attempted"
+
+    try:
+        early = _creating_row_mutate(
+            run_dir_fd=run_dir_fd, projection=projection, leaf=leaf, lifecycle_id=lifecycle_id, trace=trace
+        )
+    except BaseException as exc:
+        if leaf is not None:
+            leaf.__exit__(type(exc), exc, exc.__traceback__)  # close failure dominates, chained
+        raise
+    projection, attempts = early.projection, early.attempts
+
+    # M3: close before anything else; a close failure dominates and stops
+    # every later step.
+    if leaf is not None:
+        try:
+            leaf.close()
+        except LifecycleFsError:
+            trace["leaf"] = "close_failed"
+            return result(
+                ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+                "the worktree leaf descriptors could not be confirmed closed",
+            )
+    if early.result is not None:
+        return result(*early.result)
+
+    # M4: fresh Git listing and admin scan after any removal.
+    outcome, detail = _check_worktree_unregistered(
+        lifecycle_id=lifecycle_id, expected_path=expected_path, identity=identity, context=context
+    )
+    if outcome is not None:
+        return result(outcome, detail)
+
+    # M5: reconciler-owned creating -> absent.
+    try:
+        projection = _publish_reconciler_worktree_transition(run_dir_fd, projection, attempts_total=attempts)
+    except LifecycleStoreError as exc:
+        return result(ReconciliationEntryOutcome.FAILED, f"the worktree absent collapse write failed ({exc.reason.value})")
+
+    # M6.
+    try:
+        _publish_projection_state(run_dir_fd, projection, state=LifecycleState.RECONCILED, attempts_total=attempts)
+    except LifecycleStoreError as exc:
+        return result(
+            ReconciliationEntryOutcome.FAILED,
+            f"the RECONCILED projection write failed ({exc.reason.value})",
+            worktree_absent_transition_confirmed_this_pass=True,
+        )
+    return result(
+        ReconciliationEntryOutcome.RECONCILED,
+        "confirmed absent and durably reconciled",
+        baseline_confirmed_absent=True,
+        verification_confirmed_absent=True,
+        worktree_confirmed_absent=True,
+        checkpoint_ref_confirmed_absent=True,
+        worktree_absent_transition_confirmed_this_pass=True,
+    )
+
+
+@dataclass(frozen=True)
+class _CreatingRowPhase:
+    projection: LifecycleProjection
+    attempts: int
+    result: tuple[ReconciliationEntryOutcome, str] | None  # early exit, after the leaf is closed
+
+
+def _creating_row_mutate(*, run_dir_fd, projection, leaf, lifecycle_id, trace) -> _CreatingRowPhase:
+    """I6 (containers), M1 (enter RECONCILING), M2 (remove the leaf).
+    Never closes the leaf -- the caller does, before acting on any
+    early-exit result."""
+    attempts = projection.reconciliation.attempts_total
+
+    # I6: both deterministic container names absent (I4 invariant).
+    try:
+        name_to_id, _ = _docker_ps_all_id_name_pairs()
+    except _DockerListingError:
+        return _CreatingRowPhase(
+            projection, attempts, (ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "container listing failed")
+        )
+    if f"codeagent-baseline-{lifecycle_id}" in name_to_id or f"codeagent-verification-{lifecycle_id}" in name_to_id:
+        return _CreatingRowPhase(
+            projection,
+            attempts,
+            (ReconciliationEntryOutcome.REFUSED, "a deterministic container name is present"),
+        )
+
+    # M1: enter RECONCILING before any mutation; the only increment.
+    if projection.state is not LifecycleState.RECONCILING:
+        attempts += 1
+        try:
+            projection = _publish_projection_state(
+                run_dir_fd, projection, state=LifecycleState.RECONCILING, attempts_total=attempts
+            )
+        except LifecycleStoreError as exc:
+            return _CreatingRowPhase(
+                projection,
+                attempts,
+                (ReconciliationEntryOutcome.FAILED, f"the RECONCILING projection write failed ({exc.reason.value})"),
+            )
+
+    # M2: remove the empty leaf, if one was found.
+    if leaf is None:
+        return _CreatingRowPhase(projection, attempts, None)
+    removal = leaf.remove_if_still_empty()
+    trace["removal"] = removal.kind.value
+    if removal.kind is LeafRemovalKind.POST_ABSENT:
+        trace["leaf"] = "removed" if removal.rmdir is RmdirReport.SUCCEEDED else "absent_after_failed_rmdir"
+        return _CreatingRowPhase(projection, attempts, None)
+    outcome, leaf_outcome = _LEAF_REMOVAL_DISPOSITION[removal.kind]
+    trace["leaf"] = leaf_outcome
+    if outcome is None:
+        return _CreatingRowPhase(projection, attempts, None)
+    return _CreatingRowPhase(projection, attempts, (outcome, f"worktree leaf removal: {removal.kind.value}"))
+
+
 def _process_open_entry(
     *,
     run_dir_fd: int,
@@ -1113,7 +1499,7 @@ def _process_open_entry_body(
             attempt_number=peek.reconciliation.attempts_total,
         )
 
-    if peek.state not in _RECONCILER_ELIGIBLE_STATES or not is_projection_reconciliation_eligible_shape(peek):
+    if not _is_reconciliation_eligible(peek):
         return ReconciliationEntryResult(
             lifecycle_id,
             ReconciliationEntryOutcome.REFUSED,
@@ -1318,7 +1704,15 @@ class _MaintenanceTraceWriter:
                         "confirmed_absent": result.verification_confirmed_absent,
                     },
                 },
-                "worktree": {"confirmed_absent": result.worktree_confirmed_absent},
+                "worktree": {
+                    "confirmed_absent": result.worktree_confirmed_absent,
+                    "initial_persisted_intent": result.worktree_initial_persisted_intent,
+                    "leaf_outcome": result.worktree_leaf_outcome,
+                    "removal_observation": result.worktree_removal_observation,
+                    "absent_transition_confirmed_this_pass": (
+                        result.worktree_absent_transition_confirmed_this_pass
+                    ),
+                },
                 "checkpoint_ref": {"ref_name": ref_name, "confirmed_absent": result.checkpoint_ref_confirmed_absent},
                 "has_recognized_temp_leftover": result.has_temp_leftover,
                 "detail": _bounded(result.detail, _DETAIL_MAX_BYTES),

@@ -2469,6 +2469,29 @@ Stage 2 (of the four-stage planning process in
   The unwired-seam boundary, crash-blocking behavior, open
   reservation/projection gap, and unchanged T-E1/T-F2 status stated
   above are all unaffected by this CI evidence.
+- **Milestone 3 worktree reconciliation row for a dead `creating`
+  worktree**, per `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  "Amendment 12 (Accepted 2026-10-02)", **is implemented and locally
+  validated on macOS (2026-10-02); not committed, Linux CI pending.**
+  Automatic pre-run reconciliation now removes a dead lifecycle's
+  deterministic worktree leaf when the record is `creating` and the leaf is
+  an empty, owner-only (mode 0700), unregistered directory with no Git admin
+  entry, then records `RECONCILED`. `state_root.py` gains
+  `open_abandoned_worktree_leaf()` and a shared, descriptor-relative removal
+  primitive (also used, with unchanged messages, by
+  `_WorktreeLeafReservation`); `lifecycle_store.py` gains the
+  `creating`-worktree eligibility predicate and a reconciler-only
+  `creating -> absent` writer (the live owner's table is unchanged);
+  `reconciliation.py` gains a bounded, names-only Git admin-directory scan
+  and the row itself, with additive maintenance-trace fields
+  (`schema_version` 1). `present`/`disposing` worktrees and an `absent`
+  record with a leftover directory still block admission. **Unwired**: no
+  CLI or controller path calls `prepare_lifecycle()`. T-E1 is unchanged;
+  `docs/threat-model.md`'s T-F2 now records partial, reconciler-level
+  coverage only, not end-to-end mitigation. Verified: full suite 3,040
+  passed, 0 skipped (`CODEAGENT_REQUIRE_DOCKER=1`); 17-file focused set
+  1,516, forward and reverse. Implementation/test evidence only, not a
+  security review. See `ENGINEERING_LOG.md`'s dated entry.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
