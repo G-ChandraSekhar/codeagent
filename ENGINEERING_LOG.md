@@ -5710,3 +5710,48 @@ plus one documentation contradiction:
 temporary revert of the fixes made the bound-crossing and common-directory
 CLOEXEC regressions fail, then the fixed file was restored byte-for-byte.
 The totals above are the post-correction ones.
+
+## 2026-10-02 — Amendment 12 (abandoned `creating` worktree reconciliation): Linux CI evidence reconciliation
+
+Documentation-only. The implementation entry above is kept as the
+historical pre-push record. Evidence below was independently re-fetched
+from the GitHub API and raw logs; no tests or Docker were rerun for this
+pass.
+
+**Confirmed on GitHub-hosted Linux CI** (commit
+`b9d79bbb351d2b75dc4c95c61478a6d24cce036f`, run
+[37093418065](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37093418065),
+job "Test (ubuntu-24.04, Python 3.12)", runner image `ubuntu-24.04`
+(Ubuntu 24.04.5 LTS) x86_64, Python 3.12.14, conclusion `success`; the API
+reports 13 steps, every one `success`): the mandatory Docker preflight
+succeeded (Docker Engine - Community, client and server `28.0.4`); the
+pinned image
+(`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`)
+was pulled and reported platform `linux/amd64`. The dedicated "Run real
+Docker verification tests" step ran only `python -m pytest
+tests/integration/test_slice_c.py -v` (`CODEAGENT_REQUIRE_DOCKER: 1` in
+that step's own logged environment): `3 passed in 2.01s` -- the legacy
+Milestone-1 suite, **not** Amendment-12-specific evidence. The separate
+"Run complete test suite" step ran `python -m pytest -q`
+(`CODEAGENT_REQUIRE_DOCKER: 1` also in that step's own logged
+environment) and reported `3037 passed, 3 skipped in 44.12s`; `3037 + 3`
+equals the local collected total of 3,040. `pytest -q` does not name the
+three skipped tests, so they are not identified or guessed here; they
+are not attributable to Docker, which was required and available in that
+step. That Amendment 12's tests ran in this step is an inference from the
+whole-suite command and the matching collected total, not from named-test
+log evidence. The final leftover-container step ran `docker ps -a
+--format '{{.Names}}'` through the anchored `grep -E
+'^codeagent-(verify-|baseline-|verification-)'`, covering all three
+CodeAgent container families; its output was empty and the step
+succeeded. This is implementation/automated-test evidence only, not a
+security review, and is GitHub-hosted `ubuntu-24.04` x86_64 evidence
+specifically, not a general Linux or ARM64 claim.
+
+The row remains unwired; `present`/`disposing` worktrees and an
+`absent` record with a leftover directory still block admission; the A4
+same-user race before `rmdir` remains; and this evidence adds no broader
+T-F2, T-F1, or T-E1 mitigation claim.
+
+`docs/threat-model.md` was inspected: it holds no Amendment-12-specific CI
+statement, so it is unchanged. `uv.lock` untouched.
