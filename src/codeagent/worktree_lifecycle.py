@@ -165,9 +165,19 @@ class WorktreeTransitionPublisher(Protocol):
     `ContainerTransitionPublisher`'s own correction-pass rationale: a
     future integration's Git-side identity should derive from this same
     source rather than a second, independently supplied value that
-    could disagree with it. **This slice constructs no such
-    integration** — these properties exist now so the Protocol shape is
-    already correct for whichever later slice adds one.
+    could disagree with it.
+
+    `repo_key` (ADR 0004 Amendment 11) was added after this Protocol
+    first shipped. Protocols are not runtime-checked, so existing code
+    imports and runs unchanged, but this *is* a contract change: every
+    conforming implementation must now also expose `repo_key`. It is
+    required because the deterministic worktree path contains
+    `repo_key` — a caller reserving under the wrong repository key with
+    the correct `lifecycle_id`/`state_root_id` would otherwise go
+    undetected. `workspace.GitWorktree` binds all three against its
+    reservation before any Git call; that integration is an optional,
+    unwired producer seam — no production composition path supplies a
+    publisher.
 
     `publish()` takes the single, pre-validated `WorktreeTransition`
     value object directly — mirroring
@@ -176,6 +186,9 @@ class WorktreeTransitionPublisher(Protocol):
     the worktree, like the checkpoint ref and unlike a container, has
     exactly one combination-validated record, not one record per role.
     """
+
+    @property
+    def repo_key(self) -> str: ...
 
     @property
     def lifecycle_id(self) -> str: ...

@@ -1764,6 +1764,10 @@ class LifecycleWorktreePublisher:
         return self._cursor.current
 
     @property
+    def repo_key(self) -> str:
+        return self._cursor.current.repo_key
+
+    @property
     def lifecycle_id(self) -> str:
         return self._cursor.current.lifecycle_id
 

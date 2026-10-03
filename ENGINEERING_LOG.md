@@ -5547,3 +5547,48 @@ pass — the independently re-verified, completed CI run plus read-only
 source/test inspection are the evidence. The pre-existing untracked
 `uv.lock` remains exactly as it was throughout — not edited, staged, or
 incorporated.
+
+## 2026-10-02 — Milestone 3: optional `GitWorktree` worktree-transition publication (ADR 0004 Amendment 11)
+
+An optional, **unwired** producer seam: `GitWorktree(...,
+worktree_publisher=None)` publishes `creating`/`present`/`disposing`/
+`absent` when given a publisher. No production composition path
+supplies one; lifecycle-aware composition is forbidden until worktree
+reconciliation/removal exist. Crashes currently block admission rather
+than recover; the reservation/projection gap remains open; T-E1/T-F2
+are not newly mitigated. Implementation/test evidence only, not a
+security review.
+
+Trade-offs decided:
+- **Failed `present` always retains the worktree.** `DURABILITY_UNCONFIRMED`
+  cannot tell whether `creating` or `present` is installed, so no
+  physical cleanup depends on the reason. Mirrors the container
+  precedent (`UNCONFIRMED_DEFERRED`).
+- **Separate `lifecycle_error` latch** instead of overloading
+  `cleanup_error`; re-raised as the same instance before every
+  idempotent return; a body exception is never masked.
+- **Identity binding includes `repo_key`** (part of the leaf path), so
+  the Protocol gained a `repo_key` property — a contract change.
+- **`observe_leaf()` only in publisher mode.** Scratchpad probes showed
+  `Path.exists()` reports a dangling symlink as absent, APFS keeps
+  `st_nlink == 2` on an unlinked directory's held fd, and fd numbers are
+  reused after close — so absence is fd-relative `ENOENT` only, guarded
+  by the closed flag. The no-publisher `Path.exists()` false-absence
+  risk is unchanged and left for a separate slice.
+
+Disclosed test corrections: Amendment 10's static
+workspace-integration test narrowed (workspace may import the
+`worktree_lifecycle` leaf, never `lifecycle_store`; controller/
+reconciliation still forbidden); the Protocol-shape test now uses exact
+equality as its docstring always claimed.
+
+Verified (macOS, Docker already running, `CODEAGENT_REQUIRE_DOCKER=1`):
+`test_workspace.py` 158 passed (92 existing unmodified + 66 new);
+`test_state_root.py` 66; `test_worktree_lifecycle.py` +
+`test_lifecycle_store.py` 288; `tests/integration/test_worktree_publication.py`
+4 (incl. a real SHA-256 repository and two real SIGKILL →
+`RECONCILIATION_BLOCKED` tests); 17-file focused set 1,380 passed,
+forward and reverse; full suite 2,904 passed, 0 skipped (up from
+2,828). No leftover containers, worktrees, `refs/codeagent` refs,
+processes, or state roots; `git diff --check` clean. Linux CI pending
+(not pushed). `uv.lock` untouched.

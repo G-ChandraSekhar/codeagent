@@ -96,7 +96,15 @@ from typing import Literal
 
 from codeagent import _git_safety
 from codeagent._lifecycle_fs import LifecycleFsError
-from codeagent.state_root import _WorktreeLeafReservation
+from codeagent.state_root import LeafObservation, _WorktreeLeafReservation
+from codeagent.worktree_lifecycle import (
+    ABSENT_WORKTREE_TRANSITION,
+    WorktreeIntent,
+    WorktreePublicationError,
+    WorktreePublicationFailure,
+    WorktreeTransition,
+    WorktreeTransitionPublisher,
+)
 
 _WORKTREE_TEMPDIR_PREFIX = "codeagent-worktree-"
 
@@ -118,6 +126,40 @@ class GitWorktreeCleanupError(GitWorktreeError):
     """Raised from __exit__ when the worktree's git registration could
     not be removed or recovered, and no other exception is already
     propagating from the with-block (see module docstring)."""
+
+
+class GitWorktreeLifecycleError(GitWorktreeError):
+    """A worktree lifecycle-projection publication failed (ADR 0004
+    Amendment 11). Raised only in optional publisher mode, always
+    explicitly `from` the `WorktreePublicationError` that caused it.
+    `reason` preserves that error's categorical reason; `transition` is
+    the target intent whose publication failed. The message is fixed
+    per transition — never the cause's text or the reason's spelling."""
+
+    def __init__(self, message: str, *, reason: WorktreePublicationFailure, transition: WorktreeIntent) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.transition = transition
+
+
+_LIFECYCLE_ERROR_MESSAGES: dict[WorktreeIntent, str] = {
+    WorktreeIntent.CREATING: "the worktree's creating lifecycle transition could not be published; "
+    "no git mutation was attempted",
+    WorktreeIntent.PRESENT: "the worktree's present lifecycle transition could not be published; "
+    "the materialized worktree was retained",
+    WorktreeIntent.DISPOSING: "the worktree's disposing lifecycle transition could not be published; "
+    "removal was not attempted",
+    WorktreeIntent.ABSENT: "the worktree's absent lifecycle transition could not be published "
+    "after its removal was confirmed",
+}
+
+
+def _lifecycle_error(exc: WorktreePublicationError, transition: WorktreeIntent) -> GitWorktreeLifecycleError:
+    """Pure translation shared by the four publication sites. The caller
+    raises the result explicitly `from exc`."""
+    return GitWorktreeLifecycleError(
+        _LIFECYCLE_ERROR_MESSAGES[transition], reason=exc.reason, transition=transition
+    )
 
 
 def _run(
@@ -165,6 +207,18 @@ class GitWorktree:
     the pre-Git/post-Git identity re-verification around it. `GitWorktree`
     never accepts a bare caller-controlled pathname for this mode — only
     the private reservation type, never a `Path`/`str`.
+
+    ADR 0004 Amendment 11: an optional `worktree_publisher` (requires a
+    reservation; identity bound on `repo_key`/`state_root_id`/
+    `lifecycle_id` before any Git call) publishes `creating` before any
+    Git mutation, `present` after a fully verified and consumed entry,
+    `disposing` before removal, and `absent` after confirmed registration
+    and leaf absence. `preserve()` publishes nothing; nothing is ever
+    refreshed or retried, and no `creating -> absent` recovery is
+    published. This is an **unwired producer seam**: no production
+    composition path supplies a publisher, and lifecycle-aware production
+    composition must not be enabled until worktree reconciliation/removal
+    exists. Without a publisher, behavior is unchanged.
     """
 
     def __init__(
@@ -173,6 +227,7 @@ class GitWorktree:
         run_id: str,
         *,
         reservation: _WorktreeLeafReservation | None = None,
+        worktree_publisher: WorktreeTransitionPublisher | None = None,
     ) -> None:
         # Slice 3C-2 correction pass: a bare type annotation is not
         # enforced by Python — an arbitrary duck-typed object exposing
@@ -187,6 +242,32 @@ class GitWorktree:
             raise GitWorktreeError(
                 "reservation must be a genuine worktree-leaf reservation object"
             )
+        # ADR 0004 Amendment 11: an optional, unwired producer seam. When
+        # supplied, the publisher's identity is bound against the
+        # reservation's own — all three fields, in memory only, before the
+        # Git preflight or any filesystem/Git access. Messages are fixed
+        # and never echo either side's values.
+        if worktree_publisher is not None:
+            if reservation is None:
+                raise GitWorktreeError("a worktree publisher requires a reserved worktree location")
+            try:
+                publisher_repo_key = worktree_publisher.repo_key
+                publisher_state_root_id = worktree_publisher.state_root_id
+                publisher_lifecycle_id = worktree_publisher.lifecycle_id
+            except AttributeError:
+                raise GitWorktreeError("the worktree publisher does not expose a lifecycle identity") from None
+            if publisher_repo_key != reservation.repo_key:
+                raise GitWorktreeError(
+                    "the worktree publisher's repository key does not match the reserved location"
+                )
+            if publisher_state_root_id != reservation.state_root_id:
+                raise GitWorktreeError(
+                    "the worktree publisher's state root does not match the reserved location"
+                )
+            if publisher_lifecycle_id != reservation.lifecycle_id:
+                raise GitWorktreeError(
+                    "the worktree publisher's lifecycle does not match the reserved location"
+                )
         # ADR 0006 section 6: a one-time capability check, before any
         # repository access at all.
         try:
@@ -226,6 +307,16 @@ class GitWorktree:
         # preserve()/dispose()/__exit__'s module-docstring-level
         # ownership-transfer discipline (ADR 0003 Amendment 2).
         self._disposition: Literal["active", "disposed", "preserved"] = "active"
+        # ADR 0004 Amendment 11 (publisher mode only). `lifecycle_error` is
+        # both the inspection field and the latch: once any publication
+        # fails, every later `__enter__`/`dispose`/`preserve`/`__exit__`
+        # surfaces this exact instance and never publishes again. It is
+        # deliberately separate from `cleanup_error`, whose type and
+        # meaning (physical-cleanup failure) are unchanged.
+        self._publisher = worktree_publisher
+        self.lifecycle_error: GitWorktreeLifecycleError | None = None
+        self._disposing_published = False
+        self._disposal_publication_attempted = False
 
     @property
     def initial_commit(self) -> str:
@@ -237,6 +328,20 @@ class GitWorktree:
         if self._initial_commit is None:
             raise GitWorktreeError("initial_commit is not available before __enter__ succeeds")
         return self._initial_commit
+
+    def _publish_lifecycle(self, transition: WorktreeTransition) -> None:
+        """Publish one worktree transition (publisher mode only). Catches
+        only `WorktreePublicationError` — anything else a publisher
+        raises propagates unchanged. On failure the translated error is
+        latched on `self.lifecycle_error` *before* being raised, so no
+        later call can publish again. Never refreshes, never retries."""
+        assert self._publisher is not None
+        try:
+            self._publisher.publish(transition)
+        except WorktreePublicationError as exc:
+            error = _lifecycle_error(exc, transition.intent)
+            self.lifecycle_error = error
+            raise error from exc
 
     def _validate_source_repo(self) -> None:
         if not self.source_repo_path.is_dir():
@@ -327,6 +432,11 @@ class GitWorktree:
         )
 
     def __enter__(self) -> Path:
+        # ADR 0004 Amendment 11: a latched publication failure is surfaced
+        # as the exact same instance, before anything else, and nothing is
+        # ever published again.
+        if self.lifecycle_error is not None:
+            raise self.lifecycle_error
         if self.path is not None:
             raise GitWorktreeError(
                 f"GitWorktree for run {self.run_id!r} is already active — create a new "
@@ -400,6 +510,15 @@ class GitWorktree:
                     "the reserved worktree location could not be confirmed before use"
                 )
             worktree_path = self._reservation.path
+            # ADR 0004 Amendment 11: `creating` is published after the
+            # claim and the pre-Git identity check, and strictly before any
+            # Git mutation. On failure nothing in Git is touched; the
+            # reservation stays `claimed`, so its own `__exit__` removes the
+            # still-empty leaf.
+            if self._publisher is not None:
+                self._publish_lifecycle(
+                    WorktreeTransition(intent=WorktreeIntent.CREATING, expected_head=source_head)
+                )
 
         # From here on, `git worktree add` is treated as potentially
         # mutating no matter how it concludes — a nonzero result, an
@@ -512,6 +631,22 @@ class GitWorktree:
                 self.cleanup_error = cleanup_error
                 raise cleanup_error from failure
             raise
+
+        # ADR 0004 Amendment 11: `present` is published only after the
+        # cleanup-owning block above has completed successfully
+        # (materialized, re-verified, consumed), and deliberately *outside*
+        # it — that block's `except BaseException` would otherwise remove
+        # the worktree on a publication failure. On failure the registered,
+        # materialized worktree is always retained (whatever the reason:
+        # `DURABILITY_UNCONFIRMED` cannot distinguish an installed CREATING
+        # from an installed PRESENT without a refresh contract this layer
+        # does not have); the reservation is already `consumed`, so its own
+        # `__exit__` never removes it; and `self.path`/`initial_commit` stay
+        # unpublished. Recovery belongs to later reconciliation.
+        if self._publisher is not None:
+            self._publish_lifecycle(
+                WorktreeTransition(intent=WorktreeIntent.PRESENT, expected_head=source_head)
+            )
 
         # Reached only once every check above has passed, including (in
         # reservation mode) the ownership transfer itself — publishing
@@ -639,6 +774,13 @@ class GitWorktree:
         disposal cannot be confirmed — never silently treated as
         successful.
         """
+        # ADR 0004 Amendment 11: the latch is checked before the
+        # disposed/preserved idempotent return — after an `absent`
+        # publication failure the disposition is already `disposed`, yet a
+        # later call must still surface that exact failure, never silently
+        # return.
+        if self.lifecycle_error is not None:
+            raise self.lifecycle_error
         if self._disposition != "active":
             return
         if self.path is None:
@@ -646,6 +788,16 @@ class GitWorktree:
             return
 
         worktree_path = self.path
+        # `disposing` before any removal; published at most once, so a
+        # retry after a `GitWorktreeCleanupError` re-runs only the physical
+        # step below. On failure `git worktree remove` never runs.
+        if self._publisher is not None and not self._disposing_published:
+            self._disposal_publication_attempted = True
+            assert self._initial_commit is not None
+            self._publish_lifecycle(
+                WorktreeTransition(intent=WorktreeIntent.DISPOSING, expected_head=self._initial_commit)
+            )
+            self._disposing_published = True
         # `git worktree remove`'s own reported outcome (nonzero exit, or
         # an infrastructure error from `_run`) is deliberately NOT part
         # of the success decision below — it is only an *attempt*. A
@@ -662,10 +814,21 @@ class GitWorktree:
             pass
 
         registration_status = self._registration_status(worktree_path)
-        try:
-            directory_absent = not worktree_path.exists()
-        except OSError:
-            directory_absent = False
+        if self._publisher is not None:
+            # Publisher mode only (ADR 0004 Amendment 11): `absent` needs
+            # an fd-relative, no-follow observation of the reserved leaf —
+            # a pathname `exists()` follows symlinks and reports a dangling
+            # one as absent. Requires the reservation's descriptors to still
+            # be open; once closed this is `UNKNOWN` and disposal fails
+            # closed. Every no-publisher path keeps the observation below,
+            # unchanged.
+            assert self._reservation is not None
+            directory_absent = self._reservation.observe_leaf() is LeafObservation.ABSENT
+        else:
+            try:
+                directory_absent = not worktree_path.exists()
+            except OSError:
+                directory_absent = False
 
         if registration_status is not False or not directory_absent:
             raise GitWorktreeCleanupError(
@@ -707,6 +870,12 @@ class GitWorktree:
 
         self.path = None
         self._disposition = "disposed"
+        # `absent` only after confirmed registration absence and confirmed
+        # leaf absence. On failure the physical removal is never undone and
+        # never reported as durably absent; the failure stays latched even
+        # though the disposition is already `disposed`.
+        if self._publisher is not None:
+            self._publish_lifecycle(ABSENT_WORKTREE_TRANSITION)
 
     def preserve(self) -> None:
         """Mark this worktree as deliberately retained. Called only by
@@ -721,8 +890,15 @@ class GitWorktree:
         `active` — preserving an already-disposed or already-preserved
         worktree is a caller error, not a legal no-op.
         """
+        if self.lifecycle_error is not None:
+            raise self.lifecycle_error
         if self._disposition != "active":
             raise GitWorktreeError("cannot preserve a worktree that is not active")
+        # A preserved worktree under a `disposing` record would be removed
+        # by a future reconciler — refused once disposal publication began.
+        if self._disposal_publication_attempted:
+            raise GitWorktreeError("cannot preserve a worktree whose lifecycle disposal has begun")
+        # Publishes nothing: the projection stays `present`.
         self._disposition = "preserved"
 
     def _cleanup_failed_worktree(self, worktree_path: Path) -> GitWorktreeCleanupError | None:
@@ -805,6 +981,15 @@ class GitWorktree:
           direct `with GitWorktree(...) as path:` caller still gets
           exact, idempotent, loudly-failing disposal.
         """
+        # ADR 0004 Amendment 11: a latched publication failure is checked
+        # before the preserved/disposed return. It is surfaced as the exact
+        # same instance only when nothing else is propagating; otherwise the
+        # body exception continues unmasked and the failure stays
+        # inspectable on `self.lifecycle_error`. Never republished.
+        if self.lifecycle_error is not None:
+            if exc_type is None:
+                raise self.lifecycle_error
+            return
         if self._disposition in ("preserved", "disposed"):
             return
 
@@ -818,4 +1003,8 @@ class GitWorktree:
                 # otherwise this would replace (mask) the real failure
                 # the with-block raised. The caller can still see
                 # cleanup_error on this instance either way.
+                raise
+        except GitWorktreeLifecycleError:
+            # Already latched on `self.lifecycle_error` by dispose().
+            if exc_type is None:
                 raise

@@ -2302,3 +2302,559 @@ def test_no_rmtree_or_prune_reference_exists_in_workspace_module() -> None:
             raise AssertionError("workspace.py must not call any *.rmtree(...)")
         if isinstance(node, ast.Constant) and node.value == "prune":
             raise AssertionError("workspace.py must not pass a 'prune' argument to git")
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 11: optional, unwired GitWorktree worktree-transition
+# publication. These tests use a recording/fault-injecting publisher
+# double; tests/integration/test_worktree_publication.py drives the real
+# LifecycleWorktreePublisher end to end.
+# ---------------------------------------------------------------------------
+
+import ast  # noqa: E402
+
+from codeagent import worktree_lifecycle as wl  # noqa: E402
+from codeagent import workspace as ws  # noqa: E402
+from codeagent.workspace import GitWorktreeLifecycleError  # noqa: E402
+
+_FORCED_DETAIL = "forced-publisher-detail-that-must-never-leak"
+
+
+class RecordingWorktreePublisher:
+    """Test double conforming to `worktree_lifecycle.WorktreeTransitionPublisher`
+    (including Amendment 11's `repo_key`). Records every publish attempt
+    with an optional observation taken at that exact moment, and raises
+    the real `WorktreePublicationError` for `fail_on`."""
+
+    def __init__(self, *, repo_key, lifecycle_id, state_root_id, fail_on=None, reason=None, observer=None):
+        self.repo_key = repo_key
+        self.lifecycle_id = lifecycle_id
+        self.state_root_id = state_root_id
+        self.fail_on = fail_on
+        self.reason = reason or wl.WorktreePublicationFailure.NOT_INSTALLED
+        self.observer = observer
+        self.events: list[tuple] = []
+
+    def publish(self, transition):
+        snapshot = self.observer(transition) if self.observer is not None else None
+        self.events.append((transition.intent, transition.expected_head, snapshot))
+        if transition.intent is self.fail_on:
+            raise wl.WorktreePublicationError(self.reason, _FORCED_DETAIL)
+
+    @property
+    def intents(self):
+        return [event[0] for event in self.events]
+
+
+def _bound_publisher(reservation, **kwargs) -> RecordingWorktreePublisher:
+    return RecordingWorktreePublisher(
+        repo_key=reservation.repo_key,
+        lifecycle_id=reservation.lifecycle_id,
+        state_root_id=reservation.state_root_id,
+        **kwargs,
+    )
+
+
+def _is_registered(repo: Path, path: Path) -> bool:
+    out = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain", "-z"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    registered = {
+        os.path.realpath(token[len("worktree ") :]) for token in out.split("\0") if token.startswith("worktree ")
+    }
+    return os.path.realpath(path) in registered
+
+
+def _force_remove_worktree(repo: Path, path: Path) -> None:
+    """Teardown for tests that deliberately retain a worktree. Confirms
+    removal rather than trusting the command's own outcome."""
+    subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(path)], capture_output=True)
+    assert not _is_registered(repo, path)
+    assert not os.path.lexists(path)
+
+
+# --- Pure 4 x 10 translation matrix (no Git) ---
+
+_TRANSITIONS = [
+    wl.WorktreeIntent.CREATING,
+    wl.WorktreeIntent.PRESENT,
+    wl.WorktreeIntent.DISPOSING,
+    wl.WorktreeIntent.ABSENT,
+]
+
+
+@pytest.mark.parametrize("transition", _TRANSITIONS)
+@pytest.mark.parametrize("reason", list(wl.WorktreePublicationFailure))
+def test_lifecycle_error_translation_matrix(transition, reason) -> None:
+    cause = wl.WorktreePublicationError(reason, _FORCED_DETAIL)
+    error = ws._lifecycle_error(cause, transition)
+    assert isinstance(error, GitWorktreeLifecycleError)
+    assert isinstance(error, GitWorktreeError)
+    assert error.reason is reason
+    assert error.transition is transition
+    message = str(error)
+    assert message == ws._LIFECYCLE_ERROR_MESSAGES[transition]
+    assert _FORCED_DETAIL not in message
+    assert reason.value not in message
+    assert reason.name not in message
+
+
+# --- Identity binding: refused before any Git preflight or mutation ---
+
+
+@pytest.fixture
+def no_git_allowed(monkeypatch):
+    def _forbidden(*_a, **_k):
+        raise AssertionError("no Git preflight or Git call may happen before binding is checked")
+
+    monkeypatch.setattr(_git_safety, "check_git_preflight", _forbidden)
+    monkeypatch.setattr(ws, "_run", _forbidden)
+
+
+_OTHER_HEX = "c" * 32
+
+
+@pytest.mark.parametrize(
+    "overrides,expected_message",
+    [
+        ({"repo_key": _OTHER_HEX}, "repository key does not match"),
+        ({"state_root_id": _OTHER_HEX}, "state root does not match"),
+        ({"lifecycle_id": _OTHER_HEX}, "lifecycle does not match"),
+        ({"repo_key": _OTHER_HEX, "lifecycle_id": _OTHER_HEX}, "repository key does not match"),
+        ({"state_root_id": _OTHER_HEX, "lifecycle_id": _OTHER_HEX}, "state root does not match"),
+        (
+            {"repo_key": _OTHER_HEX, "state_root_id": _OTHER_HEX, "lifecycle_id": _OTHER_HEX},
+            "repository key does not match",
+        ),
+    ],
+)
+def test_publisher_identity_mismatch_refused_before_git(
+    reservation_repo, no_git_allowed, overrides, expected_message
+) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        identity = {
+            "repo_key": reservation.repo_key,
+            "lifecycle_id": reservation.lifecycle_id,
+            "state_root_id": reservation.state_root_id,
+        }
+        identity.update(overrides)
+        publisher = RecordingWorktreePublisher(**identity)
+        with pytest.raises(GitWorktreeError) as excinfo:
+            GitWorktree(repo, run_id="r-bind", reservation=reservation, worktree_publisher=publisher)
+        assert expected_message in str(excinfo.value)
+        assert _OTHER_HEX not in str(excinfo.value)
+        assert reservation.repo_key not in str(excinfo.value)
+        assert publisher.events == []
+
+
+def test_publisher_without_reservation_refused_before_git(reservation_repo, no_git_allowed) -> None:
+    repo, _state_root = reservation_repo
+    publisher = RecordingWorktreePublisher(
+        repo_key=_WT_REPO_KEY, lifecycle_id=_WT_LIFECYCLE_ID, state_root_id=_OTHER_HEX
+    )
+    with pytest.raises(GitWorktreeError) as excinfo:
+        GitWorktree(repo, run_id="r-bind", worktree_publisher=publisher)
+    assert "requires a reserved worktree location" in str(excinfo.value)
+
+
+def test_publisher_without_identity_refused_before_git(reservation_repo, no_git_allowed) -> None:
+    repo, state_root = reservation_repo
+
+    class _NoIdentity:
+        def publish(self, transition):  # pragma: no cover - never reached
+            raise AssertionError
+
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        with pytest.raises(GitWorktreeError) as excinfo:
+            GitWorktree(repo, run_id="r-bind", reservation=reservation, worktree_publisher=_NoIdentity())
+        assert str(excinfo.value) == "the worktree publisher does not expose a lifecycle identity"
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__
+
+
+# --- Real-Git ordering of all four transitions ---
+
+
+def test_real_git_publication_ordering_for_all_four_transitions(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    head = _head(repo)
+    holder: dict = {}
+
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+
+        def observe(transition):
+            path = reservation.path
+            snapshot = {
+                "registered": _is_registered(repo, path),
+                "leaf": reservation.observe_leaf(),
+                "materialized": (path / "jobs" / "worker.py").exists() if path.exists() else False,
+                "wt_path_published": holder["wt"].path is not None,
+            }
+            if snapshot["registered"]:
+                snapshot["head"] = _head(path)
+            return snapshot
+
+        publisher = _bound_publisher(reservation, observer=observe)
+        worktree = GitWorktree(repo, run_id="r-order", reservation=reservation, worktree_publisher=publisher)
+        holder["wt"] = worktree
+        with worktree as path:
+            assert worktree.initial_commit == head
+        assert worktree._disposition == "disposed"
+
+    assert publisher.intents == [
+        wl.WorktreeIntent.CREATING,
+        wl.WorktreeIntent.PRESENT,
+        wl.WorktreeIntent.DISPOSING,
+        wl.WorktreeIntent.ABSENT,
+    ]
+    creating, present, disposing, absent = [event[2] for event in publisher.events]
+    # creating: before any Git mutation -- unregistered, the empty reserved leaf.
+    assert creating["registered"] is False
+    assert creating["leaf"] is sr.LeafObservation.RESERVED_INODE
+    assert creating["materialized"] is False
+    # present: materialized, registered, at the origin commit, path not yet exposed.
+    assert present["registered"] is True
+    assert present["materialized"] is True
+    assert present["head"] == head
+    assert present["wt_path_published"] is False
+    # disposing: before removal -- still registered.
+    assert disposing["registered"] is True
+    # absent: after confirmed registration absence and fd-relative leaf absence.
+    assert absent["registered"] is False
+    assert absent["leaf"] is sr.LeafObservation.ABSENT
+    # Every carrying transition records the same immutable origin commit.
+    assert [event[1] for event in publisher.events] == [head, head, head, None]
+    assert not _is_registered(repo, path)
+
+
+# --- Failure at each transition ---
+
+
+def test_creating_failure_mutates_no_git_and_latches(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.CREATING)
+        worktree = GitWorktree(repo, run_id="r-c", reservation=reservation, worktree_publisher=publisher)
+        with mock.patch.object(ws, "_run", wraps=ws._run) as run_spy:
+            with pytest.raises(GitWorktreeLifecycleError) as excinfo:
+                worktree.__enter__()
+        err = excinfo.value
+        assert err.transition is wl.WorktreeIntent.CREATING
+        assert isinstance(err.__cause__, wl.WorktreePublicationError)
+        assert _FORCED_DETAIL not in str(err)
+        assert not any("worktree" in call.args and "add" in call.args for call in run_spy.call_args_list)
+        assert not _is_registered(repo, reservation.path)
+        assert reservation._state is sr._ReservationState.CLAIMED
+        assert worktree.lifecycle_error is err
+        assert worktree.path is None
+        for later in (worktree.__enter__, worktree.dispose, worktree.preserve):
+            with pytest.raises(GitWorktreeLifecycleError) as again:
+                later()
+            assert again.value is err
+        assert publisher.intents == [wl.WorktreeIntent.CREATING]
+    # The reservation's own exit removed the still-empty leaf.
+    assert not os.path.lexists(reservation.path)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [wl.WorktreePublicationFailure.ILLEGAL_TRANSITION, wl.WorktreePublicationFailure.DURABILITY_UNCONFIRMED],
+)
+def test_present_failure_retains_registered_worktree_outside_enter_cleanup(reservation_repo, reason) -> None:
+    repo, state_root = reservation_repo
+    head = _head(repo)
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.PRESENT, reason=reason)
+        worktree = GitWorktree(repo, run_id="r-p", reservation=reservation, worktree_publisher=publisher)
+        with mock.patch.object(
+            worktree, "_cleanup_failed_reservation_worktree", wraps=worktree._cleanup_failed_reservation_worktree
+        ) as cleanup_spy:
+            with pytest.raises(GitWorktreeLifecycleError) as excinfo:
+                worktree.__enter__()
+        err = excinfo.value
+        assert err.transition is wl.WorktreeIntent.PRESENT
+        assert err.reason is reason
+        cleanup_spy.assert_not_called()  # enter-time cleanup never ran
+        assert reservation._state is sr._ReservationState.CONSUMED
+        assert _is_registered(repo, reservation.path)
+        assert (reservation.path / "jobs" / "worker.py").exists()
+        assert _head(reservation.path) == head
+        assert worktree.path is None
+        with pytest.raises(GitWorktreeError):
+            worktree.initial_commit
+        with pytest.raises(GitWorktreeLifecycleError) as again:
+            worktree.dispose()
+        assert again.value is err
+        assert worktree._disposition == "active"
+        assert publisher.intents == [wl.WorktreeIntent.CREATING, wl.WorktreeIntent.PRESENT]
+    # The consumed reservation's exit closed descriptors but kept the worktree.
+    assert _is_registered(repo, reservation.path)
+    _force_remove_worktree(repo, reservation.path)
+
+
+def test_disposing_failure_prevents_removal_and_never_republishes(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.DISPOSING)
+        worktree = GitWorktree(repo, run_id="r-d", reservation=reservation, worktree_publisher=publisher)
+        path = worktree.__enter__()
+        with mock.patch.object(ws, "_run", wraps=ws._run) as run_spy:
+            with pytest.raises(GitWorktreeLifecycleError) as excinfo:
+                worktree.dispose()
+            err = excinfo.value
+            assert err.transition is wl.WorktreeIntent.DISPOSING
+            # A second dispose() and the context exit surface the same
+            # instance and never republish or remove.
+            with pytest.raises(GitWorktreeLifecycleError) as again:
+                worktree.dispose()
+            assert again.value is err
+            with pytest.raises(GitWorktreeLifecycleError) as at_exit:
+                worktree.__exit__(None, None, None)
+            assert at_exit.value is err
+            assert not any("remove" in call.args for call in run_spy.call_args_list)
+        with pytest.raises(GitWorktreeLifecycleError) as on_preserve:
+            worktree.preserve()
+        assert on_preserve.value is err
+        assert _is_registered(repo, path)
+        assert worktree._disposition == "active"
+        assert publisher.intents.count(wl.WorktreeIntent.DISPOSING) == 1
+    _force_remove_worktree(repo, path)
+
+
+def test_absent_failure_after_confirmed_removal_stays_latched_despite_disposed(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.ABSENT)
+        worktree = GitWorktree(repo, run_id="r-a", reservation=reservation, worktree_publisher=publisher)
+        path = worktree.__enter__()
+        with pytest.raises(GitWorktreeLifecycleError) as excinfo:
+            worktree.dispose()
+        err = excinfo.value
+        cause = err.__cause__
+        assert err.transition is wl.WorktreeIntent.ABSENT
+        assert isinstance(cause, wl.WorktreePublicationError)
+        # Physical removal happened first and is never undone.
+        assert not _is_registered(repo, path)
+        assert reservation.observe_leaf() is sr.LeafObservation.ABSENT
+        assert worktree._disposition == "disposed"
+        # The latch is checked before the disposed idempotent return.
+        with pytest.raises(GitWorktreeLifecycleError) as again:
+            worktree.dispose()
+        assert again.value is err
+        with pytest.raises(GitWorktreeLifecycleError) as at_exit:
+            worktree.__exit__(None, None, None)
+        assert at_exit.value is err
+        assert err.__cause__ is cause
+        assert publisher.intents == [
+            wl.WorktreeIntent.CREATING,
+            wl.WorktreeIntent.PRESENT,
+            wl.WorktreeIntent.DISPOSING,
+            wl.WorktreeIntent.ABSENT,
+        ]
+
+
+def test_body_exception_is_not_masked_by_lifecycle_failure(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.ABSENT)
+        worktree = GitWorktree(repo, run_id="r-mask", reservation=reservation, worktree_publisher=publisher)
+        with pytest.raises(ValueError, match="body failure"):
+            with worktree:
+                raise ValueError("body failure")
+        assert isinstance(worktree.lifecycle_error, GitWorktreeLifecycleError)
+        assert worktree.lifecycle_error.transition is wl.WorktreeIntent.ABSENT
+
+
+def test_body_exception_not_masked_when_already_latched(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.DISPOSING)
+        worktree = GitWorktree(repo, run_id="r-mask2", reservation=reservation, worktree_publisher=publisher)
+        with pytest.raises(ValueError, match="body failure"):
+            with worktree as path:
+                with pytest.raises(GitWorktreeLifecycleError):
+                    worktree.dispose()
+                raise ValueError("body failure")
+        assert worktree.lifecycle_error is not None
+        assert publisher.intents.count(wl.WorktreeIntent.DISPOSING) == 1
+    _force_remove_worktree(repo, path)
+
+
+def test_physical_retry_after_cleanup_error_skips_disposing_republish(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(repo, run_id="r-retry", reservation=reservation, worktree_publisher=publisher)
+        worktree.__enter__()
+        real_status = worktree._registration_status
+        calls = {"n": 0}
+
+        def _unconfirmed_once(path):
+            calls["n"] += 1
+            return True if calls["n"] == 1 else real_status(path)
+
+        with mock.patch.object(worktree, "_registration_status", side_effect=_unconfirmed_once):
+            with pytest.raises(GitWorktreeCleanupError):
+                worktree.dispose()
+            assert worktree.lifecycle_error is None
+            assert worktree._disposition == "active"
+            # Disposal has begun: preserve is refused.
+            with pytest.raises(GitWorktreeError, match="lifecycle disposal has begun"):
+                worktree.preserve()
+            worktree.dispose()
+        assert worktree._disposition == "disposed"
+        assert publisher.intents == [
+            wl.WorktreeIntent.CREATING,
+            wl.WorktreeIntent.PRESENT,
+            wl.WorktreeIntent.DISPOSING,
+            wl.WorktreeIntent.ABSENT,
+        ]
+
+
+def test_preserve_publishes_nothing(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(repo, run_id="r-pres", reservation=reservation, worktree_publisher=publisher)
+        with worktree as path:
+            worktree.preserve()
+        assert publisher.intents == [wl.WorktreeIntent.CREATING, wl.WorktreeIntent.PRESENT]
+        assert _is_registered(repo, path)
+    _force_remove_worktree(repo, path)
+
+
+def test_lifecycle_aware_disposal_with_closed_reservation_descriptors_fails_closed(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(repo, run_id="r-closed", reservation=reservation, worktree_publisher=publisher)
+        path = worktree.__enter__()
+    # Reservation context has exited: descriptors closed, consumed worktree kept.
+    assert reservation.observe_leaf() is sr.LeafObservation.UNKNOWN
+    with pytest.raises(GitWorktreeCleanupError):
+        worktree.dispose()
+    assert wl.WorktreeIntent.ABSENT not in publisher.intents
+    assert publisher.intents[-1] is wl.WorktreeIntent.DISPOSING
+    assert worktree._disposition == "active"
+    assert worktree.lifecycle_error is None
+    # Git's own removal did run; only the leaf confirmation failed closed.
+    assert not _is_registered(repo, path)
+
+
+def test_concurrent_entry_publishes_creating_exactly_once(reservation_repo) -> None:
+    import threading
+
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktrees = [
+            GitWorktree(repo, run_id=f"r-race-{i}", reservation=reservation, worktree_publisher=publisher)
+            for i in range(2)
+        ]
+        barrier = threading.Barrier(2)
+        outcomes: dict[int, object] = {}
+
+        def attempt(index):
+            barrier.wait(timeout=5)
+            try:
+                worktrees[index].__enter__()
+                outcomes[index] = "entered"
+            except GitWorktreeError as exc:
+                outcomes[index] = exc
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        winners = [i for i, outcome in outcomes.items() if outcome == "entered"]
+        assert len(winners) == 1
+        loser = 1 - winners[0]
+        assert "already been claimed" in str(outcomes[loser])
+        assert publisher.intents.count(wl.WorktreeIntent.CREATING) == 1
+        worktrees[winners[0]].dispose()
+
+
+def test_no_publisher_reservation_disposal_keeps_existing_observation(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        with mock.patch.object(
+            sr._WorktreeLeafReservation, "observe_leaf", side_effect=AssertionError("must not be used")
+        ):
+            with GitWorktree(repo, run_id="r-nopub", reservation=reservation) as path:
+                pass
+        assert not _is_registered(repo, path)
+
+
+def test_no_publisher_legacy_tempdir_mode_unchanged(reservation_repo) -> None:
+    repo, _state_root = reservation_repo
+    worktree = GitWorktree(repo, run_id="r-legacy")
+    assert worktree._publisher is None
+    assert worktree.lifecycle_error is None
+    with worktree as path:
+        assert path.exists()
+    assert not path.exists()
+    assert worktree.lifecycle_error is None
+
+
+# --- Static scope proofs (AST-based; strings and docstrings ignored) ---
+
+_SRC = Path(__file__).resolve().parents[2] / "src" / "codeagent"
+
+
+def _calls_to_gitworktree(tree: ast.AST):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (isinstance(func, ast.Name) and func.id == "GitWorktree") or (
+                isinstance(func, ast.Attribute) and func.attr == "GitWorktree"
+            ):
+                yield node
+
+
+def test_no_production_module_constructs_gitworktree() -> None:
+    offenders = []
+    for module in sorted(_SRC.glob("*.py")):
+        tree = ast.parse(module.read_text())
+        if any(True for _ in _calls_to_gitworktree(tree)):
+            offenders.append(module.name)
+    assert offenders == []
+
+
+def test_no_production_call_passes_worktree_publisher_to_gitworktree() -> None:
+    for module in sorted(_SRC.glob("*.py")):
+        tree = ast.parse(module.read_text())
+        for call in _calls_to_gitworktree(tree):
+            assert all(keyword.arg != "worktree_publisher" for keyword in call.keywords), module.name
+
+
+def test_workspace_imports_worktree_lifecycle_but_never_lifecycle_store() -> None:
+    tree = ast.parse((_SRC / "workspace.py").read_text())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+            imported.update(f"{node.module}.{alias.name}" for alias in node.names)
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+    assert "codeagent.worktree_lifecycle" in imported
+    assert not any("lifecycle_store" in name for name in imported)
+
+
+def test_lifecycle_store_legitimately_declares_and_constructs_worktree_publisher() -> None:
+    """The scope proofs above are about `GitWorktree` calls only; the
+    shared-publisher bundle's own `worktree_publisher` field and its
+    construction in `lifecycle_store.py` remain allowed."""
+    tree = ast.parse((_SRC / "lifecycle_store.py").read_text())
+    annotated = {
+        node.target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    keyword_uses = {kw.arg for node in ast.walk(tree) if isinstance(node, ast.Call) for kw in node.keywords}
+    assert "worktree_publisher" in annotated
+    assert "worktree_publisher" in keyword_uses

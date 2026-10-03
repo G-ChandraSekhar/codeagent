@@ -3552,3 +3552,121 @@ Verified (macOS, real Docker daemon, `CODEAGENT_REQUIRE_DOCKER=1`):
 passed (up from 283 before this pass's five new tests); see
 `ENGINEERING_LOG.md`'s dated correction-pass entry for the complete
 focused-set and full-suite totals.
+
+## Amendment 11 (Accepted 2026-10-02): optional `GitWorktree` worktree-transition publication — an unwired producer seam
+
+**Status of this seam.** `GitWorktree` gains an optional, keyword-only
+`worktree_publisher` parameter (default `None`). It is an **unwired
+producer seam**: no production composition path constructs
+`GitWorktree` at all, and none supplies a publisher (proven by AST
+tests: no `GitWorktree(...)` call and no `worktree_publisher=` keyword
+anywhere in `src/codeagent/`). **Lifecycle-aware production composition
+must not be enabled until worktree reconciliation and removal exist.**
+Today, a crash that leaves a non-`absent` worktree projection **blocks
+admission** of new runs in that repository (`RECONCILIATION_BLOCKED`), and
+so does an `absent` projection accompanied by a leftover reserved leaf or
+Git registration — fail-closed blocking, not recovery. The reservation/projection crash gap
+(below) remains open. T-E1 and T-F2 are **not** newly mitigated. The
+evidence for this amendment is implementation/automated-test evidence
+only, not a security review.
+
+### 1. Identity binding
+
+When a publisher is supplied, a reservation is required, and the
+publisher's `repo_key`, `state_root_id`, and `lifecycle_id` must equal
+the reservation's — checked in that fixed order, before the Git
+preflight and before any filesystem access. Every refusal is a
+`GitWorktreeError` with a fixed message that never echoes a value; a
+publisher lacking identity attributes is refused `from None`.
+`repo_key` is included because it is part of the deterministic leaf
+path. `_WorktreeLeafReservation` now carries these three fields
+(supplied by `StateRoot.reserve_worktree_leaf()`) as read-only
+properties.
+
+**Protocol contract change.** `worktree_lifecycle.WorktreeTransitionPublisher`
+gains a `repo_key` property. The Protocol is not runtime-checked, so
+existing code is source-compatible, but every conforming implementation
+must now provide it. The only implementation,
+`lifecycle_store.LifecycleWorktreePublisher`, derives it from the
+shared cursor's current projection, like its other two identity fields.
+
+### 2. Publication order
+
+The three non-`absent` publications (`creating`, `present`,
+`disposing`) carry the same immutable materialization (origin) commit
+as `expected_head`; `absent` carries no `expected_head` (`None`).
+
+1. `creating` — after `claim()` and the pre-Git identity check, before
+   any Git mutation.
+2. `present` — after materialization, post-Git verification, and
+   `consume()`, **outside** the enter-time cleanup-owning block, and
+   before `path`/`initial_commit` are published.
+3. `disposing` — first thing in `dispose()`, before
+   `git worktree remove`; published at most once (a physical retry
+   after `GitWorktreeCleanupError` skips it).
+4. `absent` — only after confirmed registration absence **and**
+   `reservation.observe_leaf() is LeafObservation.ABSENT`.
+
+`preserve()` publishes nothing (the projection stays `present`) and is
+refused once a `disposing` publication has been attempted. A Git
+failure after `creating` runs the existing exact enter-time cleanup and
+leaves the projection `creating`; there is **no** `creating → absent`
+recovery publication. Nothing at this layer refreshes or retries.
+
+### 3. Failure disposition
+
+A `WorktreePublicationError` becomes `GitWorktreeLifecycleError`
+(`reason`, `transition`, one fixed message per transition), raised
+`from` the original and latched on the public `lifecycle_error` field.
+`cleanup_error` keeps its exact existing type and meaning.
+
+| Failed transition | Physical state left | Disposition | `path` visible |
+|---|---|---|---|
+| `creating` | no Git mutation; reservation `CLAIMED`, its exit removes the empty leaf | active | no |
+| `present` | **registered, materialized worktree always retained**, whatever the reason (`DURABILITY_UNCONFIRMED` cannot distinguish installed `creating` from installed `present`) | active | no |
+| `disposing` | worktree intact; removal never attempted | active | yes |
+| `absent` | already physically removed; never undone, never reported durably absent | disposed | no |
+
+**Latch.** Once set, `__enter__`, `dispose`, `preserve`, and `__exit__`
+check it before every idempotent early return and re-raise the same
+instance (identity and `__cause__` preserved); nothing is published
+again. `__exit__` raises it only when the body raised nothing — a body
+exception is never masked.
+
+### 4. `LeafObservation`
+
+`_WorktreeLeafReservation.observe_leaf()` is observational and never
+raises: `UNKNOWN` if the reservation's descriptors are already closed
+(checked by flag, since closed fd numbers can be reused); fd-relative
+no-follow `stat(name)` → `ENOENT` is `ABSENT`, any other `OSError` is
+`UNKNOWN`; a non-directory (including a symlink) is `OTHER`; a
+directory is `RESERVED_INODE` only when `samestat` with the held leaf
+fd, else `OTHER`. Link count is never consulted (APFS reports
+`st_nlink == 2` for an unlinked directory's held fd). It is used **only
+in publisher mode**; every no-publisher path keeps its existing
+`Path.exists()` observation (which can report a dangling symlink as
+absent — an unchanged residual risk for a separate slice). Lifecycle-
+aware disposal therefore requires the reservation context to stay open
+through `dispose()`/`__exit__`; if it is closed, `absent` is not
+published and `GitWorktreeCleanupError` is raised.
+
+### 5. Crash gap — open, fail-closed
+
+Reconciliation still refuses every non-absent worktree projection, and
+an `absent` projection with a leftover leaf/registration. A crash at
+any point between reserving the leaf and a confirmed `absent` therefore
+blocks admission. Real SIGKILL tests prove this for a durable `creating`
+(empty unregistered leaf) and a durable `present` (registered
+worktree). Closing the gap needs a composition owner that controls
+reservation order, a §8 refinement for an exactly-empty unregistered
+reserved leaf, and worktree reconciliation removal — all later work.
+
+### 6. Disclosed test corrections
+
+Amendment 10's static test that forbade `workspace.py` from referring
+to worktree publication is narrowed (renamed
+`test_no_controller_or_reconciliation_integration_and_workspace_uses_only_the_leaf_module`):
+controller/reconciliation integration stays fully forbidden, and
+`workspace.py` may import only the stdlib-only `worktree_lifecycle`
+leaf, never `lifecycle_store`. The Protocol-shape test, whose docstring
+said "exactly" but checked a subset, is now an exact equality check.

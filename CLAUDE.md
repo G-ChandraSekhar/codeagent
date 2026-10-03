@@ -2406,6 +2406,32 @@ Stage 2 (of the four-stage planning process in
   not claim any change to the accepted design, schema, transition
   table, or scope stated above, and `docs/threat-model.md`'s T-E1/T-F2
   entries remain unaffected.
+- **Milestone 3 optional `GitWorktree` worktree-transition
+  publication**, per `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  "Amendment 11 (Accepted 2026-10-02)", **is implemented and locally
+  validated on macOS (2026-10-02); not committed, Linux CI pending.**
+  `GitWorktree` gains an optional `worktree_publisher` (default `None`;
+  no-publisher behavior unchanged) bound to the reservation's
+  `repo_key`/`state_root_id`/`lifecycle_id` before Git preflight;
+  publishes `creating` before any Git mutation, `present` after
+  materialization+`consume()` outside the cleanup-owning block,
+  `disposing` before removal, and `absent` only after confirmed
+  registration absence and `observe_leaf() is ABSENT` (new
+  `state_root.LeafObservation`); `preserve()` publishes nothing. A
+  failed `present` always retains the worktree; failures latch on a
+  separate `lifecycle_error` (`GitWorktreeLifecycleError`), re-raised as
+  the same instance, never masking a body exception; no refresh/retry,
+  no `creating→absent` recovery. `WorktreeTransitionPublisher` gained
+  `repo_key` (contract change). **This is an unwired producer seam**: no
+  production composition path supplies the publisher, and
+  lifecycle-aware production composition must not be enabled until
+  worktree reconciliation and removal exist. Crashes currently block
+  admission (`RECONCILIATION_BLOCKED`, proven by real SIGKILL tests)
+  rather than recover; the reservation/projection gap remains open;
+  T-E1/T-F2 are not newly mitigated. Verified: full suite 2,904 passed,
+  0 skipped (`CODEAGENT_REQUIRE_DOCKER=1`); 17-file focused set 1,380,
+  forward and reverse. Implementation/test evidence only, not a
+  security review. See `ENGINEERING_LOG.md`'s dated entry.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

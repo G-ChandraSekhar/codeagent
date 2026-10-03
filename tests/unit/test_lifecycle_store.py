@@ -4119,12 +4119,15 @@ def test_worktree_publisher_identity_properties_match_cursor_projection(tmp_path
         publisher = ls.LifecycleWorktreePublisher(writer, current)
         assert publisher.lifecycle_id == current.lifecycle_id == lease.lifecycle_id
         assert publisher.state_root_id == current.state_root_id
+        # ADR 0004 Amendment 11: repo_key, from the same cursor projection.
+        assert publisher.repo_key == current.repo_key == lease.repo_key
 
         publisher.publish(_wt(wl.WorktreeIntent.CREATING, _sha("1")))
         # Identity is unaffected by an ordinary resource transition --
         # it is still derived from the (now-advanced) cursor projection.
         assert publisher.lifecycle_id == publisher.current.lifecycle_id == lease.lifecycle_id
         assert publisher.state_root_id == publisher.current.state_root_id
+        assert publisher.repo_key == publisher.current.repo_key == lease.repo_key
     finally:
         lease.close()
 
@@ -4310,13 +4313,21 @@ def test_shared_bundle_worktree_interleaving_no_spurious_staleness(tmp_path, mon
 # --- Static proof: no production workspace/controller/reconciliation integration ---
 
 
-def test_no_workspace_controller_or_reconciliation_integration_exists():
-    """Static source-level proof that this slice wires nothing into
-    `workspace.py`, `controller.py`, or `reconciliation.py` -- a direct
-    analogy to the existing `test_no_container_worktree_or_checkpoint_ref_mutation_reachable`
-    static proof already covering 3A-2's own scope boundary."""
-    for module_name in ("workspace", "controller", "reconciliation"):
+def test_no_controller_or_reconciliation_integration_and_workspace_uses_only_the_leaf_module():
+    """Static source-level scope proof. Updated by ADR 0004 Amendment 11:
+    `workspace.py` now deliberately imports the dependency-light
+    `worktree_lifecycle` module (the optional, unwired producer seam), so
+    the Amendment 10 version of this test -- which forbade that import --
+    is narrowed rather than kept. What still holds, and is asserted:
+    `controller.py`/`reconciliation.py` have no worktree-publication
+    integration at all, and `workspace.py` never imports `lifecycle_store`
+    nor references the concrete adapter or writer method."""
+    for module_name in ("controller", "reconciliation"):
         source = Path(f"src/codeagent/{module_name}.py").read_text()
         assert "worktree_lifecycle" not in source, f"{module_name}.py must not import worktree_lifecycle"
         assert "LifecycleWorktreePublisher" not in source
         assert "record_worktree_transition" not in source
+    workspace_source = Path("src/codeagent/workspace.py").read_text()
+    assert "lifecycle_store" not in workspace_source
+    assert "LifecycleWorktreePublisher" not in workspace_source
+    assert "record_worktree_transition" not in workspace_source

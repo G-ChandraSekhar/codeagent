@@ -338,7 +338,13 @@ class StateRoot:
             raise
         path = Path(self.path) / "worktrees" / repo_key / lifecycle_id
         return _WorktreeLeafReservation(
-            path=path, parent_fd=parent_fd, leaf_fd=leaf_fd, leaf_name=lifecycle_id
+            path=path,
+            parent_fd=parent_fd,
+            leaf_fd=leaf_fd,
+            leaf_name=lifecycle_id,
+            repo_key=repo_key,
+            lifecycle_id=lifecycle_id,
+            state_root_id=self.state_root_id,
         )
 
     def close(self) -> None:
@@ -355,6 +361,20 @@ class StateRoot:
             self._close_state = _CloseState.FAILED
             raise
         self._close_state = _CloseState.CLOSED
+
+
+@unique
+class LeafObservation(str, Enum):
+    """`_WorktreeLeafReservation.observe_leaf()`'s result (ADR 0004
+    Amendment 11). Only a confirmed `ENOENT` on the leaf name is
+    `ABSENT`; every other inspection failure is `UNKNOWN`, never
+    `ABSENT`. Link count is never consulted (an unlinked directory's held
+    descriptor can still report a nonzero `st_nlink`, e.g. on APFS)."""
+
+    ABSENT = "absent"
+    RESERVED_INODE = "reserved_inode"
+    OTHER = "other"
+    UNKNOWN = "unknown"
 
 
 @unique
@@ -434,11 +454,24 @@ class _WorktreeLeafReservation:
     contract is deliberately not designed in this slice).
     """
 
-    def __init__(self, *, path: Path, parent_fd: int, leaf_fd: int, leaf_name: str) -> None:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        parent_fd: int,
+        leaf_fd: int,
+        leaf_name: str,
+        repo_key: str,
+        lifecycle_id: str,
+        state_root_id: str,
+    ) -> None:
         self._path = path
         self._parent_fd = parent_fd
         self._leaf_fd = leaf_fd
         self._leaf_name = leaf_name
+        self._repo_key = repo_key
+        self._lifecycle_id = lifecycle_id
+        self._state_root_id = state_root_id
         self._state = _ReservationState.RESERVED
         self._claim_lock = threading.Lock()
         self._descriptors_closed = False
@@ -447,6 +480,46 @@ class _WorktreeLeafReservation:
     @property
     def path(self) -> Path:
         return self._path
+
+    # ADR 0004 Amendment 11: the identity `GitWorktree` binds an optional
+    # worktree publisher against, before any Git call. All three are set
+    # once by `StateRoot.reserve_worktree_leaf()` and never change.
+    @property
+    def repo_key(self) -> str:
+        return self._repo_key
+
+    @property
+    def lifecycle_id(self) -> str:
+        return self._lifecycle_id
+
+    @property
+    def state_root_id(self) -> str:
+        return self._state_root_id
+
+    def observe_leaf(self) -> LeafObservation:
+        """Observational, non-mutating, never raises (ADR 0004 Amendment
+        11). The closed flag is checked before any descriptor is touched:
+        a closed descriptor number may already have been reused by an
+        unrelated open file, so relying on `EBADF` could silently inspect
+        the wrong directory. fd-relative, no-follow `stat` of the leaf
+        name; only a confirmed `ENOENT` is `ABSENT`."""
+        if self._descriptors_closed:
+            return LeafObservation.UNKNOWN
+        try:
+            current = os.stat(self._leaf_name, dir_fd=self._parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return LeafObservation.ABSENT
+        except OSError:
+            return LeafObservation.UNKNOWN
+        if not stat.S_ISDIR(current.st_mode):
+            return LeafObservation.OTHER
+        try:
+            reserved = os.fstat(self._leaf_fd)
+        except OSError:
+            return LeafObservation.UNKNOWN
+        if os.path.samestat(current, reserved):
+            return LeafObservation.RESERVED_INODE
+        return LeafObservation.OTHER
 
     def fileno(self) -> int:
         """Read-only access to the open leaf descriptor, for an

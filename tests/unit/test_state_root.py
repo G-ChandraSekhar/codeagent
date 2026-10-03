@@ -914,3 +914,126 @@ def test_no_rmtree_or_prune_reference_exists_in_state_root_module() -> None:
             raise AssertionError("state_root.py must not call any *.rmtree(...)")
         if isinstance(node, ast.Constant) and node.value == "prune":
             raise AssertionError("state_root.py must not reference a 'prune' operation")
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 11: reservation identity and observe_leaf().
+# ---------------------------------------------------------------------------
+
+
+def test_reservation_exposes_bound_identity(tmp_path):
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    try:
+        with state_root.reserve_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID) as reservation:
+            assert reservation.repo_key == _REPO_KEY
+            assert reservation.lifecycle_id == _LIFECYCLE_ID
+            assert reservation.state_root_id == state_root.state_root_id
+    finally:
+        state_root.close()
+
+
+def test_observe_leaf_reserved_inode_then_absent_after_removal(tmp_path):
+    """The retained leaf descriptor still refers to the now-unlinked
+    inode, yet the fd-relative no-follow lookup of the name is a confirmed
+    ENOENT -- the only thing ABSENT relies on (never link count)."""
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    try:
+        with state_root.reserve_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID) as reservation:
+            assert reservation.observe_leaf() is sr.LeafObservation.RESERVED_INODE
+            os.rmdir(reservation.path)
+            assert reservation.observe_leaf() is sr.LeafObservation.ABSENT
+            os.fstat(reservation.fileno())  # the held descriptor is still valid
+    finally:
+        state_root.close()
+
+
+def test_observe_leaf_dangling_symlink_is_other_not_absent(tmp_path):
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    try:
+        with state_root.reserve_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID) as reservation:
+            os.rmdir(reservation.path)
+            os.symlink(tmp_path / "does-not-exist", reservation.path)
+            # The pathname check this replaces in publisher mode would
+            # misreport this as absent.
+            assert not reservation.path.exists()
+            assert reservation.observe_leaf() is sr.LeafObservation.OTHER
+            os.unlink(reservation.path)
+    finally:
+        state_root.close()
+
+
+def test_observe_leaf_foreign_directory_and_wrong_type_are_other(tmp_path):
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    try:
+        with state_root.reserve_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID) as reservation:
+            os.rmdir(reservation.path)
+            os.mkdir(reservation.path)
+            assert reservation.observe_leaf() is sr.LeafObservation.OTHER
+            os.rmdir(reservation.path)
+            reservation.path.write_text("x")
+            assert reservation.observe_leaf() is sr.LeafObservation.OTHER
+            os.unlink(reservation.path)
+    finally:
+        state_root.close()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="permission checks are bypassed for root")
+def test_observe_leaf_permission_failure_is_unknown_not_absent(tmp_path):
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    try:
+        with state_root.reserve_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID) as reservation:
+            parent = reservation.path.parent
+            original = stat.S_IMODE(os.stat(parent).st_mode)
+            os.chmod(parent, 0o000)
+            try:
+                assert reservation.observe_leaf() is sr.LeafObservation.UNKNOWN
+            finally:
+                os.chmod(parent, original)
+    finally:
+        state_root.close()
+
+
+def test_observe_leaf_unknown_after_descriptors_closed_even_if_fd_numbers_reused(tmp_path):
+    """fd-reuse defense: after the reservation closes its descriptors, the
+    same integer descriptor numbers are reopened onto an unrelated
+    directory that *does* contain an entry with the leaf's name. Relying
+    on EBADF would then inspect the wrong directory; the closed-flag check
+    must return UNKNOWN without touching the reused numbers."""
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    (decoy / _LIFECYCLE_ID).mkdir()
+    reopened: list[int] = []
+    try:
+        with state_root.reserve_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID) as reservation:
+            parent_fd = reservation._parent_fd
+            leaf_fd = reservation._leaf_fd
+        # Reassign BOTH freed descriptor numbers: the parent number onto
+        # the decoy directory, the leaf number onto the decoy's same-named
+        # child. Without the closed-flag check, this would be misread as
+        # the reserved inode.
+        matched: set[int] = set()
+        for _ in range(256):
+            fd = os.open(decoy, os.O_RDONLY | os.O_DIRECTORY)
+            if fd == leaf_fd:
+                os.close(fd)
+                fd = os.open(decoy / _LIFECYCLE_ID, os.O_RDONLY | os.O_DIRECTORY)
+                assert fd == leaf_fd
+            reopened.append(fd)
+            if fd in (parent_fd, leaf_fd):
+                matched.add(fd)
+            if matched == {parent_fd, leaf_fd}:
+                break
+        assert matched == {parent_fd, leaf_fd}
+
+        # Demonstrate the danger the flag guards against: with the flag
+        # bypassed, the reused numbers resolve to the decoy and are
+        # misclassified as the reserved inode.
+        reservation._descriptors_closed = False
+        assert reservation.observe_leaf() is sr.LeafObservation.RESERVED_INODE
+        reservation._descriptors_closed = True
+        assert reservation.observe_leaf() is sr.LeafObservation.UNKNOWN
+    finally:
+        for fd in reopened:
+            os.close(fd)
+        state_root.close()

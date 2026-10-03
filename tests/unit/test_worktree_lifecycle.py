@@ -87,12 +87,14 @@ def test_worktree_publication_failure_has_the_identical_ten_member_taxonomy_as_c
 
 
 def test_worktree_transition_publisher_protocol_shape():
-    """Structural check: the Protocol declares exactly lifecycle_id,
-    state_root_id, and publish -- no more, no less -- mirroring
-    ContainerTransitionPublisher's own shape."""
-    annotations = getattr(wl.WorktreeTransitionPublisher, "__protocol_attrs__", None)
+    """Structural check: the Protocol's public members are exactly
+    repo_key, lifecycle_id, state_root_id, and publish. `repo_key` was
+    added by ADR 0004 Amendment 11 -- a contract change every conforming
+    implementation must satisfy. (The previous version of this test
+    claimed "exactly" but only checked a subset; it is now an exact
+    equality check.)"""
     members = {name for name in dir(wl.WorktreeTransitionPublisher) if not name.startswith("_")}
-    assert {"lifecycle_id", "state_root_id", "publish"}.issubset(members)
+    assert members == {"repo_key", "lifecycle_id", "state_root_id", "publish"}
 
 
 def test_module_is_dependency_light_stdlib_only():
