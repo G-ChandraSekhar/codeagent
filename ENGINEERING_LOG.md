@@ -6211,3 +6211,59 @@ No other defect was found. Totals after the correction:
 
 Linux CI is pending; nothing is committed. T-E1, T-F1 and T-F2 are unchanged.
 T-M1 gains partial, reconciler-level coverage. `uv.lock` was untouched.
+
+## 2026-10-03 — Slice 3C-5 / ADR 0004 Amendment 16: Linux CI evidence reconciliation
+
+Documentation-only; no tests or Docker were rerun for this pass. Run
+[37154425420](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37154425420)
+was independently re-fetched from the GitHub Actions API and a fresh raw log.
+The 3C-5 implementation entry above is kept verbatim as the pre-push record,
+and its "Linux CI is pending" is superseded here.
+
+**The run.**
+- Push-triggered, head `70ad69607512441b924044e3f74eaa78a9c318b0` (commit
+  "feat: reconcile orphaned checkpoint refs", an ordinary fast-forward over
+  `3cd4d99`), `completed` / `success`.
+- Job "Test (ubuntu-24.04, Python 3.12)": all 13 API-reported steps `success`;
+  zero `##[error]` annotations.
+- Ubuntu 24.04.5 LTS, CPython 3.12.14, Docker client and server `28.0.4`.
+- The pinned image
+  `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`
+  reported `linux/amd64`.
+
+**Dedicated Docker step.** `python -m pytest tests/integration/test_slice_c.py
+-v`, with `CODEAGENT_REQUIRE_DOCKER: 1`, gave `4 passed in 2.17s`, all four
+named `PASSED`. 3C-5 did not change that file, and it contains no 3C-5-specific
+test.
+
+**Complete suite.** `python -m pytest -q`, with `CODEAGENT_REQUIRE_DOCKER: 1` in
+that step's own environment, gave `3366 passed, 3 skipped in 65.72s`, with 0
+failed. 3,366 + 3 = 3,369, matching the local collected total at `70ad696`.
+
+**What the log does not show.**
+- `pytest -q` names no tests, so the three skips are not identified.
+- There is no named-test evidence for the new reconciliation tests, T34, or
+  T47. That they ran is an inference from the whole-suite command, the matching
+  collection total, and the successful run.
+
+**Leftover-container check.** A full `docker ps -a --format '{{.Names}}'`
+listing through the anchored `grep -E '^codeagent-(verify-|baseline-|verification-)'`
+(all three families) produced empty output, and the step succeeded.
+
+**Boundaries, unchanged.**
+- Refs alongside a worktree or live container still block admission; chaining
+  is deferred.
+- Abandonment, ADR 0005, CLI wiring and operator wiring are unimplemented.
+- The A4 same-user races are open, including the two-command observation
+  window and no compare-and-swap for an observed-absent ref. Owner mutations
+  stay protected by Git compare-and-swap.
+- Observation output is time-bounded, not byte-bounded.
+- Ref deletion makes checkpoint commits collectable.
+- T-E1, T-F1 and T-F2 are not newly mitigated; T-M1 coverage is partial and
+  reconciler-level only.
+- This is GitHub-hosted `ubuntu-24.04` x86_64, automated-test evidence, not a
+  security review.
+
+`docs/threat-model.md` was inspected. Its Amendment 16 note under T-M1 states
+scope only, with no CI-pending statement, so it is unchanged. `uv.lock` was
+untouched.

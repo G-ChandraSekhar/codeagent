@@ -4722,8 +4722,9 @@ SHA anywhere, and `schema_version` stays 1:
 
 ### 8. Evidence
 
-Local verification only: macOS, Git 2.54.0, Docker already running (it was not
-started or restarted), `CODEAGENT_REQUIRE_DOCKER=1`. Linux CI is pending.
+Local verification: macOS, Git 2.54.0, Docker already running (it was not
+started or restarted), `CODEAGENT_REQUIRE_DOCKER=1`. Linux CI evidence is at the
+end of this section.
 
 **New tests: 125.**
 - `test_checkpoint_ref.py`, 6: dangling refs on SHA-1 and SHA-256; mutations
@@ -4786,3 +4787,49 @@ The sources were restored byte-for-byte afterwards.
 
 No leftover containers, worktrees, `refs/codeagent` refs, Git admin entries,
 processes, fixture directories, Docker volumes or default state root remained.
+
+**Confirmed on GitHub-hosted Linux CI.** Commit
+`70ad69607512441b924044e3f74eaa78a9c318b0` (an ordinary fast-forward over
+`3cd4d99`), run
+[37154425420](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37154425420).
+
+- **Run.** Push-triggered, `completed` / `success`. Job "Test (ubuntu-24.04,
+  Python 3.12)". All 13 API-reported steps `success`; zero `##[error]`
+  annotations.
+- **Environment.** Runner image `ubuntu-24.04` (Ubuntu 24.04.5 LTS), CPython
+  3.12.14. The Docker preflight reported client and server `28.0.4`.
+- **Image.** The pinned
+  `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`,
+  which reported `linux/amd64`.
+- **Dedicated Docker step.** `python -m pytest tests/integration/test_slice_c.py
+  -v`, with `CODEAGENT_REQUIRE_DOCKER: 1`, gave `4 passed in 2.17s`, all four
+  named `PASSED`. That file contains no Slice 3C-5-specific test.
+- **Complete suite.** `python -m pytest -q`, with `CODEAGENT_REQUIRE_DOCKER: 1`
+  in that step's own environment, gave `3366 passed, 3 skipped in 65.72s`, with 0
+  failed. 3,366 + 3 = 3,369, which matches the local collected total.
+- **Limits.** `pytest -q` prints no test names, so:
+  - the three skips are not identified;
+  - there is no named-test log evidence for the new reconciliation tests, T34,
+    or T47. That they ran is an inference from the whole-suite command, the
+    matching collection total, and the successful run.
+- **Leftover-container check.** A full `docker ps -a --format '{{.Names}}'`
+  listing filtered through the anchored
+  `grep -E '^codeagent-(verify-|baseline-|verification-)'`, covering all three
+  CodeAgent container families, produced empty output, and the step succeeded.
+
+This evidence changes none of §7's non-claims:
+
+- A ref alongside a worktree or live container still blocks admission;
+  worktree→ref and container chaining remain deferred.
+- Abandonment, ADR 0005 cancellation, CLI wiring and operator wiring remain
+  unimplemented.
+- The A4 same-user races remain open. The two-command observation has a
+  window, and no compare-and-swap runs for an observed-absent ref. Owner
+  mutations stay protected by Git compare-and-swap.
+- Observation output is time-bounded but not byte-bounded.
+- Ref deletion makes checkpoint commits unreachable and subject to garbage
+  collection.
+- T-E1, T-F1 and T-F2 are not newly mitigated, and T-M1 has only partial,
+  reconciler-level coverage.
+- This is GitHub-hosted `ubuntu-24.04` x86_64, automated-test evidence, not a
+  security review.

@@ -2713,8 +2713,11 @@ Stage 2 (of the four-stage planning process in
       automated-test evidence, not a security review.
 - **Milestone 3 Slice 3C-5: checkpoint-ref reconciliation for dead entries
   whose worktree and containers are already absent**, per ADR 0004
-  "Amendment 16 (Accepted 2026-10-03)". **Implemented and locally validated on
-  macOS (2026-10-03); not yet committed, and Linux CI is pending.**
+  "Amendment 16 (Accepted 2026-10-03)". **Implemented, locally validated on
+  macOS (2026-10-03), committed (`70ad69607512441b924044e3f74eaa78a9c318b0`) as
+  an ordinary fast-forward over `3cd4d99`, and confirmed on GitHub-hosted Linux
+  CI** (run
+  [37154425420](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37154425420)).
   - **Eligible shape:** a non-absent checkpoint-ref record with the worktree
     record and both container records absent and `failure` null. Owner states
     or `RECONCILING`.
@@ -2754,6 +2757,46 @@ Stage 2 (of the four-stage planning process in
     still block.
   - **Verified:** 125 new tests; ten mutations caught; full suite 3,244 → 3,369
     passed, 0 skipped; focused set 1,848 forward and reverse; no leftovers.
+  - **Linux CI evidence (run
+    [37154425420](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37154425420)):**
+    - **Run:** push-triggered, head `70ad69607512441b924044e3f74eaa78a9c318b0`,
+      `completed` / `success`.
+    - **Job:** "Test (ubuntu-24.04, Python 3.12)"; all 13 API-reported steps
+      `success`; zero `##[error]` annotations.
+    - **Environment:** runner image `ubuntu-24.04` (Ubuntu 24.04.5 LTS),
+      CPython 3.12.14, Docker client and server `28.0.4`.
+    - **Image:** the pinned
+      `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`,
+      which reported `linux/amd64`.
+    - **Dedicated Docker step:**
+      `python -m pytest tests/integration/test_slice_c.py -v`, with
+      `CODEAGENT_REQUIRE_DOCKER: 1`, gave `4 passed in 2.17s`, all four named
+      `PASSED`. That file contains no Slice 3C-5-specific test.
+    - **Complete suite:** `python -m pytest -q`, with
+      `CODEAGENT_REQUIRE_DOCKER: 1` in that step's own environment, gave
+      `3366 passed, 3 skipped in 65.72s`, with 0 failed.
+      3,366 + 3 = 3,369, matching the local collected total.
+    - **Limits:** `pytest -q` names no tests, so the three skips are not
+      identified and there is no named-test log evidence for the new
+      reconciliation tests, T34, or T47. That they ran is an inference from
+      the whole-suite command, the matching collection total, and the
+      successful run.
+    - **Leftover check:** a full `docker ps -a --format '{{.Names}}'` listing
+      through the anchored `grep -E '^codeagent-(verify-|baseline-|verification-)'`
+      (all three families) produced empty output, and the step succeeded.
+  - **Boundaries (unchanged by CI):**
+    - A checkpoint ref alongside a worktree or live container still blocks
+      admission; worktree→ref and container chaining remain deferred.
+    - Abandonment, ADR 0005 cancellation, CLI wiring and operator wiring remain
+      unimplemented.
+    - The A4 same-user races remain open. The two-command absence observation
+      has a race window, and no compare-and-swap runs when the ref is observed
+      absent. Owner mutations remain protected by Git compare-and-swap.
+    - Observation output is time-bounded but not byte-bounded.
+    - Deleting the owned ref makes checkpoint commits unreachable and subject
+      to later Git garbage collection.
+    - This is GitHub-hosted `ubuntu-24.04` x86_64, automated-test evidence, not
+      a security review.
   - **Threats:** T-E1, T-F1 and T-F2 are unchanged. T-M1 gains partial,
     reconciler-level coverage only. Not wired to any entry point.
 - One Stage-2 spike is unstarted: Responses API strict function tools
