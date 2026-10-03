@@ -3670,3 +3670,42 @@ controller/reconciliation integration stays fully forbidden, and
 `workspace.py` may import only the stdlib-only `worktree_lifecycle`
 leaf, never `lifecycle_store`. The Protocol-shape test, whose docstring
 said "exactly" but checked a subset, is now an exact equality check.
+
+### 7. Evidence
+
+Local (macOS, `CODEAGENT_REQUIRE_DOCKER=1`): complete suite 2,904
+passed, 0 skipped.
+
+**Confirmed on GitHub-hosted Linux CI** (commit
+`c248b6d656a6afc52ce08f140ce5f0a3b598343a`, run
+[37088701609](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37088701609),
+job "Test (ubuntu-24.04, Python 3.12)", runner image `ubuntu-24.04`
+(Ubuntu 24.04.5 LTS) x86_64, Python 3.12.14, conclusion `success`; the
+API reports 13 steps, every one `success`): the mandatory Docker
+preflight succeeded (Docker Engine - Community, client and server
+version `28.0.4`); the pinned verification image
+(`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`)
+was pulled and reported platform `linux/amd64`. The dedicated "Run real
+Docker verification tests" step ran only `python -m pytest
+tests/integration/test_slice_c.py -v` (`CODEAGENT_REQUIRE_DOCKER: 1` in
+that step's own logged environment): `3 passed in 2.87s` — the legacy
+Milestone-1 suite only, **not** Amendment-11-specific evidence. The
+separate "Run complete test suite" step ran `python -m pytest -q`
+(`CODEAGENT_REQUIRE_DOCKER: 1` also present in that step's own logged
+environment) and reported `2901 passed, 3 skipped in 53.72s`; this is
+the step through which Amendment 11's tests (including
+`tests/integration/test_worktree_publication.py`) executed. `2901 + 3`
+equals the local collected total of 2,904. `pytest -q` prints no
+skipped-test identities, so the 3 skips are not identified or guessed
+from this log; they are not attributable to Docker, which was required
+and available during that step. The final leftover-container step ran
+`docker ps -a --format '{{.Names}}'` through the anchored `grep -E
+'^codeagent-(verify-|baseline-|verification-)'`, covering all three
+CodeAgent container families; its output was empty and the step
+succeeded. This is implementation/automated-test evidence only, not a
+security review, and is GitHub-hosted `ubuntu-24.04` x86_64 evidence
+specifically, not a general Linux or ARM64 claim.
+
+Nothing in this evidence changes the accepted API, binding, ordering,
+failure table, `LeafObservation` contract, crash-gap analysis, or
+scope above; T-E1/T-F2 are not newly mitigated.
