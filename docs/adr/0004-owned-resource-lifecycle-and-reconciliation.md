@@ -4338,3 +4338,133 @@ named tests and then reverted; the module is byte-identical afterwards:
 No leftover CodeAgent containers, worktree registrations, `refs/codeagent` refs,
 child processes, fixture directories or default state root remained.
 `git diff --check` is clean.
+
+**Linux CI result: failed.** Commit
+`bd77411ee2f44bd5150202384070540c80326ed7`, run
+[37138458659](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37138458659).
+
+- **Run:** triggered by a push. Job "Test (ubuntu-24.04, Python 3.12)",
+  Ubuntu 24.04.5 LTS, CPython 3.12.14. Conclusion `failure`.
+- **Steps that succeeded:**
+  - Docker preflight, with client and server `28.0.4`.
+  - The pinned image, which reported `linux/amd64`.
+  - The dedicated `python -m pytest tests/integration/test_slice_c.py -v`,
+    `3 passed`.
+  - The leftover-container check, whose output was empty.
+- **Step that failed:** `python -m pytest -q`, run with
+  `CODEAGENT_REQUIRE_DOCKER: 1`, reported `2 failed, 3228 passed, 3 skipped`.
+  2 + 3,228 + 3 equals the local collected total of 3,233. `pytest -q` does not
+  name the skipped tests.
+- **The failing tests:** T30 and T31 both ended `PATCH_VALIDATION_FAILED`.
+- **Cause:** post-patch verification ran as the fixed `--user 1000:1000`, and
+  that user could not read the bind-mounted reserved leaf. The leaf is mode 0700
+  and owned by the runner user. Verification therefore failed, and the repair
+  iteration re-applied an already-applied patch.
+- **Why local runs missed it:** macOS Docker Desktop masks mount permissions,
+  so local runs passed.
+
+This run is failed evidence, not confirmation. The fix is forward-only and is
+recorded in Amendment 15.
+
+## Amendment 15 (Accepted 2026-10-03): verification containers run as the effective host identity
+
+**Context.** Amendment 14's Linux CI run 37138458659 failed (see Amendment 14
+§8). Two invariants conflict:
+
+- **The reserved leaf (A12/A13).** The deterministic worktree leaf is
+  bind-mounted read-only as `/workspace`. It is mode exactly 0700 and owned by
+  the effective host user.
+- **The container identity (`DockerVerifier`).** Every verification container
+  ran as a fixed `--user 1000:1000`.
+
+On any native Linux host whose user is not uid 1000, the container cannot read
+the mount.
+
+A disposable Linux-semantics experiment (a named Docker volume) reproduced this.
+uid 1000 against a 0700 leaf owned by uid 1001 failed with
+`ModuleNotFoundError: No module named 'tests'`. uid 1001 against the same leaf,
+and uid 1000 against a 0755 leaf, each reached only the fixture's genuine bug
+assertion. The legacy path works only because its mount is a world-readable
+Git-created subdirectory. The log does not print the runner's uid; that it is
+not 1000 is inferred from this experiment and the failure pattern.
+
+**Decision.**
+
+- `DockerVerifier.__init__` computes `--user <os.geteuid()>:<os.getegid()>`
+  once, through `_effective_container_user()`. Both `docker create` sites (the
+  legacy path and the lifecycle-aware path) pass that value beside
+  `_SECURITY_FLAGS`.
+- The identity is the *effective* one because it is the identity that creates,
+  and owns, the reserved leaf.
+- Every other isolation flag is byte-identical, pinned by a unit test: network
+  none, read-only root filesystem, tmpfs `/tmp`, memory and swap caps, CPU and
+  PID limits, `--cap-drop ALL`, `no-new-privileges`.
+- The 0700 leaf, its layout, and A12/A13 attribution are unchanged.
+- **Fails closed, with no fallback to `1000:1000`:**
+  - A platform without POSIX `os.geteuid`/`os.getegid` is refused at
+    construction, before any Docker call.
+  - An effective uid of 0 is refused at construction
+    (`"verification containers refuse effective uid 0"`). Without that, running
+    CodeAgent as root would make the formerly non-root container process root,
+    which weakens the sandbox (CLAUDE.md rule 6).
+  - An effective gid of 0 is refused separately
+    (`"verification containers refuse effective gid 0 (the root group)"`). With a
+    nonzero uid this does not make the process root, but it would give the
+    process the root-group identity, which the fixed `1000:1000` never had. The
+    uid check runs first.
+
+**Consequences.**
+
+- **Container process identity.** The process runs with the host user's
+  numeric uid and gid. Docker user-namespace remapping is not assumed, so a
+  container escape would act as the host user. Under the fixed `1000:1000` it
+  would instead have acted as whatever account owns uid 1000 on that host, which
+  on a multi-user machine may be a different real user. This changes who the
+  container's identity maps to on the host. It is not claimed to be a stronger
+  boundary.
+- **Mounts and writes.** The only bind mount stays read-only. Writable space is
+  still only the tmpfs.
+- **S4 spike evidence.** Its recorded production configuration
+  (`spikes/s4/S4_RESULT.md`) and its spike helpers
+  (`flags_without("--user")`) describe the pre-Amendment-15 tuple. They are
+  historical and left unchanged. The non-root property they tested still holds,
+  but rerunning S4 would need a spike-side update. That is a named residual. The
+  S4 workflows are manual-only and never part of push CI.
+- **Unsupported invocations.** Windows hosts, effective uid 0, and effective
+  gid 0 are refused rather than run.
+
+**Evidence.** Local verification only: macOS, Docker already running,
+`CODEAGENT_REQUIRE_DOCKER=1`. Linux CI is pending.
+
+- **New unit tests** in `tests/unit/test_executor.py`, 9 cases:
+  - the exact remaining flag tuple;
+  - the real effective identity;
+  - both create paths passing a distinctive fake effective identity;
+  - an unsupported platform for each missing function;
+  - three uid-0/gid-0 cases, each pinning its exact message.
+- **Two new real-Docker regressions,** each with a 0700 mount root:
+  - `test_slice_c.py::test_real_docker_reads_a_private_0700_mount_as_the_effective_host_identity`,
+    on the legacy path. It runs in CI's dedicated Docker step.
+  - `test_lifecycle_run.py::test_t46_post_patch_verification_reads_the_private_0700_leaf`,
+    which uses the composition. It records leaf mode 0700 at the durable
+    `present` publish, and post-patch verification must pass.
+
+  Each container command asserts `id -u:id -g` equals the effective host
+  identity before importing or running the fixture tests. That makes both tests
+  load-bearing even where mount permissions are masked.
+- **Mutation check.** With the identity temporarily forced back to `1000:1000`,
+  both regressions failed locally (`TEST_FAILURE`, and `BUDGET_EXCEEDED`). T30
+  still passed locally under that mutation, which is exactly why the original
+  defect escaped local verification. The executor was then restored
+  byte-for-byte.
+- **Totals.**
+
+  | Run | Result |
+  |---|---|
+  | `test_executor.py` | 142 passed |
+  | 17-file focused set plus `test_lifecycle_run.py` and `test_slice_c.py` | 1,723 passed, forward and reverse |
+  | Full suite | 3,244 passed, 0 skipped (up from 3,233) |
+
+  No leftover resources remained.
+
+This is implementation and test evidence, not a security review.

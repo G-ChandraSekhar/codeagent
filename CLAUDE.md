@@ -2600,7 +2600,12 @@ Stage 2 (of the four-stage planning process in
 - **Milestone 3 Slice 3C-4: first lifecycle-aware internal run composition**,
   per `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
   "Amendment 14 (Accepted 2026-10-03)". **Implemented and locally validated on
-  macOS (2026-10-03); uncommitted and awaiting joint review.**
+  macOS (2026-10-03), committed (`bd77411`) and pushed. Linux CI run
+  [37138458659](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37138458659)
+  failed**: `2 failed, 3228 passed, 3 skipped` (T30 and T31). The cause was the
+  verification container's fixed `--user 1000:1000`, which could not read the
+  0700 reserved leaf on Linux. This is fixed forward by Amendment 15 (below), not
+  reverted. The run is failed evidence, not confirmation.
   - **What it adds:** `src/codeagent/_lifecycle_run.py::run_lifecycle_aware()`
     composes the lease, one shared cursor and its four publishers, the
     deterministic reservation, a publisher-mode `GitWorktree`, a lifecycle-aware
@@ -2642,8 +2647,29 @@ Stage 2 (of the four-stage planning process in
     - Full suite: 3,233 passed, 0 skipped.
     - Six temporary mutations were each caught.
     - No leftover resources.
-  - **Linux CI is pending.** This is implementation/test evidence only, not a
-    security review. See `ENGINEERING_LOG.md`'s dated entry.
+  - **Linux CI failed** (run 37138458659, above). This is implementation/test
+    evidence only, not a security review. See `ENGINEERING_LOG.md`'s dated
+    entries.
+- **Milestone 3 fix-forward: verification containers run as the effective host
+  identity**, per ADR 0004 "Amendment 15 (Accepted 2026-10-03)". **Implemented
+  and locally validated on macOS (2026-10-03); not yet committed, and Linux CI
+  is pending.**
+  - **The change:** `DockerVerifier` passes
+    `--user <os.geteuid()>:<os.getegid()>`, computed once at construction, at
+    both `docker create` sites in place of the fixed `1000:1000`. Every other
+    isolation flag is byte-identical. The 0700 reserved leaf and A12/A13 are
+    unchanged.
+  - **Fails closed:** with no POSIX effective IDs, or with an effective uid or
+    gid of 0, construction is refused and there is no fallback.
+  - **Regressions:** two real-Docker tests with a 0700 mount, one on the legacy
+    path (`test_slice_c.py`, run by CI's dedicated Docker step) and one through
+    the composition (T46). Both assert the container's `id -u:id -g` and then
+    import or pass the fixture tests. Forcing the identity back to `1000:1000`
+    makes both fail locally.
+  - **S4:** its spike evidence and helpers describe the old tuple. They are
+    historical and left unchanged (a named residual).
+  - **Verified:** full suite 3,244 passed, 0 skipped. Focused set plus both
+    integration files 1,723 passed, forward and reverse.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

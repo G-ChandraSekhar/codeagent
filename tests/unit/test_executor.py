@@ -1892,3 +1892,126 @@ def test_removing_id_none_is_unreachable(monkeypatch, tmp_path):
     removing_calls = [c for c in publisher.calls if c[1] is cl.ContainerIntent.REMOVING]
     assert removing_calls
     assert all(c[2] is not None for c in removing_calls)
+
+
+# --------------------------------------------------------------------
+# ADR 0004 Amendment 15: the container runs as the effective host
+# identity, never a fixed 1000:1000, and fails closed otherwise.
+# --------------------------------------------------------------------
+
+import os  # noqa: E402
+
+from codeagent.executor import _effective_container_user  # noqa: E402
+
+_FAKE_EUID, _FAKE_EGID = 4242, 4343
+
+
+def _fake_effective_identity(monkeypatch, uid=_FAKE_EUID, gid=_FAKE_EGID):
+    monkeypatch.setattr(os, "geteuid", lambda: uid)
+    monkeypatch.setattr(os, "getegid", lambda: gid)
+
+
+def test_security_flags_carry_no_fixed_user_and_are_otherwise_unchanged() -> None:
+    """Every pre-Amendment-15 isolation flag is present, byte-identical and
+    in order; only the fixed `--user 1000:1000` pair was removed."""
+    assert _SECURITY_FLAGS == (
+        "--network", "none",
+        "--read-only",
+        "--tmpfs", "/tmp:rw,size=64m",
+        "--memory", "512m",
+        "--memory-swap", "512m",
+        "--cpus", "1",
+        "--pids-limit", "128",
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+    )
+    assert "--user" not in _SECURITY_FLAGS and "1000:1000" not in _SECURITY_FLAGS
+
+
+def test_effective_container_user_is_the_real_effective_identity() -> None:
+    assert _effective_container_user() == f"{os.geteuid()}:{os.getegid()}"
+
+
+def _assert_create_argv_uses_effective_identity(argv: list[str]) -> None:
+    assert "1000:1000" not in argv
+    assert argv.count("--user") == 1
+    assert argv[argv.index("--user") + 1] == f"{_FAKE_EUID}:{_FAKE_EGID}"
+    start = argv.index(_SECURITY_FLAGS[0])
+    assert tuple(argv[start : start + len(_SECURITY_FLAGS)]) == _SECURITY_FLAGS
+
+
+def test_legacy_create_argv_passes_the_effective_identity(monkeypatch, tmp_path) -> None:
+    _fake_effective_identity(monkeypatch)
+    captured: list[str] = []
+    calls = [
+        _create_success(),
+        _result(0, _state_json(exit_code=0, oom_killed=False)),
+        _result(0),
+        _listing([(_OTHER_CONTAINER_ID, "unrelated")]),
+    ]
+
+    def fake_run_docker(*args: str, **kwargs):
+        if args and args[0] == "create":
+            captured.extend(args)
+        return calls.pop(0)
+
+    monkeypatch.setattr("codeagent.executor._run_docker", fake_run_docker)
+    monkeypatch.setattr("codeagent.executor.uuid4", lambda: _FIXED_UUID)
+    monkeypatch.setattr("codeagent.executor.subprocess.Popen", lambda *a, **k: _FakeProc())
+
+    result = DockerVerifier(tmp_path, clock=SteppingClock()).run_baseline()
+    assert result.outcome == events.VerificationOutcome.PASSED
+    _assert_create_argv_uses_effective_identity(captured)
+
+
+def test_lifecycle_aware_create_argv_passes_the_effective_identity(monkeypatch, tmp_path) -> None:
+    _fake_effective_identity(monkeypatch)
+    captured: list[str] = []
+    calls = [_create_success(), _result(0, _state_json(status="exited", exit_code=0)), _result(0)]
+
+    def fake_run_docker(*args: str, **kwargs):
+        if args and args[0] == "create":
+            captured.extend(args)
+        return calls.pop(0)
+
+    monkeypatch.setattr("codeagent.executor._run_docker", fake_run_docker)
+    monkeypatch.setattr(docker_ownership_module, "docker_ps_all_id_name_pairs", lambda **k: ({}, {}))
+    monkeypatch.setattr("codeagent.executor.subprocess.Popen", lambda *a, **k: _FakeProc())
+
+    ctx = DockerVerifierLifecycleContext(publisher=_FakeContainerPublisher())
+    result = DockerVerifier(tmp_path, clock=SteppingClock(), lifecycle_context=ctx).run_baseline()
+    assert result.outcome is events.VerificationOutcome.PASSED
+    _assert_create_argv_uses_effective_identity(captured)
+
+
+@pytest.mark.parametrize("missing", ["geteuid", "getegid"])
+def test_unsupported_platform_fails_closed_without_fallback(monkeypatch, tmp_path, missing) -> None:
+    """No POSIX effective IDs: construction is refused before any Docker
+    call — never a silent fallback to 1000:1000."""
+    monkeypatch.delattr(os, missing)
+    monkeypatch.setattr("codeagent.executor._run_docker", lambda *a, **k: pytest.fail("Docker must not be called"))
+    with pytest.raises(ValueError, match="unsupported"):
+        DockerVerifier(tmp_path, clock=SteppingClock())
+
+
+_UID0_MESSAGE = "verification containers refuse effective uid 0"
+_GID0_MESSAGE = "verification containers refuse effective gid 0 (the root group)"
+
+
+@pytest.mark.parametrize(
+    "uid, gid, message",
+    [
+        (0, 4343, _UID0_MESSAGE),  # uid 0 would make the process root
+        (4242, 0, _GID0_MESSAGE),  # root group only; the process is not root
+        (0, 0, _UID0_MESSAGE),  # the uid check runs first
+    ],
+)
+def test_effective_uid_0_and_gid_0_are_refused(monkeypatch, tmp_path, uid, gid, message) -> None:
+    """Both are refused before any Docker call, each with its exact fixed
+    message: uid 0 would make the formerly non-root container root; gid 0
+    with a nonzero uid would grant the root-group identity."""
+    _fake_effective_identity(monkeypatch, uid, gid)
+    monkeypatch.setattr("codeagent.executor._run_docker", lambda *a, **k: pytest.fail("Docker must not be called"))
+    with pytest.raises(ValueError) as excinfo:
+        DockerVerifier(tmp_path, clock=SteppingClock())
+    assert str(excinfo.value) == message

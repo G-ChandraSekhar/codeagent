@@ -6,7 +6,7 @@ slice plan. Most tests are Docker-free: an injected owner-state
 `activate()` failure sends `run()` straight to `_terminate()` (real
 evidence capture, real worktree disposal, no baseline), and
 `DockerVerifier.__init__` makes no Docker call. Only the end-to-end and
-crash-boundary tests (T30-T38) carry `requires_docker`; the exact set is
+crash-boundary tests (T30-T38) and the T46 regression carry `requires_docker`; the exact set is
 pinned by T41.
 
 Every `LifecycleRunCleanupError` assertion also checks the message is
@@ -1249,6 +1249,52 @@ def test_t38_construction_failure_disposes_and_is_reconciled(env):
     _assert_fully_clean(env, repo_key, lifecycle_id)
 
 
+@requires_docker
+def test_t46_post_patch_verification_reads_the_private_0700_leaf(env, monkeypatch):
+    """T46 (ADR 0004 Amendment 15 regression): the composition's mount is
+    the reserved worktree leaf, mode 0700. Post-patch verification must run
+    as the effective host identity and actually import and pass the fixture
+    tests from that mount. Run 37138458659 failed exactly here on Linux under
+    the former fixed `--user 1000:1000`; the identity check also makes this
+    load-bearing on hosts (such as macOS Docker Desktop) that mask mount
+    permissions."""
+    identity = f"{os.geteuid()}:{os.getegid()}"
+    modes = []
+    real = ls.LifecycleWorktreePublisher.publish
+
+    def publish(self, transition):
+        real(self, transition)
+        if transition.intent is WorktreeIntent.PRESENT:
+            (run_dir,) = _run_dirs(env.state)
+            leaf = _leaf(env.state, run_dir.parent.parent.name, run_dir.name)
+            modes.append(os.stat(leaf).st_mode & 0o777)
+
+    monkeypatch.setattr(ls.LifecycleWorktreePublisher, "publish", publish)
+    result = lr.run_lifecycle_aware(
+        env.repo,
+        run_id="r-0700",
+        task_statement="fix retry bug",
+        approval_mode=domain.ApprovalMode.INTERACTIVE,
+        evidence_root=env.evidence,
+        patch_operations=(PatchOperation("jobs/worker.py", BUGGY, FIXED),),
+        model=MarkerGatedFakeModel(read_path="jobs/worker.py", marker=BUG_MARKER, plan=PLAN),
+        approval=FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
+        verify_command=(
+            "sh",
+            "-c",
+            f'test "$(id -u):$(id -g)" = "{identity}" && exec python3 -B -m unittest tests.test_worker',
+        ),
+        clock=SystemClock(),
+        max_repair_iterations=0,
+    )
+    assert modes == [0o700]
+    assert result.finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED, result.finished
+    assert result.finished.error is None and result.release_confirmed
+    repo_key, lifecycle_id, proj = _only_run(env.state)
+    assert proj["state"] == "COMPLETE"
+    _assert_fully_clean(env, repo_key, lifecycle_id)
+
+
 # ---------------------------------------------------------------------------
 # F. Concurrency and scope pins
 # ---------------------------------------------------------------------------
@@ -1321,7 +1367,7 @@ def _calls_named(tree, name):
 def test_t41_scope_and_marker_pins():
     """T41: no bundled module imports the internal composition; only it calls
     `prepare_lifecycle(`/`create_shared_lifecycle_publishers(`; and exactly
-    the T30-T38 tests require Docker."""
+    the T30-T38 and T46 tests require Docker."""
     importers, callers = [], {"prepare_lifecycle": set(), "create_shared_lifecycle_publishers": set()}
     for module in sorted(_SRC.glob("*.py")):
         tree = ast.parse(module.read_text())
@@ -1347,4 +1393,6 @@ def test_t41_scope_and_marker_pins():
         )
 
     docker_tests = {n for n in dir(this) if n.startswith("test_") and marked(getattr(this, n))}
-    assert docker_tests == {n for n in dir(this) if n.startswith(tuple(f"test_t{i}_" for i in range(30, 39)))}
+    assert docker_tests == {
+        n for n in dir(this) if n.startswith(tuple(f"test_t{i}_" for i in (*range(30, 39), 46)))
+    }

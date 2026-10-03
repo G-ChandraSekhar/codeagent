@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import subprocess
 import threading
@@ -427,13 +428,45 @@ _SECURITY_FLAGS: tuple[str, ...] = (
     "1",
     "--pids-limit",
     "128",
-    "--user",
-    "1000:1000",
+    # `--user` is deliberately absent: it is the effective host identity,
+    # computed per verifier by `_effective_container_user()` (ADR 0004
+    # Amendment 15) and passed beside these flags at every `docker create`.
     "--cap-drop",
     "ALL",
     "--security-opt",
     "no-new-privileges",
 )
+
+
+def _effective_container_user() -> str:
+    """The `--user` value for every verification container: the effective
+    host UID:GID (ADR 0004 Amendment 15). The effective identity is the one
+    that creates and owns the deterministic 0700 worktree leaf, so it is the
+    only identity guaranteed to read the read-only bind mount; the previous
+    fixed `1000:1000` could not read it on a host whose user is not uid 1000.
+
+    Fails closed rather than falling back to any fixed identity: a platform
+    without POSIX effective IDs is refused. Effective uid 0 is refused because
+    it would make the formerly non-root container process root. Effective gid
+    0 is refused too: with a nonzero uid it does not make the process root,
+    but it would give the process the root-group identity the fixed
+    `1000:1000` never had.
+    """
+    geteuid = getattr(os, "geteuid", None)
+    getegid = getattr(os, "getegid", None)
+    if geteuid is None or getegid is None:
+        raise ValueError(
+            "verification containers require POSIX effective user and group IDs; "
+            "this platform is unsupported"
+        )
+    uid, gid = geteuid(), getegid()
+    if uid == 0:
+        raise ValueError("verification containers refuse effective uid 0")
+    if gid == 0:
+        raise ValueError(
+            "verification containers refuse effective gid 0 (the root group)"
+        )
+    return f"{uid}:{gid}"
 
 
 class DockerVerifier:
@@ -474,6 +507,7 @@ class DockerVerifier:
         # "failed to create the verification container" instead of a
         # clear reason.
         self._worktree_path = str(resolved)
+        self._container_user = _effective_container_user()
         self._image = image
         self._command = command
         self._timeout_seconds = timeout_seconds
@@ -556,6 +590,8 @@ class DockerVerifier:
                 "--name",
                 name,
                 *_SECURITY_FLAGS,
+                "--user",
+                self._container_user,
                 "--mount",
                 f"type=bind,source={self._worktree_path},target=/workspace,readonly",
                 "--workdir",
@@ -1085,6 +1121,8 @@ class DockerVerifier:
                 "--name",
                 name,
                 *_SECURITY_FLAGS,
+                "--user",
+                self._container_user,
                 *label_flags,
                 "--mount",
                 f"type=bind,source={self._worktree_path},target=/workspace,readonly",

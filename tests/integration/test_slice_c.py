@@ -330,3 +330,30 @@ def test_real_docker_cleanup_after_container_level_test_failure() -> None:
             result = verifier.run_baseline()
             assert result.outcome == events.VerificationOutcome.TEST_FAILURE
         _no_stray_containers()
+
+
+def test_real_docker_reads_a_private_0700_mount_as_the_effective_host_identity() -> None:
+    """ADR 0004 Amendment 15 regression (legacy, no lifecycle context): the
+    mounted root is mode 0700, owned by the effective host user. The
+    container must run as exactly that identity and import the fixture's
+    tests from the mount. Under the former fixed `--user 1000:1000` this
+    fails twice over on a host whose user is not uid 1000: the identity
+    check below, and (on native Linux Docker) the import itself, which is
+    the run 37138458659 failure."""
+    identity = f"{os.geteuid()}:{os.getegid()}"
+    with real_fixture_repo() as repo:
+        os.chmod(repo, 0o700)
+        assert (os.stat(repo).st_mode & 0o777) == 0o700
+        verifier = DockerVerifier(
+            repo,
+            command=(
+                "sh",
+                "-c",
+                f'test "$(id -u):$(id -g)" = "{identity}" && python3 -B -c "import tests.test_worker"',
+            ),
+            clock=SystemClock(),
+        )
+        result = verifier.run_baseline()
+        assert result.outcome is events.VerificationOutcome.PASSED, result
+        assert result.exit_code == 0
+    _no_stray_containers()

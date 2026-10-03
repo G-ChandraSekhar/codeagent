@@ -5989,3 +5989,63 @@ implementation.
 
 Linux CI is pending: nothing is staged, committed or pushed. T-E1, T-F1 and
 T-F2 are unchanged. `uv.lock` was untouched.
+
+## 2026-10-03 — Correction: Slice 3C-4 failed Linux CI; fix-forward to the effective host identity (ADR 0004 Amendment 15, Accepted)
+
+The 3C-4 entry above is the historical pre-push record. It is kept unchanged,
+and its "Linux CI is pending" is superseded by this entry.
+
+**Failed CI evidence.** Commit `bd77411`, run
+[37138458659](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37138458659),
+conclusion `failure`. The complete-suite step reported
+`2 failed, 3228 passed, 3 skipped`, which accounts for all 3,233. The failing
+tests were T30 and T31. Every other step succeeded:
+- the Docker preflight (`28.0.4`);
+- the image check (`linux/amd64`);
+- the dedicated `test_slice_c.py` step, `3 passed`;
+- the empty leftover check.
+
+**Root cause.**
+- The reserved worktree leaf, which is mode 0700 and owned by the host user,
+  became the bind-mount root.
+- The container's fixed `--user 1000:1000` could not read it on the runner.
+- The baseline was expected to fail anyway, so the defect surfaced only at
+  post-patch verification. The repair loop then re-applied the patch.
+- A disposable named-volume experiment reproduced it: uid 1000 on a 0700 leaf
+  owned by uid 1001 gave `ModuleNotFoundError`, and both controls passed import.
+- Why every earlier check missed it:
+  - macOS Docker Desktop masks mount permissions, so local runs passed.
+  - Before 3C-4, nothing mounted the 0700 leaf.
+  - `test_slice_3b6.py` mounts the repository itself.
+  - A12/A13 involve no container.
+
+**Lesson.** A `PASSED` locally on Docker Desktop does not prove a bind mount is
+readable on native Linux. Each regression now asserts the container identity
+explicitly, so it fails on macOS too.
+
+**Decisions.**
+- **Fix forward, not revert (author decision).** The composition has no
+  operator-facing caller.
+- **Use `os.geteuid()`/`os.getegid()` (author decision).** The effective
+  identity is the one that creates the leaf.
+- **Fail closed (my decision; accepted at review).** A platform without POSIX
+  effective IDs is refused. Effective uid 0 is refused, because it would make
+  the formerly non-root container process root. Effective gid 0 is refused
+  separately: with a nonzero uid it does not make the process root, but it would
+  grant the root-group identity. Each refusal has its own fixed message, and
+  there is no fallback to `1000:1000`.
+- **S4 left as historical.** Its spike helpers still assume `--user` lives in
+  `_SECURITY_FLAGS`; that is recorded as a residual.
+
+**Verification (local, macOS, `CODEAGENT_REQUIRE_DOCKER=1`).**
+- 9 new unit cases.
+- Two real-Docker 0700-mount regressions: the legacy `test_slice_c.py` test and
+  T46.
+- Mutation to `1000:1000`: both regressions failed, T30 still passed (the
+  original blind spot), and the file was restored byte-for-byte.
+- `test_executor.py`: 142 passed.
+- Focused set plus both integration files: 1,723 passed, forward and reverse.
+- Full suite: 3,244 passed, 0 skipped.
+- No leftovers.
+
+Linux CI is pending. Nothing is committed. `uv.lock` was untouched.
