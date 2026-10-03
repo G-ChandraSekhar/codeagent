@@ -344,6 +344,25 @@ def is_projection_creating_worktree_reconciliation_shape(projection: LifecyclePr
     )
 
 
+def is_projection_materialized_worktree_reconciliation_shape(projection: LifecycleProjection) -> bool:
+    """ADR 0004 Amendment 13: a `creating`/`present`/`disposing` worktree
+    record (with its origin commit) whose checkpoint ref is absent, whose
+    `failure` is null, and whose two container records are absent.
+    Includes Amendment 12's `creating` shape; the reconciler routes a
+    `creating` record with no registration to Amendment 12's row."""
+    return (
+        projection.worktree.intent
+        in (WorktreeIntent.CREATING, WorktreeIntent.PRESENT, WorktreeIntent.DISPOSING)
+        and projection.worktree.expected_head is not None
+        and projection.checkpoint_ref == ABSENT_TRANSITION
+        and projection.failure is None
+        and projection.baseline.intent is ContainerIntent.ABSENT
+        and projection.baseline.id is None
+        and projection.verification.intent is ContainerIntent.ABSENT
+        and projection.verification.id is None
+    )
+
+
 def _container_to_dict(container: ContainerAttribution) -> dict:
     return {"intent": container.intent.value, "id": container.id}
 
@@ -1311,13 +1330,21 @@ def _publish_reconciler_container_transition(
     return updated
 
 
-# ADR 0004 Amendment 12: reconciler-only worktree edges, distinct from the
-# live owner's `_validate_worktree_edge` (unchanged). `creating -> absent`
-# here means only that, at the time of the check, the exact deterministic
-# path was unregistered, had no Git admin entry, and its name lookup was
-# ENOENT -- never the live owner's historical claim.
+# ADR 0004 Amendments 12 and 13: reconciler-only worktree edges, distinct
+# from the live owner's `_validate_worktree_edge` (unchanged). An edge to
+# `absent` means only that, at the time of the check, the exact
+# deterministic path was unregistered, had no Git admin entry, and its name
+# lookup was ENOENT -- never the live owner's historical claim. An edge to
+# `disposing` is the reconciler's write-ahead before `git worktree remove`,
+# and must keep the exact same origin commit. `disposing -> disposing`
+# with the same commit is a no-op that publishes nothing.
 _RECONCILER_WORKTREE_TRANSITION_EDGES: frozenset[tuple[WorktreeIntent, WorktreeIntent]] = frozenset(
-    {(WorktreeIntent.CREATING, WorktreeIntent.ABSENT)}
+    {
+        (WorktreeIntent.CREATING, WorktreeIntent.ABSENT),
+        (WorktreeIntent.CREATING, WorktreeIntent.DISPOSING),
+        (WorktreeIntent.PRESENT, WorktreeIntent.DISPOSING),
+        (WorktreeIntent.DISPOSING, WorktreeIntent.ABSENT),
+    }
 )
 
 
@@ -1326,9 +1353,13 @@ def _publish_reconciler_worktree_transition(
     projection: LifecycleProjection,
     *,
     attempts_total: int,
+    target: WorktreeTransition = ABSENT_WORKTREE_TRANSITION,
 ) -> LifecycleProjection:
-    """Record the reconciler-owned `creating -> absent` worktree collapse
-    (ADR 0004 Amendment 12). Requires the entry to already be
+    """Record one reconciler-owned worktree edge (ADR 0004 Amendments 12
+    and 13): `creating -> absent`, `creating/present -> disposing`, or
+    `disposing -> absent` (`target` defaults to absent). A `disposing`
+    target must keep the current origin commit; `disposing -> disposing`
+    with that commit is a no-op that publishes nothing. Requires the entry to already be
     `RECONCILING` (the caller entered it before mutating anything) with
     `attempts_total` unchanged -- never an increment. Every other field is
     carried forward unchanged; one atomic publish, classified exactly like
@@ -1337,9 +1368,16 @@ def _publish_reconciler_worktree_transition(
         raise _illegal_transition("the reconciler worktree transition requires RECONCILING")
     if attempts_total != projection.reconciliation.attempts_total:
         raise _illegal_transition("the reconciler worktree transition never changes attempts_total")
-    if (projection.worktree.intent, WorktreeIntent.ABSENT) not in _RECONCILER_WORKTREE_TRANSITION_EDGES:
+    if not isinstance(target, WorktreeTransition):
+        raise _illegal_transition("the reconciler worktree target must be a WorktreeTransition")
+    current = projection.worktree
+    if target.intent is WorktreeIntent.DISPOSING and target.expected_head != current.expected_head:
+        raise _illegal_transition("a reconciler disposing write must keep the exact same origin commit")
+    if current.intent is WorktreeIntent.DISPOSING and target.intent is WorktreeIntent.DISPOSING:
+        return projection  # resume no-op: publishes nothing
+    if (current.intent, target.intent) not in _RECONCILER_WORKTREE_TRANSITION_EDGES:
         raise _illegal_transition("not a legal reconciler-owned worktree transition edge")
-    updated = replace(projection, worktree=ABSENT_WORKTREE_TRANSITION)
+    updated = replace(projection, worktree=target)
     data = _encode_and_bound_projection(updated)
     try:
         publish_private_file_atomically_at(run_dir_fd, LIFECYCLE_JSON_FILENAME, data, mode=0o600)

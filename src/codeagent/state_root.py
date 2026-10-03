@@ -299,6 +299,19 @@ class StateRoot:
         validate_hex32(repo_key, field_name="repo_key")
         return open_existing_directory_chain_if_present(self.root_fd, ["worktrees", repo_key])
 
+    def observe_materialized_worktree_leaf(self, repo_key: str, lifecycle_id: str) -> "MaterializedLeafObservation":
+        """ADR 0004 Amendment 13: a fresh, no-follow, fd-relative observation
+        of a dead lifecycle's deterministic worktree leaf. Holds no
+        descriptor after it returns. `MATERIALIZED` means a real directory,
+        owned by the current user, mode exactly 0700, containing a no-follow
+        regular `.git` file; it cannot tell the original directory from a
+        valid replacement. Raises `LifecycleFsError(CLEANUP_UNCONFIRMED)` on
+        an unconfirmed descriptor close (never reported as `UNKNOWN`), or the
+        `_assert_cloexec` capability error."""
+        validate_hex32(repo_key, field_name="repo_key")
+        validate_hex32(lifecycle_id, field_name="lifecycle_id")
+        return _observe_materialized_leaf(self, repo_key, lifecycle_id)
+
     def open_abandoned_worktree_leaf(self, repo_key: str, lifecycle_id: str) -> "AbandonedLeafOpenResult":
         """ADR 0004 Amendment 12: observe (never create) a dead lifecycle's
         deterministic worktree leaf. Returns `EMPTY_PRIVATE_DIRECTORY` with
@@ -893,7 +906,7 @@ class _LeafObservationDiagnostic(Exception):
     """Private, categorical-only cause for a setup-cleanup failure: carries
     the observation the open was about to return, never raw OS text."""
 
-    def __init__(self, observation: AbandonedLeafObservation) -> None:
+    def __init__(self, observation: "AbandonedLeafObservation | MaterializedLeafObservation") -> None:
         super().__init__(observation.value)
         self.observation = observation
 
@@ -963,6 +976,86 @@ class _AbandonedWorktreeLeaf:
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         self._close_once(exc_value)
         return False
+
+
+@unique
+class MaterializedLeafObservation(str, Enum):
+    ABSENT = "absent"
+    MATERIALIZED = "materialized"
+    CONFLICT = "conflict"
+    UNKNOWN = "unknown"  # inspection failure only, never a close failure
+
+
+def _observe_materialized_leaf(state_root: "StateRoot", repo_key: str, lifecycle_id: str) -> MaterializedLeafObservation:
+    try:
+        parent_fd = open_existing_directory_chain_if_present(state_root.root_fd, ["worktrees", repo_key])
+    except LifecycleFsError as exc:
+        if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED:
+            raise
+        if exc.reason in (
+            LifecycleFsFailure.SYMLINK_REFUSED,
+            LifecycleFsFailure.NOT_A_DIRECTORY,
+            LifecycleFsFailure.UNSAFE_PERMISSIONS,
+        ):
+            return MaterializedLeafObservation.CONFLICT
+        return MaterializedLeafObservation.UNKNOWN
+    if parent_fd is None:
+        return MaterializedLeafObservation.ABSENT
+
+    opened = [parent_fd]
+
+    def finish(observation: MaterializedLeafObservation) -> MaterializedLeafObservation:
+        # Every locally owned descriptor, attempted exactly once.
+        _dominant_cleanup(opened, _LeafObservationDiagnostic(observation))
+        return observation
+
+    try:
+        try:
+            st = os.stat(lifecycle_id, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return finish(MaterializedLeafObservation.ABSENT)
+        except OSError:
+            return finish(MaterializedLeafObservation.UNKNOWN)
+        if not stat.S_ISDIR(st.st_mode):
+            return finish(MaterializedLeafObservation.CONFLICT)
+        flags = os.O_RDONLY | _directory_flag() | _nofollow_flag() | _cloexec_flag()
+        try:
+            leaf_fd = os.open(lifecycle_id, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                return finish(MaterializedLeafObservation.CONFLICT)
+            return finish(MaterializedLeafObservation.UNKNOWN)
+        opened.append(leaf_fd)
+        _assert_cloexec(leaf_fd)
+        try:
+            held = os.fstat(leaf_fd)
+        except OSError:
+            return finish(MaterializedLeafObservation.UNKNOWN)
+        if (
+            not os.path.samestat(st, held)
+            or held.st_uid != os.getuid()
+            or stat.S_IMODE(held.st_mode) != 0o700
+        ):
+            return finish(MaterializedLeafObservation.CONFLICT)
+        try:
+            git_file = os.stat(".git", dir_fd=leaf_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return finish(MaterializedLeafObservation.CONFLICT)
+        except OSError:
+            return finish(MaterializedLeafObservation.UNKNOWN)
+        if not stat.S_ISREG(git_file.st_mode):
+            return finish(MaterializedLeafObservation.CONFLICT)
+        return finish(MaterializedLeafObservation.MATERIALIZED)
+    except LifecycleFsError as exc:
+        # `_assert_cloexec` failure, or a `finish()` cleanup failure that has
+        # already attempted every descriptor -- never a second close attempt.
+        if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED:
+            raise
+        _dominant_cleanup(opened, exc)
+        raise
+    except BaseException as exc:
+        _dominant_cleanup(opened, exc)
+        raise
 
 
 def _open_abandoned_leaf(state_root: "StateRoot", repo_key: str, lifecycle_id: str) -> AbandonedLeafOpenResult:

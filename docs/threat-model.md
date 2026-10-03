@@ -822,18 +822,26 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   empty, private (owner-only, mode 0700), unregistered directory with no
   Git admin entry. Automatic pre-run reconciliation removes that empty
   leaf (non-recursive, descriptor-relative `rmdir`, independently
-  re-observed) and records the entry `RECONCILED`. This mechanism is
-  **not wired** to any CLI or controller composition path. Worktrees left
-  `present` or `disposing`, an `absent` record with a leftover directory,
-  and general orphaned-worktree removal all remain unresolved and still
-  block admission
+  re-observed) and records the entry `RECONCILED`. ADR 0004 Amendment 13
+  adds a second narrow row: a materialized `creating`/`present`/`disposing`
+  worktree with exactly one unlocked, non-bare Git registration, exactly
+  one matching admin entry, a private (mode 0700) directory containing a
+  regular `.git` file, and its containers and checkpoint ref already
+  absent, is removed by one bounded `git worktree remove --force <exact
+  path>` and recorded `RECONCILED` only after the registration, admin
+  entry, and directory are each freshly confirmed absent. Neither
+  mechanism is **wired** to any CLI or controller composition path.
+  Still unresolved and still blocking admission: a worktree whose
+  containers or checkpoint ref remain, a locked/ambiguous/inconsistent
+  registration, an `absent` record with a leftover directory, an
+  unregistered directory left by a partial Git removal, and general
+  orphaned-worktree removal
 - Planned control: the production design is **accepted** in
   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md` —
   worktrees at deterministic paths under the CodeAgent state root,
   removed only after exact attribution and confirmed container absence,
   by fail-closed pre-run reconciliation or `codeagent reconcile`.
-  Implemented only for the narrow empty-reservation row above; removal of
-  a materialized (`present`/`disposing`) worktree is not implemented
+  Implemented only for the two narrow rows above (Amendments 12 and 13)
 - Evidence/future test: the S5 spike's macOS/arm64 evidence covers the
   worktree side of this too, in spike scaffolding only — it demonstrates
   a fresh-process reconciler correctly identifying and removing an
@@ -843,25 +851,28 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   (`spikes/s5/S5_RESULT.md`). Linux/x86-64 workflow run
   `34783737248` reproduced the same result with independent clean
   baseline/final diagnostics. As with T-F1, this is spike evidence only.
-  Production evidence covers only the Amendment 12 row: real-Git and
-  real-filesystem tests in `tests/unit/test_reconciliation.py`, and real
-  SIGKILL tests in `tests/integration/test_worktree_publication.py`
-  (a dead owner after a durable `creating`, and a reconciler killed at
-  each of its three resume points) — automated-test evidence, not a
-  security review
+  Production evidence covers only the Amendment 12 and 13 rows: real-Git
+  and real-filesystem tests in `tests/unit/test_reconciliation.py`, and
+  real SIGKILL tests in `tests/integration/test_worktree_publication.py`
+  (a dead owner after a durable `creating` or `present`, a reconciler
+  killed at each resume point of both rows, and a deterministic model of a
+  kill during the Git command) — automated-test evidence, not a security
+  review
 - Residual risk: between the crash and the next sweep, content sits on disk
   — acceptable for a local single-user tool, not acceptable if this were
   ever multi-tenant (explicitly out of scope, A5). Accepting ADR 0004 does
   not mitigate or resolve this threat or T-F1 in production. T-F2 remains
-  open: Amendment 12's narrow empty-reservation row is implemented but
-  unwired (no CLI or controller path calls `prepare_lifecycle()`), and
-  removal of `present`/`disposing` worktrees, of an `absent` record's
-  leftover directory, and general orphaned-worktree cleanup remain
-  unimplemented. End-to-end mitigation still requires production wiring
+  open: the Amendment 12 and 13 rows are implemented but unwired (no CLI
+  or controller path calls `prepare_lifecycle()`); worktrees whose
+  containers or checkpoint ref remain, an `absent` record's leftover
+  directory, a partial-removal leftover, and general orphaned-worktree
+  cleanup remain unimplemented; and a reconciler killed by SIGKILL while
+  `git worktree remove` runs leaves an orphaned Git process whose
+  lifetime nothing bounds. End-to-end mitigation still requires production wiring
   plus production acceptance tests on both platforms. T-F1 remains open
   as stated in its own entry
 - Owning milestone/spike: ADR 0004 (accepted) — Milestone 3 lifecycle
-  work; in progress (Amendment 12's row only; unwired)
+  work; in progress (Amendments 12 and 13 rows only; unwired)
 
 **T-F3 — Corrupt/partial JSONL event log after crash mid-write.**
 - Asset/objective: O5, O7

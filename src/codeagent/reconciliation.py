@@ -69,7 +69,7 @@ from ._docker_ownership import DockerListingError as _DockerListingError
 from ._docker_ownership import InspectOwnership as _InspectOwnership
 from ._docker_ownership import parse_inspect_output as _parse_inspect_output
 from ._docker_ownership import parse_ps_all_output as _parse_ps_all_output
-from ._git_safety import GIT_TIMEOUT_SECONDS, GitSafetyError, run_git_bounded
+from ._git_safety import GIT_TIMEOUT_SECONDS, GitSafetyError, GitSafetyFailure, ObjectFormat, run_git_bounded
 from ._lifecycle_fs import (
     LifecycleFsError,
     LifecycleFsFailure,
@@ -109,16 +109,17 @@ from .lifecycle_store import (
     LifecycleStoreError,
     LifecycleStoreFailure,
     WorktreeIntent,
+    WorktreeTransition,
     _publish_projection_state,
     _publish_reconciler_container_transition,
     _publish_reconciler_worktree_transition,
-    is_projection_creating_worktree_reconciliation_shape,
+    is_projection_materialized_worktree_reconciliation_shape,
     is_projection_fully_absent_shape,
     is_projection_reconciliation_eligible_shape,
     load_lifecycle_projection,
 )
 from .repo_identity import RepositoryIdentity, TrustedRepositoryContext
-from .state_root import AbandonedLeafObservation, LeafRemovalKind, RmdirReport
+from .state_root import AbandonedLeafObservation, LeafRemovalKind, MaterializedLeafObservation, RmdirReport
 from .state_locks import LockError, LockFailure, LockHandle, LockKind, LockScope, acquire_lifecycle_lock
 
 MAINTENANCE_DIRNAME = "maintenance"
@@ -203,6 +204,16 @@ class ReconciliationEntryResult:
     worktree_leaf_outcome: str = "not_inspected"
     worktree_removal_observation: str | None = None
     worktree_absent_transition_confirmed_this_pass: bool = False
+    # ADR 0004 Amendment 13: pre-/post-command evidence for a materialized
+    # worktree. `None` means "not observed in this pass" -- never invented.
+    worktree_registration_pre: dict | None = None
+    worktree_registration_post: dict | None = None
+    worktree_admin_matches_pre: int | str | None = None
+    worktree_admin_matches_post: int | str | None = None
+    worktree_leaf_pre: str | None = None
+    worktree_leaf_post: str | None = None
+    worktree_removal_attempt: str = "not_attempted"
+    worktree_disposing_transition_confirmed_this_pass: bool = False
 
 
 @dataclass(frozen=True)
@@ -577,17 +588,29 @@ class _GitWorktreeListingError(Exception):
     pass
 
 
-def _worktree_registered_paths(working_tree_root: str) -> set[str]:
+class _WorktreeListingError(_GitWorktreeListingError):
+    """The bounded listing failed or timed out, or its output is malformed.
+    Both are inspection failures (`SUBSTRATE_UNAVAILABLE`)."""
+
+
+_HEX_RE = re.compile(rb"^[0-9a-f]+$")
+
+
+@dataclass(frozen=True)
+class _WorktreeRecord:
+    path: str
+    head: str | None  # None only for a bare record
+    kind: str  # "branch" | "detached" | "bare"
+    branch: str | None
+    locked: bool
+    prunable: bool
+
+
+def _run_worktree_listing(working_tree_root: str) -> bytes:
     """One bounded, timeout-controlled, no-shell, no-hooks
-    `git worktree list --porcelain -z` listing of every registered
-    worktree path, run through the shared hardened `run_git_bounded`
-    seam (sanitized `GIT_*` environment, structured argv only, byte-
-    capped output with confirmed child termination on timeout or
-    overflow). `-z` NUL-delimits every field instead of newline-
-    delimiting them, so a registered path containing a newline or any
-    other Git-quoting-sensitive character cannot be misparsed into a
-    different (or missed) path — a NUL byte can never appear in a real
-    POSIX pathname, so it is an unambiguous delimiter."""
+    `git worktree list --porcelain -z` through the shared hardened
+    `run_git_bounded` seam. `-z` NUL-delimits every field, so a registered
+    path containing a newline cannot be misparsed."""
     try:
         result = run_git_bounded(
             working_tree_root,
@@ -599,13 +622,166 @@ def _worktree_registered_paths(working_tree_root: str) -> set[str]:
             timeout=GIT_TIMEOUT_SECONDS,
         )
     except GitSafetyError as exc:
-        raise _GitWorktreeListingError("git worktree listing failed, timed out, or exceeded its output bound") from exc
+        raise _WorktreeListingError("git worktree listing failed, timed out, or exceeded its output bound") from exc
+    return result.stdout
 
+
+def _parse_worktree_listing(stdout: bytes, *, oid_hex_len: int | None) -> tuple[_WorktreeRecord, ...]:
+    """Structural parser for `git worktree list --porcelain -z` (ADR 0004
+    Amendment 13). Each field is `key` or `key SP value`, NUL-terminated; a
+    record ends with an empty field. Validates every record and field but
+    keeps structurally valid duplicate paths: target-aware duplicate
+    analysis belongs to `_analyze_worktree_listing`. `oid_hex_len=None`
+    accepts either object-format length (legacy callers). Any violation
+    raises `_WorktreeListingError` -- the listing is never partially
+    trusted."""
+
+    def malformed() -> _WorktreeListingError:
+        return _WorktreeListingError("git worktree listing is malformed")
+
+    if not stdout or not stdout.endswith(b"\x00"):
+        raise malformed()
+    fields = stdout[:-1].split(b"\x00")
+    if not fields or fields[-1] != b"":
+        raise malformed()
+
+    records: list[_WorktreeRecord] = []
+    current: list[bytes] = []
+    for field in fields:
+        if field != b"":
+            current.append(field)
+            continue
+        if not current:
+            raise malformed()  # a stray empty field
+        records.append(_parse_worktree_record(current, oid_hex_len=oid_hex_len, malformed=malformed))
+        current = []
+    if current or not records:
+        raise malformed()
+    return tuple(records)
+
+
+def _parse_worktree_record(fields: list[bytes], *, oid_hex_len: int | None, malformed) -> _WorktreeRecord:
+    seen: dict[bytes, bytes | None] = {}
+    for index, field in enumerate(fields):
+        key, sep, value = field.partition(b" ")
+        if key in seen:
+            raise malformed()
+        if key == b"worktree":
+            if index != 0 or not sep or not value.startswith(b"/"):
+                raise malformed()
+        elif key in (b"HEAD", b"branch"):
+            if not sep or not value:
+                raise malformed()
+        elif key in (b"detached", b"bare"):
+            if sep:
+                raise malformed()
+        elif key in (b"locked", b"prunable"):
+            pass  # with or without a reason; the reason is never retained
+        else:
+            raise malformed()  # unknown key
+        seen[key] = value if sep else None
+    if b"worktree" not in seen:
+        raise malformed()
+    kinds = [k for k in (b"branch", b"detached", b"bare") if k in seen]
+    if len(kinds) != 1:
+        raise malformed()
+    kind = kinds[0].decode()
+    head = seen.get(b"HEAD")
+    if kind == "bare":
+        if head is not None:
+            raise malformed()
+    else:
+        if head is None or not _HEX_RE.fullmatch(head):
+            raise malformed()
+        if oid_hex_len is None:
+            if len(head) not in (40, 64):
+                raise malformed()
+        elif len(head) != oid_hex_len:
+            raise malformed()
+    branch = seen.get(b"branch")
+    return _WorktreeRecord(
+        path=os.path.normpath(os.fsdecode(seen[b"worktree"])),
+        head=head.decode() if head is not None else None,
+        kind=kind,
+        branch=os.fsdecode(branch) if branch is not None else None,
+        locked=b"locked" in seen,
+        prunable=b"prunable" in seen,
+    )
+
+
+@dataclass(frozen=True)
+class _TargetRegistration:
+    """`state` is "absent" (0 target records), "present" (1 or "many"), or
+    "unknown" (listing failure; every other field None). `target_bare` is
+    set iff exactly one target record exists; `locked`/`prunable` iff
+    exactly one NON-bare target record exists."""
+
+    state: str
+    target_records: int | str | None
+    target_bare: bool | None
+    locked: bool | None
+    prunable: bool | None
+
+    def to_trace(self) -> dict:
+        return {
+            "state": self.state,
+            "target_records": self.target_records,
+            "target_bare": self.target_bare,
+            "locked": self.locked,
+            "prunable": self.prunable,
+        }
+
+
+_UNKNOWN_REGISTRATION = _TargetRegistration("unknown", None, None, None, None)
+
+
+@dataclass(frozen=True)
+class _WorktreeListingAnalysis:
+    registration: _TargetRegistration
+
+
+def _analyze_worktree_listing(records: tuple[_WorktreeRecord, ...], *, target_path: str) -> _WorktreeListingAnalysis:
+    """Target-aware analysis: duplicate normalized NON-target paths make the
+    listing malformed (`_WorktreeListingError`); records matching the
+    deterministic target are counted 0 / 1 / "many" and returned as data
+    -- "many" is positive ambiguity the caller refuses."""
+    target = os.path.normpath(target_path)
+    seen: set[str] = set()
+    matches = [r for r in records if r.path == target]
+    for record in records:
+        if record.path == target:
+            continue
+        if record.path in seen:
+            raise _WorktreeListingError("git worktree listing repeats a path")
+        seen.add(record.path)
+    if not matches:
+        return _WorktreeListingAnalysis(_TargetRegistration("absent", 0, None, None, None))
+    if len(matches) > 1:
+        return _WorktreeListingAnalysis(_TargetRegistration("present", "many", None, None, None))
+    only = matches[0]
+    if only.kind == "bare":
+        return _WorktreeListingAnalysis(_TargetRegistration("present", 1, True, None, None))
+    return _WorktreeListingAnalysis(_TargetRegistration("present", 1, False, only.locked, only.prunable))
+
+
+def _observe_target_registration(working_tree_root: str, *, oid_hex_len: int, target_path: str) -> _TargetRegistration:
+    try:
+        records = _parse_worktree_listing(_run_worktree_listing(working_tree_root), oid_hex_len=oid_hex_len)
+        return _analyze_worktree_listing(records, target_path=target_path).registration
+    except _WorktreeListingError:
+        return _UNKNOWN_REGISTRATION
+
+
+def _worktree_registered_paths(working_tree_root: str) -> set[str]:
+    """Legacy set of every registered path, built by the same structural
+    parser. With no authorized target exception, ANY duplicate normalized
+    path makes the listing malformed."""
+    records = _parse_worktree_listing(_run_worktree_listing(working_tree_root), oid_hex_len=None)
     paths: set[str] = set()
-    prefix = b"worktree "
-    for token in result.stdout.split(b"\x00"):
-        if token.startswith(prefix):
-            paths.add(os.path.normpath(os.fsdecode(token[len(prefix) :])))
+    for record in records:
+        if record.path in paths:
+            raise _WorktreeListingError("git worktree listing repeats a path")
+        paths.add(record.path)
     return paths
 
 
@@ -649,7 +825,29 @@ def _scan_worktree_admin_entries(canonical_common_dir: str, lifecycle_id: str) -
     return result
 
 
-def _scan_admin_entries_into(opened: list[int], canonical_common_dir: str, lifecycle_id: str) -> _AdminScanResult:
+def _count_worktree_admin_entries(canonical_common_dir: str, lifecycle_id: str) -> int | str:
+    """ADR 0004 Amendment 13: the same bounded, names-only, close-once scan,
+    counting every admin name for this lifecycle instead of stopping at
+    the first. Returns 0, 1, "many", or "unknown" (limit exceeded, an
+    inspection failure, or a `worktrees/` that is not a real directory).
+    A descriptor-close failure raises `LifecycleFsError(CLEANUP_UNCONFIRMED)`
+    and dominates, exactly as `_scan_worktree_admin_entries`."""
+    opened: list[int] = []
+    counter = [0]
+    try:
+        result = _scan_admin_entries_into(opened, canonical_common_dir, lifecycle_id, counter=counter)
+    except BaseException as exc:
+        _dominant_cleanup(opened, exc)
+        raise
+    _dominant_cleanup(opened, _AdminScanDiagnostic(result))
+    if result in (_AdminScanResult.NONE_FOUND, _AdminScanResult.MATCH_FOUND):
+        return counter[0] if counter[0] < 2 else "many"
+    return "unknown"
+
+
+def _scan_admin_entries_into(
+    opened: list[int], canonical_common_dir: str, lifecycle_id: str, *, counter: list[int] | None = None
+) -> _AdminScanResult:
     flags = os.O_RDONLY | _directory_flag() | _nofollow_flag() | _cloexec_flag()
     try:
         common_fd = os.open(canonical_common_dir, flags)
@@ -685,9 +883,13 @@ def _scan_admin_entries_into(opened: list[int], canonical_common_dir: str, lifec
                     return _AdminScanResult.LIMIT_EXCEEDED
                 match = _ADMIN_NAME_RE.fullmatch(name)
                 if match is not None and match["id"] == target:
-                    return _AdminScanResult.MATCH_FOUND
+                    if counter is None:
+                        return _AdminScanResult.MATCH_FOUND
+                    counter[0] += 1
     except OSError:
         return _AdminScanResult.INSPECTION_FAILED
+    if counter is not None and counter[0]:
+        return _AdminScanResult.MATCH_FOUND
     return _AdminScanResult.NONE_FOUND
 
 
@@ -862,7 +1064,7 @@ def _is_reconciliation_eligible(projection: LifecycleProjection) -> bool:
     are admitted by neither predicate."""
     return projection.state in _RECONCILER_ELIGIBLE_STATES and (
         is_projection_reconciliation_eligible_shape(projection)
-        or is_projection_creating_worktree_reconciliation_shape(projection)
+        or is_projection_materialized_worktree_reconciliation_shape(projection)
     )
 
 
@@ -928,8 +1130,8 @@ def _reconcile_locked_entry(
             worktree_initial_persisted_intent=initial_intent,
         )
 
-    if projection.worktree.intent is WorktreeIntent.CREATING:
-        result = _reconcile_creating_worktree_entry(
+    if projection.worktree.intent is not WorktreeIntent.ABSENT:
+        result = _route_worktree_entry(
             run_dir_fd=run_dir_fd,
             lifecycle_id=lifecycle_id,
             projection=projection,
@@ -1234,6 +1436,371 @@ def _reconcile_absent_worktree_entry(
         checkpoint_ref_confirmed_absent=True,
         baseline_id=observed_ids["baseline"],
         verification_id=observed_ids["verification"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 13: materialized `creating`/`present`/`disposing`
+# worktrees, removed only by one bounded, hardened, single-force
+# `git worktree remove --force <exact path>`.
+# ---------------------------------------------------------------------------
+
+_WORKTREE_REMOVE_STDOUT_MAX_BYTES = 4096
+
+# Every reason `run_git_bounded` can emit for this command -> trace value.
+# An unexpected reason falls back to "cleanup_unconfirmed": nothing about the
+# child is asserted, and no observation or transition follows it.
+_REMOVAL_ATTEMPT_BY_FAILURE = {
+    GitSafetyFailure.BOUNDED_COMMAND_FAILED: "exited_nonzero",
+    GitSafetyFailure.GIT_COMMAND_TIMEOUT: "stopped_after_failure",
+    GitSafetyFailure.BINARY_OUTPUT_TOO_LARGE: "stopped_after_failure",
+    GitSafetyFailure.PROCESS_SETUP_FAILED: "stopped_after_failure",
+    GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED: "cleanup_unconfirmed",
+    GitSafetyFailure.GIT_EXECUTABLE_UNAVAILABLE: "launch_failed",
+}
+
+
+def _attempt_worktree_remove(working_tree_root: str, target_path: str) -> str:
+    """Run the one sanctioned worktree mutation. Its exit status is never
+    evidence of success; the caller always re-observes (unless the child
+    was never launched, or was not confirmed stopped)."""
+    try:
+        run_git_bounded(
+            working_tree_root,
+            "worktree",
+            "remove",
+            "--force",
+            target_path,
+            limit=_WORKTREE_REMOVE_STDOUT_MAX_BYTES,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except GitSafetyError as exc:
+        return _REMOVAL_ATTEMPT_BY_FAILURE.get(exc.reason, "cleanup_unconfirmed")
+    return "exited_zero"
+
+
+@dataclass(frozen=True)
+class _WorktreeObservation:
+    registration: _TargetRegistration
+    admin: int | str  # 0 / 1 / "many" / "unknown"
+    leaf: str  # MaterializedLeafObservation value
+
+
+def _observe_worktree(
+    *, state_root, identity: RepositoryIdentity, context: TrustedRepositoryContext, lifecycle_id: str, target_path: str
+) -> _WorktreeObservation:
+    """Three fresh, independent observations. A descriptor-close or
+    CLOEXEC failure propagates as `LifecycleFsError`."""
+    registration = _observe_target_registration(
+        context.working_tree_root,
+        oid_hex_len=ObjectFormat(identity.object_format).hex_length,
+        target_path=target_path,
+    )
+    admin = _count_worktree_admin_entries(identity.canonical_common_dir, lifecycle_id)
+    leaf = state_root.observe_materialized_worktree_leaf(identity.repo_key, lifecycle_id).value
+    return _WorktreeObservation(registration, admin, leaf)
+
+
+def _pre_removal_gate(intent: WorktreeIntent, registration: _TargetRegistration, admin):
+    """Decide every row that registration and admin evidence settle on their
+    own, before any leaf observation. Returns `(outcome, detail)` to stop,
+    or `None` when the leaf observer's result is genuinely needed: one
+    eligible registration with one admin entry, or `disposing` with neither
+    (where an absent leaf is the collapse case). A `creating` record with no
+    registration never reaches here (Amendment 12 routing)."""
+    refused = ReconciliationEntryOutcome.REFUSED
+    if registration.state == "unknown" or admin == "unknown":
+        return ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the worktree could not be fully inspected"
+    if registration.target_records == "many":
+        return refused, "the worktree path is registered more than once"
+    if registration.target_records == 1:
+        if registration.target_bare:
+            return refused, "the worktree registration is bare"
+        if registration.locked:
+            return refused, "the worktree registration is locked"
+        if admin != 1:
+            return refused, "the worktree registration has no single matching admin entry"
+        return None
+    if intent is not WorktreeIntent.DISPOSING:
+        return refused, "the worktree is not registered"
+    if admin != 0:
+        return refused, "a git worktree admin entry exists without a registration"
+    return None
+
+
+def _classify_pre_removal(intent: WorktreeIntent, obs: _WorktreeObservation):
+    """Before-command table. Returns ("remove" | "collapse", None, None) or
+    ("stop", outcome, detail). Nothing has been changed yet."""
+    r, admin, leaf = obs.registration, obs.admin, obs.leaf
+    refused = ReconciliationEntryOutcome.REFUSED
+    if r.state == "unknown" or admin == "unknown" or leaf == "unknown":
+        return "stop", ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the worktree could not be fully inspected"
+    if leaf == "conflict":
+        return "stop", refused, "the worktree leaf is not a private materialized directory"
+    if r.target_records == "many":
+        return "stop", refused, "the worktree path is registered more than once"
+    if r.target_records == 1:
+        if r.target_bare:
+            return "stop", refused, "the worktree registration is bare"
+        if r.locked:
+            return "stop", refused, "the worktree registration is locked"
+        if admin != 1:
+            return "stop", refused, "the worktree registration has no single matching admin entry"
+        if leaf == "materialized":
+            if r.prunable:
+                return "stop", refused, "git reports the registered worktree as prunable"
+            return "remove", None, None
+        if intent is WorktreeIntent.DISPOSING:
+            return "remove", None, None  # D2: disposing, registered, directory confirmed absent
+        return "stop", refused, "the registered worktree directory is missing without disposal begun"
+    if admin != 0:
+        return "stop", refused, "a git worktree admin entry exists without a registration"
+    if leaf == "absent" and intent is WorktreeIntent.DISPOSING:
+        return "collapse", None, None
+    return "stop", refused, "the worktree is not registered"
+
+
+def _classify_post_removal(obs: _WorktreeObservation):
+    """After-command table. Returns (outcome or None if confirmed absent,
+    leaf_outcome)."""
+    r, admin, leaf = obs.registration, obs.admin, obs.leaf
+    refused = ReconciliationEntryOutcome.REFUSED
+    failed = ReconciliationEntryOutcome.FAILED
+    if r.state == "unknown" or admin == "unknown" or leaf == "unknown":
+        return ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "removal_unconfirmed"
+    if leaf == "conflict" or r.target_records == "many":
+        return refused, "removal_unconfirmed"
+    if r.target_records == 1:
+        if r.target_bare or r.locked or admin != 1:
+            return refused, "removal_unconfirmed"
+        if leaf == "materialized":
+            return failed, "removal_unconfirmed"
+        return failed, "registered_directory_missing"
+    if admin != 0:
+        return refused, "removal_unconfirmed"
+    if leaf == "materialized":
+        return failed, "partial_removal_leftover"
+    return None, "removed_by_git"
+
+
+def _route_worktree_entry(
+    *,
+    run_dir_fd: int,
+    lifecycle_id: str,
+    projection: LifecycleProjection,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+) -> ReconciliationEntryResult:
+    """Dispatch a non-absent worktree record (ADR 0004 Amendments 12/13):
+    `creating` with no registration goes to Amendment 12's empty-leaf row
+    (whose own admin scan refuses any admin entry); everything else goes
+    to the Amendment 13 materialized row."""
+    target_path = os.path.normpath(os.path.join(state_root.path, "worktrees", identity.repo_key, lifecycle_id))
+
+    def stop(outcome, detail, registration=None) -> ReconciliationEntryResult:
+        return ReconciliationEntryResult(
+            lifecycle_id,
+            outcome,
+            detail,
+            run_id=projection.run_id,
+            attempt_number=projection.reconciliation.attempts_total,
+            worktree_registration_pre=registration.to_trace() if registration is not None else None,
+        )
+
+    outcome, detail = _observe_checkpoint_ref_absent(lifecycle_id=lifecycle_id, identity=identity, context=context)
+    if outcome is not None:
+        return stop(outcome, detail)
+    registration = _observe_target_registration(
+        context.working_tree_root,
+        oid_hex_len=ObjectFormat(identity.object_format).hex_length,
+        target_path=target_path,
+    )
+    if registration.state == "unknown":
+        return stop(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "worktree listing failed", registration)
+    if projection.worktree.intent is WorktreeIntent.CREATING and registration.state == "absent":
+        result = _reconcile_creating_worktree_entry(
+            run_dir_fd=run_dir_fd,
+            lifecycle_id=lifecycle_id,
+            projection=projection,
+            state_root=state_root,
+            identity=identity,
+            context=context,
+        )
+        return replace(result, worktree_registration_pre=registration.to_trace())
+    return _reconcile_materialized_worktree_entry(
+        run_dir_fd=run_dir_fd,
+        lifecycle_id=lifecycle_id,
+        projection=projection,
+        state_root=state_root,
+        identity=identity,
+        context=context,
+        registration=registration,
+        target_path=target_path,
+    )
+
+
+def _reconcile_materialized_worktree_entry(
+    *,
+    run_dir_fd: int,
+    lifecycle_id: str,
+    projection: LifecycleProjection,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+    registration: _TargetRegistration,
+    target_path: str,
+) -> ReconciliationEntryResult:
+    """ADR 0004 Amendment 13. Inspection (admin scan, leaf, containers)
+    mutates nothing. Then: RECONCILING (+1 only on a fresh cycle) ->
+    reconciler `-> disposing` (skipped when already disposing) -> one
+    `git worktree remove --force` -> three fresh observations ->
+    `disposing -> absent` -> RECONCILED. `absent` is published only when
+    the registration, the admin entry, and the leaf are all independently
+    confirmed absent."""
+    intent = projection.worktree.intent
+    attempts = projection.reconciliation.attempts_total
+    trace: dict = {
+        "leaf_outcome": "removal_not_attempted",
+        "registration_pre": registration.to_trace(),
+        "registration_post": None,
+        "admin_pre": None,
+        "admin_post": None,
+        "leaf_pre": None,
+        "leaf_post": None,
+        "attempt": "not_attempted",
+        "disposing": False,
+        "absent": False,
+    }
+
+    def result(outcome, detail, **extra) -> ReconciliationEntryResult:
+        return ReconciliationEntryResult(
+            lifecycle_id,
+            outcome,
+            detail,
+            run_id=projection.run_id,
+            attempt_number=attempts,
+            worktree_leaf_outcome=trace["leaf_outcome"],
+            worktree_registration_pre=trace["registration_pre"],
+            worktree_registration_post=trace["registration_post"],
+            worktree_admin_matches_pre=trace["admin_pre"],
+            worktree_admin_matches_post=trace["admin_post"],
+            worktree_leaf_pre=trace["leaf_pre"],
+            worktree_leaf_post=trace["leaf_post"],
+            worktree_removal_attempt=trace["attempt"],
+            worktree_disposing_transition_confirmed_this_pass=trace["disposing"],
+            worktree_absent_transition_confirmed_this_pass=trace["absent"],
+            **extra,
+        )
+
+    # I4: admin entries. I5 (the leaf) only for rows that need its result:
+    # registration/admin evidence that already decides the outcome is never
+    # overridden by a leaf observation or its cleanup failure.
+    try:
+        admin = _count_worktree_admin_entries(identity.canonical_common_dir, lifecycle_id)
+        trace["admin_pre"] = admin
+        gate = _pre_removal_gate(intent, registration, admin)
+        if gate is not None:
+            return result(*gate)
+        leaf = state_root.observe_materialized_worktree_leaf(identity.repo_key, lifecycle_id).value
+        trace["leaf_pre"] = leaf
+    except LifecycleFsError as exc:
+        trace["leaf_outcome"] = (
+            "close_failed" if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED else "not_inspected"
+        )
+        return result(_classify_entry_fs_failure(exc), "the worktree could not be inspected")
+    action, outcome, detail = _classify_pre_removal(intent, _WorktreeObservation(registration, admin, leaf))
+    if action == "stop":
+        return result(outcome, detail)
+
+    # I6: both deterministic container names absent (invariant I4).
+    try:
+        name_to_id, _ = _docker_ps_all_id_name_pairs()
+    except _DockerListingError:
+        return result(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "container listing failed")
+    if f"codeagent-baseline-{lifecycle_id}" in name_to_id or f"codeagent-verification-{lifecycle_id}" in name_to_id:
+        return result(ReconciliationEntryOutcome.REFUSED, "a deterministic container name is present")
+
+    # M1: enter RECONCILING before any mutation; the only increment.
+    if projection.state is not LifecycleState.RECONCILING:
+        attempts += 1
+        try:
+            projection = _publish_projection_state(
+                run_dir_fd, projection, state=LifecycleState.RECONCILING, attempts_total=attempts
+            )
+        except LifecycleStoreError as exc:
+            return result(ReconciliationEntryOutcome.FAILED, f"the RECONCILING projection write failed ({exc.reason.value})")
+
+    # M2: reconciler write-ahead to `disposing` (skipped when already disposing).
+    if intent is not WorktreeIntent.DISPOSING:
+        try:
+            projection = _publish_reconciler_worktree_transition(
+                run_dir_fd,
+                projection,
+                attempts_total=attempts,
+                target=WorktreeTransition(
+                    intent=WorktreeIntent.DISPOSING, expected_head=projection.worktree.expected_head
+                ),
+            )
+        except LifecycleStoreError as exc:
+            return result(ReconciliationEntryOutcome.FAILED, f"the worktree disposing write failed ({exc.reason.value})")
+        trace["disposing"] = True
+
+    if action == "collapse":
+        trace["leaf_outcome"] = "already_absent"
+    else:
+        # M3: the one bounded, hardened, single-force removal.
+        attempt = _attempt_worktree_remove(context.working_tree_root, target_path)
+        trace["attempt"] = attempt
+        if attempt == "launch_failed":
+            return result(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "git could not be launched")
+        if attempt == "cleanup_unconfirmed":
+            trace["leaf_outcome"] = "removal_unconfirmed"
+            return result(
+                ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+                "the git worktree removal could not be confirmed stopped",
+            )
+        # M4: three fresh observations, whatever the command reported.
+        try:
+            post = _observe_worktree(
+                state_root=state_root,
+                identity=identity,
+                context=context,
+                lifecycle_id=lifecycle_id,
+                target_path=target_path,
+            )
+        except LifecycleFsError as exc:
+            trace["leaf_outcome"] = (
+                "close_failed" if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED else "removal_unconfirmed"
+            )
+            return result(_classify_entry_fs_failure(exc), "the worktree could not be re-observed")
+        trace["registration_post"] = post.registration.to_trace()
+        trace["admin_post"] = post.admin
+        trace["leaf_post"] = post.leaf
+        outcome, leaf_outcome = _classify_post_removal(post)
+        trace["leaf_outcome"] = leaf_outcome
+        if outcome is not None:
+            return result(outcome, f"worktree removal not confirmed ({leaf_outcome})")
+
+    # M5: reconciler-owned `disposing -> absent`.
+    try:
+        projection = _publish_reconciler_worktree_transition(run_dir_fd, projection, attempts_total=attempts)
+    except LifecycleStoreError as exc:
+        return result(ReconciliationEntryOutcome.FAILED, f"the worktree absent collapse write failed ({exc.reason.value})")
+    trace["absent"] = True
+
+    # M6.
+    try:
+        _publish_projection_state(run_dir_fd, projection, state=LifecycleState.RECONCILED, attempts_total=attempts)
+    except LifecycleStoreError as exc:
+        return result(ReconciliationEntryOutcome.FAILED, f"the RECONCILED projection write failed ({exc.reason.value})")
+    return result(
+        ReconciliationEntryOutcome.RECONCILED,
+        "confirmed absent and durably reconciled",
+        baseline_confirmed_absent=True,
+        verification_confirmed_absent=True,
+        worktree_confirmed_absent=True,
+        checkpoint_ref_confirmed_absent=True,
     )
 
 
@@ -1711,6 +2278,16 @@ class _MaintenanceTraceWriter:
                     "removal_observation": result.worktree_removal_observation,
                     "absent_transition_confirmed_this_pass": (
                         result.worktree_absent_transition_confirmed_this_pass
+                    ),
+                    "registration_pre": result.worktree_registration_pre,
+                    "registration_post": result.worktree_registration_post,
+                    "admin_matches_pre": result.worktree_admin_matches_pre,
+                    "admin_matches_post": result.worktree_admin_matches_post,
+                    "leaf_pre": result.worktree_leaf_pre,
+                    "leaf_post": result.worktree_leaf_post,
+                    "removal_attempt": result.worktree_removal_attempt,
+                    "disposing_transition_confirmed_this_pass": (
+                        result.worktree_disposing_transition_confirmed_this_pass
                     ),
                 },
                 "checkpoint_ref": {"ref_name": ref_name, "confirmed_absent": result.checkpoint_ref_confirmed_absent},

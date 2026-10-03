@@ -4420,7 +4420,6 @@ def test_reconciler_worktree_writer_never_changes_attempts(tmp_path, attempts_to
     [
         wl.ABSENT_WORKTREE_TRANSITION,
         wl.WorktreeTransition(intent=wl.WorktreeIntent.PRESENT, expected_head=_ORIGIN),
-        wl.WorktreeTransition(intent=wl.WorktreeIntent.DISPOSING, expected_head=_ORIGIN),
     ],
 )
 def test_reconciler_worktree_writer_only_creating_to_absent(tmp_path, worktree):
@@ -4462,8 +4461,15 @@ def test_reconciler_worktree_writer_classifies_publication_failures(tmp_path, mo
         os.close(fd)
 
 
-def test_live_owner_worktree_edges_unchanged_and_reconciler_table_is_exactly_one_edge():
-    assert ls._RECONCILER_WORKTREE_TRANSITION_EDGES == frozenset({(wl.WorktreeIntent.CREATING, wl.WorktreeIntent.ABSENT)})
+def test_live_owner_worktree_edges_unchanged_and_reconciler_table_is_exact():
+    assert ls._RECONCILER_WORKTREE_TRANSITION_EDGES == frozenset(
+        {
+            (wl.WorktreeIntent.CREATING, wl.WorktreeIntent.ABSENT),
+            (wl.WorktreeIntent.CREATING, wl.WorktreeIntent.DISPOSING),
+            (wl.WorktreeIntent.PRESENT, wl.WorktreeIntent.DISPOSING),
+            (wl.WorktreeIntent.DISPOSING, wl.WorktreeIntent.ABSENT),
+        }
+    )
     t = wl.WorktreeTransition
     absent = wl.ABSENT_WORKTREE_TRANSITION
     creating = t(intent=wl.WorktreeIntent.CREATING, expected_head=_ORIGIN)
@@ -4478,3 +4484,119 @@ def test_live_owner_worktree_edges_unchanged_and_reconciler_table_is_exactly_one
             else:
                 with pytest.raises(ls.LifecycleStoreError):
                     ls._validate_worktree_edge(current, target)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 13: materialized-worktree eligibility and the
+# reconciler-only `-> disposing` / `disposing -> absent` edges.
+# ---------------------------------------------------------------------------
+
+
+def _with_worktree(projection, intent, head=_ORIGIN):
+    return dataclasses.replace(projection, worktree=wl.WorktreeTransition(intent=intent, expected_head=head))
+
+
+def test_materialized_worktree_shape_truth_table():
+    base = _base_projection()
+    for intent in (wl.WorktreeIntent.CREATING, wl.WorktreeIntent.PRESENT, wl.WorktreeIntent.DISPOSING):
+        projection = _with_worktree(base, intent)
+        assert ls.is_projection_materialized_worktree_reconciliation_shape(projection)
+        assert not ls.is_projection_materialized_worktree_reconciliation_shape(
+            _with_role(projection, role="baseline", intent=ls.ContainerIntent.PRESENT, id="9" * 64)
+        )
+        assert not ls.is_projection_materialized_worktree_reconciliation_shape(
+            dataclasses.replace(
+                projection,
+                checkpoint_ref=cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_ORIGIN),
+            )
+        )
+        assert not ls.is_projection_materialized_worktree_reconciliation_shape(
+            dataclasses.replace(projection, failure=ls.FailureDetail(phase="p", detail="d"))
+        )
+    assert not ls.is_projection_materialized_worktree_reconciliation_shape(base)
+
+
+@pytest.mark.parametrize("source", [wl.WorktreeIntent.CREATING, wl.WorktreeIntent.PRESENT])
+def test_reconciler_disposing_write_ahead_keeps_head_and_carries_fields(tmp_path, source):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_worktree(_base_projection(state=ls.LifecycleState.RECONCILING, attempts_total=2), source)
+        target = wl.WorktreeTransition(intent=wl.WorktreeIntent.DISPOSING, expected_head=_ORIGIN)
+        updated = ls._publish_reconciler_worktree_transition(fd, projection, attempts_total=2, target=target)
+        assert updated.worktree == target
+        assert dataclasses.replace(updated, worktree=projection.worktree) == projection
+        on_disk = _read_back(run_dir)
+        assert on_disk["worktree"] == {"intent": "disposing", "expected_head": _ORIGIN}
+        assert on_disk["reconciliation"]["attempts_total"] == 2
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_disposing_requires_same_head(tmp_path):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_worktree(_base_projection(state=ls.LifecycleState.RECONCILING), wl.WorktreeIntent.PRESENT)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_worktree_transition(
+                fd,
+                projection,
+                attempts_total=0,
+                target=wl.WorktreeTransition(intent=wl.WorktreeIntent.DISPOSING, expected_head="2" * 40),
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_disposing_resume_is_a_no_op_publishing_nothing(tmp_path, monkeypatch):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        monkeypatch.setattr(
+            ls, "publish_private_file_atomically_at", lambda *a, **k: pytest.fail("a no-op must not publish")
+        )
+        projection = _with_worktree(_base_projection(state=ls.LifecycleState.RECONCILING), wl.WorktreeIntent.DISPOSING)
+        same = ls._publish_reconciler_worktree_transition(
+            fd,
+            projection,
+            attempts_total=0,
+            target=wl.WorktreeTransition(intent=wl.WorktreeIntent.DISPOSING, expected_head=_ORIGIN),
+        )
+        assert same is projection
+    finally:
+        os.close(fd)
+
+
+def test_reconciler_disposing_to_absent_collapse(tmp_path):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _with_worktree(_base_projection(state=ls.LifecycleState.RECONCILING, attempts_total=1), wl.WorktreeIntent.DISPOSING)
+        updated = ls._publish_reconciler_worktree_transition(fd, projection, attempts_total=1)
+        assert updated.worktree == wl.ABSENT_WORKTREE_TRANSITION
+        assert _read_back(run_dir)["worktree"] == {"intent": "absent", "expected_head": None}
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "source, target_intent",
+    [
+        (wl.WorktreeIntent.PRESENT, wl.WorktreeIntent.ABSENT),  # never skips disposing
+        (wl.WorktreeIntent.DISPOSING, wl.WorktreeIntent.PRESENT),
+        (wl.WorktreeIntent.ABSENT, wl.WorktreeIntent.DISPOSING),
+    ],
+)
+def test_reconciler_worktree_illegal_amendment_13_edges(tmp_path, source, target_intent):
+    fd, _ = _open_run_dir_fd(tmp_path)
+    try:
+        base = _base_projection(state=ls.LifecycleState.RECONCILING)
+        projection = base if source is wl.WorktreeIntent.ABSENT else _with_worktree(base, source)
+        target = (
+            wl.ABSENT_WORKTREE_TRANSITION
+            if target_intent is wl.WorktreeIntent.ABSENT
+            else wl.WorktreeTransition(intent=target_intent, expected_head=projection.worktree.expected_head or _ORIGIN)
+        )
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_worktree_transition(fd, projection, attempts_total=0, target=target)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)

@@ -2530,6 +2530,31 @@ Stage 2 (of the four-stage planning process in
   `absent` record with a leftover directory still block admission; the A4
   same-user race before `rmdir` remains; and this evidence adds no broader
   T-F2, T-F1, or T-E1 mitigation claim.
+- **Milestone 3 worktree reconciliation row for a dead materialized
+  `creating`/`present`/`disposing` worktree**, per
+  `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  "Amendment 13 (Accepted 2026-10-03)", **is implemented and locally
+  validated on macOS (2026-10-03); not committed, Linux CI pending.** When
+  the checkpoint ref and both containers are already absent, automatic
+  pre-run reconciliation removes the worktree with one bounded, hardened
+  `git worktree remove --force <exact path>` (never `-f -f`, never
+  `prune`), and records `RECONCILED` only after the registration, the Git
+  admin entry, and the directory are each freshly confirmed absent.
+  `reconciliation.py` gains a structural `-z` listing parser plus a
+  target-aware analyzer (the legacy path set uses the same parser),
+  admin-entry counting, the row and its routing (a `creating` record with no
+  registration still goes to Amendment 12's row); `state_root.py` gains
+  `observe_materialized_worktree_leaf()`; `lifecycle_store.py` gains the
+  eligibility predicate and reconciler-only `-> disposing` /
+  `disposing -> absent` edges (the live owner's table is unchanged).
+  Locked/ambiguous/inconsistent registrations, partial-removal leftovers,
+  and entries with containers or a checkpoint ref still block admission.
+  **Unwired**; T-E1 unchanged; T-F2 updated to cover both rows as partial,
+  reconciler-level coverage only. A SIGKILL during the Git command can
+  orphan the Git process (documented residual). Verified: full suite 3,164
+  passed, 0 skipped (`CODEAGENT_REQUIRE_DOCKER=1`); 17-file focused set
+  1,640, forward and reverse. Implementation/test evidence only, not a
+  security review. See `ENGINEERING_LOG.md`'s dated entry.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

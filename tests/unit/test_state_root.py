@@ -1608,3 +1608,126 @@ def test_close_failure_never_touches_reused_descriptor_numbers(abandoned_root, t
         monkeypatch.undo()
         for fd in reopened:
             os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 13: observe_materialized_worktree_leaf (fresh, no held
+# descriptor, never distinguishes the original from a valid replacement).
+# ---------------------------------------------------------------------------
+
+
+def _observe(state_root):
+    return state_root.observe_materialized_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID)
+
+
+def _make_materialized_leaf(state_root, *, mode=0o700, git="file"):
+    leaf = _make_empty_leaf(state_root)
+    if git == "file":
+        (leaf / ".git").write_text("gitdir: /nowhere\n")
+    elif git == "dir":
+        (leaf / ".git").mkdir()
+    elif git == "symlink":
+        os.symlink("/nowhere", leaf / ".git")
+    (leaf / "content.txt").write_text("x")
+    leaf.chmod(mode)
+    return leaf
+
+
+def test_materialized_observer_absent_parent_and_absent_leaf(abandoned_root):
+    before = _open_fd_count()
+    assert _observe(abandoned_root) is sr.MaterializedLeafObservation.ABSENT
+    _make_parent(abandoned_root)
+    assert _observe(abandoned_root) is sr.MaterializedLeafObservation.ABSENT
+    assert _open_fd_count() == before
+
+
+def test_materialized_observer_materialized_and_replacement_is_still_materialized(abandoned_root):
+    leaf = _make_materialized_leaf(abandoned_root)
+    before = _open_fd_count()
+    assert _observe(abandoned_root) is sr.MaterializedLeafObservation.MATERIALIZED
+    assert _open_fd_count() == before
+    # A valid replacement directory cannot be told apart from the original.
+    os.rename(leaf, leaf.parent / "original")
+    _make_materialized_leaf(abandoned_root)
+    assert _observe(abandoned_root) is sr.MaterializedLeafObservation.MATERIALIZED
+    for child in (leaf.parent / "original").iterdir():
+        child.unlink()
+    (leaf.parent / "original").rmdir()
+
+
+@pytest.mark.parametrize("setup", ["mode_0755", "git_dir", "git_symlink", "git_missing", "leaf_symlink", "leaf_file"])
+def test_materialized_observer_conflicts(abandoned_root, tmp_path, setup):
+    leaf = _abandoned_leaf_path(abandoned_root)
+    if setup == "mode_0755":
+        _make_materialized_leaf(abandoned_root, mode=0o755)
+    elif setup == "git_dir":
+        _make_materialized_leaf(abandoned_root, git="dir")
+    elif setup == "git_symlink":
+        _make_materialized_leaf(abandoned_root, git="symlink")
+    elif setup == "git_missing":
+        _make_materialized_leaf(abandoned_root, git=None)
+    elif setup == "leaf_symlink":
+        _make_parent(abandoned_root)
+        target = tmp_path / "elsewhere"
+        target.mkdir(mode=0o700)
+        (target / ".git").write_text("x")
+        os.symlink(target, leaf)
+    elif setup == "leaf_file":
+        _make_parent(abandoned_root)
+        leaf.write_text("x")
+    before = _open_fd_count()
+    assert _observe(abandoned_root) is sr.MaterializedLeafObservation.CONFLICT
+    assert _open_fd_count() == before
+    if leaf.is_dir() and not leaf.is_symlink():
+        leaf.chmod(0o700)
+        git = leaf / ".git"
+        if git.is_dir() and not git.is_symlink():
+            git.rmdir()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="permission checks are bypassed for root")
+def test_materialized_observer_unreadable_parent_is_unknown(abandoned_root):
+    parent = _make_parent(abandoned_root)
+    parent.chmod(0o000)
+    try:
+        assert _observe(abandoned_root) is sr.MaterializedLeafObservation.UNKNOWN
+    finally:
+        parent.chmod(0o700)
+
+
+def test_materialized_observer_cloexec_failure_alone_and_with_cleanup_failure(abandoned_root, monkeypatch):
+    _make_materialized_leaf(abandoned_root)
+    cloexec_error = lf.LifecycleFsError(lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE, "no cloexec")
+    monkeypatch.setattr(sr, "_assert_cloexec", lambda fd: (_ for _ in ()).throw(cloexec_error))
+    before = _open_fd_count()
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        _observe(abandoned_root)
+    assert excinfo.value is cloexec_error
+    assert _open_fd_count() == before
+    calls: list = []
+    monkeypatch.setattr(sr, "_dominant_cleanup", _failing_dominant_cleanup(calls))
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        _observe(abandoned_root)
+    assert excinfo.value.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+    assert excinfo.value.__cause__ is cloexec_error
+    assert len(calls) == 1 and len(calls[0]) == 2
+    assert _open_fd_count() == before
+
+
+@pytest.mark.parametrize("setup", ["materialized", "conflict", "absent_leaf"])
+def test_materialized_observer_setup_close_failure_raises_never_unknown(abandoned_root, monkeypatch, setup):
+    if setup == "materialized":
+        _make_materialized_leaf(abandoned_root)
+    elif setup == "conflict":
+        _make_materialized_leaf(abandoned_root, git=None)
+    else:
+        _make_parent(abandoned_root)
+    calls: list = []
+    monkeypatch.setattr(sr, "_dominant_cleanup", _failing_dominant_cleanup(calls))
+    before = _open_fd_count()
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        _observe(abandoned_root)
+    assert excinfo.value.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+    assert isinstance(excinfo.value.__cause__, sr._LeafObservationDiagnostic)
+    assert len(calls) == 1
+    assert _open_fd_count() == before

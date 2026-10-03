@@ -3292,13 +3292,21 @@ def test_a12_fresh_creating_empty_leaf_is_reconciled(a12):
     assert payload["worktree"] == {"intent": "absent", "expected_head": None}
     assert payload["reconciliation"]["attempts_total"] == 1
     event, _ = _a12_entry_event(a12, result)
-    assert event["worktree"] == {
+    amendment_12_fields = {
         "confirmed_absent": True,
         "initial_persisted_intent": "creating",
         "leaf_outcome": "removed",
         "removal_observation": "post_absent",
         "absent_transition_confirmed_this_pass": True,
     }
+    assert {k: event["worktree"][k] for k in amendment_12_fields} == amendment_12_fields
+    # Amendment 13 additions: the router's registration analysis is recorded;
+    # the materialized-row evidence was never collected on this path.
+    assert event["worktree"]["registration_pre"] == {
+        "state": "absent", "target_records": 0, "target_bare": None, "locked": None, "prunable": None
+    }
+    assert event["worktree"]["removal_attempt"] == "not_attempted"
+    assert event["worktree"]["leaf_post"] is None
 
 
 @pytest.mark.parametrize("parent_present", [True, False])
@@ -3729,12 +3737,16 @@ def test_a12_publication_failures_leave_exact_disk_state_and_resume(
 
 
 @pytest.mark.parametrize("worktree", ["present", "disposing"])
-def test_a12_present_and_disposing_refused_at_pre_lock_check(a12, worktree):
+def test_a12_present_and_disposing_without_registration_refused_by_amendment_13(a12, worktree):
+    """Superseded by Amendment 13: `present`/`disposing` records are now
+    eligible, so they pass the pre-lock check. With no registration and an
+    empty leaf (no `.git` file) the Amendment 13 table still refuses them,
+    with nothing changed."""
     run_dir, path = _a12_seed(a12, worktree=worktree)
     entry = a12.reconcile().entries[0]
     assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
-    assert entry.worktree_initial_persisted_intent is None  # never fabricated from the pre-lock peek
-    assert entry.worktree_leaf_outcome == "not_inspected"
+    assert entry.worktree_initial_persisted_intent == worktree
+    assert entry.worktree_removal_attempt == "not_attempted"
     assert _read_projection_dict(run_dir)["state"] == "PREPARING"
     assert path.is_dir()
 
@@ -3891,6 +3903,657 @@ def test_a12_admin_scan_bounds_apply_before_matching(a12, monkeypatch, names, ma
     monkeypatch.setattr(rc, "_ADMIN_SCAN_MAX_NAME_BYTES", max_bytes)
     result = rc._scan_worktree_admin_entries(a12.identity.canonical_common_dir, _A12_ID)
     assert result is rc._AdminScanResult[expected]
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 13: materialized `creating`/`present`/`disposing`
+# worktrees. Real Git and real filesystem; only the Docker listing is patched.
+# ---------------------------------------------------------------------------
+
+import shutil as _shutil
+
+from codeagent import _git_safety as _gs
+from codeagent import workspace as _ws
+
+_A13_ID = "e" * 32
+_H40 = "a" * 40
+
+
+def _rec(path, *, head=_H40, kind=b"detached", extra=()):
+    fields = [b"worktree " + path.encode()]
+    if head is not None:
+        fields.append(b"HEAD " + head.encode())
+    fields.append(kind)
+    fields.extend(extra)
+    return b"".join(f + b"\x00" for f in fields) + b"\x00"
+
+
+def test_a13_parser_accepts_the_real_field_grammar():
+    out = (
+        _rec("/r", kind=b"branch refs/heads/main")
+        + _rec("/w1", extra=(b"locked", b"prunable gitdir file points to non-existent location"))
+        + _rec("/w2", extra=(b"locked my reason",))
+        + _rec("/bare", head=None, kind=b"bare")
+    )
+    records = rc._parse_worktree_listing(out, oid_hex_len=40)
+    assert [r.path for r in records] == ["/r", "/w1", "/w2", "/bare"]
+    assert records[0].kind == "branch" and records[0].branch == "refs/heads/main"
+    assert records[1].locked and records[1].prunable
+    assert records[2].locked and not records[2].prunable
+    assert records[3].kind == "bare" and records[3].head is None
+    assert rc._parse_worktree_listing(_rec("/x", head="b" * 64), oid_hex_len=None)[0].head == "b" * 64
+
+
+@pytest.mark.parametrize(
+    "out",
+    [
+        b"",
+        _rec("/a")[:-1],  # missing final record terminator
+        b"\x00" + _rec("/a"),  # stray empty field
+        _rec("/a", extra=(b"color blue",)),  # unknown key
+        _rec("/a", extra=(b"locked", b"locked")),  # duplicate field
+        b"HEAD " + _H40.encode() + b"\x00worktree /a\x00detached\x00\x00",  # worktree not first
+        _rec("relative/path"),
+        _rec("/a", head="b" * 64),  # wrong object-format length
+        _rec("/a", head=_H40.upper()),
+        _rec("/a", kind=b"detached yes"),
+        _rec("/a", head=_H40, kind=b"bare"),  # bare with HEAD
+        _rec("/a", kind=b"branch"),  # branch without value
+        _rec("/a", kind=b"detached", extra=(b"branch refs/heads/x",)),  # two kinds
+        b"worktree /a\x00HEAD " + _H40.encode() + b"\x00\x00",  # no kind
+    ],
+)
+def test_a13_parser_rejects_malformed_listings(out):
+    with pytest.raises(rc._WorktreeListingError):
+        rc._parse_worktree_listing(out, oid_hex_len=40)
+
+
+def test_a13_analyzer_counts_target_and_rejects_duplicate_non_targets():
+    target = "/state/worktrees/k/" + _A13_ID
+    parse = lambda out: rc._parse_worktree_listing(out, oid_hex_len=40)  # noqa: E731
+    # Duplicate non-target path: structurally valid, analytically malformed.
+    with pytest.raises(rc._WorktreeListingError):
+        rc._analyze_worktree_listing(parse(_rec("/r") + _rec("/dup") + _rec("/dup")), target_path=target)
+    # Duplicate target path: returned as data ("many"), never malformed.
+    many = rc._analyze_worktree_listing(parse(_rec("/r") + _rec(target) + _rec(target)), target_path=target)
+    assert many.registration == rc._TargetRegistration("present", "many", None, None, None)
+    zero = rc._analyze_worktree_listing(parse(_rec("/r")), target_path=target)
+    assert zero.registration == rc._TargetRegistration("absent", 0, None, None, None)
+    one = rc._analyze_worktree_listing(parse(_rec("/r") + _rec(target, extra=(b"locked x",))), target_path=target)
+    assert one.registration == rc._TargetRegistration("present", 1, False, True, False)
+    bare = rc._analyze_worktree_listing(parse(_rec("/r") + _rec(target, head=None, kind=b"bare")), target_path=target)
+    assert bare.registration == rc._TargetRegistration("present", 1, True, None, None)
+
+
+def test_a13_legacy_registered_paths_uses_same_parser_and_rejects_any_duplicate(monkeypatch):
+    monkeypatch.setattr(rc, "_run_worktree_listing", lambda root: _rec("/r") + _rec("/t") + _rec("/t"))
+    with pytest.raises(rc._GitWorktreeListingError):
+        rc._worktree_registered_paths("/repo")
+    monkeypatch.setattr(rc, "_run_worktree_listing", lambda root: b"garbage")
+    with pytest.raises(rc._GitWorktreeListingError):
+        rc._worktree_registered_paths("/repo")
+    monkeypatch.setattr(rc, "_run_worktree_listing", lambda root: _rec("/r") + _rec("/t"))
+    assert rc._worktree_registered_paths("/repo") == {"/r", "/t"}
+
+
+def _a13_git_dir(h) -> _Path:
+    return _Path(h.identity.canonical_common_dir)
+
+
+@pytest.mark.parametrize(
+    "names, limit, expected",
+    [([], None, 0), ([_A13_ID], None, 1), ([_A13_ID, f"{_A13_ID}9"], None, "many"), (["x", "y", "z"], 2, "unknown")],
+)
+def test_a13_admin_count(harness, monkeypatch, names, limit, expected):
+    for name in names:
+        (_a13_git_dir(harness) / "worktrees" / name).mkdir(parents=True)
+    if limit is not None:
+        monkeypatch.setattr(rc, "_ADMIN_SCAN_MAX_ENTRIES", limit)
+    assert rc._count_worktree_admin_entries(harness.identity.canonical_common_dir, _A13_ID) == expected
+
+
+def test_a13_admin_count_close_failure_raises(harness, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(rc, "_dominant_cleanup", _a12_failing_cleanup(calls))
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        rc._count_worktree_admin_entries(harness.identity.canonical_common_dir, _A13_ID)
+    assert excinfo.value.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+
+
+def _a13_leaf(h) -> _Path:
+    return _Path(h.state_root.path) / "worktrees" / h.identity.repo_key / _A13_ID
+
+
+def _a13_materialize(h):
+    """A real, registered, materialized worktree at the deterministic path,
+    left behind as a crashed owner would leave it."""
+    with h.state_root.reserve_worktree_leaf(h.identity.repo_key, _A13_ID) as reservation:
+        wt = _ws.GitWorktree(h.repo, run_id="crashed", reservation=reservation)
+        wt.__enter__()
+    return _a13_leaf(h)
+
+
+def _a13_seed(h, intent, *, state=ls.LifecycleState.PREPARING, attempts=0, materialize=True):
+    head = _run("git", "-C", str(h.repo), "rev-parse", "HEAD").stdout.strip()
+    projection = dataclasses.replace(
+        _initial_projection(h, _A13_ID),
+        state=state,
+        worktree=_wl.WorktreeTransition(intent=_wl.WorktreeIntent(intent), expected_head=head),
+        reconciliation=ls.ReconciliationSummary(attempts_total=attempts, recent_failures=()),
+    )
+    run_dir = _seed_run_dir(h, _A13_ID, projection)
+    leaf = _a13_materialize(h) if materialize else _a13_leaf(h)
+    return run_dir, leaf
+
+
+def _a13_registered(h) -> bool:
+    out = _run("git", "-C", str(h.repo), "worktree", "list", "--porcelain").stdout
+    return f"worktree {os.path.realpath(_a13_leaf(h))}" in out
+
+
+@pytest.fixture
+def a13(harness, monkeypatch):
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: _empty_listing())
+    yield harness
+    leaf = _a13_leaf(harness)
+    if _a13_registered(harness):
+        _run("git", "-C", str(harness.repo), "worktree", "unlock", str(leaf), check=False)
+        _run("git", "-C", str(harness.repo), "worktree", "remove", "--force", str(leaf), check=False)
+    admin = _a13_git_dir(harness) / "worktrees"
+    if admin.is_symlink():
+        admin.unlink()
+    elif admin.is_dir():
+        for child in admin.iterdir():
+            if child.name.startswith(_A13_ID):
+                _shutil.rmtree(child)
+    if leaf.is_symlink() or leaf.is_file():
+        leaf.unlink()
+    elif leaf.exists():
+        for root, dirs, _files in os.walk(leaf):
+            for d in dirs:
+                os.chmod(os.path.join(root, d), 0o700)
+        os.chmod(leaf, 0o700)
+        _shutil.rmtree(leaf)
+
+
+def _a13_event(h, result):
+    event, _ = _a12_entry_event(h, result)
+    return event["worktree"]
+
+
+@pytest.mark.parametrize("intent", ["creating", "present", "disposing"])
+def test_a13_real_materialized_worktree_is_removed_and_reconciled(a13, intent):
+    run_dir, leaf = _a13_seed(a13, intent)
+    assert _a13_registered(a13) and (leaf / ".git").is_file()
+    result = a13.reconcile()
+    entry = result.entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+    assert not result.blocked
+    assert not _a13_registered(a13) and not os.path.lexists(leaf)
+    assert rc._count_worktree_admin_entries(a13.identity.canonical_common_dir, _A13_ID) == 0
+    payload = _read_projection_dict(run_dir)
+    assert payload["state"] == "RECONCILED"
+    assert payload["worktree"] == {"intent": "absent", "expected_head": None}
+    assert payload["reconciliation"]["attempts_total"] == 1
+    trace = _a13_event(a13, result)
+    assert trace["initial_persisted_intent"] == intent
+    assert trace["registration_pre"] == {
+        "state": "present", "target_records": 1, "target_bare": False, "locked": False, "prunable": False
+    }
+    assert trace["admin_matches_pre"] == 1 and trace["leaf_pre"] == "materialized"
+    assert trace["removal_attempt"] == "exited_zero"
+    assert trace["registration_post"] == {
+        "state": "absent", "target_records": 0, "target_bare": None, "locked": None, "prunable": None
+    }
+    assert trace["admin_matches_post"] == 0 and trace["leaf_post"] == "absent"
+    assert trace["leaf_outcome"] == "removed_by_git"
+    assert trace["disposing_transition_confirmed_this_pass"] is (intent != "disposing")
+    assert trace["absent_transition_confirmed_this_pass"] is True
+
+
+def test_a13_real_sha256_present_worktree_is_reconciled(tmp_path, monkeypatch):
+    repo = tmp_path / "repo256"
+    init = subprocess.run(
+        ["git", "init", "-q", "--object-format=sha256", str(repo)], capture_output=True, text=True
+    )
+    if init.returncode != 0:
+        pytest.skip("installed git does not support --object-format=sha256")
+    _run("git", "-C", str(repo), "config", "user.email", "a@b.com")
+    _run("git", "-C", str(repo), "config", "user.name", "a")
+    (repo / "f.txt").write_text("x")
+    _run("git", "-C", str(repo), "add", ".")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    _set_state_dir(monkeypatch, tmp_path, "state-256")
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: _empty_listing())
+    h = _Harness(repo, tmp_path / "state-256")
+    try:
+        assert h.identity.object_format == "sha256"
+        run_dir, leaf = _a13_seed(h, "present")
+        entry = h.reconcile().entries[0]
+        assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+        assert not os.path.lexists(leaf)
+        assert _read_projection_dict(run_dir)["state"] == "RECONCILED"
+    finally:
+        h.close()
+
+
+@pytest.mark.parametrize("intent, expected", [("disposing", "RECONCILED"), ("present", "REFUSED"), ("creating", "REFUSED")])
+def test_a13_registered_but_directory_missing_d2_only_for_disposing(a13, intent, expected):
+    run_dir, leaf = _a13_seed(a13, intent)
+    _shutil.rmtree(leaf)
+    assert _a13_registered(a13)
+    entry = a13.reconcile().entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome[expected], entry.detail
+    if expected == "RECONCILED":
+        assert not _a13_registered(a13)
+        assert rc._count_worktree_admin_entries(a13.identity.canonical_common_dir, _A13_ID) == 0
+    else:
+        assert _a13_registered(a13)  # nothing changed
+        assert entry.worktree_removal_attempt == "not_attempted"
+        assert _read_projection_dict(run_dir)["state"] == "PREPARING"
+
+
+def test_a13_disposing_with_nothing_left_collapses_without_git(a13, monkeypatch):
+    run_dir, _ = _a13_seed(a13, "disposing", materialize=False)
+    monkeypatch.setattr(rc, "_attempt_worktree_remove", lambda *a: pytest.fail("no removal for a collapse"))
+    entry = a13.reconcile().entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED
+    assert entry.worktree_leaf_outcome == "already_absent"
+    assert entry.worktree_removal_attempt == "not_attempted"
+    assert _read_projection_dict(run_dir)["state"] == "RECONCILED"
+
+
+def test_a13_present_with_nothing_left_is_refused(a13):
+    run_dir, _ = _a13_seed(a13, "present", materialize=False)
+    entry = a13.reconcile().entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert _read_projection_dict(run_dir)["state"] == "PREPARING"
+
+
+@pytest.mark.parametrize(
+    "setup", ["locked", "missing_git_file", "extra_admin", "unregistered_leftover", "leaf_symlink_swap"]
+)
+@pytest.mark.parametrize("intent", ["present", "disposing"])
+def test_a13_pre_removal_refusals_change_nothing(a13, monkeypatch, tmp_path, setup, intent):
+    run_dir, leaf = _a13_seed(a13, intent)
+    if setup == "locked":
+        _run("git", "-C", str(a13.repo), "worktree", "lock", str(leaf))
+    elif setup == "missing_git_file":
+        (leaf / ".git").unlink()
+    elif setup == "extra_admin":
+        (_a13_git_dir(a13) / "worktrees" / f"{_A13_ID}9").mkdir()
+    elif setup == "unregistered_leftover":
+        _shutil.rmtree(_a13_git_dir(a13) / "worktrees" / _A13_ID)
+    elif setup == "leaf_symlink_swap":
+        os.rename(leaf, tmp_path / "moved")
+        os.symlink(tmp_path / "moved", leaf)
+    monkeypatch.setattr(rc, "_attempt_worktree_remove", lambda *a: pytest.fail("must not attempt removal"))
+    entry = a13.reconcile().entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED, (setup, entry.detail)
+    payload = _read_projection_dict(run_dir)
+    assert payload["state"] == "PREPARING" and payload["worktree"]["intent"] == intent
+    if setup == "leaf_symlink_swap":
+        os.unlink(leaf)
+        os.rename(tmp_path / "moved", leaf)
+
+
+def test_a13_unregistered_creating_leftover_routes_to_amendment_12_and_is_refused(a13, monkeypatch):
+    run_dir, leaf = _a13_seed(a13, "creating")
+    _shutil.rmtree(_a13_git_dir(a13) / "worktrees" / _A13_ID)
+    monkeypatch.setattr(
+        sr.StateRoot, "observe_materialized_worktree_leaf", lambda *a: pytest.fail("Amendment 13 observer must not run")
+    )
+    entry = a13.reconcile().entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED  # Amendment 12: non-empty leaf -> CONFLICT
+    assert entry.worktree_leaf_outcome == "conflict_not_removed"
+    assert leaf.is_dir()
+
+
+@pytest.mark.parametrize("setup", ["checkpoint_ref", "container"])
+def test_a13_checkpoint_ref_or_container_present_is_refused(a13, monkeypatch, setup):
+    run_dir, leaf = _a13_seed(a13, "present")
+    if setup == "checkpoint_ref":
+        monkeypatch.setattr(rc.CheckpointRef, "observe", lambda self: cr.RefObservation(present=True, oid="0" * 40))
+    else:
+        monkeypatch.setattr(
+            rc, "_docker_ps_all_id_name_pairs", lambda: _listing({f"codeagent-verification-{_A13_ID}": "f" * 64})
+        )
+    entry = a13.reconcile().entries[0]
+    monkeypatch.undo()
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert _a13_registered(a13) and leaf.is_dir()
+
+
+def test_a13_symlink_inside_worktree_and_hostile_filter_are_harmless(a13, tmp_path):
+    canary = tmp_path / "canary"
+    canary.mkdir()
+    (canary / "keep.txt").write_text("keep")
+    marker = tmp_path / "FILTER_RAN"
+    _run("git", "-C", str(a13.repo), "config", "filter.spy.clean", f"touch {marker}; cat")
+    run_dir, leaf = _a13_seed(a13, "present")
+    os.symlink(canary, leaf / "link-out")
+    (leaf / ".gitattributes").write_text("* filter=spy\n")
+    (leaf / "f.txt").write_text("changed")
+    entry = a13.reconcile().entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED
+    assert (canary / "keep.txt").read_text() == "keep"
+    assert not marker.exists()
+
+
+def _a13_obs(state="present", records=1, bare=False, locked=False, prunable=False, admin=1, leaf="materialized"):
+    if state == "unknown":
+        registration = rc._UNKNOWN_REGISTRATION
+    elif records == 0:
+        registration = rc._TargetRegistration("absent", 0, None, None, None)
+    elif records == "many":
+        registration = rc._TargetRegistration("present", "many", None, None, None)
+    elif bare:
+        registration = rc._TargetRegistration("present", 1, True, None, None)
+    else:
+        registration = rc._TargetRegistration("present", 1, False, locked, prunable)
+    return rc._WorktreeObservation(registration, admin, leaf)
+
+
+@pytest.mark.parametrize(
+    "obs, outcome, leaf_outcome",
+    [
+        (_a13_obs(state="unknown"), "SUBSTRATE_UNAVAILABLE", "removal_unconfirmed"),
+        (_a13_obs(admin="unknown"), "SUBSTRATE_UNAVAILABLE", "removal_unconfirmed"),
+        (_a13_obs(leaf="unknown"), "SUBSTRATE_UNAVAILABLE", "removal_unconfirmed"),
+        (_a13_obs(leaf="conflict"), "REFUSED", "removal_unconfirmed"),
+        (_a13_obs(records="many"), "REFUSED", "removal_unconfirmed"),
+        (_a13_obs(bare=True), "REFUSED", "removal_unconfirmed"),
+        (_a13_obs(locked=True), "REFUSED", "removal_unconfirmed"),
+        (_a13_obs(admin=0), "REFUSED", "removal_unconfirmed"),
+        (_a13_obs(admin="many"), "REFUSED", "removal_unconfirmed"),
+        (_a13_obs(), "FAILED", "removal_unconfirmed"),
+        (_a13_obs(leaf="absent"), "FAILED", "registered_directory_missing"),
+        (_a13_obs(records=0, admin=1, leaf="absent"), "REFUSED", "removal_unconfirmed"),
+        (_a13_obs(records=0, admin=0), "FAILED", "partial_removal_leftover"),
+        (_a13_obs(records=0, admin=0, leaf="absent"), "RECONCILED", "removed_by_git"),
+    ],
+)
+def test_a13_after_command_outcome_table(a13, monkeypatch, obs, outcome, leaf_outcome):
+    run_dir, _ = _a13_seed(a13, "present")
+    monkeypatch.setattr(rc, "_attempt_worktree_remove", lambda *a: "exited_zero")
+    monkeypatch.setattr(rc, "_observe_worktree", lambda **k: obs)
+    entry = a13.reconcile().entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome[outcome], entry.detail
+    assert entry.worktree_leaf_outcome == leaf_outcome
+    payload = _read_projection_dict(run_dir)
+    if outcome == "RECONCILED":
+        assert payload["state"] == "RECONCILED" and entry.worktree_absent_transition_confirmed_this_pass
+    else:
+        assert payload["state"] == "RECONCILING" and payload["worktree"]["intent"] == "disposing"
+        assert entry.worktree_absent_transition_confirmed_this_pass is False
+
+
+@pytest.mark.parametrize("reason", [lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED, lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE])
+def test_a13_post_observation_descriptor_failures_dominate(a13, monkeypatch, reason):
+    run_dir, _ = _a13_seed(a13, "present")
+    monkeypatch.setattr(rc, "_attempt_worktree_remove", lambda *a: "exited_zero")
+    monkeypatch.setattr(rc, "_observe_worktree", lambda **k: (_ for _ in ()).throw(lf.LifecycleFsError(reason, "x")))
+    entry = a13.reconcile().entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE
+    assert entry.worktree_leaf_outcome == (
+        "close_failed" if reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED else "removal_unconfirmed"
+    )
+    assert _read_projection_dict(run_dir)["worktree"]["intent"] == "disposing"
+
+
+@pytest.mark.parametrize(
+    "reason, attempt, outcome, observed",
+    [
+        (_gs.GitSafetyFailure.BOUNDED_COMMAND_FAILED, "exited_nonzero", "FAILED", True),
+        (_gs.GitSafetyFailure.GIT_COMMAND_TIMEOUT, "stopped_after_failure", "FAILED", True),
+        (_gs.GitSafetyFailure.BINARY_OUTPUT_TOO_LARGE, "stopped_after_failure", "FAILED", True),
+        (_gs.GitSafetyFailure.PROCESS_SETUP_FAILED, "stopped_after_failure", "FAILED", True),
+        (_gs.GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED, "cleanup_unconfirmed", "SUBSTRATE_UNAVAILABLE", False),
+        (_gs.GitSafetyFailure.GIT_EXECUTABLE_UNAVAILABLE, "launch_failed", "SUBSTRATE_UNAVAILABLE", False),
+        (_gs.GitSafetyFailure.MALFORMED_OID, "cleanup_unconfirmed", "SUBSTRATE_UNAVAILABLE", False),  # defensive fallback
+    ],
+)
+def test_a13_command_failure_table(a13, monkeypatch, reason, attempt, outcome, observed):
+    run_dir, leaf = _a13_seed(a13, "present")
+    real = rc.run_git_bounded
+
+    def fake(root, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            raise _gs.GitSafetyError(reason, "simulated")
+        return real(root, *args, **kwargs)
+
+    monkeypatch.setattr(rc, "run_git_bounded", fake)
+    entry = a13.reconcile().entries[0]
+    monkeypatch.undo()
+    assert entry.worktree_removal_attempt == attempt
+    assert entry.outcome is rc.ReconciliationEntryOutcome[outcome]
+    assert (entry.worktree_registration_post is not None) is observed
+    assert (entry.worktree_leaf_post is not None) is observed
+    payload = _read_projection_dict(run_dir)
+    assert payload["state"] == "RECONCILING" and payload["worktree"]["intent"] == "disposing"
+    assert entry.worktree_absent_transition_confirmed_this_pass is False
+    assert _a13_registered(a13) and leaf.is_dir()  # the fake changed nothing
+
+
+def test_a13_deterministic_registration_removed_but_directory_remains(a13, monkeypatch):
+    """Portable model of a partial removal: the 'command' deletes only the
+    Git admin entry. Fresh observation: unregistered, no admin entry, a
+    materialized directory -> FAILED now, REFUSED on every later pass."""
+    run_dir, leaf = _a13_seed(a13, "present")
+
+    def partial(root, target):
+        _shutil.rmtree(_a13_git_dir(a13) / "worktrees" / _A13_ID)
+        return "exited_nonzero"
+
+    monkeypatch.setattr(rc, "_attempt_worktree_remove", partial)
+    first = a13.reconcile().entries[0]
+    assert first.outcome is rc.ReconciliationEntryOutcome.FAILED
+    assert first.worktree_leaf_outcome == "partial_removal_leftover"
+    monkeypatch.undo()
+    second = a13.reconcile().entries[0]
+    assert second.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert leaf.is_dir()
+    assert _read_projection_dict(run_dir)["worktree"]["intent"] == "disposing"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="permission checks are bypassed for root")
+def test_a13_conditional_real_partial_removal_after_permission_failure(a13, tmp_path):
+    """Conditional evidence only (the portable proof is the deterministic
+    test above): runs only if this host's Git reproduces a partial removal."""
+    probe_repo = _make_repo(tmp_path, "probe")
+    probe_wt = tmp_path / "probe-wt"
+    _run("git", "-C", str(probe_repo), "worktree", "add", "-q", "--detach", str(probe_wt))
+    (probe_wt / "sub").mkdir()
+    (probe_wt / "sub" / "f").write_text("x")
+    os.chmod(probe_wt / "sub", 0o500)
+    _run("git", "-C", str(probe_repo), "worktree", "remove", "--force", str(probe_wt), check=False)
+    reproduced = probe_wt.exists() and str(probe_wt) not in _run(
+        "git", "-C", str(probe_repo), "worktree", "list", "--porcelain"
+    ).stdout.replace(os.path.realpath(probe_wt), str(probe_wt))
+    os.chmod(probe_wt / "sub", 0o700) if (probe_wt / "sub").exists() else None
+    if not reproduced:
+        pytest.skip("this host's git does not reproduce a partial removal")
+    run_dir, leaf = _a13_seed(a13, "present")
+    (leaf / "sub").mkdir()
+    (leaf / "sub" / "f").write_text("x")
+    os.chmod(leaf / "sub", 0o500)
+    entry = a13.reconcile().entries[0]
+    os.chmod(leaf / "sub", 0o700)
+    assert entry.outcome in (rc.ReconciliationEntryOutcome.FAILED, rc.ReconciliationEntryOutcome.REFUSED)
+    assert _read_projection_dict(run_dir)["worktree"]["intent"] == "disposing"
+
+
+# Publication order for a fresh `present` entry: #1 RECONCILING (M1),
+# #2 present->disposing (M2), #3 disposing->absent (M5), #4 RECONCILED (M6).
+@pytest.mark.parametrize(
+    "nth, installed, disk_state, disk_worktree, removed",
+    [
+        (1, False, "PREPARING", "present", False),
+        (1, True, "RECONCILING", "present", False),
+        (2, False, "RECONCILING", "present", False),
+        (2, True, "RECONCILING", "disposing", False),
+        (3, False, "RECONCILING", "disposing", True),
+        (3, True, "RECONCILING", "absent", True),
+        (4, False, "RECONCILING", "absent", True),
+        (4, True, "RECONCILED", "absent", True),
+    ],
+)
+def test_a13_publication_failures_and_resume(a13, monkeypatch, nth, installed, disk_state, disk_worktree, removed):
+    run_dir, leaf = _a13_seed(a13, "present")
+    _a12_publish_fault(monkeypatch, nth, installed=installed)
+    first = a13.reconcile()
+    monkeypatch.setattr(ls, "publish_private_file_atomically_at", lf.publish_private_file_atomically_at)
+    entry = first.entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome.FAILED
+    assert entry.worktree_disposing_transition_confirmed_this_pass is (nth > 2)
+    assert entry.worktree_absent_transition_confirmed_this_pass is (nth > 3)
+    payload = _read_projection_dict(run_dir)
+    assert payload["state"] == disk_state and payload["worktree"]["intent"] == disk_worktree
+    assert (not _a13_registered(a13)) is removed
+    second = a13.reconcile()
+    assert not second.blocked, second.entries[0].detail
+    final = _read_projection_dict(run_dir)
+    assert final["state"] == "RECONCILED" and final["worktree"]["intent"] == "absent"
+    assert final["reconciliation"]["attempts_total"] == 1
+    assert not _a13_registered(a13) and not os.path.lexists(leaf)
+
+
+@pytest.mark.parametrize("intent", ["present", "disposing"])
+def test_a13_resume_from_reconciling_keeps_attempts(a13, intent):
+    run_dir, leaf = _a13_seed(a13, intent, state=ls.LifecycleState.RECONCILING, attempts=1)
+    entry = a13.reconcile().entries[0]
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED
+    assert entry.worktree_disposing_transition_confirmed_this_pass is (intent == "present")
+    assert _read_projection_dict(run_dir)["reconciliation"]["attempts_total"] == 1
+
+
+def test_a13_maintenance_event_fits_bound_with_every_new_field_maximal(tmp_path):
+    reg = {"state": "unknown", "target_records": "many", "target_bare": False, "locked": False, "prunable": False}
+    fd = os.open(tmp_path / "trace.jsonl", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        writer = rc._MaintenanceTraceWriter(fd=fd, maintenance_id="f" * 32, state_root_id="s" * 32, repo_key="r" * 32)
+        writer.entry_recorded(
+            rc.ReconciliationEntryResult(
+                "a" * 32,
+                rc.ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+                "x" * 2000,
+                run_id="r" * 2000,
+                attempt_number=10**9,
+                baseline_id="b" * 64,
+                verification_id="c" * 64,
+                worktree_initial_persisted_intent="disposing",
+                worktree_leaf_outcome="registered_directory_missing",
+                worktree_removal_observation="pre_inspection_failed",
+                worktree_absent_transition_confirmed_this_pass=True,
+                worktree_registration_pre=reg,
+                worktree_registration_post=reg,
+                worktree_admin_matches_pre="unknown",
+                worktree_admin_matches_post="unknown",
+                worktree_leaf_pre="materialized",
+                worktree_leaf_post="materialized",
+                worktree_removal_attempt="stopped_after_failure",
+                worktree_disposing_transition_confirmed_this_pass=True,
+            )
+        )
+    finally:
+        os.close(fd)
+    assert len((tmp_path / "trace.jsonl").read_bytes()) <= rc.MAINTENANCE_EVENT_MAX_BYTES
+
+
+def test_a13_exactly_one_git_mutation_argv_and_single_force():
+    import inspect
+
+    source = inspect.getsource(rc)
+    tree = ast.parse(source)
+    removes = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            consts = [a.value for a in node.args if isinstance(a, ast.Constant)]
+            if "remove" in consts and "worktree" in consts:
+                removes.append(consts)
+    # Exactly one Git mutation call, carrying exactly one `--force` (never
+    # `-f -f`); the module's only other `--force` is the pre-existing
+    # `docker rm --force` by immutable container id.
+    assert removes == [["worktree", "remove", "--force"]]
+
+
+def _a13_trap_observer(monkeypatch):
+    """Replace the Amendment 13 leaf observer with one that counts its
+    calls and fails with CLEANUP_UNCONFIRMED -- so any row that wrongly
+    observes the leaf would turn into SUBSTRATE_UNAVAILABLE."""
+    calls = {"n": 0}
+
+    def trap(self, repo_key, lifecycle_id):
+        calls["n"] += 1
+        raise lf.LifecycleFsError(lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED, "would-be leaf cleanup failure")
+
+    monkeypatch.setattr(sr.StateRoot, "observe_materialized_worktree_leaf", trap)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "intent, registration, admin, real_setup, outcome",
+    [
+        ("present", None, "unknown", None, "SUBSTRATE_UNAVAILABLE"),
+        ("present", rc._TargetRegistration("present", "many", None, None, None), None, None, "REFUSED"),
+        ("present", rc._TargetRegistration("present", 1, True, None, None), None, None, "REFUSED"),
+        ("present", None, None, "lock", "REFUSED"),
+        ("disposing", None, None, "lock", "REFUSED"),
+        ("present", None, 0, None, "REFUSED"),
+        ("present", None, None, "extra_admin", "REFUSED"),
+        ("disposing", None, "many", None, "REFUSED"),
+        ("present", None, None, "unregister", "REFUSED"),
+        ("present", rc._TargetRegistration("absent", 0, None, None, None), 1, None, "REFUSED"),
+        ("disposing", rc._TargetRegistration("absent", 0, None, None, None), 1, None, "REFUSED"),
+        ("disposing", rc._TargetRegistration("absent", 0, None, None, None), "many", None, "REFUSED"),
+    ],
+)
+def test_a13_leaf_observer_never_runs_when_evidence_already_decides(
+    a13, monkeypatch, intent, registration, admin, real_setup, outcome
+):
+    run_dir, leaf = _a13_seed(a13, intent)
+    if real_setup == "lock":
+        _run("git", "-C", str(a13.repo), "worktree", "lock", str(leaf))
+    elif real_setup == "extra_admin":
+        (_a13_git_dir(a13) / "worktrees" / f"{_A13_ID}9").mkdir()
+    elif real_setup == "unregister":
+        _shutil.rmtree(_a13_git_dir(a13) / "worktrees" / _A13_ID)  # 0 registrations, 0 admin entries
+    if registration is not None:
+        monkeypatch.setattr(rc, "_observe_target_registration", lambda *a, **k: registration)
+    if admin is not None:
+        monkeypatch.setattr(rc, "_count_worktree_admin_entries", lambda *a: admin)
+    calls = _a13_trap_observer(monkeypatch)
+    entry = a13.reconcile().entries[0]
+    assert calls["n"] == 0
+    assert entry.outcome is rc.ReconciliationEntryOutcome[outcome], entry.detail
+    assert entry.worktree_leaf_pre is None
+    assert entry.worktree_removal_attempt == "not_attempted"
+    payload = _read_projection_dict(run_dir)
+    assert payload["state"] == "PREPARING" and payload["worktree"]["intent"] == intent
+
+
+def test_a13_unknown_registration_never_reaches_the_leaf_observer(a13, monkeypatch):
+    run_dir, _ = _a13_seed(a13, "present")
+    monkeypatch.setattr(rc, "_observe_target_registration", lambda *a, **k: rc._UNKNOWN_REGISTRATION)
+    calls = _a13_trap_observer(monkeypatch)
+    entry = a13.reconcile().entries[0]
+    assert calls["n"] == 0
+    assert entry.outcome is rc.ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE
+    assert _read_projection_dict(run_dir)["state"] == "PREPARING"
+
+
+@pytest.mark.parametrize("intent, materialize", [("present", True), ("disposing", True), ("disposing", False)])
+def test_a13_leaf_observer_runs_exactly_once_where_its_result_is_needed(a13, monkeypatch, intent, materialize):
+    """One eligible registration with one admin entry, or `disposing` with
+    neither: the observer runs once, so its cleanup failure now (and only
+    now) dominates as SUBSTRATE_UNAVAILABLE."""
+    run_dir, _ = _a13_seed(a13, intent, materialize=materialize)
+    calls = _a13_trap_observer(monkeypatch)
+    entry = a13.reconcile().entries[0]
+    assert calls["n"] == 1
+    assert entry.outcome is rc.ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE
+    assert entry.worktree_leaf_outcome == "close_failed"
+    assert _read_projection_dict(run_dir)["state"] == "PREPARING"
 
 
 # ---------------------------------------------------------------------------

@@ -5777,3 +5777,72 @@ T-F1 and T-F2 under "unstarted Stage-2 spike"; both now sit under a
 "partial production tests" line instead. Other entries in that index were
 not reviewed in this pass. No code, tests, ADRs, or `CLAUDE.md` changed
 (none repeat the false claim). `uv.lock` untouched.
+
+## 2026-10-03 — Milestone 3: reconciling dead materialized worktrees (ADR 0004 Amendment 13)
+
+A second narrow worktree reconciliation row: a dead lifecycle whose worktree
+record is `creating`/`present`/`disposing`, with containers and checkpoint
+ref already absent, is removed by one bounded `git worktree remove --force
+<exact path>` and recorded `RECONCILED` only when the registration, admin
+entry, and directory are each freshly confirmed absent. Unwired; T-E1
+unchanged; T-F2 still only partially addressed.
+
+Trade-offs decided during planning (several review rounds), with the
+experiments behind them (Git 2.54, scratchpad only):
+- `--force` did not follow symlinks out of the worktree and did not run a
+  hostile clean filter; a locked worktree needs `-f -f`, which is never used;
+  Git refused a leaf swapped for a symlink ("does not point back"), so Git's
+  own back-pointer check guards the gap between inspection and removal.
+- A registered worktree whose directory is gone is removed exactly by
+  `remove --force` (no prune) — allowed only for `disposing` (D2), since under
+  `present`/`creating` it implies outside interference.
+- A deletion failure can leave an unregistered directory with content; that
+  stays `REFUSED` (no recursive deletion), a documented residual.
+- Fresh observations instead of a held descriptor: holding one inside a
+  directory Git is deleting gains nothing, at the honest cost that a valid
+  replacement directory is indistinguishable from the original.
+- A SIGKILL during the command can orphan the Git process; the next pass
+  stays fail-closed because the command only deletes. Modelled, not proven,
+  by a deterministic test.
+
+Implementation notes:
+- One structural parser feeds both the new target-aware analyzer and the
+  legacy registered-path set (which now rejects any duplicate path).
+- Routing: a `creating` record with no registration goes to Amendment 12's
+  row unchanged — its own admin scan refuses any admin entry, so the outcome
+  matches the planned `(creating, 0, ≥1) → REFUSED` row without a second
+  scan. In the Amendment 13 row a `worktrees/` that is not a real directory
+  counts as admin "unknown" (`SUBSTRATE_UNAVAILABLE`), fail-closed.
+- Five existing assertions changed by design, each because the approved
+  behaviour changed: the reconciler edge table is wider than one edge;
+  `disposing → absent` is now a legal reconciler edge; Amendment 12's
+  "present/disposing refused at the pre-lock check" no longer holds (they are
+  eligible now, and still refused when unregistered); the Amendment 12 trace
+  test now checks its own fields plus the new ones; and
+  `test_real_sigkill_after_durable_present_blocks_admission` became
+  `…_is_reconciled_by_next_admission`.
+- `reconciliation.py` still contains no filesystem-removal call; its only
+  Git mutation is the one `worktree remove --force` argv.
+
+Verified (macOS, Git 2.54.0, Docker 29.8.0 already running, not started or
+restarted, `CODEAGENT_REQUIRE_DOCKER=1`): `test_state_root.py` 129 (116 + 13);
+`test_lifecycle_store.py` 283 (275 + 8, net of one removed parametrize case);
+`test_reconciliation.py` 305 (207 + 98); `test_worktree_publication.py` 12
+(7 + 5); the 17-file focused set 1,640 forward and reverse; full suite 3,164
+passed, 0 skipped (up from 3,040). No leftover containers, worktrees,
+`refs/codeagent` refs, Git admin directories, processes (including the
+modelled orphan), or default state root; `git diff --check` clean. Linux CI
+pending (not pushed). `uv.lock` untouched.
+
+Same-day correction pass (before commit): the row counted admin entries and
+then always observed the leaf before classifying, so a leaf observation or
+its `CLEANUP_UNCONFIRMED` could override an already-decided locked, bare,
+ambiguous, or admin-inconsistent refusal -- contrary to the accepted routing
+order. A new `_pre_removal_gate` now settles every row that registration and
+admin evidence decide on their own; the observer runs only for one eligible
+registration with one admin entry, or `disposing` with neither. 16 new tests
+(12 rows proving zero observer calls with a trap that would otherwise raise
+`CLEANUP_UNCONFIRMED`, 1 unknown-registration row, 3 rows proving exactly one
+call). Temporarily restoring the old ordering made all 12 zero-call rows
+fail; the fixed file was then restored byte-for-byte. Totals above are the
+post-correction ones.

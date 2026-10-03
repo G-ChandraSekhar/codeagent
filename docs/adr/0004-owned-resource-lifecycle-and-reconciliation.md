@@ -3902,3 +3902,124 @@ The row remains unwired; `present`/`disposing` worktrees and an
 `absent` record with a leftover directory still block admission; the A4
 same-user race before `rmdir` remains; and this evidence adds no broader
 T-F2, T-F1, or T-E1 mitigation claim.
+
+## Amendment 13 (Accepted 2026-10-03): reconciling a dead materialized `creating`, `present` or `disposing` worktree
+
+**Scope.** This refines §8 for dead lifecycles whose worktree record is
+`creating`, `present` or `disposing` (with its origin commit) and whose
+checkpoint ref, `failure`, and both container records are already absent.
+Such a worktree is removed only by one bounded, hardened
+`git worktree remove --force <exact canonical path>`. Unchanged:
+- a `creating` record with no registration still goes to Amendment 12's row;
+- locked, ambiguous, bare, or inconsistent registrations are `REFUSED`, and
+  `-f -f` and `git worktree prune` are never used;
+- an unregistered directory with content (for example a partial Git
+  removal) is `REFUSED`; recursive deletion stays forbidden (I2);
+- entries whose containers or checkpoint ref remain are not handled here;
+- no live-`HEAD` comparison (Amendment 10).
+
+Nothing is wired to a CLI or controller entry point. T-E1 is unchanged;
+T-F2 stays partially addressed at the reconciler level only. Evidence is
+implementation and automated-test evidence, not a security review.
+
+### 1. Listing grammar
+
+`git worktree list --porcelain -z` is parsed structurally: each field is
+`key` or `key SP value`, NUL-terminated, and a record ends with an empty
+field. Each record needs `worktree <absolute path>` first; `HEAD <oid>`
+(lowercase hex of the repository's object-format length) unless `bare`;
+exactly one of `branch <ref>`, `detached`, `bare`; and optional `locked` /
+`prunable` with or without a reason (never retained). An unknown key, a
+repeated field, a bad terminator, or any other violation is malformed. A
+separate target-aware analysis counts records matching the deterministic
+path (0, 1, or "many"); duplicate non-target paths are malformed, and
+"many" is positive ambiguity (`REFUSED`). Malformed or failed listings are
+`SUBSTRATE_UNAVAILABLE`. The legacy registered-path set uses the same parser
+and rejects any duplicate path.
+
+### 2. Attribution before removal
+
+Removal needs exactly one non-bare, unlocked target registration, exactly
+one admin name matching `<lifecycle-id>[0-9]*` (the bounded scan, now
+counting), and a fresh no-follow observation of the leaf: a real directory,
+owned by the current user, mode exactly 0700, containing a no-follow regular
+`.git` file (`materialized`). `prunable` with a materialized leaf is
+`REFUSED`. **D2:** for a `disposing` record only, the same registration and
+admin evidence with the leaf confirmed `absent` also authorises the exact-path
+removal (Git 2.54 then removes exactly that registration); `prunable` is
+allowed but not required. The same shape under `present` or `creating` is
+`REFUSED`. A `disposing` record with no registration, no admin entry, and an
+absent leaf collapses to absent without running Git. The observer holds no
+descriptor across the command, so it cannot tell the original directory from
+a valid replacement: it reports `materialized` for either. Git's own
+back-pointer check refuses a swapped path (observed directly).
+
+Evaluation order: registration, then admin count, and the leaf observer only
+when its result is needed. Registration or admin `unknown` is
+`SUBSTRATE_UNAVAILABLE`; a many/bare/locked registration, a single
+registration whose admin count is not exactly one, `present` with no
+registration, and `disposing` with no registration but an admin entry are all
+`REFUSED` without observing the leaf, so a leaf observation (or its cleanup
+failure) can never override them. The observer runs only for one eligible
+registration with one admin entry, or for `disposing` with neither.
+
+### 3. The command
+
+`run_git_bounded(root, "worktree", "remove", "--force", <path>, limit=4096,
+timeout=30)`, with the hardened baseline argv and sanitized environment. Its
+exit status is never evidence. A nonzero exit, a timeout, an output overflow,
+or a monitoring failure (each with the child confirmed stopped) is followed by
+three fresh observations. An unconfirmed child stop, an unexpected failure
+reason, or a launch failure is `SUBSTRATE_UNAVAILABLE` with no observation
+and no later transition.
+
+### 4. After the command
+
+`disposing → absent` is published only when the registration, the admin
+entry, and the leaf are all confirmed absent. Otherwise: any unknown
+observation is `SUBSTRATE_UNAVAILABLE`; a leaf conflict, a duplicated, bare
+or newly locked registration, or inconsistent admin evidence is `REFUSED`;
+the registration still present (directory present or missing) or an
+unregistered materialized directory is `FAILED`. The next pass re-inspects
+from scratch; an unregistered materialized directory is then `REFUSED`.
+
+### 5. Transitions, resume, and trace
+
+Reconciler-only edges (the live owner's table is unchanged):
+`creating/present → disposing` (same origin commit), `disposing → disposing`
+(same commit; a no-op that publishes nothing), and `disposing → absent`.
+Order: `RECONCILING` (`attempts_total + 1` only on a fresh cycle), `→
+disposing`, the command, the observations, `→ absent`, `RECONCILED`. Every
+pass reloads the record; a durability-unconfirmed write may be installed and
+the next pass follows what it finds. The maintenance trace (`schema_version`
+1) gains `registration_pre`/`registration_post` (state, target count,
+`target_bare`, `locked`, `prunable` — non-null only when meaningful),
+`admin_matches_pre`/`post`, `leaf_pre`/`post`, `removal_attempt`, and
+`disposing_transition_confirmed_this_pass`; no paths, reasons, Git output,
+admin names, or exception text.
+
+### 6. SIGKILL during the command
+
+If the reconciler is killed while `git worktree remove` runs, that Git
+process is orphaned; nothing prevents this or bounds its lifetime. The next
+pass is still fail-closed: it re-observes everything, and because the command
+only deletes, all three observations being absent is a terminal state, while
+anything present yields `FAILED`, `REFUSED` or `SUBSTRATE_UNAVAILABLE` and
+never `absent`. A deterministic test models this state (the stand-in command
+deletes only the admin entry and leaves a detached grandchild); it is a model,
+not proof of every behaviour of a real concurrent removal.
+
+### 7. Evidence
+
+Local (macOS, Git 2.54.0, Docker already running, `CODEAGENT_REQUIRE_DOCKER=1`):
+124 new tests (13 state-root, 8 lifecycle-store, 98 reconciliation, 5
+integration); the 17-file focused set 1,640 passed in forward and reverse
+order; the full suite 3,164 passed, 0 skipped. Real-Git coverage includes
+`creating`/`present`/`disposing` removal, SHA-256, D2, locked, symlink-swap,
+missing `.git`, extra admin entries, an unregistered leftover, a symlink out
+of the worktree and a hostile clean filter (both harmless), and SIGKILL tests
+for a dead `present` owner and for the reconciler after each step. The
+permission-based partial-removal test is conditional: it runs only when the
+host's Git reproduces that behaviour (it did on this host); the portable
+proof is a deterministic fault-injection test. Linux CI is pending (not
+pushed).

@@ -319,12 +319,144 @@ def test_real_sigkill_inside_reconciler_resumes_without_reincrement(tmp_path, mo
         _teardown_crashed(repo, leaf)
 
 
-def test_real_sigkill_after_durable_present_blocks_admission(tmp_path, monkeypatch):
+def test_real_sigkill_after_durable_present_is_reconciled_by_next_admission(tmp_path, monkeypatch):
+    """ADR 0004 Amendment 13: before Amendment 13 this blocked admission."""
     repo, leaf, payload = _crash_and_inspect(tmp_path, monkeypatch, "present")
     try:
         assert payload["worktree"] == {"intent": "present", "expected_head": _head(repo)}
         assert _is_registered(repo, leaf)
         assert (leaf / "f.txt").exists()
-        _blocked(repo)
+        _no_containers(monkeypatch)
+        _admit_and_close(repo)
+        dead = _dead_projection(tmp_path / "state-root", leaf.name)
+        assert dead["state"] == "RECONCILED"
+        assert dead["worktree"] == {"intent": "absent", "expected_head": None}
+        assert dead["reconciliation"]["attempts_total"] == 1
+        assert not _is_registered(repo, leaf)
+        assert not os.path.lexists(leaf)
     finally:
         _teardown_crashed(repo, leaf)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 13: a reconciler killed inside the materialized-worktree
+# row, and a deterministic model of a SIGKILL during the Git command.
+# ---------------------------------------------------------------------------
+
+
+def _a13_reconcile_and_sigkill(repo_path: str, state_dir: str, point: str, pid_file: str) -> None:
+    """Module-level (picklable) child: a real admission whose reconciliation
+    self-SIGKILLs at `point`: after M1 (RECONCILING), after M2 (disposing),
+    after the real `git worktree remove` ("after_command"), after M5
+    (absent), or "during_command" -- a deterministic model of the orphaned
+    Git child: the stand-in command deletes only the admin entry, starts a
+    detached `sleep` grandchild, and the reconciler dies before the
+    command is confirmed. A model of that state, not proof of every
+    behavior of a real concurrently running `git worktree remove`."""
+    os.environ["CODEAGENT_STATE_DIR"] = state_dir
+    import shutil as shutil_child
+
+    import codeagent.lifecycle_store as ls_child
+    import codeagent.reconciliation as rc_child
+
+    rc_child._docker_ps_all_id_name_pairs = lambda: ({}, {})
+
+    def die():
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    if point in ("after_m1", "after_m2", "after_m5"):
+        real_publish = ls_child.publish_private_file_atomically_at
+        seen = {"n": 0}
+        stop_at = {"after_m1": 1, "after_m2": 2, "after_m5": 3}[point]
+
+        def publish(*a, **k):
+            real_publish(*a, **k)
+            seen["n"] += 1
+            if seen["n"] == stop_at:
+                die()
+
+        ls_child.publish_private_file_atomically_at = publish
+    elif point == "after_command":
+        real_attempt = rc_child._attempt_worktree_remove
+
+        def attempt(root, target):
+            real_attempt(root, target)
+            die()
+
+        rc_child._attempt_worktree_remove = attempt
+    else:  # during_command
+
+        def attempt(root, target):
+            common = subprocess.run(
+                ["git", "-C", root, "rev-parse", "--git-common-dir"], capture_output=True, text=True, check=True
+            ).stdout.strip()
+            admin = Path(root, common) / "worktrees" / Path(target).name
+            shutil_child.rmtree(admin)
+            orphan = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            Path(pid_file).write_text(str(orphan.pid))
+            die()
+
+        rc_child._attempt_worktree_remove = attempt
+    ls_child.prepare_lifecycle(repo_path, run_id="wt-a13-reconciler-killed")
+    die()  # unreachable
+
+
+@pytest.mark.parametrize(
+    "point, disk_worktree, registered, leaf_present, final",
+    [
+        ("after_m1", "present", True, True, "RECONCILED"),
+        ("after_m2", "disposing", True, True, "RECONCILED"),
+        ("after_command", "disposing", False, False, "RECONCILED"),
+        ("after_m5", "absent", False, False, "RECONCILED"),
+        ("during_command", "disposing", False, True, "BLOCKED"),
+    ],
+)
+def test_real_sigkill_inside_materialized_reconciler(tmp_path, monkeypatch, point, disk_worktree, registered, leaf_present, final):
+    repo, leaf, _ = _crash_and_inspect(tmp_path, monkeypatch, "present")
+    state_dir = tmp_path / "state-root"
+    pid_file = tmp_path / "orphan.pid"
+    try:
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(target=_a13_reconcile_and_sigkill, args=(str(repo), str(state_dir), point, str(pid_file)))
+        proc.start()
+        proc.join(timeout=60)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=10)
+            pytest.fail("reconciler child did not self-SIGKILL within the timeout")
+        assert proc.exitcode == -signal.SIGKILL
+
+        crashed = _dead_projection(state_dir, leaf.name)
+        assert crashed["state"] == "RECONCILING"
+        assert crashed["worktree"]["intent"] == disk_worktree
+        assert crashed["reconciliation"]["attempts_total"] == 1
+        assert _is_registered(repo, leaf) is registered
+        assert os.path.lexists(leaf) is leaf_present
+
+        _no_containers(monkeypatch)
+        if final == "BLOCKED":
+            # Unregistered, no admin entry, but a materialized directory:
+            # fail closed; `absent` is never published.
+            _blocked(repo)
+            assert _dead_projection(state_dir, leaf.name)["worktree"]["intent"] == "disposing"
+            return
+        _admit_and_close(repo)
+        dead = _dead_projection(state_dir, leaf.name)
+        assert dead["state"] == "RECONCILED"
+        assert dead["worktree"] == {"intent": "absent", "expected_head": None}
+        assert dead["reconciliation"]["attempts_total"] == 1
+        assert not _is_registered(repo, leaf) and not os.path.lexists(leaf)
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if _is_registered(repo, leaf):
+            subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(leaf)], capture_output=True)
+        if os.path.lexists(leaf):
+            import shutil
+
+            shutil.rmtree(leaf)
+        assert not _is_registered(repo, leaf)
+        assert not os.path.lexists(leaf)
