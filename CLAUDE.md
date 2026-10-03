@@ -2604,8 +2604,11 @@ Stage 2 (of the four-stage planning process in
   [37138458659](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37138458659)
   failed**: `2 failed, 3228 passed, 3 skipped` (T30 and T31). The cause was the
   verification container's fixed `--user 1000:1000`, which could not read the
-  0700 reserved leaf on Linux. This is fixed forward by Amendment 15 (below), not
-  reverted. The run is failed evidence, not confirmation.
+  0700 reserved leaf on Linux. The run is failed evidence, not confirmation. It
+  was fixed forward, not reverted, by Amendment 15's ordinary fast-forward commit
+  `bdfeeec`. That commit's run
+  [37140167141](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37140167141)
+  succeeded, which made `main` green with history unchanged (see below).
   - **What it adds:** `src/codeagent/_lifecycle_run.py::run_lifecycle_aware()`
     composes the lease, one shared cursor and its four publishers, the
     deterministic reservation, a publisher-mode `GitWorktree`, a lifecycle-aware
@@ -2647,13 +2650,17 @@ Stage 2 (of the four-stage planning process in
     - Full suite: 3,233 passed, 0 skipped.
     - Six temporary mutations were each caught.
     - No leftover resources.
-  - **Linux CI failed** (run 37138458659, above). This is implementation/test
-    evidence only, not a security review. See `ENGINEERING_LOG.md`'s dated
-    entries.
+  - **Linux CI:** run 37138458659 for `bd77411` failed (above). Run 37140167141
+    for the fix-forward `bdfeeec` succeeded (Amendment 15, below). This is
+    implementation/test evidence only, not a security review. See
+    `ENGINEERING_LOG.md`'s dated entries.
 - **Milestone 3 fix-forward: verification containers run as the effective host
-  identity**, per ADR 0004 "Amendment 15 (Accepted 2026-10-03)". **Implemented
-  and locally validated on macOS (2026-10-03); not yet committed, and Linux CI
-  is pending.**
+  identity**, per ADR 0004 "Amendment 15 (Accepted 2026-10-03)". **Implemented,
+  locally validated on macOS (2026-10-03), committed
+  (`bdfeeece944f519fc17c6781a9e6bf773dd13667`) as an ordinary fast-forward over
+  `bd77411`, and confirmed on GitHub-hosted Linux CI** (run
+  [37140167141](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37140167141),
+  push-triggered, conclusion `success`; all 13 API-reported steps `success`).
   - **The change:** `DockerVerifier` passes
     `--user <os.geteuid()>:<os.getegid()>`, computed once at construction, at
     both `docker create` sites in place of the fixed `1000:1000`. Every other
@@ -2668,8 +2675,42 @@ Stage 2 (of the four-stage planning process in
     makes both fail locally.
   - **S4:** its spike evidence and helpers describe the old tuple. They are
     historical and left unchanged (a named residual).
-  - **Verified:** full suite 3,244 passed, 0 skipped. Focused set plus both
-    integration files 1,723 passed, forward and reverse.
+  - **Verified locally:** full suite 3,244 passed, 0 skipped. Focused set plus
+    both integration files 1,723 passed, forward and reverse.
+  - **Linux CI evidence (run 37140167141):**
+    - **Environment:** job "Test (ubuntu-24.04, Python 3.12)", Ubuntu 24.04.5 LTS,
+      CPython 3.12.14, Docker client and server `28.0.4`.
+    - **Image:** the pinned
+      `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`,
+      which reported `linux/amd64`.
+    - **Dedicated Docker step:**
+      `python -m pytest tests/integration/test_slice_c.py -v` gave
+      `4 passed in 2.73s`. The verbose log names
+      `test_real_docker_reads_a_private_0700_mount_as_the_effective_host_identity`
+      as `PASSED`, which is direct evidence for the legacy-path regression.
+    - **Complete suite:** `python -m pytest -q`, with
+      `CODEAGENT_REQUIRE_DOCKER: 1` in that step's own environment, gave
+      `3241 passed, 3 skipped in 82.07s`. 3,241 + 3 = 3,244, matching the local
+      collected total, and the previous T30/T31 failures did not recur.
+      `pytest -q` prints no test names, so the three skips are not identified
+      and there is no named-test log evidence for T30, T31 or T46. No test
+      failed, Docker was required and available in that step, and all three
+      are collected from `test_lifecycle_run.py`. That each actually ran,
+      rather than skipped, is an inference.
+    - **Leftover check:** the anchored
+      `^codeagent-(verify-|baseline-|verification-)` filter over a full
+      `docker ps -a` name listing covered all three container families,
+      produced empty output, and the step succeeded.
+  - **Remaining risks:**
+    - The runner's uid is not printed in either log. The uid mismatch behind
+      run 37138458659 is supported by the source and the experiment; it is not
+      direct log evidence.
+    - S4's historical spike helpers still assume the old fixed-user tuple.
+    - A container escape now maps to the invoking host user rather than the
+      fixed uid 1000.
+    - The existing crash and reconciliation gaps remain.
+    - The CI evidence covers GitHub-hosted `ubuntu-24.04` x86_64 only. It is
+      automated-test evidence, not a security review.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

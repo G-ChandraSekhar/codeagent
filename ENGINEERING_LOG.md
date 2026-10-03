@@ -6049,3 +6049,67 @@ explicitly, so it fails on macOS too.
 - No leftovers.
 
 Linux CI is pending. Nothing is committed. `uv.lock` was untouched.
+
+## 2026-10-03 — Slice 3C-4 and Amendment 15: Linux CI evidence reconciliation
+
+Documentation-only. No tests or Docker were rerun for this pass. Both runs were
+independently re-fetched from the GitHub Actions API and their raw logs. The
+two entries above are kept verbatim as the historical record: the pre-push 3C-4
+implementation entry, and the failed-run fix-forward entry. Their "Linux CI is
+pending" statements are superseded here.
+
+The runs, in chronological order:
+
+1. **Run [37138458659](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37138458659), commit `bd77411`, conclusion `failure`.**
+   - **Steps:** of the 13 API-reported steps, 11 succeeded, 1 failed (the
+     complete suite) and 1 was skipped (a post step).
+   - **Dedicated Docker step:**
+     `python -m pytest tests/integration/test_slice_c.py -v`, `3 passed`.
+   - **Complete suite:** `python -m pytest -q`, with
+     `CODEAGENT_REQUIRE_DOCKER: 1`, reported `2 failed, 3228 passed, 3 skipped`.
+     The failures were T30 and T31.
+   - **Leftover-container check:** output empty, step `success`.
+2. **Run [37140167141](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37140167141), commit `bdfeeec`, conclusion `success`.**
+   - **Commit:** the Amendment 15 fix, an ordinary fast-forward over `bd77411`
+     with no amend, rebase, revert or force-push.
+   - **Steps:** all 13 API-reported steps succeeded.
+   - **Environment:** Ubuntu 24.04.5 LTS, CPython 3.12.14, Docker client and
+     server `28.0.4`.
+   - **Image:** the pinned image reported `linux/amd64`.
+   - **Dedicated Docker step:**
+     `python -m pytest tests/integration/test_slice_c.py -v`, `4 passed in 2.73s`.
+     The verbose log names
+     `test_real_docker_reads_a_private_0700_mount_as_the_effective_host_identity`
+     as `PASSED`.
+   - **Complete suite:** `python -m pytest -q`, with
+     `CODEAGENT_REQUIRE_DOCKER: 1` in that step's own environment, reported
+     `3241 passed, 3 skipped in 82.07s`. 3,241 + 3 = 3,244, matching the local
+     collected total.
+   - **Leftover-container check:** the anchored
+     `^codeagent-(verify-|baseline-|verification-)` filter over a full
+     `docker ps -a` name listing covered all three families. Its output was
+     empty and the step succeeded.
+
+`bdfeeec` fixed a real, Linux-only permission mismatch: the container ran as a
+fixed uid 1000, and the 0700 reserved leaf belonged to the host user.
+History was not rewritten: run 37138458659 stays recorded as failed evidence,
+and `main` became green through the next ordinary commit.
+
+**Evidence limits.**
+- `pytest -q` prints no test names, so the three skips are not identified, and
+  there is no named-test log evidence for T30, T31 or T46.
+- What the log does show: no test failed, Docker was required and available,
+  and all three tests are collected from `test_lifecycle_run.py`. That each
+  ran, rather than skipped, is inference.
+- The runner's uid is printed in neither log. The uid mismatch is supported by
+  the source and the experiment, not by direct log evidence.
+
+**Remaining risks (unchanged).**
+- S4's historical spike helpers still assume the old fixed-user tuple.
+- A container escape now maps to the invoking host user rather than uid 1000.
+- The crash and reconciliation gaps remain.
+- This evidence covers GitHub-hosted `ubuntu-24.04` x86_64 only and is
+  automated-test evidence, not a security review.
+
+`docs/threat-model.md` was inspected. It has no Amendment-15-specific or
+CI-pending statement, so it is unchanged. `uv.lock` was untouched.

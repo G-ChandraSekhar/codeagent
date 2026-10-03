@@ -4291,8 +4291,9 @@ sink's later validation at capture is unchanged.
 ### 8. Evidence
 
 Local verification only: macOS, Git 2.54.0, Python 3.12.14, Docker already
-running, `CODEAGENT_REQUIRE_DOCKER=1`. Nothing has been committed or pushed, so
-Linux CI is pending.
+running, `CODEAGENT_REQUIRE_DOCKER=1`. Nothing had been committed or pushed at
+the time of this local verification. The Linux CI results, one failed run and
+then one successful fix-forward run, are recorded at the end of this section.
 
 **New test file.** `tests/integration/test_lifecycle_run.py` holds 46 named
 specifications (T1–T45 plus T17b), which expand to 69 collected tests through
@@ -4366,6 +4367,17 @@ child processes, fixture directories or default state root remained.
 This run is failed evidence, not confirmation. The fix is forward-only and is
 recorded in Amendment 15.
 
+**Linux CI after the fix-forward: success.** Amendment 15's ordinary
+fast-forward commit `bdfeeece944f519fc17c6781a9e6bf773dd13667` (over
+`bd77411`, with history unchanged) was confirmed by run
+[37140167141](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37140167141).
+The run was push-triggered and concluded `success`. The complete suite gave
+`3241 passed, 3 skipped`, which equals the 3,244 collected locally, and the
+T30/T31 failures above did not recur. Full details, and the limits on what the
+log can show, are in Amendment 15's Evidence. This amendment's own composition
+is therefore green on GitHub-hosted `ubuntu-24.04` only together with
+Amendment 15.
+
 ## Amendment 15 (Accepted 2026-10-03): verification containers run as the effective host identity
 
 **Context.** Amendment 14's Linux CI run 37138458659 failed (see Amendment 14
@@ -4433,8 +4445,62 @@ not 1000 is inferred from this experiment and the failure pattern.
 - **Unsupported invocations.** Windows hosts, effective uid 0, and effective
   gid 0 are refused rather than run.
 
-**Evidence.** Local verification only: macOS, Docker already running,
-`CODEAGENT_REQUIRE_DOCKER=1`. Linux CI is pending.
+**Evidence.**
+
+Local verification: macOS, Docker already running,
+`CODEAGENT_REQUIRE_DOCKER=1`.
+
+**Confirmed on GitHub-hosted Linux CI.** Commit
+`bdfeeece944f519fc17c6781a9e6bf773dd13667`, run
+[37140167141](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37140167141).
+
+- **Run.** Push-triggered, status `completed`, conclusion `success`. The API
+  reports 13 steps, every one `success`.
+- **Environment.** Job "Test (ubuntu-24.04, Python 3.12)": runner image
+  `ubuntu-24.04` (Ubuntu 24.04.5 LTS) x86_64, CPython 3.12.14. The Docker
+  preflight reported client and server `28.0.4`.
+- **Image.** The pinned
+  `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`,
+  which reported `linux/amd64`.
+- **Dedicated Docker step.** It ran
+  `python -m pytest tests/integration/test_slice_c.py -v`, with
+  `CODEAGENT_REQUIRE_DOCKER: 1` in that step's environment, and gave
+  `4 passed in 2.73s`. Its verbose output names
+  `test_real_docker_reads_a_private_0700_mount_as_the_effective_host_identity`
+  as `PASSED`. That is direct log evidence that the legacy-path regression
+  passed on Linux.
+- **Complete suite.** It ran `python -m pytest -q`, with
+  `CODEAGENT_REQUIRE_DOCKER: 1` in that step's own environment, and gave
+  `3241 passed, 3 skipped in 82.07s`. 3,241 + 3 = 3,244, which matches the
+  local collected total. The T30/T31 failures of run 37138458659 did not recur.
+- **Limits of the suite evidence.** `pytest -q` prints no test names, so the
+  three skips are not identified, and there is no named-test log evidence for
+  T30, T31, or T46. What the log supports:
+  - no test failed;
+  - Docker was required and available in that step;
+  - all three tests are collected from `tests/integration/test_lifecycle_run.py`.
+
+  That each one actually ran, rather than skipped, is an inference.
+- **Leftover-container check.** It applied the anchored
+  `grep -E '^codeagent-(verify-|baseline-|verification-)'` to a full
+  `docker ps -a --format '{{.Names}}'` listing. That covers the legacy
+  `codeagent-verify-*` family and both deterministic lifecycle families. The
+  output was empty and the step succeeded.
+
+**Residual risks.**
+
+- **Runner uid not in the log.** The runner's uid is not printed in either run's
+  log. The uid mismatch is supported by the source and by the experiment above,
+  not by direct log evidence.
+- **S4 helpers.** S4's historical spike helpers still assume the old fixed-user
+  tuple.
+- **Escape mapping.** A container escape now maps to the invoking host user
+  rather than the fixed uid 1000.
+- **Crash and reconciliation gaps.** The existing gaps (Amendment 14 §6) remain.
+- **Scope of the evidence.** This covers GitHub-hosted `ubuntu-24.04` x86_64
+  only. It is automated-test evidence, not a security review.
+
+The local evidence follows.
 
 - **New unit tests** in `tests/unit/test_executor.py`, 9 cases:
   - the exact remaining flag tuple;
