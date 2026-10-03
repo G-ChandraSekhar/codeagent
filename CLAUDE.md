@@ -2597,6 +2597,53 @@ Stage 2 (of the four-stage planning process in
   its lifetime, and the test for that state is a deterministic model, not
   proof; and a valid replacement directory cannot be distinguished from the
   original.
+- **Milestone 3 Slice 3C-4: first lifecycle-aware internal run composition**,
+  per `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
+  "Amendment 14 (Accepted 2026-10-03)". **Implemented and locally validated on
+  macOS (2026-10-03); uncommitted and awaiting joint review.**
+  - **What it adds:** `src/codeagent/_lifecycle_run.py::run_lifecycle_aware()`
+    composes the lease, one shared cursor and its four publishers, the
+    deterministic reservation, a publisher-mode `GitWorktree`, a lifecycle-aware
+    `DockerVerifier`, a publishing `CheckpointSession` and `RunController` with
+    its owner publisher. No other `src` module changed.
+  - **Lease ownership (closes Amendment 8 §6):** the composition owns the lease,
+    so the repository lock is held for the whole run.
+  - **After `RunFinished`:**
+    - the worktree is never exited, so nothing is disposed twice and nothing is
+      mutated (R1);
+    - only the reservation's descriptors and the lease are released, each once
+      and outside any exception handler;
+    - declared release failures are returned in `LifecycleRunResult`.
+  - **Raise path and other release combinations:** each ends as either the exact
+    original exception (when every stage is confirmed) or one sanitized
+    `LifecycleRunCleanupError` raised `from` its primary. Every unconfirmed
+    stage remains represented in `failed_stages`; D retains each distinct
+    reportable exception once, as an exact instance. A deduplicated exception
+    remains observable through the original exception or an earlier retained
+    exception's chain.
+  - **Two separate rules:** stage confirmation and outcomes come from pre-dedup
+    attribution (R8). The cycle-safe identity dedup (D) only decides which
+    exceptions are reported. A `None` release field never means the stage was
+    confirmed.
+  - **Evidence root:** checked before any reservation, using the sink's own
+    helpers, against the source and the whole state root.
+  - **Boundary and gate:** it is an internal, unexported module that no bundled
+    CLI or production module imports (AST-pinned). Python does not enforce
+    privacy. No operator entry point may call it until a checkpoint-ref
+    reconciliation row, a worktree-plus-container row, abandonment and ADR 0005
+    cancellation exist, because a crash during most of a real run still blocks
+    the repository.
+  - **Threats:** T-E1, T-F1 and T-F2 are unchanged. T-E1 gains a note that
+    concurrent refusal is shown for this internal path only.
+  - **Verified** (Docker running, `CODEAGENT_REQUIRE_DOCKER=1`):
+    - `tests/integration/test_lifecycle_run.py` has 46 named specifications
+      (69 collected). The real-Docker set is exactly T30–T38.
+    - 17-file focused set plus the new file: 1,709 passed, forward and reverse.
+    - Full suite: 3,233 passed, 0 skipped.
+    - Six temporary mutations were each caught.
+    - No leftover resources.
+  - **Linux CI is pending.** This is implementation/test evidence only, not a
+    security review. See `ENGINEERING_LOG.md`'s dated entry.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

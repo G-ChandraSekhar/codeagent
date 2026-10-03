@@ -5895,3 +5895,97 @@ original.
 
 `docs/threat-model.md` was inspected: it holds no Amendment-13-specific CI
 statement, so it is unchanged. `uv.lock` untouched.
+
+## 2026-10-03 — Milestone 3 Slice 3C-4: first lifecycle-aware internal run composition (ADR 0004 Amendment 14, Accepted)
+
+**What.** `src/codeagent/_lifecycle_run.py::run_lifecycle_aware()` is the first
+code that composes a real run on the lifecycle substrate:
+- the lease, plus one shared cursor and four publishers;
+- the deterministic reservation;
+- a publisher-mode `GitWorktree`;
+- a lifecycle-aware `DockerVerifier`;
+- a publishing `CheckpointSession`;
+- `RunController`, with its owner publisher.
+
+No other `src` module changed. A five-revision joint plan review preceded
+implementation.
+
+**Decisions and trade-offs.**
+- **Composition before recovery prerequisites (author decision).**
+  Reconciliation still blocks on several shapes a crashed real run leaves:
+  a worktree with a container, any non-absent checkpoint ref, Ctrl-C after
+  the first patch, and preserve paths. Abandonment doesn't exist yet. The
+  composition is therefore internal (an underscore module, not exported,
+  pinned with no bundled importer), and Amendment 14 gates any operator entry
+  point on a ref row, a worktree-plus-container row, abandonment, and ADR 0005.
+  Amendment 14 does not claim "only tests can reach it", because Python does
+  not enforce privacy.
+- **Lease ownership (closes Amendment 8 §6).** The composition owns the lease
+  for the whole run, and the lease holds the repository lock throughout.
+  Declared release failures after `RunFinished` are returned in
+  `LifecycleRunResult`, never raised (author decision).
+- **R1: no retry after `RunFinished`.** `_terminate()` is the only disposal
+  attempt. The worktree is never exited after `run()` returns, so there is no
+  second `git worktree remove` and no mutation after the finish. This is safe
+  only because a reservation-mode `GitWorktree` owns no descriptor or tempdir;
+  T8 pins that premise.
+- **R5: raise-path failures are never silently dropped.** Every recorded
+  field (`worktree.cleanup_error`, `worktree.lifecycle_error`,
+  `reservation.cleanup_error`) and every stage exception is inspected, and the
+  result is one sanitized `LifecycleRunCleanupError`, chained from the
+  original exception. Every unconfirmed stage remains represented in
+  `failed_stages`; D retains each distinct reportable exception once. A
+  deduplicated exception remains observable through the original exception or
+  an earlier retained exception's chain.
+  The exact original is re-raised only when every stage is confirmed. This
+  follows the repo's cleanup-dominance precedent, with no `ExceptionGroup`.
+- **J: D reports, R8 decides.** Identity dedup alone would have:
+  - hidden a failed stage;
+  - let `lease_release_error is None` read as "released";
+  - let a deduped `BaseException` make R4 return normally.
+
+  Stage confirmation and outcomes now come from pre-dedup attribution. A
+  recorded field is O-owned only if it is unchanged by identity from the
+  pre-call snapshot and reachable from the original exception. Identity
+  cannot prove whether the same object was reassigned; the rule doesn't claim
+  to.
+- **H1: stages run outside the handler** (the 3C-3 precedent). Otherwise every
+  stage exception would gain the original as its implicit `__context__`.
+- **H2: unexpected exceptions from `GitWorktree.__exit__` are attributed to
+  `WORKTREE_PHYSICAL`** (accepted limitation).
+- **The evidence root is validated before reservation** with the sink's own
+  unmodified helpers, against the source and the whole state root. An
+  evidence file inside `runs/<id>/` would make reconciliation refuse even a
+  `COMPLETE` entry (scratchpad-confirmed).
+
+**Test notes and deviations from the plan text.**
+- Docker-free coverage uses two injections:
+  - an `activate()` failure, which goes straight to `_terminate()`;
+  - a body exception raised after the worktree is entered.
+- The evidence-root tests (T26–T28) prove that locks were released and the
+  PREPARING entry is reconciled. They patch only the reconciler's Docker
+  listing (the `test_worktree_publication.py` precedent for container-free
+  rows) instead of being Docker-marked.
+- T27 uses a deep `worktrees/` descendant rather than the exact predicted
+  leaf. The lifecycle id isn't known before the run, and the containment
+  semantics are identical.
+- T41 also carries the `requires_docker` marker pin. That keeps the
+  named-specification count at the planned 46.
+- One test-only bug was found while running: T36 read a top-level `baseline`
+  key, but containers are nested under `containers`. It was fixed before any
+  totals were taken.
+
+**Verification.** macOS, Docker already running, with
+`CODEAGENT_REQUIRE_DOCKER=1`:
+- `test_lifecycle_run.py`: 46 named specifications, 69 collected.
+- With `test_workspace.py`: 227 passed.
+- 17-file focused set plus the new file: 1,709 passed, forward and reverse.
+- Full suite: 3,233 passed, 0 skipped (up from 3,164).
+- Six temporary mutations were each caught, and the module was restored
+  byte-for-byte.
+- No leftover containers, worktrees, refs, processes, fixture directories or
+  default state root.
+- `git diff --check` is clean, and the new files are whitespace-clean.
+
+Linux CI is pending: nothing is staged, committed or pushed. T-E1, T-F1 and
+T-F2 are unchanged. `uv.lock` was untouched.

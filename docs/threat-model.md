@@ -681,6 +681,17 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   real run starts, so two concurrent *live* invocations against the
   same repository are still not prevented in practice — reconciliation
   only recovers a *dead* one.
+  **Slice 3C-4 (Amendment 14, Accepted)** adds an internal composition,
+  `codeagent._lifecycle_run.run_lifecycle_aware()`, whose lease holds the
+  repository lock for the entire run. A real two-process test proves that a
+  second run on this path is refused with `BUSY` before any run directory,
+  leaf or ref is created. That is evidence **for this internal path only**,
+  not a mitigation:
+  - no bundled CLI or production module calls the composition;
+  - Amendment 14 gates any operator entry point on further recovery work;
+  - the legacy lifecycle-unaware `GitWorktree` path is unchanged.
+
+  T-E1's status is therefore unchanged.
 - Planned control: controller entry-gating on `prepare_lifecycle()`
   before a run starts; worktree/checkpoint-ref *removal* during
   reconciliation for a non-absent dead-run shape (Slice 3B-5 implements

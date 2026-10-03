@@ -4061,3 +4061,280 @@ SIGKILL during the Git command can orphan the Git process with no bound on
 its lifetime, and the test for that state is a deterministic model, not
 proof; and a valid replacement directory cannot be distinguished from the
 original.
+
+## Amendment 14 (Accepted 2026-10-03): the first lifecycle-aware internal run composition
+
+**Scope.** Milestone 3 Slice 3C-4 adds `codeagent._lifecycle_run.run_lifecycle_aware()`,
+the first code that composes the lifecycle substrate into one real run:
+`prepare_lifecycle()`'s lease, one shared projection cursor with its four
+publishers (`create_shared_lifecycle_publishers()`), the deterministic worktree
+reservation, a publisher-mode `GitWorktree`, a lifecycle-aware `DockerVerifier`,
+a publishing `CheckpointSession`, and a `RunController` with its owner-state
+publisher. It settles the question Amendment 8 §6 left open: who owns the
+`LifecycleLease`, and what a release failure does to the outer result. No
+existing `src` module changes.
+
+**Boundary.** No bundled CLI or production module imports or calls it
+(AST-pinned). It lives in an underscore module that `codeagent/__init__.py` does
+not export. Python does not enforce privacy, so a consumer that imports it leaves
+the supported boundary. This amendment does not claim that only tests can reach
+it.
+
+**Gate.** No operator entry point may call this composition until all of the
+following exist:
+- a dead-run checkpoint-ref reconciliation row;
+- a worktree-plus-container reconciliation row;
+- abandonment (§11);
+- ADR 0005 cancellation.
+
+The reason: a crash in the windows that dominate a real run's duration (§10
+below) blocks the repository, and no CodeAgent recovery exists for it yet.
+
+### 1. Ownership
+
+The composition owns the lease for the whole run. The lease holds the repository
+lock, the lifecycle lock, and the state-root and run-directory descriptors; the
+repository lock is therefore held across the entire composed run.
+
+| Resource | Owner and lifetime |
+|---|---|
+| Writer and cursor | Scoped to the lease. |
+| Reservation | Owned by the composition, and `CONSUMED` once the worktree is entered. |
+| `GitWorktree` | Entered by the composition. Once `run()` starts, teardown authority passes to the controller's `_terminate()`. |
+| Controller, verifier, session, applier, reader, sink | Hold nothing between calls. |
+
+In reservation mode `GitWorktree` owns no descriptor or temporary directory of
+its own (`_tempdir` is set only in tempdir mode), so not exiting it leaks
+nothing.
+
+I13 holds: `complete()` (the final projection write) runs inside
+`_terminate()`, and the lifecycle lock is released afterwards, in
+`lease.close()`.
+
+### 2. Ordered body
+
+1. `prepare_lifecycle()`. It self-cleans and raises on failure.
+2. Inside one `try`:
+   - open the writer;
+   - create the shared publishers;
+   - take the trusted source path, `initial.source_repo_path`;
+   - validate the evidence root (§4);
+   - reserve and enter the leaf;
+   - construct and enter `GitWorktree`;
+   - build every collaborator from the worktree path;
+   - call `controller.run()`.
+3. **H1.** The `except BaseException` handler only binds `original`. Every
+   cleanup stage runs afterwards, outside any handler, so the composition never
+   adds an implicit `__context__` to a stage's exception (the Amendment 9/3C-3
+   precedent).
+4. Take R5 if `original` is set, otherwise R4.
+
+### 3. Cleanup rules
+
+Each cleanup stage is attempted exactly once, in a fixed order, through
+`_attempt`. `_attempt` returns either the stage's declared failure or anything
+else raised, including any `BaseException`, and never raises itself. No
+`finally` block wraps a stage.
+
+- **R1, sole teardown authority.** Once `run()` returns, `_terminate()` was the
+  only disposal and ref-deletion attempt. The composition never calls
+  `GitWorktree.__exit__`, `dispose()` or `preserve()` again, so nothing is
+  disposed a second time and nothing in Git, Docker or the filesystem is mutated
+  after `RunFinished`. A latched `GitWorktreeLifecycleError` is never re-raised,
+  because the controller already mapped it.
+- **R2, stages.**
+  - Returned path: `RESERVATION` (`reservation.__exit__(None, None, None)`),
+    then `LEASE` (`lease.close()`).
+  - Raise path: `WORKTREE_PHYSICAL` (`worktree.__exit__(exc)`, only if the
+    worktree was entered), then `RESERVATION` (if reserved), then `LEASE`.
+- **R3, declared types.**
+
+  | Stage | Declared type |
+  |---|---|
+  | `RESERVATION` | `LifecycleFsError` |
+  | `LEASE` | `LifecycleStoreError` |
+  | Worktree recorded fields | `GitWorktreeCleanupError` (`WORKTREE_PHYSICAL`) and `GitWorktreeLifecycleError` (`WORKTREE_PUBLICATION`) |
+
+  Anything else escaping a stage call is an unexpected failure, attributed to
+  the stage whose call raised it.
+- **H2.** An unexpected exception escaping `GitWorktree.__exit__` is attributed
+  to `WORKTREE_PHYSICAL`; it cannot be attributed more finely from outside that
+  call. `WORKTREE_PUBLICATION` is only ever the latched field.
+- **Candidate order.**
+  1. `WORKTREE_PHYSICAL`: the unexpected exception, then `cleanup_error`.
+  2. `WORKTREE_PUBLICATION`: `lifecycle_error`.
+  3. `RESERVATION`: the unexpected exception, then `cleanup_error` (or the
+     declared error on the returned path).
+  4. `LEASE`: the declared or unexpected exception.
+
+  Recorded fields are read for every object that was constructed, including a
+  worktree whose `__enter__` failed.
+- **R8, attribution, which decides confirmation and every outcome.**
+  - Immediately before an exit stage, its object's recorded fields are
+    snapshotted by identity.
+  - A recorded-field candidate is **O-owned** when it is unchanged by identity
+    from the pre-call snapshot (or its stage never ran) and is reachable from
+    the original exception. A snapshot compares identities: it cannot show
+    whether code reassigned the same object, and the rule does not claim to.
+  - Every other candidate is **attributed**. That includes every exception
+    escaping a stage call, and any recorded field whose identity changed during
+    the call.
+  - `failed_stages`/`unconfirmed_stages` are the unique stages of the
+    attributed candidates, in first-occurrence order.
+- **D, reporting only.** D selects which instances appear in `failures`. It is
+  iterative and cycle-safe:
+  - it walks `__cause__` and `__context__` by object identity, with a visited-id
+    set seeded from the original exception;
+  - it excludes a candidate reachable from the original or from an earlier
+    retained record, so the first occurrence in stage order wins;
+  - it retains a later candidate that wraps an earlier one;
+  - it treats a suppressed `__context__` as reachable, which is conservative.
+
+  D never changes R8's results. A stage can therefore be unconfirmed with no
+  record of its own, and a `None` error field never means confirmation.
+- **R4, returned path.** Let A be the attributed candidates and F = D(A).
+
+  | Condition | Outcome |
+  |---|---|
+  | No unexpected candidate | Return `LifecycleRunResult(finished, unconfirmed_stages, R, L)`. R and L come from F's retained `RESERVATION`/`LEASE` records. |
+  | Exactly one candidate overall, an unexpected non-`Exception` `BaseException` | Re-raise it exactly. |
+  | Otherwise | Raise `LifecycleRunCleanupError(finished, None, F, failed_stages)` from the first unexpected candidate. |
+
+  An unexpected failure excluded by D still selects this row, so it is never
+  silently swallowed.
+- **R5, raise path.** With O as the original exception:
+  - no attributed candidate: re-raise O exactly;
+  - otherwise: raise `LifecycleRunCleanupError(None, O, D(candidates, O),
+    failed_stages)` from O.
+
+  This is the repository's cleanup-dominance convention (`_bounded_subprocess`,
+  `LifecycleLease.__exit__`, `GitWorktree` enter-time cleanup), extended so
+  that every unconfirmed stage remains represented in `failed_stages` and D
+  retains each distinct reportable exception once. A deduplicated exception
+  remains observable through the original exception or an earlier retained
+  exception's chain. It includes converting a
+  `KeyboardInterrupt` when cleanup is unconfirmed. On this path
+  `GitWorktree.__exit__` may dispose, because no `RunFinished` was returned and
+  the retry is idempotent and observation-confirmed.
+- **R6.** A `BaseException` that lands after `RunFinished` is appended but
+  before `run()` returns takes R5. The contract keys on `run()` returning.
+- **R7, sanitization.** The message is a fixed prefix followed by
+  `failed_stages` values. It never interpolates any retained exception, path,
+  Git output or caller input. Retained instances are never mutated, re-chained
+  or wrapped. No `ExceptionGroup` is used (Amendment 7 §4).
+
+### 4. Evidence root
+
+Before any reservation, the evidence root goes through the sink's own
+unmodified checks:
+- `_validate_no_symlink_ancestors`;
+- bidirectional `_validate_containment` of the resolved root against the
+  canonical source;
+- the same containment check against the whole state root.
+
+The state-root check is a superset of the deterministic worktree check, and it
+keeps the artifact out of `runs/<id>/`. That matters because reconciliation's
+inner-entry check refuses any unrecognized file there before it peeks at the
+terminal state, so an artifact there would block even a `COMPLETE` entry. The
+sink's later validation at capture is unchanged.
+
+### 5. Types
+
+- `CleanupStage`: `WORKTREE_PHYSICAL`, `WORKTREE_PUBLICATION`, `RESERVATION`,
+  `LEASE`.
+- `CleanupFailure(stage, exception, declared)`.
+- `LifecycleRunResult(finished, unconfirmed_stages, reservation_release_error,
+  lease_release_error)`, with `release_confirmed` as the authoritative check.
+- `LifecycleRunCleanupError`, with `finished`, `original`, `failures` and
+  `failed_stages`.
+
+### 6. Failure table (what the next run sees)
+
+| Failure | Outcome | Next run |
+|---|---|---|
+| Inside `prepare_lifecycle` | Raised | Ok, or blocked (the 3B-1 residual, a run directory without a projection). |
+| Writer, publishers, evidence-root refusal, or reservation | O exactly, or a cleanup error from O; projection PREPARING and all absent | Reconciled. |
+| `GitWorktree` init/enter | The enter error exactly, or a cleanup error from it | Reconciled (3B-1/A12/A13), or blocked if cleanup is unconfirmed. |
+| Collaborator construction | Worktree disposed on R5 | Reconciled. |
+| Ordinary `Exception`, or any terminal outcome from `run()` | Result; projection `COMPLETE` when teardown is confirmed | Ok. |
+| Disposal failure or latched `absent` failure inside `_terminate()` | Result with `LIFECYCLE_CLEANUP_UNCONFIRMED`; never retried | A13 when no ref exists, otherwise blocked. |
+| `BaseException` during `run()` | R5 | Blocked once a checkpoint ref exists (ADR 0005 gap). |
+
+**Crash windows that block the next run:**
+- between run-directory creation and the initial projection publish;
+- after the leaf is reserved but before `creating`;
+- a worktree together with any container;
+- any non-absent checkpoint ref;
+- Ctrl-C after the first patch;
+- preserve paths.
+
+**Crash windows that the next run reconciles:**
+- PREPARING with everything absent;
+- `creating`/`present` worktree alone;
+- after ref deletion but before `COMPLETE`.
+
+### 7. Non-claims
+
+- **Threat model.** T-E1 is not mitigated: the repository lock covers only this
+  internal path, and the legacy lifecycle-unaware path is unchanged. T-F1 and
+  T-F2 are unchanged; tests pin blocking, not recovery.
+- **Raise path.** Reservation and lease failures exist only in the raised error.
+- **Lone `BaseException` after `RunFinished`.** When a lone `BaseException` is
+  re-raised after `RunFinished`, the `RunFinished` is observable only through
+  the caller's `event_log`.
+- **Unguarded window.** Asynchronous delivery inside or between attempt steps
+  is not guarded.
+- **Same-user swaps.** These remain under A4.
+- **Evidence.** This is implementation and automated-test evidence, not a
+  security review.
+
+### 8. Evidence
+
+Local verification only: macOS, Git 2.54.0, Python 3.12.14, Docker already
+running, `CODEAGENT_REQUIRE_DOCKER=1`. Nothing has been committed or pushed, so
+Linux CI is pending.
+
+**New test file.** `tests/integration/test_lifecycle_run.py` holds 46 named
+specifications (T1–T45 plus T17b), which expand to 69 collected tests through
+parametrization. The real-Docker set is exactly T30–T38, pinned by T41:
+
+| Test | Behavior |
+|---|---|
+| T30 | Happy path: `COMPLETE`, every resource absent, evidence published. |
+| T31 | A second run reports `SKIPPED_TERMINAL`. |
+| T32 | A model error after baseline still ends `COMPLETE`. |
+| T33 | A disposal failure is reconciled by A13 on the next run. |
+| T34 | `KeyboardInterrupt` after a durable ref `PRESENT` blocks the next run. |
+| T35 | SIGKILL after worktree `present` is reconciled. |
+| T36 | SIGKILL after baseline `PRESENT` blocks. |
+| T37 | SIGKILL after ref `PRESENT` blocks. |
+| T38 | A construction failure is reconciled. |
+
+The other 37 named specifications run without Docker. Every one of their
+injected failures is a monkeypatched release or publication failure.
+
+**Narrowed AST proofs.** The two `tests/unit/test_workspace.py` proofs that no
+production module constructs `GitWorktree` are narrowed to "only
+`_lifecycle_run.py`". This is a disclosed correction, not a weakening: the
+narrower assertion is exact equality.
+
+**Mutation checks.** Temporary mutations of the module were each caught by the
+named tests and then reverted; the module is byte-identical afterwards:
+- stages inside the handler (T19, T39);
+- R4 deciding from D (T44, T6);
+- exiting the worktree after `run()` (T1, T2);
+- removing the O-owned rule (T16, T24);
+- deriving `failed_stages` from D (T21, T45);
+- taking R4's fields from raw candidates (T43).
+
+**Totals.**
+
+| Run | Result |
+|---|---|
+| New file plus `test_workspace.py` | 227 passed |
+| 17-file focused set (1,640) plus the new file | 1,709 passed, forward and reverse |
+| Full suite | 3,233 passed, 0 skipped (up from 3,164) |
+
+No leftover CodeAgent containers, worktree registrations, `refs/codeagent` refs,
+child processes, fixture directories or default state root remained.
+`git diff --check` is clean.

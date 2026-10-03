@@ -2816,20 +2816,31 @@ def _calls_to_gitworktree(tree: ast.AST):
                 yield node
 
 
-def test_no_production_module_constructs_gitworktree() -> None:
-    offenders = []
+# Milestone 3 Slice 3C-4 (ADR 0004 Amendment 14) narrowed these two proofs
+# from "no production module" to "only the internal composition": the
+# underscore module `_lifecycle_run.py` is now the single place that
+# constructs a `GitWorktree` and supplies a worktree publisher, and no
+# bundled module imports it (pinned in tests/integration/test_lifecycle_run.py).
+_COMPOSITION_MODULE = "_lifecycle_run.py"
+
+
+def test_only_the_internal_composition_constructs_gitworktree() -> None:
+    constructing = []
     for module in sorted(_SRC.glob("*.py")):
         tree = ast.parse(module.read_text())
         if any(True for _ in _calls_to_gitworktree(tree)):
-            offenders.append(module.name)
-    assert offenders == []
+            constructing.append(module.name)
+    assert constructing == [_COMPOSITION_MODULE]
 
 
-def test_no_production_call_passes_worktree_publisher_to_gitworktree() -> None:
+def test_only_the_internal_composition_passes_worktree_publisher_to_gitworktree() -> None:
+    passing = set()
     for module in sorted(_SRC.glob("*.py")):
         tree = ast.parse(module.read_text())
         for call in _calls_to_gitworktree(tree):
-            assert all(keyword.arg != "worktree_publisher" for keyword in call.keywords), module.name
+            if any(keyword.arg == "worktree_publisher" for keyword in call.keywords):
+                passing.add(module.name)
+    assert passing == {_COMPOSITION_MODULE}
 
 
 def test_workspace_imports_worktree_lifecycle_but_never_lifecycle_store() -> None:
