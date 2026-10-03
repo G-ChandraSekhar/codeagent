@@ -4600,3 +4600,271 @@ def test_reconciler_worktree_illegal_amendment_13_edges(tmp_path, source, target
         assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
     finally:
         os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 16: checkpoint-ref reconciliation shape, deletion
+# candidates, and the reconciler-owned checkpoint-ref writer.
+# ---------------------------------------------------------------------------
+
+_A16_SHA_LENGTHS = [pytest.param(40, id="sha1"), pytest.param(64, id="sha256")]
+
+
+def _a16_sha(char, length):
+    return char * length
+
+
+def _a16_ref_record(intent, length=40, *, a="a", b="b"):
+    A, B = _a16_sha(a, length), _a16_sha(b, length)
+    return {
+        "creating": cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=A),
+        "present": cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=A),
+        "advancing": cs.CheckpointTransition(
+            intent=cs.CheckpointIntent.ADVANCING, accepted_sha=A, expected_old_sha=A, proposed_new_sha=B
+        ),
+        "removing": cs.CheckpointTransition(intent=cs.CheckpointIntent.REMOVING, accepted_sha=A, expected_old_sha=A),
+    }[intent]
+
+
+def _a16_removing(sha):
+    return cs.CheckpointTransition(intent=cs.CheckpointIntent.REMOVING, accepted_sha=sha, expected_old_sha=sha)
+
+
+def _a16_with_ref(projection, transition):
+    return dataclasses.replace(projection, checkpoint_ref=transition)
+
+
+@pytest.mark.parametrize("intent", ["creating", "present", "advancing", "removing"])
+def test_a16_checkpoint_ref_shape_truth_table(intent):
+    base = _a16_with_ref(_base_projection(), _a16_ref_record(intent))
+    assert ls.is_projection_checkpoint_ref_reconciliation_shape(base)
+    # Disjoint from every existing reconciliation shape.
+    assert not ls.is_projection_reconciliation_eligible_shape(base)
+    assert not ls.is_projection_materialized_worktree_reconciliation_shape(base)
+    assert not ls.is_projection_creating_worktree_reconciliation_shape(base)
+    # A worktree, a container record, or a failure excludes it.
+    assert not ls.is_projection_checkpoint_ref_reconciliation_shape(_creating(base))
+    for role, cintent, cid in (
+        ("baseline", ls.ContainerIntent.CREATING, None),
+        ("verification", ls.ContainerIntent.PRESENT, "9" * 64),
+    ):
+        assert not ls.is_projection_checkpoint_ref_reconciliation_shape(
+            _with_role(base, role=role, intent=cintent, id=cid)
+        )
+    assert not ls.is_projection_checkpoint_ref_reconciliation_shape(
+        dataclasses.replace(base, failure=ls.FailureDetail(phase="p", detail="d"))
+    )
+
+
+def test_a16_absent_ref_record_is_not_the_checkpoint_ref_shape():
+    assert not ls.is_projection_checkpoint_ref_reconciliation_shape(_base_projection())
+
+
+@pytest.mark.parametrize("length", _A16_SHA_LENGTHS)
+def test_a16_deletion_candidates_are_exactly_section_8(length):
+    A, B = _a16_sha("a", length), _a16_sha("b", length)
+    assert ls.checkpoint_ref_deletion_candidates(_a16_ref_record("creating", length)) == (("proposed", A),)
+    assert ls.checkpoint_ref_deletion_candidates(_a16_ref_record("present", length)) == (("accepted", A),)
+    assert ls.checkpoint_ref_deletion_candidates(_a16_ref_record("advancing", length)) == (
+        ("accepted", A),
+        ("proposed", B),
+    )
+    assert ls.checkpoint_ref_deletion_candidates(_a16_ref_record("removing", length)) == (("accepted", A),)
+    assert ls.checkpoint_ref_deletion_candidates(cs.ABSENT_TRANSITION) == ()
+
+
+_A16_LEGAL_REMOVING = [
+    ("creating", "a"),
+    ("present", "a"),
+    ("advancing", "a"),
+    ("advancing", "b"),
+]
+
+
+@pytest.mark.parametrize("length", _A16_SHA_LENGTHS)
+@pytest.mark.parametrize("intent, char", _A16_LEGAL_REMOVING)
+def test_a16_writer_legal_removing_edges(tmp_path, length, intent, char):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _a16_with_ref(_base_projection(state=ls.LifecycleState.RECONCILING, attempts_total=2), _a16_ref_record(intent, length))
+        target = _a16_removing(_a16_sha(char, length))
+        updated = ls._publish_reconciler_checkpoint_ref_transition(fd, projection, attempts_total=2, target=target)
+        assert updated.checkpoint_ref == target
+        assert dataclasses.replace(updated, checkpoint_ref=projection.checkpoint_ref) == projection
+        on_disk = _read_back(run_dir)["checkpoint_ref"]
+        assert on_disk == {
+            "intent": "removing",
+            "accepted_sha": _a16_sha(char, length),
+            "expected_old_sha": _a16_sha(char, length),
+            "proposed_new_sha": None,
+        }
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("length", _A16_SHA_LENGTHS)
+@pytest.mark.parametrize("intent", ["creating", "present", "advancing", "removing"])
+def test_a16_writer_absent_collapse_from_every_non_absent_intent(tmp_path, length, intent):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _a16_with_ref(_base_projection(state=ls.LifecycleState.RECONCILING, attempts_total=1), _a16_ref_record(intent, length))
+        updated = ls._publish_reconciler_checkpoint_ref_transition(
+            fd, projection, attempts_total=1, target=cs.ABSENT_TRANSITION
+        )
+        assert updated.checkpoint_ref == cs.ABSENT_TRANSITION
+        assert _read_back(run_dir)["checkpoint_ref"]["intent"] == "absent"
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("length", _A16_SHA_LENGTHS)
+def test_a16_writer_removing_to_same_removing_is_a_no_op(tmp_path, length):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _a16_with_ref(_base_projection(state=ls.LifecycleState.RECONCILING), _a16_ref_record("removing", length))
+        same = ls._publish_reconciler_checkpoint_ref_transition(
+            fd, projection, attempts_total=0, target=_a16_removing(_a16_sha("a", length))
+        )
+        assert same is projection
+        assert not (run_dir / ls.LIFECYCLE_JSON_FILENAME).exists()  # nothing published
+    finally:
+        os.close(fd)
+
+
+_A16_ILLEGAL = [
+    pytest.param("creating", lambda n: _a16_removing(_a16_sha("b", n)), id="creating-removing-non-candidate"),
+    pytest.param("present", lambda n: _a16_removing(_a16_sha("b", n)), id="present-removing-non-candidate"),
+    pytest.param("advancing", lambda n: _a16_removing(_a16_sha("c", n)), id="advancing-removing-third-sha"),
+    pytest.param("removing", lambda n: _a16_removing(_a16_sha("b", n)), id="removing-to-different-sha"),
+    pytest.param(
+        "present",
+        lambda n: cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=_a16_sha("a", n)),
+        id="present-target",
+    ),
+    pytest.param(
+        "advancing",
+        lambda n: cs.CheckpointTransition(intent=cs.CheckpointIntent.PRESENT, accepted_sha=_a16_sha("b", n)),
+        id="advancing-collapse-is-owner-only",
+    ),
+    pytest.param(
+        "creating",
+        lambda n: cs.CheckpointTransition(intent=cs.CheckpointIntent.CREATING, proposed_new_sha=_a16_sha("a", n)),
+        id="creating-target",
+    ),
+    pytest.param(
+        "present",
+        lambda n: cs.CheckpointTransition(
+            intent=cs.CheckpointIntent.ADVANCING,
+            accepted_sha=_a16_sha("a", n),
+            expected_old_sha=_a16_sha("a", n),
+            proposed_new_sha=_a16_sha("b", n),
+        ),
+        id="advancing-target",
+    ),
+]
+
+
+@pytest.mark.parametrize("length", _A16_SHA_LENGTHS)
+@pytest.mark.parametrize("intent, make_target", _A16_ILLEGAL)
+def test_a16_writer_refuses_every_other_edge(tmp_path, length, intent, make_target):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _a16_with_ref(_base_projection(state=ls.LifecycleState.RECONCILING), _a16_ref_record(intent, length))
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_checkpoint_ref_transition(fd, projection, attempts_total=0, target=make_target(length))
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+        assert not (run_dir / ls.LIFECYCLE_JSON_FILENAME).exists()
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "target", [cs.ABSENT_TRANSITION, _a16_removing("a" * 40)], ids=["absent", "removing"]
+)
+def test_a16_writer_refuses_an_absent_record(tmp_path, target):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _base_projection(state=ls.LifecycleState.RECONCILING)
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_checkpoint_ref_transition(fd, projection, attempts_total=0, target=target)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+        assert not (run_dir / ls.LIFECYCLE_JSON_FILENAME).exists()
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "state", [ls.LifecycleState.PREPARING, ls.LifecycleState.ACTIVE, ls.LifecycleState.CLEANING]
+)
+def test_a16_writer_requires_reconciling(tmp_path, state):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _a16_with_ref(_base_projection(state=state), _a16_ref_record("present"))
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_checkpoint_ref_transition(
+                fd, projection, attempts_total=0, target=cs.ABSENT_TRANSITION
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+        assert not (run_dir / ls.LIFECYCLE_JSON_FILENAME).exists()
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("attempts_total", [0, 2])
+def test_a16_writer_never_changes_attempts_total(tmp_path, attempts_total):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _a16_with_ref(_base_projection(state=ls.LifecycleState.RECONCILING, attempts_total=1), _a16_ref_record("present"))
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_checkpoint_ref_transition(
+                fd, projection, attempts_total=attempts_total, target=cs.ABSENT_TRANSITION
+            )
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("target", [None, "absent", ls.ContainerIntent.ABSENT])
+def test_a16_writer_refuses_a_non_transition_target(tmp_path, target):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        projection = _a16_with_ref(_base_projection(state=ls.LifecycleState.RECONCILING), _a16_ref_record("present"))
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_checkpoint_ref_transition(fd, projection, attempts_total=0, target=target)
+        assert excinfo.value.reason is ls.LifecycleStoreFailure.ILLEGAL_TRANSITION
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "fs_reason, store_reason",
+    [
+        (lf.LifecycleFsFailure.IO_FAILED, ls.LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED),
+        (lf.LifecycleFsFailure.INSTALLED_DURABILITY_UNCONFIRMED, ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED),
+    ],
+)
+def test_a16_writer_classifies_publication_failures(tmp_path, monkeypatch, fs_reason, store_reason):
+    fd, run_dir = _open_run_dir_fd(tmp_path)
+    try:
+        def boom(*a, **k):
+            raise lf.LifecycleFsError(fs_reason, "injected")
+
+        monkeypatch.setattr(ls, "publish_private_file_atomically_at", boom)
+        projection = _a16_with_ref(_base_projection(state=ls.LifecycleState.RECONCILING), _a16_ref_record("present"))
+        with pytest.raises(ls.LifecycleStoreError) as excinfo:
+            ls._publish_reconciler_checkpoint_ref_transition(
+                fd, projection, attempts_total=0, target=_a16_removing("a" * 40)
+            )
+        assert excinfo.value.reason is store_reason
+    finally:
+        os.close(fd)
+
+
+def test_a16_live_owner_checkpoint_ref_table_is_unchanged():
+    """The live owner may still never write `advancing -> removing` or a
+    removing at a proposed SHA: those edges are reconciler-only."""
+    with pytest.raises(ls.LifecycleStoreError):
+        ls._validate_checkpoint_ref_edge(_a16_ref_record("advancing"), _a16_removing("b" * 40))
+    with pytest.raises(ls.LifecycleStoreError):
+        ls._validate_checkpoint_ref_edge(_a16_ref_record("creating"), _a16_removing("a" * 40))
+    ls._validate_checkpoint_ref_edge(_a16_ref_record("present"), _a16_removing("a" * 40))  # owner edge still legal

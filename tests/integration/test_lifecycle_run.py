@@ -2,11 +2,12 @@
 aware run composition, `codeagent._lifecycle_run.run_lifecycle_aware()`.
 
 Test numbers (T1..T45, T17b) map to the 46 named specifications in the
-slice plan. Most tests are Docker-free: an injected owner-state
+slice plan; T46 (ADR 0004 Amendment 15) and T47 (Amendment 16) were added
+later, and T34 was corrected by Amendment 16 from BLOCKED to RECONCILED. Most tests are Docker-free: an injected owner-state
 `activate()` failure sends `run()` straight to `_terminate()` (real
 evidence capture, real worktree disposal, no baseline), and
 `DockerVerifier.__init__` makes no Docker call. Only the end-to-end and
-crash-boundary tests (T30-T38) and the T46 regression carry `requires_docker`; the exact set is
+crash-boundary tests (T30-T38, T47) and the T46 regression carry `requires_docker`; the exact set is
 pinned by T41.
 
 Every `LifecycleRunCleanupError` assertion also checks the message is
@@ -1119,8 +1120,12 @@ def _blocked(repo):
 
 
 @requires_docker
-def test_t34_keyboard_interrupt_after_ref_present_blocks_next_run(env, monkeypatch):
-    """T34: ADR 0005 gap, pinned honestly."""
+def test_t34_keyboard_interrupt_after_ref_present_is_reconciled_next_run(env, monkeypatch):
+    """T34: the ADR 0005 interruption shape. Before ADR 0004 Amendment 16
+    the dead entry blocked the next run (a non-absent checkpoint ref was
+    never reconciled); its worktree is disposed on the raise path and both
+    containers are absent, so the checkpoint-ref row now recovers it.
+    Disclosed correction: this test previously pinned `_blocked`."""
     real = ls.LifecycleCheckpointRefPublisher.publish
     ki = KeyboardInterrupt()
     armed = {"on": True}
@@ -1139,7 +1144,12 @@ def test_t34_keyboard_interrupt_after_ref_present_blocks_next_run(env, monkeypat
     assert proj["checkpoint_ref"]["intent"] == "present"
     assert _codeagent_refs(env.repo) == [f"refs/codeagent/runs/{lifecycle_id}/checkpoint"]
     assert proj["worktree"]["intent"] == "absent"  # disposed on the raise path
-    _blocked(env.repo)
+    monkeypatch.setattr(ls.LifecycleCheckpointRefPublisher, "publish", real)
+    ls.prepare_lifecycle(str(env.repo), run_id="r-after").close()
+    dead = _projection(env.state / "repos" / repo_key / "runs" / lifecycle_id)
+    assert dead["state"] == "RECONCILED"
+    assert dead["checkpoint_ref"]["intent"] == "absent"
+    _assert_fully_clean(env, repo_key, lifecycle_id)
 
 
 def _child_run_and_sigkill(repo, state_dir, evidence, point):
@@ -1153,7 +1163,16 @@ def _child_run_and_sigkill(repo, state_dir, evidence, point):
     def die():
         os.kill(os.getpid(), signal.SIGKILL)
 
-    if point == "worktree_present":
+    if point == "worktree_absent":
+        real = ls_c.LifecycleWorktreePublisher.publish
+
+        def publish(self, transition):
+            real(self, transition)
+            if transition.intent is WorktreeIntent.ABSENT:
+                die()
+
+        ls_c.LifecycleWorktreePublisher.publish = publish
+    elif point == "worktree_present":
         real = ls_c.LifecycleWorktreePublisher.publish
 
         def publish(self, transition):
@@ -1234,6 +1253,26 @@ def test_t37_sigkill_after_ref_present_blocks(env):
     assert proj["checkpoint_ref"]["intent"] == "present"
     assert _codeagent_refs(env.repo) == [f"refs/codeagent/runs/{lifecycle_id}/checkpoint"]
     _blocked(env.repo)
+
+
+@requires_docker
+def test_t47_sigkill_in_teardown_after_worktree_absent_is_reconciled(env):
+    """T47 (ADR 0004 Amendment 16): the owner dies inside `_terminate()`
+    after the durable worktree `absent` and before the checkpoint-ref
+    delete. The dead entry (CLEANING, worktree and containers absent, ref
+    present) is recovered by the checkpoint-ref row on the next run."""
+    repo_key, lifecycle_id, proj = _crash(env, "worktree_absent")
+    assert proj["state"] == "CLEANING"
+    assert proj["worktree"]["intent"] == "absent"
+    assert proj["containers"]["baseline"]["intent"] == "absent"
+    assert proj["containers"]["verification"]["intent"] == "absent"
+    assert proj["checkpoint_ref"]["intent"] == "present"
+    assert _codeagent_refs(env.repo) == [f"refs/codeagent/runs/{lifecycle_id}/checkpoint"]
+    ls.prepare_lifecycle(str(env.repo), run_id="r-after").close()
+    dead = _projection(env.state / "repos" / repo_key / "runs" / lifecycle_id)
+    assert dead["state"] == "RECONCILED"
+    assert dead["checkpoint_ref"]["intent"] == "absent"
+    _assert_fully_clean(env, repo_key, lifecycle_id)
 
 
 @requires_docker
@@ -1367,7 +1406,7 @@ def _calls_named(tree, name):
 def test_t41_scope_and_marker_pins():
     """T41: no bundled module imports the internal composition; only it calls
     `prepare_lifecycle(`/`create_shared_lifecycle_publishers(`; and exactly
-    the T30-T38 and T46 tests require Docker."""
+    the T30-T38, T46 and T47 tests require Docker."""
     importers, callers = [], {"prepare_lifecycle": set(), "create_shared_lifecycle_publishers": set()}
     for module in sorted(_SRC.glob("*.py")):
         tree = ast.parse(module.read_text())
@@ -1394,5 +1433,5 @@ def test_t41_scope_and_marker_pins():
 
     docker_tests = {n for n in dir(this) if n.startswith("test_") and marked(getattr(this, n))}
     assert docker_tests == {
-        n for n in dir(this) if n.startswith(tuple(f"test_t{i}_" for i in (*range(30, 39), 46)))
+        n for n in dir(this) if n.startswith(tuple(f"test_t{i}_" for i in (*range(30, 39), 46, 47)))
     }

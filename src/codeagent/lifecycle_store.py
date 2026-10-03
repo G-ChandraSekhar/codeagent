@@ -363,6 +363,41 @@ def is_projection_materialized_worktree_reconciliation_shape(projection: Lifecyc
     )
 
 
+def is_projection_checkpoint_ref_reconciliation_shape(projection: LifecycleProjection) -> bool:
+    """ADR 0004 Amendment 16: a non-absent checkpoint-ref record
+    (`creating`/`present`/`advancing`/`removing`) whose worktree record and
+    both container records are absent and whose `failure` is null. The
+    worktree-present and container-present shapes are deliberately not
+    admitted (section 9's container -> worktree -> ref order, I5)."""
+    return (
+        projection.checkpoint_ref.intent is not CheckpointIntent.ABSENT
+        and projection.worktree.intent is WorktreeIntent.ABSENT
+        and projection.worktree.expected_head is None
+        and projection.failure is None
+        and projection.baseline.intent is ContainerIntent.ABSENT
+        and projection.baseline.id is None
+        and projection.verification.intent is ContainerIntent.ABSENT
+        and projection.verification.id is None
+    )
+
+
+def checkpoint_ref_deletion_candidates(transition: CheckpointTransition) -> tuple[tuple[str, str], ...]:
+    """ADR 0004 section 8's deletion candidates for a persisted
+    checkpoint-ref record, as `(role, sha)` pairs in a fixed order:
+    `creating` -> its `proposed_new_sha`; `present` and `removing` -> their
+    `accepted_sha`; `advancing` -> its `accepted_sha` and its
+    `proposed_new_sha`; `absent` -> none. The single source of this table
+    for both the reconciler and its transition writer (Amendment 16)."""
+    intent = transition.intent
+    if intent is CheckpointIntent.CREATING:
+        return (("proposed", transition.proposed_new_sha),)
+    if intent in (CheckpointIntent.PRESENT, CheckpointIntent.REMOVING):
+        return (("accepted", transition.accepted_sha),)
+    if intent is CheckpointIntent.ADVANCING:
+        return (("accepted", transition.accepted_sha), ("proposed", transition.proposed_new_sha))
+    return ()
+
+
 def _container_to_dict(container: ContainerAttribution) -> dict:
     return {"intent": container.intent.value, "id": container.id}
 
@@ -1378,6 +1413,53 @@ def _publish_reconciler_worktree_transition(
     if (current.intent, target.intent) not in _RECONCILER_WORKTREE_TRANSITION_EDGES:
         raise _illegal_transition("not a legal reconciler-owned worktree transition edge")
     updated = replace(projection, worktree=target)
+    data = _encode_and_bound_projection(updated)
+    try:
+        publish_private_file_atomically_at(run_dir_fd, LIFECYCLE_JSON_FILENAME, data, mode=0o600)
+    except LifecycleFsError as exc:
+        raise _classify_publication_failure(exc) from exc
+    return updated
+
+
+def _publish_reconciler_checkpoint_ref_transition(
+    run_dir_fd: int,
+    projection: LifecycleProjection,
+    *,
+    attempts_total: int,
+    target: CheckpointTransition,
+) -> LifecycleProjection:
+    """Record one reconciler-owned checkpoint-ref edge (ADR 0004 Amendment
+    16). From a non-absent record, exactly two targets are legal:
+
+    - `removing(X)`, the write-ahead record before a compare-and-swap
+      delete, where X is one of the record's own section 8 deletion
+      candidates (`checkpoint_ref_deletion_candidates`). `removing(F) ->
+      removing(F)` is a resume no-op that publishes nothing; a `removing`
+      record never moves to a different SHA.
+    - `absent`, only after the caller confirmed the ref absent (by a
+      normal return from `CheckpointRef.delete()` or by a fresh
+      observation). This writer never inspects Git itself.
+
+    Requires `RECONCILING` with `attempts_total` unchanged. The live
+    owner's checkpoint-ref table is untouched by this function."""
+    if projection.state is not LifecycleState.RECONCILING:
+        raise _illegal_transition("the reconciler checkpoint-ref transition requires RECONCILING")
+    if attempts_total != projection.reconciliation.attempts_total:
+        raise _illegal_transition("the reconciler checkpoint-ref transition never changes attempts_total")
+    if not isinstance(target, CheckpointTransition):
+        raise _illegal_transition("the reconciler checkpoint-ref target must be a CheckpointTransition")
+    current = projection.checkpoint_ref
+    if current.intent is CheckpointIntent.ABSENT:
+        raise _illegal_transition("an absent checkpoint-ref record has nothing to reconcile")
+    if target.intent is CheckpointIntent.REMOVING:
+        candidates = {sha for _, sha in checkpoint_ref_deletion_candidates(current)}
+        if target.accepted_sha not in candidates:
+            raise _illegal_transition("a reconciler removing write must name one of the record's own deletion candidates")
+        if current.intent is CheckpointIntent.REMOVING:
+            return projection  # resume no-op: the only candidate is its own SHA
+    elif target != ABSENT_TRANSITION:
+        raise _illegal_transition("not a legal reconciler-owned checkpoint-ref transition edge")
+    updated = replace(projection, checkpoint_ref=target)
     data = _encode_and_bound_projection(updated)
     try:
         publish_private_file_atomically_at(run_dir_fd, LIFECYCLE_JSON_FILENAME, data, mode=0o600)

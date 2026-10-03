@@ -2210,3 +2210,84 @@ def test_a_generated_lifecycle_id_is_accepted_by_checkpoint_ref(repo: Path) -> N
     constructed = CheckpointRef(repo, generated)
     assert constructed.lifecycle_id == generated
     assert constructed.ref_name == f"refs/codeagent/runs/{generated}/checkpoint"
+
+
+# --------------------------------------------------------------------
+# ADR 0004 Amendment 16: a *dangling* symbolic ref is never reported as
+# absent. `git for-each-ref` silently skips a broken ref, so `observe()`
+# probes `git symbolic-ref --quiet` whenever the listing is empty.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_observe_refuses_a_dangling_symbolic_ref(tmp_path: Path, object_format: str) -> None:
+    try:
+        repo = _make_repo(tmp_path / "source", object_format)
+    except subprocess.CalledProcessError:
+        pytest.skip(f"installed git does not support --object-format={object_format}")
+    ref = CheckpointRef(repo, LIFECYCLE_ID)
+    _git(repo, "symbolic-ref", ref.ref_name, "refs/heads/does-not-exist")
+    # The precondition this guards: Git's own listing omits the broken ref.
+    assert _git(repo, "for-each-ref", ref.ref_name).stdout == ""
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.observe()
+    assert excinfo.value.reason is CheckpointRefFailure.SYMBOLIC_REF
+    assert excinfo.value.outcome is MutationOutcome.SYMBOLIC
+
+
+def test_mutations_refuse_a_dangling_symbolic_ref_and_leave_it_untouched(
+    repo: Path, ref: CheckpointRef
+) -> None:
+    """Load-bearing: before Amendment 16, `create()`'s pre-check observed
+    a dangling symbolic ref as absent, and `update-ref --no-deref` would
+    then have rewritten the owned name into a regular ref."""
+    head = _head(repo)
+    _git(repo, "symbolic-ref", ref.ref_name, "refs/heads/does-not-exist")
+    for call in (
+        lambda: ref.create(head),
+        lambda: ref.advance(expected_old_oid=head, new_oid=_commit(repo, "two\n")),
+        lambda: ref.delete(expected_oid=head),
+    ):
+        with pytest.raises(CheckpointRefError) as excinfo:
+            call()
+        assert excinfo.value.reason is CheckpointRefFailure.SYMBOLIC_REF
+        assert (
+            _git(repo, "symbolic-ref", ref.ref_name).stdout.strip() == "refs/heads/does-not-exist"
+        ), "the dangling symbolic ref must be left exactly as it was"
+
+
+def test_observe_still_reports_a_truly_absent_ref_as_absent(ref: CheckpointRef) -> None:
+    assert ref.observe() == RefObservation(present=False, oid=None)
+
+
+def test_a_failed_symbolic_probe_is_an_observation_failure_never_absence(
+    ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = checkpoint_ref_module._run_git
+
+    def failing_probe(repo_path, *args):
+        if args[:1] == ("symbolic-ref",):
+            return subprocess.CompletedProcess(args, 128, "", "")
+        return real(repo_path, *args)
+
+    monkeypatch.setattr(checkpoint_ref_module, "_run_git", failing_probe)
+    with pytest.raises(CheckpointRefError) as excinfo:
+        ref.observe()
+    assert excinfo.value.reason is CheckpointRefFailure.OBSERVATION_FAILED
+    assert excinfo.value.outcome is MutationOutcome.UNKNOWN
+
+
+def test_the_symbolic_probe_runs_only_on_an_empty_listing(
+    repo: Path, ref: CheckpointRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+    real = checkpoint_ref_module._run_git
+
+    def recording(repo_path, *args):
+        calls.append(args[0])
+        return real(repo_path, *args)
+
+    monkeypatch.setattr(checkpoint_ref_module, "_run_git", recording)
+    _git(repo, "update-ref", ref.ref_name, _head(repo))
+    assert ref.observe().present
+    assert "symbolic-ref" not in calls

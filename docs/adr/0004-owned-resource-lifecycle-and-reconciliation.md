@@ -4534,3 +4534,255 @@ The local evidence follows.
   No leftover resources remained.
 
 This is implementation and test evidence, not a security review.
+
+## Amendment 16 (Accepted 2026-10-03): reconciling a dead checkpoint ref whose worktree and containers are already absent
+
+**Scope.** Milestone 3 Slice 3C-5. This amendment implements §8's
+checkpoint-ref reconciliation table for one shape only:
+
+- the state is `PREPARING`, `ACTIVE`, `CLEANING` or `RECONCILING`;
+- the checkpoint-ref record is `creating`, `present`, `advancing` or `removing`;
+- the worktree record is `absent`;
+- both container records are `absent`;
+- `failure` is null.
+
+The shape check is `lifecycle_store.is_projection_checkpoint_ref_reconciliation_shape`.
+
+**Not covered.** A ref alongside a worktree record (§9 and I5 require the
+worktree first) or a container record. Nothing is wired to a CLI or controller
+entry point.
+
+### 1. Deletion candidates
+
+`lifecycle_store.checkpoint_ref_deletion_candidates` is the single source of
+§8's table, shared by the reconciler and its writer.
+
+| Persisted intent | Candidates (role) |
+|---|---|
+| `creating` | `proposed_new_sha` (`proposed`) |
+| `present` | `accepted_sha` (`accepted`) |
+| `advancing` | `accepted_sha` (`accepted`), then `proposed_new_sha` (`proposed`) |
+| `removing` | `accepted_sha` (`accepted`) |
+
+The comparison value is always the observed live SHA, and only when it is a
+candidate.
+
+### 2. Order
+
+Every inspection happens before any mutation, in §9's order.
+
+**Inspections:**
+
+1. **Containers.** A fresh container listing must show both deterministic names
+   absent.
+2. **Worktree, which must be confirmed absent (I5).**
+   - The exact path must be unregistered in a fresh Git listing.
+   - The bounded Git admin-entry scan must find none.
+   - The deterministic leaf name must be observed absent by Amendment 13's
+     descriptor-relative, no-follow observer
+     (`StateRoot.observe_materialized_worktree_leaf`). Only a genuinely missing
+     name counts as absence; any other inspection error is
+     `SUBSTRATE_UNAVAILABLE`, never absence.
+3. **Object format.** The discovered object format must equal the trusted
+   identity's.
+4. **The owned ref.** It is observed without following a symbolic ref.
+
+**Mutations:**
+
+1. Enter `RECONCILING`. `attempts_total` is incremented only when this is a
+   fresh cycle.
+2. Publish the reconciler-owned write-ahead record `removing(observed)`. This
+   is a no-op when the record is already `removing` at that SHA.
+3. Delete with exactly one `CheckpointRef.delete(expected_oid=observed)`. This
+   is the existing compare-and-swap `update-ref --stdin` transaction with
+   no-deref, which re-observes while holding Git's lock and has hooks disabled.
+4. Publish the reconciler-owned `absent`, only after the delete returns
+   normally.
+5. Publish `RECONCILED`, last.
+
+If the ref was already absent at observation, step 1 is followed directly by
+steps 4 and 5, with no Git mutation.
+
+**Reconciler-only edges** (`_publish_reconciler_checkpoint_ref_transition`;
+the live owner's table is unchanged):
+
+- `creating(P) → removing(P)`;
+- `present(A) → removing(A)`;
+- `advancing(A,B) → removing(A | B)`;
+- `removing(F) → removing(F)`, a no-op that publishes nothing;
+- any of the four non-absent intents `→ absent`.
+
+All of these require `RECONCILING` and an unchanged `attempts_total`.
+
+### 3. Outcomes
+
+| Observation or result | Outcome | Mutation |
+|---|---|---|
+| A container name is present | `REFUSED` | none |
+| The container listing failed | `SUBSTRATE_UNAVAILABLE` | none |
+| The worktree is registered, an admin entry exists, or a leaf entry exists | `REFUSED` | none |
+| The worktree listing, admin scan, or leaf inspection failed | `SUBSTRATE_UNAVAILABLE` | none |
+| The object format disagrees | `REFUSED` | none |
+| The ref is symbolic (dangling or resolvable) | `REFUSED` | none |
+| The ref is an unrelated direct SHA | `REFUSED` | none |
+| The ref observation failed, timed out, or was ambiguous | `SUBSTRATE_UNAVAILABLE` | none |
+| The ref is absent | collapse to `absent`, then `RECONCILED` | projection only |
+| The ref is at a candidate SHA | delete, then `RECONCILED` | ref deleted |
+| Delete `UNCHANGED` (including a compare-and-swap rejection) | `FAILED`; `removing(observed)` stays installed | none confirmed |
+| Delete `UNEXPECTED` (the ref moved or vanished during the call) | `REFUSED` | none |
+| Delete `SYMBOLIC` | `REFUSED` | none |
+| Delete `UNKNOWN`, `TRANSACTION_CLEANUP_UNCONFIRMED`, or an error claiming `APPLIED` | `SUBSTRATE_UNAVAILABLE` | unknown |
+| Any projection write failed or was unconfirmed | `FAILED`, with no later mutation | as installed |
+
+### 4. Resume
+
+Every pass reloads the projection and inspects from scratch.
+
+- **Installed `removing(X)`, ref still at X.** The pass deletes without a
+  second write-ahead record and without incrementing.
+- **Installed `removing(X)`, ref absent.** It collapses to `absent`.
+- **Unconfirmed write-ahead record.** Either record that may be installed
+  leads to the same SHA.
+- **Unconfirmed final `RECONCILED`.** It is already clean final, so it is
+  `SKIPPED_TERMINAL` (I11).
+
+### 5. Disclosed corrections
+
+- **Dangling symbolic ref in `CheckpointRef.observe()`.** It reported a
+  *dangling* symbolic ref as absent, because `git for-each-ref` silently skips
+  broken refs (confirmed on Git 2.54). When the listing is empty it now probes
+  `git symbolic-ref --quiet <ref>`, using the same hardened, time-bounded Git
+  runner:
+
+  | `symbolic-ref --quiet` exit | Result |
+  |---|---|
+  | 0 | `SYMBOLIC_REF` |
+  | 1 | absent |
+  | anything else | `OBSERVATION_FAILED` |
+
+  This also closes a real owner-path hole. `create()`'s pre-check saw a
+  dangling symbolic ref as absent, and `update-ref --no-deref` would then
+  rewrite the owned name. ADR 0003 Amendment 1 already requires a symbolic ref
+  to be refused.
+- **`reconciliation._observe_checkpoint_ref_absent`.** It now maps a symbolic
+  ref to `REFUSED`, per §5, instead of `SUBSTRATE_UNAVAILABLE`. Other
+  observation failures stay `SUBSTRATE_UNAVAILABLE`.
+- **Joint-review correction: the leaf check.** The first implementation
+  checked the leaf with `os.path.lexists()`, which returns `False` on *any*
+  `OSError`. With the leaf present but its parent unreadable (`EACCES`), it
+  reported absence, and the row deleted the ref, contrary to I5. A temporary
+  mutation that restored `lexists` produced `RECONCILED`. The row now uses the
+  descriptor-relative observer, and a load-bearing regression pins
+  `SUBSTRATE_UNAVAILABLE` with zero mutation.
+- **T34 in `tests/integration/test_lifecycle_run.py`.** It previously pinned
+  the Ctrl-C-after-patch shape as `BLOCKED`. It now asserts `RECONCILED`,
+  because that shape (worktree disposed on the raise path, containers absent,
+  ref `present`) is exactly this row.
+
+### 6. Maintenance trace
+
+The trace's `checkpoint_ref` object gains categorical fields only; there is no
+SHA anywhere, and `schema_version` stays 1:
+
+- `initial_persisted_intent`;
+- `observation_pre`, one of `absent`, `candidate_accepted`,
+  `candidate_proposed`, `unexpected`, `symbolic`, `ambiguous`, `unknown`;
+- `candidate_role`;
+- `removal_attempt`, one of `not_attempted`, `applied`, `unchanged`,
+  `unexpected`, `symbolic`, `unknown`;
+- `removing_transition_confirmed_this_pass`;
+- `absent_transition_confirmed_this_pass`.
+
+### 7. Non-claims
+
+- **Shapes that still block admission.** A ref alongside a worktree (T37's
+  SIGKILL shape) or a live container still blocks admission (T36), as do
+  abandonment-only cases.
+- **Unreachable commits.** Deleting the ref leaves its checkpoint commits
+  unreachable, and Git's garbage collection may remove them.
+- **Unbounded output.** `observe()` output is bounded only by matching one
+  exact name.
+- **Same-user races (A4).** These are not closed.
+  - **Observed at a candidate SHA.** If the ref moves between the observation
+    and the delete, the compare-and-swap refuses it and the moved ref survives.
+  - **Observed absent.** No compare-and-swap is involved. A ref created by
+    another same-user process after that observation is not detected, and the
+    record still collapses to `absent`.
+  - **Within the observation itself.** It is two Git commands (`for-each-ref`,
+    then `symbolic-ref --quiet`), so a change between them can go unseen.
+  - **Owner mutations** stay protected by Git's own compare-and-swap.
+  - **Probe resources.** The probe runs through the primitive's existing
+    hardened Git runner: no `GIT_*` environment, hooks disabled, a structured
+    argv, a 30-second timeout. Its output is captured whole, as `for-each-ref`'s
+    already was, rather than through the byte-bounded subprocess runner.
+- **Threats.** T-E1, T-F1 and T-F2 are not newly mitigated. T-M1 gains
+  reconciler-level coverage for these shapes only.
+- **Evidence.** This is implementation and automated-test evidence, not a
+  security review.
+
+### 8. Evidence
+
+Local verification only: macOS, Git 2.54.0, Docker already running (it was not
+started or restarted), `CODEAGENT_REQUIRE_DOCKER=1`. Linux CI is pending.
+
+**New tests: 125.**
+- `test_checkpoint_ref.py`, 6: dangling refs on SHA-1 and SHA-256; mutations
+  refusing a dangling ref and leaving it untouched; a truly absent ref; a
+  failed probe; the probe running only on an empty listing.
+- `test_lifecycle_store.py`, 54: the shape truth table; candidates; every legal
+  and illegal reconciler edge at both SHA lengths; the no-op; the state and
+  attempt preconditions; publication-failure classification; the unchanged
+  owner table.
+- `test_reconciliation.py`, 64:
+  - every intent × live value, both `advancing` outcomes, and dangling and
+    resolvable symbolic refs;
+  - a real SHA-256 repository;
+  - an ambiguous observation and a failed observation;
+  - an object-format mismatch;
+  - every delete `MutationOutcome`, including unconfirmed transaction cleanup;
+  - real compare-and-swap races (moved and deleted);
+  - a held lifecycle lock;
+  - blockers, with zero mutation;
+  - ineligible shapes;
+  - every write failing or unconfirmed at each of the 4 writes, plus resume;
+  - two real reconciler SIGKILLs (after the write-ahead `removing`, and after
+    the delete);
+  - byte-identical unrelated refs;
+  - the observer correction;
+  - an unreadable leaf parent, never treated as absence (joint-review
+    regression).
+- `test_lifecycle_run.py`, 1: T47, an owner SIGKILL in teardown after the
+  worktree `absent` is published, which is then reconciled (real Docker). T34
+  was corrected. T36 and T37 still block.
+
+**Mutation checks.** Ten distinct mutations, each caught by its named tests:
+
+- **Wrong deletion candidates:**
+  - `advancing` dropping `proposed`;
+  - the writer accepting any SHA (run twice: once before and once after a
+    test-helper rename).
+- **The compare-and-swap replaced by a plain delete.** The moved-ref race test
+  catches it: a moved ref would have been deleted.
+- **Symbolic handling:**
+  - the probe removed;
+  - the row treating a symbolic ref as absent;
+  - the observer correction reverted.
+- **Unsafe ordering:**
+  - deleting before the write-ahead record;
+  - skipping the worktree check;
+  - skipping the container check;
+  - the leaf observed with `os.path.lexists()` (joint review: this produced
+    `RECONCILED`, deleting the ref).
+
+The sources were restored byte-for-byte afterwards.
+
+**Totals.**
+
+| Run | Result |
+|---|---|
+| Targeted four files (`test_checkpoint_ref`, `test_lifecycle_store`, `test_reconciliation`, `test_lifecycle_run`) | 908 passed, forward and reverse |
+| Focused Milestone 3 set (17 files plus `test_lifecycle_run.py` and `test_slice_c.py`) | 1,848 passed, forward and reverse |
+| Full suite | 3,369 passed, 0 skipped (up from 3,244) |
+
+No leftover containers, worktrees, `refs/codeagent` refs, Git admin entries,
+processes, fixture directories, Docker volumes or default state root remained.

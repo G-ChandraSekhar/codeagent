@@ -2711,6 +2711,51 @@ Stage 2 (of the four-stage planning process in
     - The existing crash and reconciliation gaps remain.
     - The CI evidence covers GitHub-hosted `ubuntu-24.04` x86_64 only. It is
       automated-test evidence, not a security review.
+- **Milestone 3 Slice 3C-5: checkpoint-ref reconciliation for dead entries
+  whose worktree and containers are already absent**, per ADR 0004
+  "Amendment 16 (Accepted 2026-10-03)". **Implemented and locally validated on
+  macOS (2026-10-03); not yet committed, and Linux CI is pending.**
+  - **Eligible shape:** a non-absent checkpoint-ref record with the worktree
+    record and both container records absent and `failure` null. Owner states
+    or `RECONCILING`.
+  - **What the reconciler confirms first, in §9 order:**
+    - both deterministic container names are absent in a fresh listing;
+    - the worktree is unregistered, with zero Git admin entries, and its
+      leaf name is observed absent by the descriptor-relative, no-follow
+      observer (an inspection error is never absence);
+    - the object format matches;
+    - the exact owned ref is observed without following a symbolic ref.
+  - **What it then does:**
+    - enters `RECONCILING`, incrementing the attempt count only on a fresh
+      cycle;
+    - publishes `removing(observed)` as a write-ahead record;
+    - performs one `CheckpointRef.delete(expected_oid=observed)`
+      compare-and-swap;
+    - publishes `absent`, then `RECONCILED`.
+  - **Deletion candidates:**
+    - `creating`: `proposed_new_sha`;
+    - `present` and `removing`: `accepted_sha`;
+    - `advancing`: either SHA.
+  - **Delete outcomes:** `UNCHANGED` gives `FAILED` and leaves the `removing`
+    record installed. `UNEXPECTED` and `SYMBOLIC` give `REFUSED`. Any unknown
+    result gives `SUBSTRATE_UNAVAILABLE`.
+  - **Trace:** the maintenance trace records categorical fields only, never a
+    SHA.
+  - **Disclosed corrections:**
+    - `CheckpointRef.observe()` now probes `git symbolic-ref --quiet` when the
+      listing is empty, because a dangling symbolic ref was reported as absent.
+      This also closes an owner `create()` hole.
+    - `_observe_checkpoint_ref_absent` maps a symbolic ref to `REFUSED`.
+    - T34 now expects `RECONCILED` (it previously expected `BLOCKED`).
+    - Joint review found that the first leaf check, `os.path.lexists()`,
+      reported an unreadable parent (`EACCES`) as absence and deleted the ref.
+      It now uses the accepted observer, with a load-bearing regression.
+  - **New test:** T47, an owner SIGKILL in teardown, is reconciled. T36 and T37
+    still block.
+  - **Verified:** 125 new tests; ten mutations caught; full suite 3,244 → 3,369
+    passed, 0 skipped; focused set 1,848 forward and reverse; no leftovers.
+  - **Threats:** T-E1, T-F1 and T-F2 are unchanged. T-M1 gains partial,
+    reconciler-level coverage only. Not wired to any entry point.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

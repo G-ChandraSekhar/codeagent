@@ -462,6 +462,25 @@ class CheckpointRef:
 
         records = [line for line in result.stdout.splitlines() if line.strip()]
         if not records:
+            # ADR 0004 Amendment 16: `for-each-ref` silently skips a
+            # *dangling* symbolic ref, so an empty listing alone is not
+            # proof of absence. `symbolic-ref --quiet` reads the ref itself
+            # without resolving it: exit 0 means symbolic (dangling or not),
+            # exit 1 means not a symbolic ref -- and, with the empty listing,
+            # absent. Anything else is a failed inspection, never absence.
+            probe = _run_git(self._repo_path, "symbolic-ref", "--quiet", self._ref_name)
+            if probe.returncode == 0:
+                raise CheckpointRefError(
+                    CheckpointRefFailure.SYMBOLIC_REF,
+                    f"the checkpoint ref {self._ref_name} is a symbolic ref and is refused",
+                    outcome=MutationOutcome.SYMBOLIC,
+                )
+            if probe.returncode != 1:
+                raise CheckpointRefError(
+                    CheckpointRefFailure.OBSERVATION_FAILED,
+                    f"the checkpoint ref {self._ref_name} could not be inspected",
+                    outcome=MutationOutcome.UNKNOWN,
+                )
             return RefObservation(present=False, oid=None)
         if len(records) != 1:
             raise CheckpointRefError(

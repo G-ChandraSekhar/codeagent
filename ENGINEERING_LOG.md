@@ -6113,3 +6113,101 @@ and `main` became green through the next ordinary commit.
 
 `docs/threat-model.md` was inspected. It has no Amendment-15-specific or
 CI-pending statement, so it is unchanged. `uv.lock` was untouched.
+
+## 2026-10-03 — Milestone 3 Slice 3C-5: checkpoint-ref reconciliation after the worktree and containers are gone (ADR 0004 Amendment 16)
+
+**What.** A new reconciliation row for a dead entry whose checkpoint ref is
+non-absent while its worktree and both containers are confirmed absent:
+- `lifecycle_store` gains the eligibility shape, a deletion-candidates helper
+  that is the single source of §8, and a reconciler-only writer;
+- `reconciliation` gains `_reconcile_checkpoint_ref_entry`.
+
+It removes the exact owned ref with one compare-and-swap delete against the
+observed value, after a write-ahead `removing` record.
+
+**Accepted decisions.**
+- The scope is worktree-absent shapes only, with no A13→ref chaining.
+- The A12/A13 admin-entry scan is part of "worktree confirmed absent".
+- A delete returning `UNEXPECTED` gives `REFUSED`.
+- No SHAs go into the trace.
+- The existing observer maps a symbolic ref to `REFUSED`.
+
+**Finding during implementation.** `CheckpointRef.observe()` reported a
+*dangling* symbolic ref as absent, because `git for-each-ref` silently skips
+broken refs. A scratch experiment confirmed it. My first matrix test exposed
+it: pointing the symref at `refs/heads/master` in a `main` repository made the
+row "reconcile" while leaving the symref behind.
+
+I asked how to handle it, and the decision was to fix the primitive. It now
+probes `git symbolic-ref --quiet` when the listing is empty:
+
+| Probe exit | Result |
+|---|---|
+| 0 | `SYMBOLIC_REF` |
+| 1 | absent |
+| anything else | `OBSERVATION_FAILED` |
+
+This also closes an owner hole: `create()`'s pre-check would have let
+`update-ref --no-deref` rewrite a planted dangling symref.
+
+**Lesson.** "Empty listing" is not "absent" for Git refs. Symbolic-ref tests
+must use a deterministic target and cover dangling and resolvable refs
+separately, never a branch name that depends on the host's default.
+
+**Test-only defects found and fixed before any totals.**
+- A new `_sha(char, length)` helper in `test_lifecycle_store.py` silently
+  shadowed the file's existing `_sha(seed)`, because module globals bind late.
+  41 earlier tests failed. Every new helper is now `_a16_`-prefixed, and a
+  duplicate-name scan of all five touched test files came back clean.
+- An eager dict in `_a16_record` built an invalid `advancing` record.
+- One resume expectation was wrong: an installed-but-unconfirmed `RECONCILED`
+  write is correctly `SKIPPED_TERMINAL` on the next pass.
+- A mutation-harness bug (an import above `from __future__`) made the
+  missing-CAS check error out instead of fail. I re-ran it correctly and it was
+  caught.
+
+**Disclosed test correction.** T34 now expects `RECONCILED`; it previously
+expected `BLOCKED`. Its shape (Ctrl-C after a durable ref `present`, worktree
+disposed, containers absent) is exactly this row. T36 and T37 still block.
+
+**Verification.** macOS, Git 2.54.0, Docker already running and not started or
+restarted, `CODEAGENT_REQUIRE_DOCKER=1`.
+- **New tests: 124.** `test_checkpoint_ref` 6, `test_lifecycle_store` 54,
+  `test_reconciliation` 63, `test_lifecycle_run` 1 (T47).
+- **Targeted four files:** 907 passed, forward and reverse.
+- **Focused Milestone 3 set:** 1,847 passed, forward and reverse.
+- **Full suite:** 3,368 passed, 0 skipped.
+- **Mutations:** nine distinct, each caught.
+- **Cleanup:** no leftover containers, worktrees, refs, admin entries,
+  processes, volumes or default state root.
+
+**Joint-review correction (same day, before commit).** The adversarial review
+confirmed one real defect. The leaf check used `os.path.lexists()`, which
+returns `False` on any `OSError`. With the leaf present and its parent
+unreadable (`EACCES`), the row treated the leaf as absent and deleted the ref,
+contrary to I5. Restoring `lexists` as a mutation produced `RECONCILED`.
+
+The row now uses Amendment 13's descriptor-relative, no-follow observer:
+
+| Observer result | Outcome |
+|---|---|
+| `ABSENT` | continue |
+| `UNKNOWN` | `SUBSTRATE_UNAVAILABLE` |
+| present or conflict | `REFUSED` |
+
+One load-bearing regression was added.
+
+The review also corrected an overclaim in Amendment 16: same-user races are
+**not** closed. In particular:
+- an observed-absent ref involves no compare-and-swap;
+- the two-command observation has a window between its commands.
+
+No other defect was found. Totals after the correction:
+- 125 new tests;
+- targeted four files: 908 passed, forward and reverse;
+- focused set: 1,848 passed, forward and reverse;
+- full suite: 3,369 passed, 0 skipped;
+- ten mutations, each caught.
+
+Linux CI is pending; nothing is committed. T-E1, T-F1 and T-F2 are unchanged.
+T-M1 gains partial, reconciler-level coverage. `uv.lock` was untouched.

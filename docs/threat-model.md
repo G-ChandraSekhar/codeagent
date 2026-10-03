@@ -1511,7 +1511,19 @@ this detailed entry states.
   owned hidden checkpoint ref is intentional shared metadata: ordinary
   branch pushes exclude it, but `git push --mirror` and other all-refs
   copies can publish it and its checkpoint commits, and an orphaned ref
-  retains objects until ADR 0004 reconciliation (Milestone 3) removes it
+  retains objects until ADR 0004 reconciliation (Milestone 3) removes it.
+  **Partially addressed at the reconciler level only (ADR 0004 Amendment
+  16):**
+  - **Removed:** a dead entry's orphaned ref is now removed by automatic
+    pre-run reconciliation, using one compare-and-swap delete against an
+    observed deletion candidate, but only when that entry's worktree and both
+    containers are already confirmed absent.
+  - **Still blocking:** a ref alongside a worktree or a live container still
+    blocks admission.
+  - **Refused:** a symbolic or unrelated ref is refused.
+  - **Not wired:** no CLI or controller entry point calls this.
+
+  This is not end-to-end mitigation.
 - Owning milestone/spike: Milestone 1 (current `GitWorktree`); Milestone 2
   (fallback removal and ADR 0003 Amendment 1 checkpoint-ref mechanics);
   Milestone 3 (ADR 0004 reconciliation of orphaned registrations and refs)
