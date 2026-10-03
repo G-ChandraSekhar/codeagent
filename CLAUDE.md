@@ -282,7 +282,32 @@ Stage 2 (of the four-stage planning process in
   run [35306212472](https://github.com/G-ChandraSekhar/codeagent/actions/runs/35306212472),
   success: 1863 passed, 1 intentional Darwin-only skip, all 3
   real-Docker tests passed, no leftover verification containers).
-  SHA-256 object-format coverage is still pending.**
+  SHA-256 object-format coverage was still pending at this slice's own
+  completion (2026-09-17). **Status correction (2026-10-02, documentation-
+  only reconciliation, not a change to this historical slice's own
+  record)**: real SHA-256-repository coverage has since been added by
+  later slices and now exists — confirmed by direct inspection of
+  `tests/unit/test_checkpoint_ref.py::test_sha256_repository_object_format`
+  (a real `git init --object-format=sha256` repository, exercising
+  `CheckpointRef`'s full `create`/`advance`/`delete` compare-and-swap
+  cycle against it), `tests/unit/test_git_safety.py::
+  test_detect_object_format_sha256` (real sha256-repository object-
+  format detection), `tests/unit/test_repo_identity.py::
+  test_discover_repository_identity_sha256_or_skipped` (real sha256
+  repository, full identity discovery), `tests/unit/
+  test_lifecycle_store.py::test_prepare_lifecycle_sha256_or_skipped`
+  (real sha256 repository, the complete `prepare_lifecycle()` flow),
+  and `tests/unit/test_patch.py::
+  test_apply_runs_end_to_end_in_a_sha256_repository` (real sha256
+  repository, a full patch-apply end-to-end run) — each with a graceful
+  `pytest.skip()` on a Git build lacking `--object-format=sha256`
+  support. This is distinct from the schema/value-shape tests added by
+  the worktree-attribution substrate slice (e.g. `test_worktree_
+  present_valid_sha256`, `test_worktree_sha1_length_refused_against_
+  sha256_repo`), which pass `object_format="sha256"` and construct
+  64-character synthetic OIDs (`"b" * 64`) without any real repository
+  — those prove the validator's own logic, not real-repository
+  evidence, and are not themselves being cited as closing this gap.**
   - `src/codeagent/evidence.py` (new): `FilesystemEvidenceSink`
     implements the accepted durable-evidence-artifact design in full —
     strictly observational `status`+`diff` capture sharing one
@@ -360,9 +385,14 @@ Stage 2 (of the four-stage planning process in
     (`/tmp`/`/var`/`/etc`) is now gated to a verified macOS/Darwin
     target match, never trusted by name alone or on another platform;
     `tests/unit/test_evidence.py` is now 37 tests. Linux CI validation
-    passed (see the run cited above). **Not yet done**: SHA-256
-    object-format exercise (ADR 0003's own
-    required-test list); a dedicated test for every scenario in the
+    passed (see the run cited above). **Not yet done at this slice's
+    own completion**: SHA-256 object-format exercise (ADR 0003's own
+    required-test list) — **status correction (2026-10-02,
+    documentation-only): this gap has since been closed by later
+    slices; see the corresponding correction on this file's earlier
+    SHA-256 statement above for the exact current test files.** Also
+    not yet done at this slice's own completion: a dedicated test for
+    every scenario in the
     original 2B-2 task's exhaustive list (several are exercised only
     incidentally via the real end-to-end tests, not each via its own
     dedicated unit test); ADR 0004's durable lifecycle store, locks, reconciliation,
@@ -2240,9 +2270,13 @@ Stage 2 (of the four-stage planning process in
 - **Milestone 3 worktree-attribution substrate slice** (`worktree_lifecycle.py`
   and `lifecycle_store.py` extensions), per
   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
-  "Amendment 10 (Accepted 2026-10-02)", is implemented and locally
-  verified on macOS (2026-10-02); **not yet committed, pushed, or
-  Linux-CI-confirmed**. Resolves Amendment 9's own named remaining open
+  "Amendment 10 (Accepted 2026-10-02)", is implemented, locally verified
+  on macOS (2026-10-02), committed (`f41da250bb7e67ea2b42113e17e25f3ec8143436`),
+  and confirmed on GitHub-hosted Linux CI (run
+  [37060981509](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37060981509),
+  `ubuntu-24.04` x86_64, Python 3.12, conclusion `success` — see the
+  closing paragraph below for the exact evidence this run supports).
+  Resolves Amendment 9's own named remaining open
   question — the worktree transition/combination table — after a joint
   review found both originally-proposed `expected_head` designs
   incomplete: an independently-republished field would require new
@@ -2330,6 +2364,48 @@ Stage 2 (of the four-stage planning process in
   `docs/threat-model.md` is **unchanged** — this slice adds no
   production wiring, so T-E1/T-F2 remain exactly as stated ("not
   implemented"/"none yet" for worktree removal), unaffected.
+  **Confirmed on GitHub-hosted Linux CI** (commit
+  `f41da250bb7e67ea2b42113e17e25f3ec8143436`, run
+  [37060981509](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37060981509),
+  `ubuntu-24.04` x86_64, Python 3.12, conclusion `success`, 1 job, 13
+  steps, every step `success`): the mandatory Docker preflight step
+  succeeded (Docker Engine - Community, version `28.0.4`); the pinned
+  verification image
+  (`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`)
+  was pulled and confirmed `linux/amd64`. The dedicated "Run real
+  Docker verification tests" step ran only `python -m pytest
+  tests/integration/test_slice_c.py -v` (`CODEAGENT_REQUIRE_DOCKER=1`
+  confirmed present in that step's own logged environment): `3 passed
+  in 2.31s`, 0 skipped — this is this file's own legacy Milestone-1
+  suite, exactly, and is **not** specific evidence for the worktree-
+  attribution substrate slice, which adds no real-Docker test of its
+  own. The separate "Run complete test suite" step (`python -m pytest
+  -q`, `CODEAGENT_REQUIRE_DOCKER=1` also confirmed present in that
+  step's own logged environment) reported `2825 passed, 3 skipped in
+  48.81s`; `2825 + 3` equals the local collected total of 2,828. This
+  is the step through which Amendment 10's new worktree tests
+  (`test_worktree_lifecycle.py` and the additions to
+  `test_lifecycle_store.py`) actually executed. The run used `pytest
+  -q`, which prints no test identities, so these 3 skips are **not
+  identified from this run's own log** and are not guessed here — they
+  are not evidence of Docker unavailability, since the daemon, the
+  pulled image, and `CODEAGENT_REQUIRE_DOCKER=1` were all already
+  confirmed for that same step. Source inspection — not CI-log
+  evidence — continues to identify the same three Linux-unconditional,
+  platform/host-specific skips named in every earlier slice's own entry
+  as the likely candidates; this is stated separately as source-based
+  inference, not something this run's own log proves. The final
+  leftover-container check ran the anchored `grep -E
+  '^codeagent-(verify-|baseline-|verification-)'` pattern, covering all
+  three CodeAgent container families, over a complete, unfiltered
+  `docker ps -a --format '{{.Names}}'` listing; its captured output was
+  empty and the step succeeded. This is implementation/automated-test
+  evidence only — it does not constitute or substitute for a security
+  review, and is GitHub-hosted `ubuntu-24.04` x86_64 evidence
+  specifically, not a general Linux or ARM64 portability claim. It does
+  not claim any change to the accepted design, schema, transition
+  table, or scope stated above, and `docs/threat-model.md`'s T-E1/T-F2
+  entries remain unaffected.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

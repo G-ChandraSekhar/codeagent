@@ -5390,3 +5390,160 @@ No new file was added to the dirty set beyond what the first pass
 already introduced; the pre-existing untracked `uv.lock` remains
 exactly as it was — not edited, staged, or incorporated. All changes
 remain unstaged and uncommitted for joint review.
+
+## 2026-10-02 — Worktree-attribution substrate slice: Linux CI evidence reconciliation, and a SHA-256 documentation erratum
+
+Slice (including its correction pass) was committed
+(`f41da250bb7e67ea2b42113e17e25f3ec8143436`) and pushed to `main` as an
+ordinary fast-forward (`0d956ff..f41da25`, no force). This is a
+documentation-only pass reconciling `CLAUDE.md`'s and ADR 0004
+Amendment 10's "not yet committed, pushed, or Linux-CI-confirmed" /
+"Linux CI confirmation is pending ... nothing has been pushed"
+placeholders against the real, independently re-verified run, plus a
+separate, unrelated documentation erratum for two long-stale "SHA-256
+object-format coverage is still pending" statements this pass happened
+to also inspect. No production code, test, workflow, configuration,
+dependency, `uv.lock`, or `docs/threat-model.md` status was changed.
+
+### Linux CI evidence
+
+GitHub Actions run [37060981509](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37060981509)
+was independently re-fetched — fresh run metadata via
+`gh api repos/.../actions/runs/37060981509`, a fresh per-job/per-step
+breakdown via `gh api repos/.../actions/runs/37060981509/jobs`, and the
+complete raw step logs via `gh run view --log`, all freshly re-queried
+rather than reused from the prior finalization report — and every fact
+below was verified directly against those fresh results.
+
+Verified: `head_sha` exactly `f41da250bb7e67ea2b42113e17e25f3ec8143436`;
+`conclusion` `success`; `status` `completed`; exactly one job ("Test
+(ubuntu-24.04, Python 3.12)"), itself `success`, with exactly 13
+API-reported steps, every one `success`. GitHub-hosted `ubuntu-24.04`
+x86_64, Python 3.12, confirmed directly from the job name. Docker
+preflight: Docker Engine - Community, version `28.0.4`, directly
+present in the raw log; step succeeded. Pinned verification image
+resolved as
+`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`
+and, after `docker pull`, confirmed exactly `linux/amd64`. The
+dedicated "Run real Docker verification tests (must execute, not
+skip)" step ran exactly `python -m pytest tests/integration/
+test_slice_c.py -v` with `CODEAGENT_REQUIRE_DOCKER=1` confirmed present
+in that step's own logged environment, and the verbose output shows all
+three of its own tests individually `PASSED` (no `SKIPPED` line
+anywhere in that step), concluding `3 passed in 2.31s` — this is this
+repository's own legacy Milestone-1 suite, exactly, and is explicitly
+**not** specific evidence for this slice's own worktree-attribution
+substrate, which adds no real-Docker test of its own. The separate "Run
+complete test suite" step ran exactly `python -m pytest -q` with
+`CODEAGENT_REQUIRE_DOCKER=1` also confirmed present in that step's own
+logged environment, concluding `2825 passed, 3 skipped in 48.81s`.
+`2825 + 3` equals the local macOS collected total of 2,828 reported in
+this slice's own prior correction-pass entry above. This slice's new
+worktree tests (`test_worktree_lifecycle.py`'s 27 tests and the
+additions to `test_lifecycle_store.py`) executed through this step, not
+through the dedicated Docker step. `pytest -q` prints no test
+identities anywhere in this log, so these 3 skips are not identified or
+guessed from the log — source inspection (not CI-log evidence)
+separately continues to identify the same three Linux-unconditional,
+platform/host-specific skips named in every earlier slice's own entry
+as the likely candidates, labeled explicitly as inference, not
+something this run's own log proves. The final leftover-container-
+check step ran the anchored `grep -E
+'^codeagent-(verify-|baseline-|verification-)'` pattern over a
+complete, unfiltered `docker ps -a --format '{{.Names}}'` listing,
+covering all three CodeAgent container families; its captured output
+was empty, and the step succeeded.
+
+`CLAUDE.md`'s worktree-attribution-substrate-slice bullet (previously
+ending its opening sentence "...is implemented and locally verified on
+macOS (2026-10-02); **not yet committed, pushed, or
+Linux-CI-confirmed**") and `docs/adr/0004-owned-resource-lifecycle-and-
+reconciliation.md`'s Amendment 10 evidence text (previously "Linux CI
+confirmation is pending as of this commit; nothing has been pushed"
+after its own evidence paragraph) are both updated in place with the
+verified evidence above, following this project's established
+convention (see, e.g., the 2026-09-29 Slice 3C-2 and 2026-10-02 Slice
+3C-3 Linux CI evidence reconciliation entries above) of correcting a
+now-stale present-tense status statement in these two living documents,
+as distinct from `ENGINEERING_LOG.md` itself. No other prose in either
+file — the accepted `expected_head` semantics, the persisted-shape
+table, the legal owner-edge table, or the milestone/scope boundaries —
+was touched.
+
+`docs/threat-model.md` was inspected and contains no Amendment-10-
+specific statement of any kind (stale or otherwise) to correct — the
+one SHA-256 mention it contains (§5.x, an ADR 0006 end-to-end-run
+reference) is unrelated to this slice or to object-format CI evidence.
+It remains unchanged. No threat is claimed newly mitigated by this
+pass: the worktree-attribution substrate remains unwired production-
+wise, and T-E1/T-F2's existing status is unaffected.
+
+### SHA-256 documentation erratum (unrelated finding, same pass)
+
+Separately, this investigation independently verified the current
+state of SHA-256 object-format test coverage, distinguishing three
+categories before concluding anything: (1) real SHA-256-repository
+tests — a genuine `git init --object-format=sha256` repository
+exercised end to end; (2) schema/value-shape tests that merely pass
+`object_format="sha256"` or construct 64-character synthetic OIDs
+without any real repository; (3) tests that gracefully `pytest.skip()`
+on a Git build lacking `--object-format=sha256` support (every real-
+repository test in category 1 also falls into this category — the two
+are not mutually exclusive).
+
+Confirmed, by direct source inspection, that category-1 (real
+repository) coverage genuinely exists today in:
+`tests/unit/test_checkpoint_ref.py::test_sha256_repository_object_format`
+(full `CheckpointRef` `create`/`advance`/`delete` compare-and-swap cycle
+against a real sha256 repo), `tests/unit/test_git_safety.py::
+test_detect_object_format_sha256` (real sha256-repository object-format
+detection only), `tests/unit/test_repo_identity.py::
+test_discover_repository_identity_sha256_or_skipped` (real sha256
+repository, full identity discovery), `tests/unit/test_lifecycle_store.py::
+test_prepare_lifecycle_sha256_or_skipped` (real sha256 repository, the
+complete `prepare_lifecycle()` composition), and `tests/unit/
+test_patch.py::test_apply_runs_end_to_end_in_a_sha256_repository` (real
+sha256 repository, a full patch-apply end-to-end run) — each gated by a
+graceful skip on an old Git build. This is genuinely distinct from
+(and does not include) this slice's own new OID-shape tests
+(`test_worktree_present_valid_sha256`,
+`test_worktree_sha1_length_refused_against_sha256_repo`, and similar),
+which are category-2 only: they pass `object_format="sha256"` directly
+to the pure schema validator and construct a 64-character synthetic
+OID, with no real repository involved at all, and were never cited as
+real-repository evidence anywhere in this slice's own material.
+
+`CLAUDE.md` carries two statements, both inside the dated "Milestone 2
+Slice 2B-2 is implemented (2026-09-17)" historical narrative, saying
+SHA-256 object-format coverage "is still pending" / "**Not yet done**:
+SHA-256 object-format exercise" — true of that slice's own completion
+date, but carrying no explicit temporal qualifier (unlike several other
+passages in the same file that do mark themselves "at the time..."),
+so each reads as a bare, misleadingly-current claim if skimmed in
+isolation. Both are corrected in place, preserving the original
+historical claim as accurate for its own date and adding an explicit,
+clearly-labeled "status correction (2026-10-02, documentation-only)"
+clause immediately after each, naming the exact five current test files
+above and explicitly distinguishing them from this slice's own
+synthetic-OID-only tests. The original historical sentences themselves
+are not deleted or rewritten — only given the missing temporal
+qualifier and a forward pointer to the current, real state.
+
+A third occurrence of the identical claim exists in `ENGINEERING_LOG.md`
+itself, inside its own historical "Milestone 2 slice 2B-2: checkpoint/
+evidence integration implemented" entry (predating this session by many
+slices). Per this project's own established convention, that historical
+entry is **not** rewritten here — this paragraph serves as the erratum/
+status note the convention calls for: as of 2026-10-02, real SHA-256-
+repository coverage exists (the same five test files named above),
+closing the gap that 2B-2 entry's own "still pending" statement
+correctly described as true at the time it was written.
+
+Verified: `git diff --check` clean on the resulting documentation-only
+diff; only `CLAUDE.md`, the ADR, and this file changed — no production
+code, test, workflow, configuration, or dependency file touched;
+nothing staged. No test run or Docker session was needed for this
+pass — the independently re-verified, completed CI run plus read-only
+source/test inspection are the evidence. The pre-existing untracked
+`uv.lock` remains exactly as it was throughout — not edited, staged, or
+incorporated.
