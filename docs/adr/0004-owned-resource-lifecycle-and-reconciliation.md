@@ -5026,8 +5026,8 @@ name or id, path, Docker or Git output, or exception text is recorded.
 ### 7. Evidence
 
 Local verification: macOS, Git 2.54.0, Docker already running (it was not
-started or restarted), `CODEAGENT_REQUIRE_DOCKER=1`. Linux CI is pending; this
-slice has not been pushed.
+started or restarted), `CODEAGENT_REQUIRE_DOCKER=1`. Linux CI evidence is at the
+end of this section.
 
 **New tests: 73.**
 
@@ -5099,3 +5099,46 @@ source was restored byte-for-byte (SHA-256 verified):
 | Targeted four files (`test_checkpoint_ref`, `test_lifecycle_store`, `test_reconciliation`, `test_lifecycle_run`) | 981 passed, forward and reverse |
 | Focused Milestone 3 set (17 files plus `test_lifecycle_run.py` and `test_slice_c.py`) | 1,921 passed, forward and reverse |
 | Full suite | 3,442 passed, 0 skipped (up from 3,369) |
+
+**Confirmed on GitHub-hosted Linux CI.** Commit
+`1578b5a390221d3f562d1ff5566a23c4bc600bce` (an ordinary fast-forward over
+`d112bb0`), run
+[37158285511](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37158285511).
+
+- **Run.** Push-triggered, `completed` / `success`. Job "Test (ubuntu-24.04,
+  Python 3.12)". All 13 API-reported steps `success`; zero `##[error]` lines in
+  the raw log.
+- **Environment.** Runner image `ubuntu-24.04` (Ubuntu 24.04.5 LTS), CPython
+  3.12.14. The Docker preflight reported client and server `28.0.4`.
+- **Image.** The pinned
+  `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`,
+  which reported `linux/amd64`.
+- **Dedicated Docker step.** `python -m pytest tests/integration/test_slice_c.py
+  -v`, with `CODEAGENT_REQUIRE_DOCKER: 1`, gave `4 passed in 2.74s`, all four
+  named `PASSED`. That file contains no Slice 3C-6-specific test.
+- **Complete suite.** `python -m pytest -q`, with `CODEAGENT_REQUIRE_DOCKER: 1`
+  in that step's own environment, gave `3439 passed, 3 skipped in 96.95s`, with
+  0 failed. 3,439 + 3 = 3,442, which matches the local collected total.
+- **Limits.** `pytest -q` prints no test names, so:
+  - the three skips are not identified;
+  - there is no named-test log evidence for the new reconciliation tests or
+    T37. That they ran is an inference from the whole-suite command, the
+    matching collection total, and the successful run.
+- **Leftover-container check.** A full `docker ps -a --format '{{.Names}}'`
+  listing filtered through the anchored
+  `grep -E '^codeagent-(verify-|baseline-|verification-)'`, covering all three
+  CodeAgent container families, produced empty output, and the step succeeded.
+
+This evidence changes none of §6's non-claims:
+
+- There is no cross-resource atomicity, and the A4 same-user races remain open.
+- A stop after Phase W can leave the worktree removed while admission stays
+  blocked.
+- Amendment 16's observation and deletion limits carry over.
+- T36 still blocks. Live-container chaining, Amendment 12-plus-ref recovery,
+  abandonment, ADR 0005 cancellation, CLI wiring and operator wiring remain
+  unimplemented.
+- T-E1 and T-F1 are unchanged; T-F2 and T-M1 have only partial,
+  reconciler-level coverage.
+- This is GitHub-hosted `ubuntu-24.04` x86_64, automated-test evidence, not a
+  security review.

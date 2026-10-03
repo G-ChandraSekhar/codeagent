@@ -6316,3 +6316,35 @@ incremented by 2 at the single entry point was caught directly on
 
 **Unchanged.** T-E1 and T-F1. T-F2 and T-M1 gain partial, reconciler-level
 notes only. Nothing is wired to an entry point. `uv.lock` untouched.
+
+## 2026-10-03 — Slice 3C-6 / ADR 0004 Amendment 17: Linux CI evidence reconciliation
+
+**What.** A documentation-only pass recording the Linux CI evidence for commit
+`1578b5a390221d3f562d1ff5566a23c4bc600bce` (ordinary fast-forward `d112bb0..1578b5a`, no force), run
+[37158285511](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37158285511). No code, test, workflow, configuration, dependency,
+design or threat-status change.
+
+**Independently re-verified** from the Actions API and a freshly fetched raw
+log:
+- push-triggered, exact head SHA, `completed` / `success`; job "Test
+  (ubuntu-24.04, Python 3.12)", all 13 steps `success`, zero `##[error]` lines;
+- Ubuntu 24.04.5 LTS (`ubuntu-24.04` image), CPython 3.12.14, Docker client and
+  server `28.0.4`; the pinned image reported `linux/amd64`;
+- `python -m pytest tests/integration/test_slice_c.py -v` with
+  `CODEAGENT_REQUIRE_DOCKER: 1`: `4 passed in 2.74s`, all four named `PASSED`
+  (no Slice 3C-6-specific test in that file);
+- `python -m pytest -q` with `CODEAGENT_REQUIRE_DOCKER: 1` in that step's own
+  environment: `3439 passed, 3 skipped in 96.95s`, 0 failed; 3,439 + 3 = 3,442,
+  matching the local total;
+- the anchored three-family leftover check printed nothing and succeeded.
+
+**Limits.** `pytest -q` names no tests: the skips are not identified, and that
+the new reconciliation tests and T37 ran is inferred from the whole-suite
+command and matching total, not from named-test log evidence.
+
+**Updated:** `CLAUDE.md` (Slice 3C-6 status and CI evidence) and ADR 0004
+Amendment 17 §7. `docs/threat-model.md` has no Amendment 17 CI-pending
+statement, so it is unchanged. Boundaries are unchanged: no cross-resource
+atomicity, A4 races open, T36 still blocks, the deferred work stays deferred.
+GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence, not a security
+review. `uv.lock` untouched.
