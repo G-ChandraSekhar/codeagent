@@ -4833,3 +4833,269 @@ This evidence changes none of §7's non-claims:
   reconciler-level coverage.
 - This is GitHub-hosted `ubuntu-24.04` x86_64, automated-test evidence, not a
   security review.
+
+## Amendment 17 (Accepted 2026-10-03): chaining a dead materialized worktree's removal into its checkpoint ref's removal
+
+**Scope.** Milestone 3 Slice 3C-6. Amendment 13 removes a dead materialized
+worktree only when its checkpoint ref is absent. Amendment 16 removes a dead
+checkpoint ref only when its worktree is absent. The most common post-patch
+crash has both, with containers absent: the repair loop, a crash between
+verification attempts, or teardown before disposal (T37). Until now that shape
+blocked admission forever.
+
+This amendment composes the two accepted rows in one locked pass and one
+reconciliation cycle. Neither row's rules are weakened, and every refusal of
+either row still applies.
+
+**Eligible shape** (`lifecycle_store.is_projection_worktree_then_checkpoint_ref_reconciliation_shape`):
+
+- the state is `PREPARING`, `ACTIVE`, `CLEANING` or `RECONCILING`;
+- the worktree record is `creating`, `present` or `disposing`, with its origin
+  commit;
+- the checkpoint-ref record is non-absent;
+- both container records are `absent` with a null id;
+- `failure` is null.
+
+It is disjoint from the Amendment 12, 13 and 16 predicates and is added, by
+union, to the eligibility check shared by the pre-lock peek and the locked
+re-read.
+
+**Routing** in the locked re-read:
+
+| Checkpoint ref | Worktree | Row |
+|---|---|---|
+| non-absent | non-absent | this amendment |
+| non-absent | absent | Amendment 16, unchanged |
+| absent | non-absent | Amendments 12/13, unchanged |
+| absent | absent | the absent-worktree row, unchanged |
+
+**Excluded:** a never-registered `creating` worktree (Amendment 12's shape)
+with a checkpoint ref is `REFUSED` with zero mutation. The owner cannot produce
+it, because the worktree is `present` before any patch creates the ref.
+
+### 1. Sequence
+
+Both locks are held for the whole pass.
+
+**Gate A, before any worktree mutation. Zero mutation if it stops.**
+
+1. **Container gate 1.** A fresh listing must show both deterministic names
+   absent.
+2. **Worktree.** Amendment 13's complete inspection (registration, admin
+   entries, the leaf, the pre-removal table). The Amendment 12 case above is
+   refused here.
+3. **Ref gate.** The object format is checked, then the owned ref is observed
+   without following a symbolic ref and classified against
+   `checkpoint_ref_deletion_candidates`. This gate never supplies the deletion
+   SHA.
+
+**Phase W.**
+
+4. Enter `RECONCILING`. `attempts_total` is incremented only on a fresh cycle.
+   This is the pass's only increment.
+5. Amendment 13's M2–M5, unchanged: write-ahead `disposing`, one
+   `git worktree remove --force` (or the collapse/D2 case), three fresh
+   observations, and reconciler-owned `disposing → absent`. Any non-success
+   stops the pass, before every later step.
+
+**Gate B, before any ref mutation. Zero ref mutation if it stops.**
+
+6. **Container gate 2.** A second complete, fresh listing. It is neither a new
+   cycle nor an increment.
+7. **Fresh, authoritative ref observation.** The same classification as step 3.
+   This is the only source of the SHA used by Phase R.
+
+**Phase R.**
+
+8. Amendment 16's M2–M4, unchanged: write-ahead `removing(observed)`, one
+   `CheckpointRef.delete(expected_oid=observed)`, then `absent` only after a
+   normal return. A ref already absent at step 7 goes straight to `absent`
+   with no Git mutation.
+9. `RECONCILED`, exactly once and last.
+
+**What this claims.** Each destructive phase has its complete inspection gate
+immediately before it: Gate A before Phase W, Gate B before Phase R. It does
+*not* claim that every inspection precedes every mutation in the combined pass,
+because Gate B follows Phase W.
+
+**I5.** The ref is removed only after the worktree is confirmed absent by
+Phase W's own post-removal observations (or Amendment 13's pre-observation in
+the collapse/D2 case), together with Gate B's fresh container listing.
+
+**Not atomicity.** Gate B is fresh evidence for Phase R after a Git worktree
+removal that may have taken a long time. It is not cross-resource atomicity,
+and it does not close A4.
+
+### 2. Outcomes
+
+| Phase | Condition | Outcome | Durable effect |
+|---|---|---|---|
+| Gate A | Container name present | `REFUSED` | none |
+| Gate A | Container listing failed | `SUBSTRATE_UNAVAILABLE` | none |
+| Gate A | Any Amendment 13 inspection refusal or failure | as Amendment 13 | none |
+| Gate A | Never-registered `creating` worktree | `REFUSED` | none |
+| Gate A | Ref unexpected or symbolic | `REFUSED` | none |
+| Gate A | Ref observation ambiguous or failed | `SUBSTRATE_UNAVAILABLE` | none |
+| Phase W | The Git removal or a post-removal observation fails or is unconfirmed | as Amendment 13 | `RECONCILING`, worktree `disposing`, ref record untouched |
+| Gate B | Container name present | `REFUSED` | `RECONCILING`, worktree `absent`, ref untouched |
+| Gate B | Container listing failed | `SUBSTRATE_UNAVAILABLE` | as above |
+| Gate B | Ref changed to a non-candidate or symbolic | `REFUSED` | as above |
+| Gate B | Ref observation failed | `SUBSTRATE_UNAVAILABLE` | as above |
+| Phase R | Delete `UNCHANGED` | `FAILED` | worktree `absent`, ref `removing(X)` |
+| Phase R | Delete `UNEXPECTED` or `SYMBOLIC` | `REFUSED` | as above |
+| Phase R | Delete `UNKNOWN`, unconfirmed cleanup, or an error claiming `APPLIED` | `SUBSTRATE_UNAVAILABLE` | as above |
+| any | A projection write failed or was unconfirmed | `FAILED`, with no later mutation | as installed |
+| end | Everything confirmed | `RECONCILED` | all absent |
+
+**Partial progress is accepted and fails closed.** A refusal or failure after
+Phase W leaves the worktree durably removed, the entry `RECONCILING`, and
+admission blocked. The next pass resumes through Amendment 16's row.
+
+### 3. Resume
+
+| Boundary | Durable projection | Next pass | Increment |
+|---|---|---|---|
+| Before `RECONCILING` | owner state, worktree `present`, ref `X` | this row, fresh cycle | +1 |
+| After `RECONCILING` | `RECONCILING`, worktree `present`, ref `X` | this row | none |
+| After `disposing` | `RECONCILING`, worktree `disposing`, ref `X` | this row (Amendment 13's `disposing` path) | none |
+| After the Git removal, before worktree `absent` | `RECONCILING`, worktree `disposing`, all observations absent | this row (collapse/D2), then Gate B | none |
+| After worktree `absent`, before or during Gate B | `RECONCILING`, worktree `absent`, ref `X` | Amendment 16 (its own listing, inspection and Phase R) | none |
+| After ref `removing`, before the delete | worktree `absent`, ref `removing(X)` | Amendment 16: delete | none |
+| After the delete, before ref `absent` | as above, live ref absent | Amendment 16: collapse | none |
+| Both absent, before `RECONCILED` | `RECONCILING`, all absent | the absent-worktree row | none |
+| `RECONCILED` installed but unconfirmed | `RECONCILED`, all absent | `SKIPPED_TERMINAL` | none |
+
+### 4. Implementation
+
+`reconciliation.py` gains narrow private helpers, and the Amendment 13 and 16
+rows are rebuilt from them with identical messages, details, outcome mapping,
+trace fields, attempt behavior and listing counts:
+
+- `_container_gate`: one listing, `confirmed_absent`, `present` or `unknown`;
+- `_inspect_materialized_worktree` and `_mutate_materialized_worktree`:
+  Amendment 13's inspection and M2–M5;
+- `_inspect_owned_checkpoint_ref` and `_mutate_checkpoint_ref`: Amendment 16's
+  inspection and M2–M4;
+- `_enter_reconciling` and `_publish_reconciled`.
+
+The standalone Amendment 13 row still lists containers once, after its worktree
+inspection. The standalone Amendment 16 row still lists once, before its
+worktree-absence checks. The chained row lists twice, in the order above.
+
+No change to `checkpoint_ref.py`, `state_root.py`, `worktree_lifecycle.py`, the
+live owner's tables or writers, the reconciler-owned writers, the controller,
+the run composition, the executor or CI.
+
+### 5. Maintenance trace
+
+`schema_version` stays 1. Two additive, categorical fields in the
+`checkpoint_ref` object:
+
+| Field | Meaning | Values |
+|---|---|---|
+| `gate_observation` | this row's pre-mutation ref gate | `absent`, `candidate_accepted`, `candidate_proposed`, `unexpected`, `symbolic`, `ambiguous`, `unknown`; `null` for every other row |
+| `container_gate` | the container listing immediately gating Phase R | `not_attempted`, `confirmed_absent`, `present`, `unknown` |
+
+`container_gate` is gate 2 for this row, the single listing for the standalone
+Amendment 16 row, and `not_attempted` for every other row. `observation_pre`
+keeps its meaning: the observation immediately before Phase R. A chained pass
+fills both the `worktree` and `checkpoint_ref` field sets. No SHA, container
+name or id, path, Docker or Git output, or exception text is recorded.
+
+### 6. Non-claims
+
+- **Still blocking:** a live container alongside a worktree (T36), every
+  Amendment 13 and 16 refusal, a never-registered `creating` worktree with a
+  ref, and abandonment-only cases.
+- **Not implemented:** live-container cleanup or container chaining,
+  Amendment 12-plus-ref recovery, abandonment, ADR 0005 cancellation, CLI or
+  operator wiring, ref sweeping, `git prune`, or any live-owner change.
+- **No cross-resource atomicity.** A same-user actor (A4) can act between the
+  phases or after gate 2. Gate 2 and the fresh observation narrow this but do
+  not close it; each phase fails closed.
+- **Amendment 16's residuals carry over:** the two-command observation window,
+  no compare-and-swap for an observed-absent ref, and time-bounded but not
+  byte-bounded observation output. Ref deletion makes checkpoint commits
+  collectable.
+- **Threats.** T-E1 and T-F1 are unchanged. T-F2 and T-M1 gain partial,
+  reconciler-level coverage for this shape only. Nothing is wired to an entry
+  point.
+- **Evidence.** This is implementation and automated-test evidence, not a
+  security review.
+
+### 7. Evidence
+
+Local verification: macOS, Git 2.54.0, Docker already running (it was not
+started or restarted), `CODEAGENT_REQUIRE_DOCKER=1`. Linux CI is pending; this
+slice has not been pushed.
+
+**New tests: 73.**
+
+- `test_lifecycle_store.py`, 17: the predicate is true for all 3 worktree
+  intents × 4 ref intents and disjoint from every other reconciliation shape;
+  false with a container record, a failure, an absent worktree, or an absent
+  ref.
+- `test_reconciliation.py`, 56, all against real Git with the Docker listing
+  spied:
+  - success for `present`+`present`, `present`+`advancing` at A and at B,
+    `disposing`+`removing`, `creating`+`creating`, and a ref already absent;
+    the D2 case; the collapse case; a real SHA-256 repository;
+  - the load-bearing order: exactly two listings, the first before any
+    projection write, the second after the durable worktree `absent` and
+    before the authoritative observation, with nothing between that
+    observation and the delete;
+  - a container name only in the second listing (`REFUSED`, ref untouched, no
+    observation after gate 2, stays refused while the container exists); a
+    second-listing failure (`SUBSTRATE_UNAVAILABLE`, then a clean Amendment 16
+    resume); container gate 1 stopping with zero mutation;
+  - the standalone Amendment 13 and 16 rows each listing exactly once;
+  - Gate A refusals with zero mutation: an unrelated SHA, dangling and
+    resolvable symbolic refs, an ambiguous observation, a failed observation,
+    the Amendment 12 case, a locked registration, a failure-bearing
+    projection, and a held lifecycle lock (`SKIPPED_ACTIVE`);
+  - Phase W failures (launch failure, unconfirmed cleanup, a partial removal)
+    stopping every later listing, observation and delete;
+  - the ref moved, deleted, made symbolic, or unobservable during Phase W;
+  - every Phase R delete outcome;
+  - all six projection writes × {publication failed, durability unconfirmed}:
+    `FAILED`, nothing logged after the failed write, then resume to
+    `RECONCILED` (or `SKIPPED_TERMINAL`) with `attempts_total` 1;
+  - real reconciler SIGKILLs after `disposing`, after worktree `absent`, and
+    after ref `removing`, each resuming with no re-increment;
+  - unrelated refs, branches and tags byte-identical;
+  - a raw trace free of SHAs, container names and ids, and paths.
+
+**Existing tests corrected (disclosed):**
+
+- T37 (`test_lifecycle_run.py`, real Docker) is renamed
+  `test_t37_sigkill_after_ref_present_is_reconciled` and now asserts
+  `RECONCILED`, `attempts_total` 1, the worktree unregistered with no leaf and
+  no admin entry, the ref absent, both containers absent, and
+  `_assert_fully_clean`. It previously pinned `BLOCKED`. T36 still blocks.
+- `test_a16_ineligible_ref_shapes_stay_refused[worktree_present]` still
+  asserts `REFUSED` (now via Amendment 13's worktree gate, since no real
+  worktree is seeded). Only its docstring changed.
+
+**Mutation checks.** Each mutation was caught by its intended tests, and the
+source was restored byte-for-byte (SHA-256 verified):
+
+| # | Mutation | Failed |
+|---|---|---|
+| 1 | Phases swapped (ref before worktree) | 26 |
+| 2 | Pre-mutation ref gate removed | 5 (every Gate A ref case) |
+| 3 | `RECONCILED` published inside Phase W | 12 |
+| 4 | A second `attempts_total` increment | 31 (the reconciler-owned writers refuse a changed count, so later writes are `FAILED`); a variant incrementing by 2 at the single entry point failed 18 tests directly on `attempts_total == 1` |
+| 5 | A Phase W failure not stopping later phases | 7 |
+| 6 | Post-worktree observation skipped (delete uses the gate value) | 12, including every Phase W race |
+| 7 | Container gate 2 removed | 10, including the second-listing tests |
+| 8 | Gate 2 reusing gate 1's result | 10, including the second-listing tests |
+| 9a | Standalone Amendment 13 row listing twice | 1 (its one-listing test) |
+| 9b | Standalone Amendment 16 row listing twice | 2 (its one-listing test, and the gate-2 resume) |
+
+**Totals.**
+
+| Run | Result |
+|---|---|
+| Targeted four files (`test_checkpoint_ref`, `test_lifecycle_store`, `test_reconciliation`, `test_lifecycle_run`) | 981 passed, forward and reverse |
+| Focused Milestone 3 set (17 files plus `test_lifecycle_run.py` and `test_slice_c.py`) | 1,921 passed, forward and reverse |
+| Full suite | 3,442 passed, 0 skipped (up from 3,369) |

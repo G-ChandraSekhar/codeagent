@@ -5055,9 +5055,11 @@ def test_a16_blockers_mutate_nothing(a16, monkeypatch, blocker, outcome):
     ["worktree_present", "baseline_creating", "verification_present", "failure_set", "terminal_complete"],
 )
 def test_a16_ineligible_ref_shapes_stay_refused(a16, shape):
-    """A ref alongside a worktree or container record (T37's shape and the
-    container rows) is deliberately not admitted; neither is a populated
-    failure or a terminal state with a non-absent ref."""
+    """A ref alongside a container record is deliberately not admitted;
+    neither is a populated failure or a terminal state with a non-absent
+    ref. A ref alongside a `present` worktree record is now Amendment 17's
+    chained shape, but with no real registered worktree it stays REFUSED by
+    Amendment 13's worktree gate, before any mutation."""
     h = a16
     transition = _a16_record("present", h.A)
     projection = dataclasses.replace(_initial_projection(h, _A16_ID), state=ls.LifecycleState.ACTIVE, checkpoint_ref=transition)
@@ -5320,3 +5322,689 @@ def test_a16_unreadable_leaf_parent_is_never_mistaken_for_absence(a16):
     assert (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes() == before
     assert _a16_value(h.repo).startswith(h.A)
     os.rmdir(leaf)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 17: worktree -> checkpoint-ref chaining in one pass.
+# The lifecycle is `_A13_ID` so Amendment 13's real-worktree helpers apply.
+# ---------------------------------------------------------------------------
+
+_A17_REF = f"refs/codeagent/runs/{_A13_ID}/checkpoint"
+
+
+@pytest.fixture
+def a17(a13, monkeypatch):
+    """Amendment 13's fixture plus three branch-free commits and one ordered
+    log of every container listing (with the durable projection at that
+    moment), `CheckpointRef.observe`, and `CheckpointRef.delete` call.
+    `h.listing_queue` holds per-call listing results (a value or an
+    exception); once empty, every listing is empty."""
+    h = a13
+    h.A, h.B, h.C = (_a16_commit(h.repo, m) for m in "ABC")
+    h.log = []
+    h.listing_queue = []
+    run_dir = h.runs_dir() / _A13_ID
+
+    def listing():
+        p = _read_projection_dict(run_dir) if (run_dir / ls.LIFECYCLE_JSON_FILENAME).exists() else None
+        h.log.append(("listing", p and (p["state"], p["worktree"]["intent"], p["checkpoint_ref"]["intent"])))
+        nxt = h.listing_queue.pop(0) if h.listing_queue else _empty_listing()
+        if isinstance(nxt, BaseException):
+            raise nxt
+        return nxt
+
+    real_observe, real_delete = rc.CheckpointRef.observe, rc.CheckpointRef.delete
+
+    def observe(self):
+        h.log.append(("observe", None))
+        return real_observe(self)
+
+    def delete(self, *, expected_oid):
+        h.log.append(("delete", expected_oid))
+        return real_delete(self, expected_oid=expected_oid)
+
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", listing)
+    monkeypatch.setattr(rc.CheckpointRef, "observe", observe)
+    monkeypatch.setattr(rc.CheckpointRef, "delete", delete)
+    yield h
+    for ref in _run("git", "-C", str(h.repo), "for-each-ref", "--format=%(refname)", "refs/codeagent").stdout.split():
+        _run("git", "-C", str(h.repo), "update-ref", "-d", "--no-deref", ref, check=False)
+
+
+def _a17_seed(h, wt_intent, ref_record, *, live=None, state=ls.LifecycleState.ACTIVE, attempts=0, materialize=True):
+    head = _run("git", "-C", str(h.repo), "rev-parse", "HEAD").stdout.strip()
+    projection = dataclasses.replace(
+        _initial_projection(h, _A13_ID),
+        state=state,
+        worktree=_wl.WorktreeTransition(intent=_wl.WorktreeIntent(wt_intent), expected_head=head),
+        checkpoint_ref=ref_record,
+        reconciliation=ls.ReconciliationSummary(attempts_total=attempts, recent_failures=()),
+    )
+    run_dir = _seed_run_dir(h, _A13_ID, projection)
+    if materialize:
+        _a13_materialize(h)
+    if live is not None:
+        _a16_set(h.repo, live, ref=_A17_REF)
+    return run_dir
+
+
+def _a17_entry(result):
+    (entry,) = [e for e in result.entries if e.lifecycle_id == _A13_ID]
+    return entry
+
+
+def _a17_kinds(h, kind):
+    return [x for x in h.log if x[0] == kind]
+
+
+def _a17_ref(h):
+    return _a16_value(h.repo, _A17_REF)
+
+
+def _a17_assert_fully_reconciled(h, run_dir, *, attempts=1):
+    assert not _a13_registered(h)
+    assert rc._count_worktree_admin_entries(h.identity.canonical_common_dir, _A13_ID) == 0
+    assert not os.path.lexists(_a13_leaf(h))
+    assert _a17_ref(h) is None
+    payload = _read_projection_dict(run_dir)
+    assert payload["state"] == "RECONCILED"
+    assert payload["worktree"] == {"intent": "absent", "expected_head": None}
+    assert payload["checkpoint_ref"]["intent"] == "absent"
+    assert payload["containers"]["baseline"]["intent"] == "absent"
+    assert payload["containers"]["verification"]["intent"] == "absent"
+    assert payload["reconciliation"]["attempts_total"] == attempts
+
+
+def _a17_assert_untouched(h, run_dir, before, *, ref_prefix):
+    """Zero mutation: projection bytes, the registered worktree, and the ref."""
+    assert (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes() == before
+    assert _a17_ref(h).startswith(ref_prefix)
+    assert not _a17_kinds(h, "delete")
+
+
+def _a17_raw_trace(h):
+    return "".join(p.read_text() for p in (h.repo_dir() / rc.MAINTENANCE_DIRNAME).glob("*.jsonl"))
+
+
+def _a17_no_removal(monkeypatch):
+    monkeypatch.setattr(rc, "_attempt_worktree_remove", lambda *a: pytest.fail("must not remove the worktree"))
+
+
+# (worktree intent, ref intent, live ref, expected observation category)
+_A17_SUCCESS = [
+    ("present", "present", "A", "candidate_accepted"),
+    ("present", "advancing", "A", "candidate_accepted"),
+    ("present", "advancing", "B", "candidate_proposed"),
+    ("disposing", "removing", "A", "candidate_accepted"),
+    ("creating", "creating", "A", "candidate_proposed"),
+    ("present", "present", None, "absent"),
+]
+
+
+@pytest.mark.parametrize("wt_intent, ref_intent, live, category", _A17_SUCCESS)
+def test_a17_chained_row_removes_worktree_then_ref(a17, wt_intent, ref_intent, live, category):
+    h = a17
+    run_dir = _a17_seed(h, wt_intent, _a16_record(ref_intent, h.A, h.B), live=getattr(h, live) if live else None)
+    head = _run("git", "-C", str(h.repo), "rev-parse", "HEAD").stdout.strip()
+    result = h.reconcile()
+    entry = _a17_entry(result)
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+    assert not result.blocked
+    _a17_assert_fully_reconciled(h, run_dir)
+    assert entry.checkpoint_ref_gate_observation == category
+    assert entry.checkpoint_ref_observation_pre == category
+    assert entry.checkpoint_ref_container_gate == "confirmed_absent"
+    assert entry.checkpoint_ref_removal_attempt == ("applied" if live else "not_attempted")
+    assert len(_a17_kinds(h, "listing")) == 2
+    event, _ = _a12_entry_event(h, result)
+    assert event["worktree"]["initial_persisted_intent"] == wt_intent
+    assert event["worktree"]["removal_attempt"] == "exited_zero"
+    assert event["worktree"]["absent_transition_confirmed_this_pass"] is True
+    assert event["worktree"]["disposing_transition_confirmed_this_pass"] is (wt_intent != "disposing")
+    ref = event["checkpoint_ref"]
+    assert ref["initial_persisted_intent"] == ref_intent
+    assert ref["gate_observation"] == category and ref["observation_pre"] == category
+    assert ref["container_gate"] == "confirmed_absent"
+    assert ref["absent_transition_confirmed_this_pass"] is True
+    assert ref["confirmed_absent"] is True and event["worktree"]["confirmed_absent"] is True
+    _a16_assert_no_sha_in_trace(h, h.A, h.B, h.C, head)
+
+
+def test_a17_d2_registered_directory_missing_disposing_with_ref(a17):
+    h = a17
+    run_dir = _a17_seed(h, "disposing", _a16_record("present", h.A), live=h.A)
+    _shutil.rmtree(_a13_leaf(h))
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+    _a17_assert_fully_reconciled(h, run_dir)
+
+
+def test_a17_disposing_collapse_with_ref_runs_no_git_removal(a17, monkeypatch):
+    h = a17
+    run_dir = _a17_seed(h, "disposing", _a16_record("present", h.A), live=h.A, materialize=False)
+    _a17_no_removal(monkeypatch)
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+    assert entry.worktree_leaf_outcome == "already_absent"
+    _a17_assert_fully_reconciled(h, run_dir)
+
+
+def test_a17_real_sha256_repository(tmp_path, monkeypatch):
+    repo = tmp_path / "repo256"
+    init = subprocess.run(["git", "init", "-q", "--object-format=sha256", str(repo)], capture_output=True, text=True)
+    if init.returncode != 0:
+        pytest.skip("installed git does not support --object-format=sha256")
+    _run("git", "-C", str(repo), "config", "user.email", "a@b.com")
+    _run("git", "-C", str(repo), "config", "user.name", "a")
+    (repo / "f.txt").write_text("x")
+    _run("git", "-C", str(repo), "add", ".")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    state_dir = _set_state_dir(monkeypatch, tmp_path, "state-256")
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: _empty_listing())
+    h = _Harness(repo, state_dir)
+    try:
+        assert h.identity.object_format == "sha256"
+        A, B = _a16_commit(repo, "A"), _a16_commit(repo, "B")
+        assert len(A) == 64
+        run_dir = _a17_seed(h, "present", _a16_record("advancing", A, B), live=B)
+        entry = _a17_entry(h.reconcile())
+        assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+        assert entry.checkpoint_ref_candidate_role == "proposed"
+        _a17_assert_fully_reconciled(h, run_dir)
+        _a16_assert_no_sha_in_trace(h, A, B)
+    finally:
+        h.close()
+
+
+def test_a17_listing_order_is_load_bearing(a17):
+    """Exactly two listings: the first before any projection write, the
+    second after `worktree absent` is durable and before the authoritative
+    ref observation; nothing lists between that observation and the delete."""
+    h = a17
+    _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+    assert _a17_entry(h.reconcile()).outcome is rc.ReconciliationEntryOutcome.RECONCILED
+    first_delete = [x[0] for x in h.log].index("delete")
+    assert [x[0] for x in h.log[: first_delete + 1]] == ["listing", "observe", "listing", "observe", "delete"]
+    assert h.log[0] == ("listing", ("ACTIVE", "present", "present"))
+    assert h.log[2] == ("listing", ("RECONCILING", "absent", "present"))
+    assert h.log[first_delete] == ("delete", h.A)
+    assert len(_a17_kinds(h, "listing")) == 2
+
+
+def test_a17_container_name_only_in_second_listing_is_refused_before_any_ref_step(a17):
+    h = a17
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+    present = _listing({f"codeagent-baseline-{_A13_ID}": "d" * 64})
+    h.listing_queue[:] = [_empty_listing(), present]
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert entry.detail == "a deterministic container name is present"
+    assert entry.checkpoint_ref_container_gate == "present"
+    assert entry.checkpoint_ref_observation_pre is None
+    assert entry.checkpoint_ref_gate_observation == "candidate_accepted"
+    assert len(_a17_kinds(h, "observe")) == 1  # the gate only; nothing after gate 2
+    assert not _a17_kinds(h, "delete")
+    assert _a17_ref(h).startswith(h.A)
+    assert not _a13_registered(h) and not os.path.lexists(_a13_leaf(h))
+    payload = _read_projection_dict(run_dir)
+    assert payload["state"] == "RECONCILING" and payload["worktree"]["intent"] == "absent"
+    assert payload["checkpoint_ref"] == {"intent": "present", "accepted_sha": h.A, "expected_old_sha": None, "proposed_new_sha": None}
+    assert payload["reconciliation"]["attempts_total"] == 1
+    # While the container exists, the resumed (Amendment 16) row stays refused.
+    h.listing_queue[:] = [present]
+    again = _a17_entry(h.reconcile())
+    assert again.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert _a17_ref(h).startswith(h.A)
+    assert _read_projection_dict(run_dir)["reconciliation"]["attempts_total"] == 1
+
+
+def test_a17_second_listing_failure_is_substrate_unavailable_then_resumes(a17):
+    h = a17
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+    h.listing_queue[:] = [_empty_listing(), rc._DockerListingError("x")]
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE
+    assert entry.detail == "container listing failed"
+    assert entry.checkpoint_ref_container_gate == "unknown"
+    assert len(_a17_kinds(h, "observe")) == 1 and not _a17_kinds(h, "delete")
+    assert _a17_ref(h).startswith(h.A)
+    assert _read_projection_dict(run_dir)["worktree"]["intent"] == "absent"
+    resumed = _a17_entry(h.reconcile())
+    assert resumed.outcome is rc.ReconciliationEntryOutcome.RECONCILED
+    assert resumed.checkpoint_ref_container_gate == "confirmed_absent"
+    _a17_assert_fully_reconciled(h, run_dir)
+
+
+@pytest.mark.parametrize(
+    "first, outcome",
+    [
+        (lambda: _listing({f"codeagent-verification-{_A13_ID}": "d" * 64}), "REFUSED"),
+        (lambda: rc._DockerListingError("x"), "SUBSTRATE_UNAVAILABLE"),
+    ],
+    ids=["name-present", "listing-fails"],
+)
+def test_a17_first_container_gate_stops_with_zero_mutation(a17, monkeypatch, first, outcome):
+    h = a17
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    h.listing_queue[:] = [first()]
+    _a17_no_removal(monkeypatch)
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome[outcome]
+    assert entry.checkpoint_ref_container_gate == "not_attempted"
+    assert not _a17_kinds(h, "observe") and len(_a17_kinds(h, "listing")) == 1
+    _a17_assert_untouched(h, run_dir, before, ref_prefix=h.A)
+    assert _a13_registered(h)
+
+
+def test_a17_standalone_amendment_13_row_lists_exactly_once(a17):
+    h = a17
+    run_dir, _ = _a13_seed(h, "present")
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED
+    assert len(_a17_kinds(h, "listing")) == 1
+    assert entry.checkpoint_ref_container_gate == "not_attempted"
+    assert entry.checkpoint_ref_gate_observation is None
+    assert _read_projection_dict(run_dir)["state"] == "RECONCILED"
+
+
+def test_a17_standalone_amendment_16_row_lists_exactly_once(a17):
+    h = a17
+    projection = dataclasses.replace(
+        _initial_projection(h, _A13_ID), state=ls.LifecycleState.ACTIVE, checkpoint_ref=_a16_record("present", h.A)
+    )
+    run_dir = _seed_run_dir(h, _A13_ID, projection)
+    _a16_set(h.repo, h.A, ref=_A17_REF)
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED
+    assert len(_a17_kinds(h, "listing")) == 1
+    assert entry.checkpoint_ref_container_gate == "confirmed_absent"
+    assert entry.checkpoint_ref_gate_observation is None
+    assert _read_projection_dict(run_dir)["state"] == "RECONCILED"
+    assert _a17_ref(h) is None
+
+
+def _a17_symbolic(h, *, dangling):
+    target = "refs/heads/a17-missing" if dangling else "refs/heads/a17-pin"
+    if not dangling:
+        _run("git", "-C", str(h.repo), "update-ref", target, "HEAD")
+    _run("git", "-C", str(h.repo), "symbolic-ref", _A17_REF, target)
+
+
+def _a17_failing_observe(reason):
+    def fail(self):
+        raise cr.CheckpointRefError(reason, "x", outcome=cr.MutationOutcome.UNKNOWN)
+
+    return fail
+
+
+@pytest.mark.parametrize(
+    "setup, outcome, category",
+    [
+        ("unrelated", "REFUSED", "unexpected"),
+        ("dangling_symbolic", "REFUSED", "symbolic"),
+        ("resolvable_symbolic", "REFUSED", "symbolic"),
+        ("ambiguous", "SUBSTRATE_UNAVAILABLE", "ambiguous"),
+        ("failed", "SUBSTRATE_UNAVAILABLE", "unknown"),
+    ],
+)
+def test_a17_ref_gate_stops_before_any_worktree_mutation(a17, monkeypatch, setup, outcome, category):
+    h = a17
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A))
+    if setup == "unrelated":
+        _a16_set(h.repo, h.C, ref=_A17_REF)
+    elif setup.endswith("symbolic"):
+        _a17_symbolic(h, dangling=setup == "dangling_symbolic")
+    else:
+        _a16_set(h.repo, h.A, ref=_A17_REF)
+        reason = cr.CheckpointRefFailure.AMBIGUOUS_OBSERVATION if setup == "ambiguous" else cr.CheckpointRefFailure.OBSERVATION_FAILED
+        monkeypatch.setattr(rc.CheckpointRef, "observe", _a17_failing_observe(reason))
+    ref_before = _a16_refs_snapshot(h.repo)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    _a17_no_removal(monkeypatch)
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome[outcome], entry.detail
+    assert entry.checkpoint_ref_gate_observation == category
+    assert entry.checkpoint_ref_observation_pre is None
+    assert entry.checkpoint_ref_container_gate == "not_attempted"
+    assert (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes() == before
+    assert _a16_refs_snapshot(h.repo) == ref_before
+    assert _a13_registered(h) and len(_a17_kinds(h, "listing")) == 1
+
+
+def test_a17_never_registered_creating_worktree_with_ref_is_refused(a17, monkeypatch):
+    """Amendment 12's shape plus a ref is excluded: REFUSED, zero mutation,
+    and the empty leaf is left in place."""
+    h = a17
+    run_dir = _a17_seed(h, "creating", _a16_record("present", h.A), live=h.A, materialize=False)
+    leaf = _a13_leaf(h)
+    leaf.mkdir(parents=True, mode=0o700)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    _a17_no_removal(monkeypatch)
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert entry.detail == "a never-registered creating worktree with a checkpoint ref is not reconciled"
+    assert not _a17_kinds(h, "observe")
+    _a17_assert_untouched(h, run_dir, before, ref_prefix=h.A)
+    assert leaf.is_dir()
+
+
+def test_a17_failure_bearing_projection_is_not_eligible(a17, monkeypatch):
+    h = a17
+    projection = dataclasses.replace(
+        _initial_projection(h, _A13_ID),
+        state=ls.LifecycleState.ACTIVE,
+        worktree=_wl.WorktreeTransition(intent=_wl.WorktreeIntent.PRESENT, expected_head=h.A),
+        checkpoint_ref=_a16_record("present", h.A),
+        failure=ls.FailureDetail(phase="p", detail="d"),
+    )
+    run_dir = _seed_run_dir(h, _A13_ID, projection)
+    _a13_materialize(h)
+    _a16_set(h.repo, h.A, ref=_A17_REF)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    _a17_no_removal(monkeypatch)
+    result = h.reconcile()
+    assert _a17_entry(result).outcome is rc.ReconciliationEntryOutcome.REFUSED and result.blocked
+    assert not _a17_kinds(h, "listing")
+    _a17_assert_untouched(h, run_dir, before, ref_prefix=h.A)
+
+
+def test_a17_held_lifecycle_lock_is_skipped_active(a17, monkeypatch):
+    h = a17
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    _a17_no_removal(monkeypatch)
+    ctx = multiprocessing.get_context("spawn")
+    ready_evt, release_evt = ctx.Event(), ctx.Event()
+    proc = ctx.Process(target=_a16_hold_lifecycle_lock, args=(str(run_dir), ready_evt, release_evt))
+    proc.start()
+    try:
+        assert ready_evt.wait(timeout=10)
+        assert _a17_entry(h.reconcile()).outcome is rc.ReconciliationEntryOutcome.SKIPPED_ACTIVE
+        _a17_assert_untouched(h, run_dir, before, ref_prefix=h.A)
+        assert _a13_registered(h)
+    finally:
+        release_evt.set()
+        proc.join(timeout=10)
+
+
+def _a17_partial(h):
+    def partial(root, target):
+        _shutil.rmtree(_a13_git_dir(h) / "worktrees" / _A13_ID)
+        return "exited_nonzero"
+
+    return partial
+
+
+@pytest.mark.parametrize(
+    "fault, outcome",
+    [
+        ("launch_failed", "SUBSTRATE_UNAVAILABLE"),
+        ("cleanup_unconfirmed", "SUBSTRATE_UNAVAILABLE"),
+        ("partial_removal", "FAILED"),
+    ],
+)
+def test_a17_phase_w_failure_stops_every_later_step(a17, monkeypatch, fault, outcome):
+    h = a17
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+    monkeypatch.setattr(
+        rc, "_attempt_worktree_remove", _a17_partial(h) if fault == "partial_removal" else (lambda *a: fault)
+    )
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome[outcome], entry.detail
+    assert len(_a17_kinds(h, "listing")) == 1  # no container gate 2
+    assert len(_a17_kinds(h, "observe")) == 1  # the gate only
+    assert not _a17_kinds(h, "delete")
+    assert entry.checkpoint_ref_container_gate == "not_attempted"
+    assert _a17_ref(h).startswith(h.A)
+    payload = _read_projection_dict(run_dir)
+    assert payload["state"] == "RECONCILING" and payload["worktree"]["intent"] == "disposing"
+    assert payload["checkpoint_ref"]["intent"] == "present"
+    assert payload["reconciliation"]["attempts_total"] == 1
+
+
+def test_a17_locked_registration_is_refused_in_gate_a(a17):
+    h = a17
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+    _run("git", "-C", str(h.repo), "worktree", "lock", str(_a13_leaf(h)))
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert entry.detail == "the worktree registration is locked"
+    assert not _a17_kinds(h, "observe") and len(_a17_kinds(h, "listing")) == 1
+    _a17_assert_untouched(h, run_dir, before, ref_prefix=h.A)
+
+
+@pytest.mark.parametrize("race", ["moved", "deleted", "symbolic", "observation_fails"])
+def test_a17_ref_change_during_phase_w_is_caught_by_the_fresh_observation(a17, monkeypatch, race):
+    h = a17
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+    real_remove = rc._attempt_worktree_remove
+
+    def remove_then_race(root, target):
+        out = real_remove(root, target)
+        if race == "moved":
+            _a16_set(h.repo, h.C, ref=_A17_REF)
+        elif race in ("deleted", "symbolic"):
+            _run("git", "-C", str(h.repo), "update-ref", "-d", _A17_REF)
+            if race == "symbolic":
+                _a17_symbolic(h, dangling=True)
+        else:
+            monkeypatch.setattr(rc.CheckpointRef, "observe", _a17_failing_observe(cr.CheckpointRefFailure.OBSERVATION_FAILED))
+        return out
+
+    monkeypatch.setattr(rc, "_attempt_worktree_remove", remove_then_race)
+    entry = _a17_entry(h.reconcile())
+    assert entry.checkpoint_ref_gate_observation == "candidate_accepted"
+    assert not _a13_registered(h) and not os.path.lexists(_a13_leaf(h))
+    payload = _read_projection_dict(run_dir)
+    if race == "deleted":
+        assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED
+        assert entry.checkpoint_ref_observation_pre == "absent"
+        assert entry.checkpoint_ref_removal_attempt == "not_attempted"
+        _a17_assert_fully_reconciled(h, run_dir)
+        return
+    expected = {"moved": ("REFUSED", "unexpected"), "symbolic": ("REFUSED", "symbolic"), "observation_fails": ("SUBSTRATE_UNAVAILABLE", "unknown")}
+    outcome, category = expected[race]
+    assert entry.outcome is rc.ReconciliationEntryOutcome[outcome]
+    assert entry.checkpoint_ref_observation_pre == category
+    assert not _a17_kinds(h, "delete")
+    assert payload["state"] == "RECONCILING" and payload["worktree"]["intent"] == "absent"
+    assert payload["checkpoint_ref"]["intent"] == "present"
+    if race == "moved":
+        assert _a17_ref(h).startswith(h.C)
+        assert _a17_entry(h.reconcile()).outcome is rc.ReconciliationEntryOutcome.REFUSED  # Amendment 16 row
+        assert _a17_ref(h).startswith(h.C)
+        assert not _a17_kinds(h, "delete")
+
+
+@pytest.mark.parametrize("reason, mutation, outcome, category", _A16_DELETE_OUTCOMES)
+def test_a17_phase_r_delete_failures_keep_the_write_ahead_record(a17, monkeypatch, reason, mutation, outcome, category):
+    h = a17
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+
+    def fake_delete(self, *, expected_oid):
+        h.log.append(("delete", expected_oid))
+        raise cr.CheckpointRefError(reason, "injected", outcome=mutation)
+
+    monkeypatch.setattr(rc.CheckpointRef, "delete", fake_delete)
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome.value == outcome.lower()
+    assert entry.checkpoint_ref_removal_attempt == category
+    payload = _read_projection_dict(run_dir)
+    assert payload["state"] == "RECONCILING" and payload["worktree"]["intent"] == "absent"
+    assert payload["checkpoint_ref"]["intent"] == "removing"
+    assert payload["reconciliation"]["attempts_total"] == 1
+    assert _a17_ref(h).startswith(h.A)
+
+
+# The chained pass's six projection writes, in order: 1 RECONCILING,
+# 2 worktree disposing, 3 worktree absent, 4 ref removing, 5 ref absent,
+# 6 RECONCILED. (installed state, worktree, ref) after each failure.
+_A17_WRITES = {
+    (1, "publication"): ("ACTIVE", "present", "present"),
+    (1, "durability"): ("RECONCILING", "present", "present"),
+    (2, "publication"): ("RECONCILING", "present", "present"),
+    (2, "durability"): ("RECONCILING", "disposing", "present"),
+    (3, "publication"): ("RECONCILING", "disposing", "present"),
+    (3, "durability"): ("RECONCILING", "absent", "present"),
+    (4, "publication"): ("RECONCILING", "absent", "present"),
+    (4, "durability"): ("RECONCILING", "absent", "removing"),
+    (5, "publication"): ("RECONCILING", "absent", "removing"),
+    (5, "durability"): ("RECONCILING", "absent", "absent"),
+    (6, "publication"): ("RECONCILING", "absent", "absent"),
+    (6, "durability"): ("RECONCILED", "absent", "absent"),
+}
+
+
+@pytest.mark.parametrize("index, kind", sorted(_A17_WRITES))
+def test_a17_every_write_failure_is_failed_then_resumes(a17, monkeypatch, index, kind):
+    h = a17
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+    fault = {"n": 0, "armed": True, "log_len": None}
+
+    def wrap(real):
+        def inner(*a, **k):
+            fault["n"] += 1
+            if fault["armed"] and fault["n"] == index:
+                fault["log_len"] = len(h.log)
+                if kind == "durability":
+                    real(*a, **k)
+                    reason = ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+                else:
+                    reason = ls.LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED
+                raise ls.LifecycleStoreError(reason, "injected")
+            return real(*a, **k)
+
+        return inner
+
+    for name in (
+        "_publish_projection_state",
+        "_publish_reconciler_worktree_transition",
+        "_publish_reconciler_checkpoint_ref_transition",
+    ):
+        monkeypatch.setattr(rc, name, wrap(getattr(rc, name)))
+    removals = []
+    real_remove = rc._attempt_worktree_remove
+    monkeypatch.setattr(rc, "_attempt_worktree_remove", lambda *a: removals.append(1) or real_remove(*a))
+
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.FAILED, entry.detail
+    assert h.log[fault["log_len"]:] == []  # nothing listed, observed, or deleted after the failed write
+    assert len(removals) == (1 if index > 2 else 0)
+    assert len(_a17_kinds(h, "delete")) == (1 if index > 4 else 0)
+    payload = _read_projection_dict(run_dir)
+    assert (payload["state"], payload["worktree"]["intent"], payload["checkpoint_ref"]["intent"]) == _A17_WRITES[(index, kind)]
+
+    fault["armed"] = False
+    resumed = _a17_entry(h.reconcile())
+    expected = (
+        rc.ReconciliationEntryOutcome.SKIPPED_TERMINAL
+        if (index, kind) == (6, "durability")
+        else rc.ReconciliationEntryOutcome.RECONCILED
+    )
+    assert resumed.outcome is expected, resumed.detail
+    _a17_assert_fully_reconciled(h, run_dir)
+
+
+def _a17_reconcile_and_sigkill(repo_path, state_dir, point):
+    """Module-level (picklable) child: a real admission whose chained
+    reconciliation self-SIGKILLs right after one durable write."""
+    os.environ["CODEAGENT_STATE_DIR"] = state_dir
+    import codeagent.lifecycle_store as ls_child
+    import codeagent.reconciliation as rc_child
+
+    rc_child._docker_ps_all_id_name_pairs = lambda: ({}, {})
+    real_wt = rc_child._publish_reconciler_worktree_transition
+    real_ref = rc_child._publish_reconciler_checkpoint_ref_transition
+
+    def die():
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    def wt(*a, **k):
+        out = real_wt(*a, **k)
+        disposing = "target" in k and k["target"].intent is _wl.WorktreeIntent.DISPOSING
+        if (point == "after_disposing") is disposing and point in ("after_disposing", "after_worktree_absent"):
+            die()
+        return out
+
+    def ref(*a, **k):
+        out = real_ref(*a, **k)
+        if point == "after_ref_removing" and k["target"].intent is cs.CheckpointIntent.REMOVING:
+            die()
+        return out
+
+    rc_child._publish_reconciler_worktree_transition = wt
+    rc_child._publish_reconciler_checkpoint_ref_transition = ref
+    ls_child.prepare_lifecycle(repo_path, run_id="a17-reconciler-killed")
+    die()  # unreachable
+
+
+@pytest.mark.parametrize(
+    "point, crashed_wt, crashed_ref, registered",
+    [
+        ("after_disposing", "disposing", "present", True),
+        ("after_worktree_absent", "absent", "present", False),
+        ("after_ref_removing", "absent", "removing", False),
+    ],
+)
+def test_a17_real_sigkill_inside_the_chained_row_resumes(tmp_path, monkeypatch, point, crashed_wt, crashed_ref, registered):
+    repo = _make_repo(tmp_path)
+    state_dir = _set_state_dir(monkeypatch, tmp_path)
+    h = _Harness(repo, state_dir)
+    try:
+        A = _a16_commit(repo, "A")
+        run_dir = _a17_seed(h, "present", _a16_record("present", A), live=A)
+    finally:
+        h.close()
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(target=_a17_reconcile_and_sigkill, args=(str(repo), str(state_dir), point))
+    proc.start()
+    proc.join(timeout=60)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=10)
+        pytest.fail("reconciler child did not self-SIGKILL within the timeout")
+    assert proc.exitcode == -signal.SIGKILL
+    crashed = _read_projection_dict(run_dir)
+    assert crashed["state"] == "RECONCILING"
+    assert crashed["reconciliation"]["attempts_total"] == 1
+    assert (crashed["worktree"]["intent"], crashed["checkpoint_ref"]["intent"]) == (crashed_wt, crashed_ref)
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: _empty_listing())
+    h = _Harness(repo, state_dir)
+    try:
+        assert _a13_registered(h) is registered
+        assert _a16_value(repo, _A17_REF).startswith(A)
+        entry = _a17_entry(h.reconcile())
+        assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+        _a17_assert_fully_reconciled(h, run_dir)
+    finally:
+        if _a13_registered(h):
+            _run("git", "-C", str(repo), "worktree", "remove", "--force", str(_a13_leaf(h)), check=False)
+        h.close()
+
+
+def test_a17_unrelated_refs_branches_and_tags_stay_byte_identical(a17):
+    h = a17
+    other = "f" * 32
+    _a16_set(h.repo, h.C, ref=f"refs/codeagent/runs/{other}/checkpoint")
+    _run("git", "-C", str(h.repo), "tag", "a17-tag", h.B)
+    _run("git", "-C", str(h.repo), "update-ref", "refs/heads/a17-branch", h.C)
+    run_dir = _a17_seed(h, "present", _a16_record("present", h.A), live=h.A)
+    before = [line for line in _a16_refs_snapshot(h.repo).splitlines() if _A17_REF not in line]
+    assert _a17_entry(h.reconcile()).outcome is rc.ReconciliationEntryOutcome.RECONCILED
+    assert _a16_refs_snapshot(h.repo).splitlines() == before
+    _a17_assert_fully_reconciled(h, run_dir)
+
+
+def test_a17_trace_is_categorical_only(a17):
+    """No SHA, container name or id, path, or exception text reaches the raw
+    trace, including on a gate-2 refusal that observed a container."""
+    h = a17
+    _a17_seed(h, "present", _a16_record("advancing", h.A, h.B), live=h.B)
+    cid = "d" * 64
+    h.listing_queue[:] = [_empty_listing(), _listing({f"codeagent-baseline-{_A13_ID}": cid})]
+    assert _a17_entry(h.reconcile()).outcome is rc.ReconciliationEntryOutcome.REFUSED
+    raw = _a17_raw_trace(h)
+    for secret in (h.A, h.B, cid, f"codeagent-baseline-{_A13_ID}", str(_a13_leaf(h)), str(h.state_dir), str(h.repo)):
+        assert secret not in raw

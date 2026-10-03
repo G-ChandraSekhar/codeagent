@@ -1247,12 +1247,25 @@ def test_t36_sigkill_after_baseline_present_blocks(env):
 
 
 @requires_docker
-def test_t37_sigkill_after_ref_present_blocks(env):
-    """T37: a non-absent checkpoint ref — no reconciliation row exists."""
+def test_t37_sigkill_after_ref_present_is_reconciled(env):
+    """T37 (ADR 0004 Amendment 17; previously blocked): the owner dies with a
+    materialized worktree and a present checkpoint ref, containers absent.
+    The next run's reconciliation removes the worktree, then the ref, in one
+    pass and one cycle."""
     repo_key, lifecycle_id, proj = _crash(env, "ref_present")
-    assert proj["checkpoint_ref"]["intent"] == "present"
+    assert proj["checkpoint_ref"]["intent"] == "present" and proj["worktree"]["intent"] == "present"
+    assert proj["containers"]["baseline"]["intent"] == "absent"
+    assert proj["containers"]["verification"]["intent"] == "absent"
     assert _codeagent_refs(env.repo) == [f"refs/codeagent/runs/{lifecycle_id}/checkpoint"]
-    _blocked(env.repo)
+    assert _registered_worktrees(env.repo)
+    ls.prepare_lifecycle(str(env.repo), run_id="r-after").close()
+    dead = _projection(env.state / "repos" / repo_key / "runs" / lifecycle_id)
+    assert dead["state"] == "RECONCILED"
+    assert dead["worktree"]["intent"] == "absent"
+    assert dead["checkpoint_ref"]["intent"] == "absent"
+    assert dead["reconciliation"]["attempts_total"] == 1
+    assert not (env.repo / ".git" / "worktrees" / lifecycle_id).exists()
+    _assert_fully_clean(env, repo_key, lifecycle_id)
 
 
 @requires_docker

@@ -125,6 +125,7 @@ from .lifecycle_store import (
     checkpoint_ref_deletion_candidates,
     is_projection_checkpoint_ref_reconciliation_shape,
     is_projection_materialized_worktree_reconciliation_shape,
+    is_projection_worktree_then_checkpoint_ref_reconciliation_shape,
     is_projection_fully_absent_shape,
     is_projection_reconciliation_eligible_shape,
     load_lifecycle_projection,
@@ -234,6 +235,12 @@ class ReconciliationEntryResult:
     checkpoint_ref_removal_attempt: str = "not_attempted"
     checkpoint_ref_removing_transition_confirmed_this_pass: bool = False
     checkpoint_ref_absent_transition_confirmed_this_pass: bool = False
+    # ADR 0004 Amendment 17 (categorical only). `gate_observation` is the
+    # chained row's read-only pre-worktree ref gate (`None` elsewhere);
+    # `container_gate` is the listing that immediately gates the ref phase
+    # (the chained row's second listing, or Amendment 16's single listing).
+    checkpoint_ref_gate_observation: str | None = None
+    checkpoint_ref_container_gate: str = "not_attempted"
 
 
 @dataclass(frozen=True)
@@ -1086,6 +1093,7 @@ def _is_reconciliation_eligible(projection: LifecycleProjection) -> bool:
         is_projection_reconciliation_eligible_shape(projection)
         or is_projection_materialized_worktree_reconciliation_shape(projection)
         or is_projection_checkpoint_ref_reconciliation_shape(projection)
+        or is_projection_worktree_then_checkpoint_ref_reconciliation_shape(projection)
     )
 
 
@@ -1156,7 +1164,20 @@ def _reconcile_locked_entry(
             worktree_initial_persisted_intent=initial_intent,
         )
 
-    if projection.checkpoint_ref.intent is not CheckpointIntent.ABSENT:
+    if projection.checkpoint_ref.intent is not CheckpointIntent.ABSENT and (
+        projection.worktree.intent is not WorktreeIntent.ABSENT
+    ):
+        # ADR 0004 Amendment 17: eligibility guarantees a materialized
+        # worktree record and both container records absent.
+        result = _reconcile_worktree_then_checkpoint_ref_entry(
+            run_dir_fd=run_dir_fd,
+            lifecycle_id=lifecycle_id,
+            projection=projection,
+            state_root=state_root,
+            identity=identity,
+            context=context,
+        )
+    elif projection.checkpoint_ref.intent is not CheckpointIntent.ABSENT:
         # ADR 0004 Amendment 16: eligibility already guarantees the worktree
         # and both container records are absent for this shape.
         result = replace(
@@ -1218,6 +1239,195 @@ def _classify_checkpoint_ref_delete_failure(exc: CheckpointRefError) -> tuple[Re
     return _CHECKPOINT_REF_DELETE_DISPOSITION[exc.outcome]
 
 
+_RECONCILED_FLAGS = dict(
+    baseline_confirmed_absent=True,
+    verification_confirmed_absent=True,
+    worktree_confirmed_absent=True,
+    checkpoint_ref_confirmed_absent=True,
+)
+
+# ADR 0004 Amendment 17: a container gate's categorical result -> the stop
+# every row already used for it (unchanged details).
+_CONTAINER_GATE_STOPS = {
+    "present": (ReconciliationEntryOutcome.REFUSED, "a deterministic container name is present"),
+    "unknown": (ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "container listing failed"),
+}
+
+
+def _container_gate(lifecycle_id: str) -> str:
+    """One complete, fresh Docker listing: `confirmed_absent` when both
+    deterministic names are absent, `present` when either is listed,
+    `unknown` when the listing failed. Categorical only."""
+    try:
+        name_to_id, _ = _docker_ps_all_id_name_pairs()
+    except _DockerListingError:
+        return "unknown"
+    if f"codeagent-baseline-{lifecycle_id}" in name_to_id or f"codeagent-verification-{lifecycle_id}" in name_to_id:
+        return "present"
+    return "confirmed_absent"
+
+
+def _enter_reconciling(run_dir_fd: int, projection: LifecycleProjection):
+    """Enter RECONCILING before any mutation -- the only increment, and only
+    on a fresh cycle. Returns `(stop, projection, attempts)`."""
+    attempts = projection.reconciliation.attempts_total
+    if projection.state is LifecycleState.RECONCILING:
+        return None, projection, attempts
+    attempts += 1
+    try:
+        projection = _publish_projection_state(
+            run_dir_fd, projection, state=LifecycleState.RECONCILING, attempts_total=attempts
+        )
+    except LifecycleStoreError as exc:
+        return (
+            (ReconciliationEntryOutcome.FAILED, f"the RECONCILING projection write failed ({exc.reason.value})"),
+            projection,
+            attempts,
+        )
+    return None, projection, attempts
+
+
+def _publish_reconciled(run_dir_fd: int, projection: LifecycleProjection, attempts: int):
+    """RECONCILED, last. Returns a stop on failure, otherwise `None`."""
+    try:
+        _publish_projection_state(run_dir_fd, projection, state=LifecycleState.RECONCILED, attempts_total=attempts)
+    except LifecycleStoreError as exc:
+        return ReconciliationEntryOutcome.FAILED, f"the RECONCILED projection write failed ({exc.reason.value})"
+    return None
+
+
+def _inspect_owned_checkpoint_ref(
+    *,
+    lifecycle_id: str,
+    transition: CheckpointTransition,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+    trace: dict,
+    key: str,
+    record_role: bool,
+):
+    """The exact owned ref, against the trusted repository and object format,
+    observed without following a symbolic ref and classified against the
+    record's section 8 deletion candidates. Mutates nothing. Records the
+    category in `trace[key]` (and the candidate role when `record_role`).
+    Returns `(stop, ref, removal_sha)`; `removal_sha` is `None` when the ref
+    is absent."""
+    try:
+        ref = CheckpointRef(context.working_tree_root, lifecycle_id)
+    except (ValueError, CheckpointRefError):
+        return (ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the checkpoint ref could not be constructed"), None, None
+    if ref.object_format.value != identity.object_format:
+        return (
+            (
+                ReconciliationEntryOutcome.REFUSED,
+                "the checkpoint ref's discovered object format disagrees with the trusted repository identity",
+            ),
+            None,
+            None,
+        )
+    try:
+        observation = ref.observe()
+    except CheckpointRefError as exc:
+        if exc.reason is CheckpointRefFailure.SYMBOLIC_REF:
+            trace[key] = "symbolic"
+            return (ReconciliationEntryOutcome.REFUSED, "the recomputed checkpoint ref is symbolic"), None, None
+        trace[key] = "ambiguous" if exc.reason is CheckpointRefFailure.AMBIGUOUS_OBSERVATION else "unknown"
+        return (ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the checkpoint ref could not be observed"), None, None
+    if not observation.present:
+        trace[key] = "absent"
+        return None, ref, None
+    for role, sha in checkpoint_ref_deletion_candidates(transition):
+        if observation.oid == sha:
+            if record_role:
+                trace["role"] = role
+            trace[key] = f"candidate_{role}"
+            return None, ref, sha
+    trace[key] = "unexpected"
+    return (
+        (
+            ReconciliationEntryOutcome.REFUSED,
+            "the checkpoint ref holds a value that is not a deletion candidate for its record",
+        ),
+        None,
+        None,
+    )
+
+
+def _mutate_checkpoint_ref(
+    *,
+    run_dir_fd: int,
+    projection: LifecycleProjection,
+    attempts: int,
+    ref,
+    removal_sha: str | None,
+    trace: dict,
+):
+    """Amendment 16's M2-M4: write-ahead `removing(observed)` (a no-op when
+    already removing), one `CheckpointRef.delete(expected_oid=observed)`,
+    then `absent` only after a normal return. A ref already absent goes
+    straight to `absent` with no Git mutation. Returns `(stop, projection)`."""
+    if removal_sha is not None:
+        already_removing = projection.checkpoint_ref.intent is CheckpointIntent.REMOVING
+        try:
+            projection = _publish_reconciler_checkpoint_ref_transition(
+                run_dir_fd,
+                projection,
+                attempts_total=attempts,
+                target=CheckpointTransition(
+                    intent=CheckpointIntent.REMOVING, accepted_sha=removal_sha, expected_old_sha=removal_sha
+                ),
+            )
+        except LifecycleStoreError as exc:
+            return (
+                (ReconciliationEntryOutcome.FAILED, f"the checkpoint-ref removing write failed ({exc.reason.value})"),
+                projection,
+            )
+        trace["removing"] = not already_removing
+        try:
+            ref.delete(expected_oid=removal_sha)
+        except CheckpointRefError as exc:
+            outcome, category = _classify_checkpoint_ref_delete_failure(exc)
+            trace["attempt"] = category
+            return (outcome, f"checkpoint-ref removal not confirmed ({category})"), projection
+        trace["attempt"] = "applied"
+    try:
+        projection = _publish_reconciler_checkpoint_ref_transition(
+            run_dir_fd, projection, attempts_total=attempts, target=ABSENT_TRANSITION
+        )
+    except LifecycleStoreError as exc:
+        return (
+            (ReconciliationEntryOutcome.FAILED, f"the checkpoint-ref absent collapse write failed ({exc.reason.value})"),
+            projection,
+        )
+    trace["absent"] = True
+    return None, projection
+
+
+def _checkpoint_ref_trace() -> dict:
+    return {
+        "pre": None,
+        "role": None,
+        "attempt": "not_attempted",
+        "removing": False,
+        "absent": False,
+        "gate": None,
+        "container_gate": "not_attempted",
+    }
+
+
+def _checkpoint_ref_result_fields(transition: CheckpointTransition, trace: dict) -> dict:
+    return dict(
+        checkpoint_ref_initial_persisted_intent=transition.intent.value,
+        checkpoint_ref_observation_pre=trace["pre"],
+        checkpoint_ref_candidate_role=trace["role"],
+        checkpoint_ref_removal_attempt=trace["attempt"],
+        checkpoint_ref_removing_transition_confirmed_this_pass=trace["removing"],
+        checkpoint_ref_absent_transition_confirmed_this_pass=trace["absent"],
+        checkpoint_ref_gate_observation=trace["gate"],
+        checkpoint_ref_container_gate=trace["container_gate"],
+    )
+
+
 def _reconcile_checkpoint_ref_entry(
     *,
     run_dir_fd: int,
@@ -1232,18 +1442,19 @@ def _reconcile_checkpoint_ref_entry(
     container records are absent.
 
     Every inspection precedes every mutation, in section 9's order: both
-    deterministic container names absent (fresh listing); the worktree
-    unregistered, with zero Git admin entries and no leaf entry (I5); the
-    repository object format; then the exact owned ref, observed without
-    following a symbolic ref. Then: RECONCILING (+1 only on a fresh cycle)
-    -> write-ahead `removing(observed)` (a no-op when already `removing`)
-    -> one `CheckpointRef.delete(expected_oid=observed)` compare-and-swap
-    -> `absent` only after a normal return -> RECONCILED. A ref already
-    absent collapses without any Git mutation. Messages and trace fields
-    are categorical; no SHA is ever recorded."""
+    deterministic container names absent (one fresh listing, recorded as
+    `container_gate`); the worktree unregistered, with zero Git admin
+    entries and no leaf entry (I5); the repository object format; then the
+    exact owned ref, observed without following a symbolic ref. Then:
+    RECONCILING (+1 only on a fresh cycle) -> write-ahead
+    `removing(observed)` (a no-op when already `removing`) -> one
+    `CheckpointRef.delete(expected_oid=observed)` compare-and-swap ->
+    `absent` only after a normal return -> RECONCILED. A ref already absent
+    collapses without any Git mutation. Messages and trace fields are
+    categorical; no SHA is ever recorded."""
     transition = projection.checkpoint_ref
     attempts = projection.reconciliation.attempts_total
-    trace = {"pre": None, "role": None, "attempt": "not_attempted", "removing": False, "absent": False}
+    trace = _checkpoint_ref_trace()
 
     def result(outcome, detail, **extra) -> ReconciliationEntryResult:
         return ReconciliationEntryResult(
@@ -1252,22 +1463,14 @@ def _reconcile_checkpoint_ref_entry(
             detail,
             run_id=projection.run_id,
             attempt_number=attempts,
-            checkpoint_ref_initial_persisted_intent=transition.intent.value,
-            checkpoint_ref_observation_pre=trace["pre"],
-            checkpoint_ref_candidate_role=trace["role"],
-            checkpoint_ref_removal_attempt=trace["attempt"],
-            checkpoint_ref_removing_transition_confirmed_this_pass=trace["removing"],
-            checkpoint_ref_absent_transition_confirmed_this_pass=trace["absent"],
+            **_checkpoint_ref_result_fields(transition, trace),
             **extra,
         )
 
     # Section 9 / I4: both deterministic container names absent.
-    try:
-        name_to_id, _ = _docker_ps_all_id_name_pairs()
-    except _DockerListingError:
-        return result(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "container listing failed")
-    if f"codeagent-baseline-{lifecycle_id}" in name_to_id or f"codeagent-verification-{lifecycle_id}" in name_to_id:
-        return result(ReconciliationEntryOutcome.REFUSED, "a deterministic container name is present")
+    trace["container_gate"] = _container_gate(lifecycle_id)
+    if trace["container_gate"] != "confirmed_absent":
+        return result(*_CONTAINER_GATE_STOPS[trace["container_gate"]])
 
     # I5: the worktree confirmed absent -- unregistered, zero admin entries,
     # and no entry at the deterministic leaf path (not followed).
@@ -1290,98 +1493,25 @@ def _reconcile_checkpoint_ref_entry(
     if leaf is not MaterializedLeafObservation.ABSENT:
         return result(ReconciliationEntryOutcome.REFUSED, "the recomputed worktree leaf is present")
 
-    # The exact owned ref, against the trusted repository and object format.
-    try:
-        ref = CheckpointRef(context.working_tree_root, lifecycle_id)
-    except (ValueError, CheckpointRefError):
-        return result(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the checkpoint ref could not be constructed")
-    if ref.object_format.value != identity.object_format:
-        return result(
-            ReconciliationEntryOutcome.REFUSED,
-            "the checkpoint ref's discovered object format disagrees with the trusted repository identity",
-        )
-    try:
-        observation = ref.observe()
-    except CheckpointRefError as exc:
-        if exc.reason is CheckpointRefFailure.SYMBOLIC_REF:
-            trace["pre"] = "symbolic"
-            return result(ReconciliationEntryOutcome.REFUSED, "the recomputed checkpoint ref is symbolic")
-        trace["pre"] = "ambiguous" if exc.reason is CheckpointRefFailure.AMBIGUOUS_OBSERVATION else "unknown"
-        return result(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the checkpoint ref could not be observed")
-    removal_sha = None
-    if not observation.present:
-        trace["pre"] = "absent"
-    else:
-        for role, sha in checkpoint_ref_deletion_candidates(transition):
-            if observation.oid == sha:
-                removal_sha = sha
-                trace["role"] = role
-                trace["pre"] = f"candidate_{role}"
-                break
-        else:
-            trace["pre"] = "unexpected"
-            return result(
-                ReconciliationEntryOutcome.REFUSED,
-                "the checkpoint ref holds a value that is not a deletion candidate for its record",
-            )
-
-    # M1: enter RECONCILING before any mutation; the only increment.
-    if projection.state is not LifecycleState.RECONCILING:
-        attempts += 1
-        try:
-            projection = _publish_projection_state(
-                run_dir_fd, projection, state=LifecycleState.RECONCILING, attempts_total=attempts
-            )
-        except LifecycleStoreError as exc:
-            return result(ReconciliationEntryOutcome.FAILED, f"the RECONCILING projection write failed ({exc.reason.value})")
-
-    if removal_sha is not None:
-        # M2: write-ahead `removing(observed)` (resume no-op when already removing).
-        already_removing = projection.checkpoint_ref.intent is CheckpointIntent.REMOVING
-        try:
-            projection = _publish_reconciler_checkpoint_ref_transition(
-                run_dir_fd,
-                projection,
-                attempts_total=attempts,
-                target=CheckpointTransition(
-                    intent=CheckpointIntent.REMOVING, accepted_sha=removal_sha, expected_old_sha=removal_sha
-                ),
-            )
-        except LifecycleStoreError as exc:
-            return result(ReconciliationEntryOutcome.FAILED, f"the checkpoint-ref removing write failed ({exc.reason.value})")
-        trace["removing"] = not already_removing
-
-        # M3: the one compare-and-swap delete against the observed value.
-        try:
-            ref.delete(expected_oid=removal_sha)
-        except CheckpointRefError as exc:
-            outcome, category = _classify_checkpoint_ref_delete_failure(exc)
-            trace["attempt"] = category
-            return result(outcome, f"checkpoint-ref removal not confirmed ({category})")
-        trace["attempt"] = "applied"
-
-    # M4: reconciler-owned `-> absent`, only after confirmed absence.
-    try:
-        projection = _publish_reconciler_checkpoint_ref_transition(
-            run_dir_fd, projection, attempts_total=attempts, target=ABSENT_TRANSITION
-        )
-    except LifecycleStoreError as exc:
-        return result(ReconciliationEntryOutcome.FAILED, f"the checkpoint-ref absent collapse write failed ({exc.reason.value})")
-    trace["absent"] = True
-
-    # M5: RECONCILED last.
-    try:
-        _publish_projection_state(run_dir_fd, projection, state=LifecycleState.RECONCILED, attempts_total=attempts)
-    except LifecycleStoreError as exc:
-        return result(ReconciliationEntryOutcome.FAILED, f"the RECONCILED projection write failed ({exc.reason.value})")
-    return result(
-        ReconciliationEntryOutcome.RECONCILED,
-        "confirmed absent and durably reconciled",
-        baseline_confirmed_absent=True,
-        verification_confirmed_absent=True,
-        worktree_confirmed_absent=True,
-        checkpoint_ref_confirmed_absent=True,
+    stop, ref, removal_sha = _inspect_owned_checkpoint_ref(
+        lifecycle_id=lifecycle_id, transition=transition, identity=identity, context=context,
+        trace=trace, key="pre", record_role=True,
     )
+    if stop is not None:
+        return result(*stop)
+
+    stop, projection, attempts = _enter_reconciling(run_dir_fd, projection)
+    if stop is not None:
+        return result(*stop)
+    stop, projection = _mutate_checkpoint_ref(
+        run_dir_fd=run_dir_fd, projection=projection, attempts=attempts, ref=ref, removal_sha=removal_sha, trace=trace
+    )
+    if stop is not None:
+        return result(*stop)
+    stop = _publish_reconciled(run_dir_fd, projection, attempts)
+    if stop is not None:
+        return result(*stop)
+    return result(ReconciliationEntryOutcome.RECONCILED, "confirmed absent and durably reconciled", **_RECONCILED_FLAGS)
 
 
 def _reconcile_absent_worktree_entry(
@@ -1870,6 +2000,153 @@ def _route_worktree_entry(
     )
 
 
+def _worktree_trace(registration: _TargetRegistration) -> dict:
+    return {
+        "leaf_outcome": "removal_not_attempted",
+        "registration_pre": registration.to_trace(),
+        "registration_post": None,
+        "admin_pre": None,
+        "admin_post": None,
+        "leaf_pre": None,
+        "leaf_post": None,
+        "attempt": "not_attempted",
+        "disposing": False,
+        "absent": False,
+    }
+
+
+def _worktree_result_fields(trace: dict) -> dict:
+    return dict(
+        worktree_leaf_outcome=trace["leaf_outcome"],
+        worktree_registration_pre=trace["registration_pre"],
+        worktree_registration_post=trace["registration_post"],
+        worktree_admin_matches_pre=trace["admin_pre"],
+        worktree_admin_matches_post=trace["admin_post"],
+        worktree_leaf_pre=trace["leaf_pre"],
+        worktree_leaf_post=trace["leaf_post"],
+        worktree_removal_attempt=trace["attempt"],
+        worktree_disposing_transition_confirmed_this_pass=trace["disposing"],
+        worktree_absent_transition_confirmed_this_pass=trace["absent"],
+    )
+
+
+def _inspect_materialized_worktree(
+    *,
+    lifecycle_id: str,
+    intent: WorktreeIntent,
+    registration: _TargetRegistration,
+    state_root,
+    identity: RepositoryIdentity,
+    trace: dict,
+):
+    """Amendment 13's worktree inspection; mutates nothing. I4: admin
+    entries. I5 (the leaf) only for rows that need its result:
+    registration/admin evidence that already decides the outcome is never
+    overridden by a leaf observation or its cleanup failure. Returns
+    `(stop, action)`."""
+    try:
+        admin = _count_worktree_admin_entries(identity.canonical_common_dir, lifecycle_id)
+        trace["admin_pre"] = admin
+        gate = _pre_removal_gate(intent, registration, admin)
+        if gate is not None:
+            return gate, None
+        leaf = state_root.observe_materialized_worktree_leaf(identity.repo_key, lifecycle_id).value
+        trace["leaf_pre"] = leaf
+    except LifecycleFsError as exc:
+        trace["leaf_outcome"] = (
+            "close_failed" if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED else "not_inspected"
+        )
+        return (_classify_entry_fs_failure(exc), "the worktree could not be inspected"), None
+    action, outcome, detail = _classify_pre_removal(intent, _WorktreeObservation(registration, admin, leaf))
+    if action == "stop":
+        return (outcome, detail), None
+    return None, action
+
+
+def _mutate_materialized_worktree(
+    *,
+    run_dir_fd: int,
+    projection: LifecycleProjection,
+    attempts: int,
+    intent: WorktreeIntent,
+    action: str,
+    lifecycle_id: str,
+    target_path: str,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+    trace: dict,
+):
+    """Amendment 13's M2-M5: reconciler `-> disposing` (skipped when already
+    disposing) -> one `git worktree remove --force` (or the collapse case)
+    -> three fresh observations -> `disposing -> absent`, published only
+    when the registration, the admin entry, and the leaf are all
+    independently confirmed absent. Returns `(stop, projection)`."""
+    if intent is not WorktreeIntent.DISPOSING:
+        try:
+            projection = _publish_reconciler_worktree_transition(
+                run_dir_fd,
+                projection,
+                attempts_total=attempts,
+                target=WorktreeTransition(
+                    intent=WorktreeIntent.DISPOSING, expected_head=projection.worktree.expected_head
+                ),
+            )
+        except LifecycleStoreError as exc:
+            return (
+                (ReconciliationEntryOutcome.FAILED, f"the worktree disposing write failed ({exc.reason.value})"),
+                projection,
+            )
+        trace["disposing"] = True
+
+    if action == "collapse":
+        trace["leaf_outcome"] = "already_absent"
+    else:
+        # M3: the one bounded, hardened, single-force removal.
+        attempt = _attempt_worktree_remove(context.working_tree_root, target_path)
+        trace["attempt"] = attempt
+        if attempt == "launch_failed":
+            return (ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "git could not be launched"), projection
+        if attempt == "cleanup_unconfirmed":
+            trace["leaf_outcome"] = "removal_unconfirmed"
+            return (
+                (ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the git worktree removal could not be confirmed stopped"),
+                projection,
+            )
+        # M4: three fresh observations, whatever the command reported.
+        try:
+            post = _observe_worktree(
+                state_root=state_root,
+                identity=identity,
+                context=context,
+                lifecycle_id=lifecycle_id,
+                target_path=target_path,
+            )
+        except LifecycleFsError as exc:
+            trace["leaf_outcome"] = (
+                "close_failed" if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED else "removal_unconfirmed"
+            )
+            return (_classify_entry_fs_failure(exc), "the worktree could not be re-observed"), projection
+        trace["registration_post"] = post.registration.to_trace()
+        trace["admin_post"] = post.admin
+        trace["leaf_post"] = post.leaf
+        outcome, leaf_outcome = _classify_post_removal(post)
+        trace["leaf_outcome"] = leaf_outcome
+        if outcome is not None:
+            return (outcome, f"worktree removal not confirmed ({leaf_outcome})"), projection
+
+    # M5: reconciler-owned `disposing -> absent`.
+    try:
+        projection = _publish_reconciler_worktree_transition(run_dir_fd, projection, attempts_total=attempts)
+    except LifecycleStoreError as exc:
+        return (
+            (ReconciliationEntryOutcome.FAILED, f"the worktree absent collapse write failed ({exc.reason.value})"),
+            projection,
+        )
+    trace["absent"] = True
+    return None, projection
+
+
 def _reconcile_materialized_worktree_entry(
     *,
     run_dir_fd: int,
@@ -1890,18 +2167,7 @@ def _reconcile_materialized_worktree_entry(
     confirmed absent."""
     intent = projection.worktree.intent
     attempts = projection.reconciliation.attempts_total
-    trace: dict = {
-        "leaf_outcome": "removal_not_attempted",
-        "registration_pre": registration.to_trace(),
-        "registration_post": None,
-        "admin_pre": None,
-        "admin_post": None,
-        "leaf_pre": None,
-        "leaf_post": None,
-        "attempt": "not_attempted",
-        "disposing": False,
-        "absent": False,
-    }
+    trace = _worktree_trace(registration)
 
     def result(outcome, detail, **extra) -> ReconciliationEntryResult:
         return ReconciliationEntryResult(
@@ -1910,128 +2176,153 @@ def _reconcile_materialized_worktree_entry(
             detail,
             run_id=projection.run_id,
             attempt_number=attempts,
-            worktree_leaf_outcome=trace["leaf_outcome"],
-            worktree_registration_pre=trace["registration_pre"],
-            worktree_registration_post=trace["registration_post"],
-            worktree_admin_matches_pre=trace["admin_pre"],
-            worktree_admin_matches_post=trace["admin_post"],
-            worktree_leaf_pre=trace["leaf_pre"],
-            worktree_leaf_post=trace["leaf_post"],
-            worktree_removal_attempt=trace["attempt"],
-            worktree_disposing_transition_confirmed_this_pass=trace["disposing"],
-            worktree_absent_transition_confirmed_this_pass=trace["absent"],
+            **_worktree_result_fields(trace),
             **extra,
         )
 
-    # I4: admin entries. I5 (the leaf) only for rows that need its result:
-    # registration/admin evidence that already decides the outcome is never
-    # overridden by a leaf observation or its cleanup failure.
-    try:
-        admin = _count_worktree_admin_entries(identity.canonical_common_dir, lifecycle_id)
-        trace["admin_pre"] = admin
-        gate = _pre_removal_gate(intent, registration, admin)
-        if gate is not None:
-            return result(*gate)
-        leaf = state_root.observe_materialized_worktree_leaf(identity.repo_key, lifecycle_id).value
-        trace["leaf_pre"] = leaf
-    except LifecycleFsError as exc:
-        trace["leaf_outcome"] = (
-            "close_failed" if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED else "not_inspected"
-        )
-        return result(_classify_entry_fs_failure(exc), "the worktree could not be inspected")
-    action, outcome, detail = _classify_pre_removal(intent, _WorktreeObservation(registration, admin, leaf))
-    if action == "stop":
-        return result(outcome, detail)
+    stop, action = _inspect_materialized_worktree(
+        lifecycle_id=lifecycle_id, intent=intent, registration=registration,
+        state_root=state_root, identity=identity, trace=trace,
+    )
+    if stop is not None:
+        return result(*stop)
 
     # I6: both deterministic container names absent (invariant I4).
-    try:
-        name_to_id, _ = _docker_ps_all_id_name_pairs()
-    except _DockerListingError:
-        return result(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "container listing failed")
-    if f"codeagent-baseline-{lifecycle_id}" in name_to_id or f"codeagent-verification-{lifecycle_id}" in name_to_id:
-        return result(ReconciliationEntryOutcome.REFUSED, "a deterministic container name is present")
+    gate = _container_gate(lifecycle_id)
+    if gate != "confirmed_absent":
+        return result(*_CONTAINER_GATE_STOPS[gate])
 
-    # M1: enter RECONCILING before any mutation; the only increment.
-    if projection.state is not LifecycleState.RECONCILING:
-        attempts += 1
-        try:
-            projection = _publish_projection_state(
-                run_dir_fd, projection, state=LifecycleState.RECONCILING, attempts_total=attempts
-            )
-        except LifecycleStoreError as exc:
-            return result(ReconciliationEntryOutcome.FAILED, f"the RECONCILING projection write failed ({exc.reason.value})")
-
-    # M2: reconciler write-ahead to `disposing` (skipped when already disposing).
-    if intent is not WorktreeIntent.DISPOSING:
-        try:
-            projection = _publish_reconciler_worktree_transition(
-                run_dir_fd,
-                projection,
-                attempts_total=attempts,
-                target=WorktreeTransition(
-                    intent=WorktreeIntent.DISPOSING, expected_head=projection.worktree.expected_head
-                ),
-            )
-        except LifecycleStoreError as exc:
-            return result(ReconciliationEntryOutcome.FAILED, f"the worktree disposing write failed ({exc.reason.value})")
-        trace["disposing"] = True
-
-    if action == "collapse":
-        trace["leaf_outcome"] = "already_absent"
-    else:
-        # M3: the one bounded, hardened, single-force removal.
-        attempt = _attempt_worktree_remove(context.working_tree_root, target_path)
-        trace["attempt"] = attempt
-        if attempt == "launch_failed":
-            return result(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "git could not be launched")
-        if attempt == "cleanup_unconfirmed":
-            trace["leaf_outcome"] = "removal_unconfirmed"
-            return result(
-                ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
-                "the git worktree removal could not be confirmed stopped",
-            )
-        # M4: three fresh observations, whatever the command reported.
-        try:
-            post = _observe_worktree(
-                state_root=state_root,
-                identity=identity,
-                context=context,
-                lifecycle_id=lifecycle_id,
-                target_path=target_path,
-            )
-        except LifecycleFsError as exc:
-            trace["leaf_outcome"] = (
-                "close_failed" if exc.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED else "removal_unconfirmed"
-            )
-            return result(_classify_entry_fs_failure(exc), "the worktree could not be re-observed")
-        trace["registration_post"] = post.registration.to_trace()
-        trace["admin_post"] = post.admin
-        trace["leaf_post"] = post.leaf
-        outcome, leaf_outcome = _classify_post_removal(post)
-        trace["leaf_outcome"] = leaf_outcome
-        if outcome is not None:
-            return result(outcome, f"worktree removal not confirmed ({leaf_outcome})")
-
-    # M5: reconciler-owned `disposing -> absent`.
-    try:
-        projection = _publish_reconciler_worktree_transition(run_dir_fd, projection, attempts_total=attempts)
-    except LifecycleStoreError as exc:
-        return result(ReconciliationEntryOutcome.FAILED, f"the worktree absent collapse write failed ({exc.reason.value})")
-    trace["absent"] = True
-
-    # M6.
-    try:
-        _publish_projection_state(run_dir_fd, projection, state=LifecycleState.RECONCILED, attempts_total=attempts)
-    except LifecycleStoreError as exc:
-        return result(ReconciliationEntryOutcome.FAILED, f"the RECONCILED projection write failed ({exc.reason.value})")
-    return result(
-        ReconciliationEntryOutcome.RECONCILED,
-        "confirmed absent and durably reconciled",
-        baseline_confirmed_absent=True,
-        verification_confirmed_absent=True,
-        worktree_confirmed_absent=True,
-        checkpoint_ref_confirmed_absent=True,
+    stop, projection, attempts = _enter_reconciling(run_dir_fd, projection)
+    if stop is not None:
+        return result(*stop)
+    stop, projection = _mutate_materialized_worktree(
+        run_dir_fd=run_dir_fd, projection=projection, attempts=attempts, intent=intent, action=action,
+        lifecycle_id=lifecycle_id, target_path=target_path, state_root=state_root, identity=identity,
+        context=context, trace=trace,
     )
+    if stop is not None:
+        return result(*stop)
+    stop = _publish_reconciled(run_dir_fd, projection, attempts)
+    if stop is not None:
+        return result(*stop)
+    return result(ReconciliationEntryOutcome.RECONCILED, "confirmed absent and durably reconciled", **_RECONCILED_FLAGS)
+
+
+def _reconcile_worktree_then_checkpoint_ref_entry(
+    *,
+    run_dir_fd: int,
+    lifecycle_id: str,
+    projection: LifecycleProjection,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+) -> ReconciliationEntryResult:
+    """ADR 0004 Amendment 17: a materialized worktree (Amendment 13) and a
+    non-absent checkpoint ref (Amendment 16), both containers absent, in one
+    locked pass and one reconciliation cycle.
+
+    Each destructive phase has its complete inspection gate immediately
+    before it; this does not claim every inspection precedes every mutation:
+
+    - Gate A (zero mutation if it stops): container gate 1; Amendment 13's
+      full worktree inspection; a read-only checkpoint-ref gate
+      (`gate_observation`), which never supplies the deletion SHA.
+    - Phase W: RECONCILING (+1 only on a fresh cycle), then Amendment 13's
+      M2-M5 through a durably confirmed worktree `absent`. Any failure stops
+      the pass before every later step.
+    - Gate B (zero ref mutation if it stops): container gate 2, a second
+      complete fresh listing (`container_gate`), then a fresh authoritative
+      ref observation (`observation_pre`), the only source of the SHA.
+    - Phase R: Amendment 16's M2-M4. Then RECONCILED, once and last.
+
+    Not cross-resource atomicity: a same-user actor (A4) can still act
+    between phases. A refusal or failure after Phase W leaves Amendment 16's
+    resumable shape. A never-registered `creating` worktree (Amendment 12's
+    shape) with a ref is refused: the owner cannot produce it."""
+    intent = projection.worktree.intent
+    transition = projection.checkpoint_ref
+    attempts = projection.reconciliation.attempts_total
+    target_path = os.path.normpath(os.path.join(state_root.path, "worktrees", identity.repo_key, lifecycle_id))
+    wt_trace: dict | None = None
+    ref_trace = _checkpoint_ref_trace()
+
+    def result(outcome, detail, **extra) -> ReconciliationEntryResult:
+        fields = _worktree_result_fields(wt_trace) if wt_trace is not None else {}
+        return ReconciliationEntryResult(
+            lifecycle_id,
+            outcome,
+            detail,
+            run_id=projection.run_id,
+            attempt_number=attempts,
+            **fields,
+            **_checkpoint_ref_result_fields(transition, ref_trace),
+            **extra,
+        )
+
+    # Gate A, before any worktree mutation.
+    gate = _container_gate(lifecycle_id)
+    if gate != "confirmed_absent":
+        return result(*_CONTAINER_GATE_STOPS[gate])
+    registration = _observe_target_registration(
+        context.working_tree_root,
+        oid_hex_len=ObjectFormat(identity.object_format).hex_length,
+        target_path=target_path,
+    )
+    wt_trace = _worktree_trace(registration)
+    if registration.state == "unknown":
+        return result(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "worktree listing failed")
+    if intent is WorktreeIntent.CREATING and registration.state == "absent":
+        return result(
+            ReconciliationEntryOutcome.REFUSED,
+            "a never-registered creating worktree with a checkpoint ref is not reconciled",
+        )
+    stop, action = _inspect_materialized_worktree(
+        lifecycle_id=lifecycle_id, intent=intent, registration=registration,
+        state_root=state_root, identity=identity, trace=wt_trace,
+    )
+    if stop is not None:
+        return result(*stop)
+    stop, _, _ = _inspect_owned_checkpoint_ref(
+        lifecycle_id=lifecycle_id, transition=transition, identity=identity, context=context,
+        trace=ref_trace, key="gate", record_role=False,
+    )
+    if stop is not None:
+        return result(*stop)
+
+    # Phase W.
+    stop, projection, attempts = _enter_reconciling(run_dir_fd, projection)
+    if stop is not None:
+        return result(*stop)
+    stop, projection = _mutate_materialized_worktree(
+        run_dir_fd=run_dir_fd, projection=projection, attempts=attempts, intent=intent, action=action,
+        lifecycle_id=lifecycle_id, target_path=target_path, state_root=state_root, identity=identity,
+        context=context, trace=wt_trace,
+    )
+    if stop is not None:
+        return result(*stop)
+
+    # Gate B, after the worktree is durably absent, before any ref mutation.
+    ref_trace["container_gate"] = _container_gate(lifecycle_id)
+    if ref_trace["container_gate"] != "confirmed_absent":
+        return result(*_CONTAINER_GATE_STOPS[ref_trace["container_gate"]])
+    stop, ref, removal_sha = _inspect_owned_checkpoint_ref(
+        lifecycle_id=lifecycle_id, transition=transition, identity=identity, context=context,
+        trace=ref_trace, key="pre", record_role=True,
+    )
+    if stop is not None:
+        return result(*stop)
+
+    # Phase R.
+    stop, projection = _mutate_checkpoint_ref(
+        run_dir_fd=run_dir_fd, projection=projection, attempts=attempts, ref=ref,
+        removal_sha=removal_sha, trace=ref_trace,
+    )
+    if stop is not None:
+        return result(*stop)
+    stop = _publish_reconciled(run_dir_fd, projection, attempts)
+    if stop is not None:
+        return result(*stop)
+    return result(ReconciliationEntryOutcome.RECONCILED, "confirmed absent and durably reconciled", **_RECONCILED_FLAGS)
 
 
 # ADR 0004 Amendment 12: removal-primitive result -> (entry outcome or
@@ -2533,6 +2824,8 @@ class _MaintenanceTraceWriter:
                     "absent_transition_confirmed_this_pass": (
                         result.checkpoint_ref_absent_transition_confirmed_this_pass
                     ),
+                    "gate_observation": result.checkpoint_ref_gate_observation,
+                    "container_gate": result.checkpoint_ref_container_gate,
                 },
                 "has_recognized_temp_leftover": result.has_temp_leftover,
                 "detail": _bounded(result.detail, _DETAIL_MAX_BYTES),

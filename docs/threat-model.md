@@ -840,10 +840,16 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   regular `.git` file, and its containers and checkpoint ref already
   absent, is removed by one bounded `git worktree remove --force <exact
   path>` and recorded `RECONCILED` only after the registration, admin
-  entry, and directory are each freshly confirmed absent. Neither
-  mechanism is **wired** to any CLI or controller composition path.
+  entry, and directory are each freshly confirmed absent. ADR 0004
+  Amendment 17 chains that row with Amendment 16's checkpoint-ref row:
+  when the same materialized worktree still has a checkpoint ref and both
+  containers are absent, one pass removes the worktree first, then
+  re-lists containers and re-observes the ref before deleting it. None of
+  these mechanisms is **wired** to any CLI or controller composition path.
   Still unresolved and still blocking admission: a worktree whose
-  containers or checkpoint ref remain, a locked/ambiguous/inconsistent
+  containers remain, a worktree whose checkpoint ref is symbolic or not a
+  deletion candidate, a never-registered `creating` worktree with a
+  checkpoint ref, a locked/ambiguous/inconsistent
   registration, an `absent` record with a leftover directory, an
   unregistered directory left by a partial Git removal, and general
   orphaned-worktree removal
@@ -852,7 +858,7 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   worktrees at deterministic paths under the CodeAgent state root,
   removed only after exact attribution and confirmed container absence,
   by fail-closed pre-run reconciliation or `codeagent reconcile`.
-  Implemented only for the two narrow rows above (Amendments 12 and 13)
+  Implemented only for the narrow rows above (Amendments 12, 13 and 17)
 - Evidence/future test: the S5 spike's macOS/arm64 evidence covers the
   worktree side of this too, in spike scaffolding only — it demonstrates
   a fresh-process reconciler correctly identifying and removing an
@@ -862,20 +868,25 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   (`spikes/s5/S5_RESULT.md`). Linux/x86-64 workflow run
   `34783737248` reproduced the same result with independent clean
   baseline/final diagnostics. As with T-F1, this is spike evidence only.
-  Production evidence covers only the Amendment 12 and 13 rows: real-Git
+  Production evidence covers only the Amendment 12, 13 and 17 rows: real-Git
   and real-filesystem tests in `tests/unit/test_reconciliation.py`, and
   real SIGKILL tests in `tests/integration/test_worktree_publication.py`
   (a dead owner after a durable `creating` or `present`, a reconciler
-  killed at each resume point of both rows, and a deterministic model of a
-  kill during the Git command) — automated-test evidence, not a security
-  review
+  killed at each resume point of the Amendment 12 and 13 rows, and a
+  deterministic model of a kill during the Git command). For the Amendment
+  17 row: real reconciler SIGKILL tests in
+  `tests/unit/test_reconciliation.py` (after `disposing`, after worktree
+  `absent`, after ref `removing`), and T37 in
+  `tests/integration/test_lifecycle_run.py` (a real owner SIGKILL, then
+  real-Docker admission reconciling it) — automated-test evidence, not a
+  security review
 - Residual risk: between the crash and the next sweep, content sits on disk
   — acceptable for a local single-user tool, not acceptable if this were
   ever multi-tenant (explicitly out of scope, A5). Accepting ADR 0004 does
   not mitigate or resolve this threat or T-F1 in production. T-F2 remains
-  open: the Amendment 12 and 13 rows are implemented but unwired (no CLI
-  or controller path calls `prepare_lifecycle()`); worktrees whose
-  containers or checkpoint ref remain, an `absent` record's leftover
+  open: the Amendment 12, 13 and 17 rows are implemented but unwired (no
+  CLI or controller path calls `prepare_lifecycle()`); worktrees whose
+  containers remain, an `absent` record's leftover
   directory, a partial-removal leftover, and general orphaned-worktree
   cleanup remain unimplemented; and a reconciler killed by SIGKILL while
   `git worktree remove` runs leaves an orphaned Git process whose
@@ -883,7 +894,7 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   plus production acceptance tests on both platforms. T-F1 remains open
   as stated in its own entry
 - Owning milestone/spike: ADR 0004 (accepted) — Milestone 3 lifecycle
-  work; in progress (Amendments 12 and 13 rows only; unwired)
+  work; in progress (Amendments 12, 13 and 17 rows only; unwired)
 
 **T-F3 — Corrupt/partial JSONL event log after crash mid-write.**
 - Asset/objective: O5, O7
@@ -1518,8 +1529,12 @@ this detailed entry states.
     pre-run reconciliation, using one compare-and-swap delete against an
     observed deletion candidate, but only when that entry's worktree and both
     containers are already confirmed absent.
-  - **Still blocking:** a ref alongside a worktree or a live container still
-    blocks admission.
+  - **Chained (Amendment 17):** a ref alongside a materialized worktree, with
+    both containers absent, is removed in the same pass only after that
+    worktree is durably confirmed absent, a second fresh container listing
+    is clean, and a fresh observation shows a deletion candidate.
+  - **Still blocking:** a ref alongside a live container, or alongside a
+    never-registered `creating` worktree, still blocks admission.
   - **Refused:** a symbolic or unrelated ref is refused.
   - **Not wired:** no CLI or controller entry point calls this.
 

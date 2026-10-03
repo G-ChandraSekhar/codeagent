@@ -381,6 +381,26 @@ def is_projection_checkpoint_ref_reconciliation_shape(projection: LifecycleProje
     )
 
 
+def is_projection_worktree_then_checkpoint_ref_reconciliation_shape(projection: LifecycleProjection) -> bool:
+    """ADR 0004 Amendment 17: a materialized-worktree record
+    (`creating`/`present`/`disposing`, with its origin commit) together
+    with a non-absent checkpoint-ref record, both container records absent,
+    and a null `failure`. Disjoint from Amendment 13's shape (which needs
+    an absent ref) and Amendment 16's (which needs an absent worktree). The
+    reconciler removes the worktree first, then the ref."""
+    return (
+        projection.worktree.intent
+        in (WorktreeIntent.CREATING, WorktreeIntent.PRESENT, WorktreeIntent.DISPOSING)
+        and projection.worktree.expected_head is not None
+        and projection.checkpoint_ref.intent is not CheckpointIntent.ABSENT
+        and projection.failure is None
+        and projection.baseline.intent is ContainerIntent.ABSENT
+        and projection.baseline.id is None
+        and projection.verification.intent is ContainerIntent.ABSENT
+        and projection.verification.id is None
+    )
+
+
 def checkpoint_ref_deletion_candidates(transition: CheckpointTransition) -> tuple[tuple[str, str], ...]:
     """ADR 0004 section 8's deletion candidates for a persisted
     checkpoint-ref record, as `(role, sha)` pairs in a fixed order:

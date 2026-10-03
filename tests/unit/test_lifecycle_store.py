@@ -4868,3 +4868,50 @@ def test_a16_live_owner_checkpoint_ref_table_is_unchanged():
     with pytest.raises(ls.LifecycleStoreError):
         ls._validate_checkpoint_ref_edge(_a16_ref_record("creating"), _a16_removing("a" * 40))
     ls._validate_checkpoint_ref_edge(_a16_ref_record("present"), _a16_removing("a" * 40))  # owner edge still legal
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 17: the worktree-then-checkpoint-ref shape.
+# ---------------------------------------------------------------------------
+
+_A17_WORKTREE_INTENTS = [wl.WorktreeIntent.CREATING, wl.WorktreeIntent.PRESENT, wl.WorktreeIntent.DISPOSING]
+_A17_REF_INTENTS = ["creating", "present", "advancing", "removing"]
+
+
+def _a17_projection(wt_intent, ref_intent):
+    base = _base_projection()
+    return dataclasses.replace(
+        base,
+        worktree=wl.WorktreeTransition(intent=wt_intent, expected_head=_ORIGIN),
+        checkpoint_ref=_a16_ref_record(ref_intent),
+    )
+
+
+@pytest.mark.parametrize("wt_intent", _A17_WORKTREE_INTENTS)
+@pytest.mark.parametrize("ref_intent", _A17_REF_INTENTS)
+def test_a17_shape_is_true_for_every_materialized_worktree_and_non_absent_ref(wt_intent, ref_intent):
+    projection = _a17_projection(wt_intent, ref_intent)
+    assert ls.is_projection_worktree_then_checkpoint_ref_reconciliation_shape(projection)
+    # Disjoint from every other reconciliation shape.
+    assert not ls.is_projection_materialized_worktree_reconciliation_shape(projection)
+    assert not ls.is_projection_checkpoint_ref_reconciliation_shape(projection)
+    assert not ls.is_projection_reconciliation_eligible_shape(projection)
+    assert not ls.is_projection_creating_worktree_reconciliation_shape(projection)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda p: dataclasses.replace(p, checkpoint_ref=cs.ABSENT_TRANSITION), id="ref-absent"),
+        pytest.param(lambda p: dataclasses.replace(p, worktree=wl.ABSENT_WORKTREE_TRANSITION), id="worktree-absent"),
+        pytest.param(lambda p: _with_role(p, role="baseline", intent=ls.ContainerIntent.CREATING, id=None), id="baseline-creating"),
+        pytest.param(
+            lambda p: _with_role(p, role="verification", intent=ls.ContainerIntent.PRESENT, id="9" * 64),
+            id="verification-present",
+        ),
+        pytest.param(lambda p: dataclasses.replace(p, failure=ls.FailureDetail(phase="p", detail="d")), id="failure-set"),
+    ],
+)
+def test_a17_shape_excludes_containers_failures_and_absent_resources(mutate):
+    projection = mutate(_a17_projection(wl.WorktreeIntent.PRESENT, "present"))
+    assert not ls.is_projection_worktree_then_checkpoint_ref_reconciliation_shape(projection)

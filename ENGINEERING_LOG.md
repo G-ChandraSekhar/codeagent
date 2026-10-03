@@ -6267,3 +6267,52 @@ listing through the anchored `grep -E '^codeagent-(verify-|baseline-|verificatio
 `docs/threat-model.md` was inspected. Its Amendment 16 note under T-M1 states
 scope only, with no CI-pending statement, so it is unchanged. `uv.lock` was
 untouched.
+
+## 2026-10-03 — Milestone 3 Slice 3C-6: worktree → checkpoint-ref reconciliation chaining (ADR 0004 Amendment 17)
+
+**What.** One new reconciliation row for a dead entry with a materialized
+worktree *and* a non-absent checkpoint ref, containers absent (T37's shape,
+previously blocked forever). It composes Amendment 13's worktree removal and
+Amendment 16's ref removal in one locked pass and one cycle:
+Gate A → Phase W → Gate B → Phase R → `RECONCILED`.
+
+**Accepted decisions (joint review).**
+- Keep both a read-only ref gate before any worktree mutation and a fresh,
+  authoritative observation after the worktree is durably absent; only the
+  latter supplies the deletion SHA.
+- Exclude a never-registered `creating` worktree plus a ref (`REFUSED`); the
+  owner cannot produce it.
+- A second complete container listing (Gate B) after the worktree is absent and
+  before any ref step. Stated as "each destructive phase has its gate
+  immediately before it", not "every inspection precedes every mutation", and
+  not atomicity.
+- Partial progress is accepted: a Gate B or Phase R stop leaves the worktree
+  removed and the entry resumable through Amendment 16's row.
+- Two additive categorical trace fields, `checkpoint_ref.gate_observation` and
+  `checkpoint_ref.container_gate`; `schema_version` unchanged.
+
+**Trade-off: refactor instead of a parallel copy.** Composing the rows needed
+their inspection and mutation separated, because every existing row
+terminalizes internally. Amendment 13 and 16 were split into narrow
+inspect/mutate helpers and rebuilt from them, rather than duplicating ~200
+lines. Proof that the standalone rows are unchanged: all 718 existing tests
+in the three affected files passed with no test edited before any new test
+was written, and two mutations (9a/9b) pin that each standalone row still lists
+containers exactly once.
+
+**Observed, not a conflict.** Standalone Amendment 13 lists containers *after*
+its worktree inspection; the chained row lists first, per the approved plan.
+Both orders are preserved as they are.
+
+**Evidence.** 73 new tests; T37 flipped to `RECONCILED` with full cleanup
+assertions (disclosed); T36 still blocks. Ten mutations (the nine planned, with
+"standalone rows listing twice" split per row) were each caught by their
+intended tests and the source restored by SHA-256. Mutation 4 as first run was caught
+through the reconciler writers' own unchanged-count guard; a variant that
+incremented by 2 at the single entry point was caught directly on
+`attempts_total == 1` (found in the final adversarial review). Targeted 981 and focused
+1,921, forward and reverse; full suite 3,442 passed, 0 skipped
+(`CODEAGENT_REQUIRE_DOCKER=1`). Linux CI pending (not pushed).
+
+**Unchanged.** T-E1 and T-F1. T-F2 and T-M1 gain partial, reconciler-level
+notes only. Nothing is wired to an entry point. `uv.lock` untouched.

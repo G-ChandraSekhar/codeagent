@@ -2799,6 +2799,45 @@ Stage 2 (of the four-stage planning process in
       a security review.
   - **Threats:** T-E1, T-F1 and T-F2 are unchanged. T-M1 gains partial,
     reconciler-level coverage only. Not wired to any entry point.
+- **Milestone 3 Slice 3C-6: worktree → checkpoint-ref reconciliation
+  chaining**, per ADR 0004 "Amendment 17 (Accepted 2026-10-03)".
+  **Implemented and locally validated on macOS (2026-10-03); not committed,
+  not pushed, Linux CI pending.**
+  - **Eligible shape:** a materialized `creating`/`present`/`disposing`
+    worktree record (with its origin commit) plus a non-absent checkpoint-ref
+    record, both container records absent, `failure` null; owner states or
+    `RECONCILING` (`lifecycle_store.is_projection_worktree_then_checkpoint_ref_reconciliation_shape`).
+  - **One pass, one cycle:**
+    - **Gate A** (zero mutation if it stops): container listing 1; Amendment
+      13's full worktree inspection; a read-only ref gate.
+    - **Phase W:** `RECONCILING` (+1 only on a fresh cycle), then Amendment
+      13's removal through a durably confirmed worktree `absent`. Any failure
+      stops the pass.
+    - **Gate B** (zero ref mutation if it stops): container listing 2, then a
+      fresh authoritative ref observation, the only source of the deletion
+      SHA.
+    - **Phase R:** Amendment 16's write-ahead `removing`, one compare-and-swap
+      delete, `absent`; then `RECONCILED`, once and last.
+  - **Excluded:** a never-registered `creating` worktree with a ref is
+    `REFUSED`. A stop after Phase W leaves the worktree removed and the entry
+    resumable through Amendment 16's row (fail-closed partial progress).
+  - **Refactor:** the Amendment 13 and 16 rows were split into narrow
+    inspect/mutate helpers and rebuilt from them; all existing tests passed
+    unedited, and each standalone row still lists containers exactly once.
+  - **Trace:** additive categorical `checkpoint_ref.gate_observation` and
+    `checkpoint_ref.container_gate`; `schema_version` unchanged; no SHAs,
+    names, ids or paths.
+  - **Tests:** 73 new. T37 now expects `RECONCILED` with full cleanup
+    assertions (it previously expected `BLOCKED`); T36 still blocks.
+  - **Verified:** ten mutations caught and sources restored byte-for-byte;
+    targeted 981 and focused 1,921, forward and reverse; full suite 3,369 →
+    3,442 passed, 0 skipped (`CODEAGENT_REQUIRE_DOCKER=1`); no leftovers.
+  - **Boundaries:** live-container cleanup and container chaining,
+    Amendment 12-plus-ref recovery, abandonment, ADR 0005 cancellation,
+    CLI/operator wiring and ref sweeping remain unimplemented. No
+    cross-resource atomicity; the A4 same-user race is narrowed, not closed.
+  - **Threats:** T-E1 and T-F1 unchanged. T-F2 and T-M1 gain partial,
+    reconciler-level coverage only. Not wired to any entry point.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
