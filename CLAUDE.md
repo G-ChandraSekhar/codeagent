@@ -2533,8 +2533,13 @@ Stage 2 (of the four-stage planning process in
 - **Milestone 3 worktree reconciliation row for a dead materialized
   `creating`/`present`/`disposing` worktree**, per
   `docs/adr/0004-owned-resource-lifecycle-and-reconciliation.md`'s
-  "Amendment 13 (Accepted 2026-10-03)", **is implemented and locally
-  validated on macOS (2026-10-03); not committed, Linux CI pending.** When
+  "Amendment 13 (Accepted 2026-10-03)", **is implemented, locally
+  validated on macOS (2026-10-03), committed
+  (`7d359ab4ae0324a7aba873ac3aac436e719bf562`), and confirmed on
+  GitHub-hosted Linux CI** (run
+  [37096976140](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37096976140),
+  `ubuntu-24.04` x86_64, Python 3.12, conclusion `success` -- see the
+  closing paragraph below for the exact evidence this run supports). When
   the checkpoint ref and both containers are already absent, automatic
   pre-run reconciliation removes the worktree with one bounded, hardened
   `git worktree remove --force <exact path>` (never `-f -f`, never
@@ -2555,6 +2560,43 @@ Stage 2 (of the four-stage planning process in
   passed, 0 skipped (`CODEAGENT_REQUIRE_DOCKER=1`); 17-file focused set
   1,640, forward and reverse. Implementation/test evidence only, not a
   security review. See `ENGINEERING_LOG.md`'s dated entry.
+  **Confirmed on GitHub-hosted Linux CI** (commit
+  `7d359ab4ae0324a7aba873ac3aac436e719bf562`, run
+  [37096976140](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37096976140),
+  triggered by a push to `main`; job "Test (ubuntu-24.04, Python 3.12)",
+  runner image `ubuntu-24.04` (Ubuntu 24.04.5 LTS) x86_64, Python 3.12.14;
+  conclusion `success`; the API reports 13 steps, every one `success`). The
+  checkout step printed `git version 2.55.0`. The mandatory Docker preflight
+  succeeded (Docker Engine - Community, client and server `28.0.4`); the
+  pinned image
+  (`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`)
+  was pulled and reported platform `linux/amd64`. The dedicated "Run real
+  Docker verification tests" step ran only `python -m pytest
+  tests/integration/test_slice_c.py -v` (`CODEAGENT_REQUIRE_DOCKER: 1` in that
+  step's own logged environment): `3 passed in 2.30s` -- the legacy
+  Milestone-1 suite only, **not** Amendment-13-specific evidence. The separate
+  "Run complete test suite" step ran `python -m pytest -q`
+  (`CODEAGENT_REQUIRE_DOCKER: 1` also in that step's own logged environment)
+  and reported `3161 passed, 3 skipped in 64.38s`; `3161 + 3` equals the
+  local collected total of 3,164. `pytest -q` does not name the three skipped
+  tests, so they are not identified here, and the log does not show whether
+  the conditional permission-based partial-removal test ran or skipped. The
+  skips are not attributable to Docker unavailability: Docker was required
+  and confirmed available in that step. The final leftover-container step ran
+  `docker ps -a --format '{{.Names}}'` through the anchored `grep -E
+  '^codeagent-(verify-|baseline-|verification-)'`, covering all three
+  CodeAgent container families; its output was empty and the step succeeded.
+  This is implementation/automated-test evidence only, not a security
+  review, and is GitHub-hosted `ubuntu-24.04` x86_64 evidence specifically,
+  not a general Linux or ARM64 claim.
+  Remaining risks are unchanged: no production wiring calls
+  `prepare_lifecycle()`; entries whose containers or checkpoint ref remain,
+  locked/ambiguous/inconsistent registrations, partial-removal leftovers, and
+  an `absent` record with a leftover directory still block admission; a
+  SIGKILL during the Git command can orphan the Git process with no bound on
+  its lifetime, and the test for that state is a deterministic model, not
+  proof; and a valid replacement directory cannot be distinguished from the
+  original.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
