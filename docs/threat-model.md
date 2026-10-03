@@ -750,7 +750,23 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   running container
 - Impact: resource leak (CPU/memory held by an orphaned container
   indefinitely)
-- Implemented control: S1's spike already demonstrates clean removal in the
+- Implemented control: **partially addressed at the substrate/reconciler
+  level only; not mitigated end to end.** Production code now implements
+  ADR 0004's container mechanisms: ownership labels and deterministic
+  per-lifecycle container names (`container_lifecycle.py`), durable
+  write-ahead container records (`lifecycle_store.py`) published by
+  `DockerVerifier`'s opt-in lifecycle-aware path (`executor.py`, Slice
+  3B-6), repository and lifecycle locks (`state_locks.py`), and fail-closed
+  automatic pre-run reconciliation (`reconciliation.py`, called by
+  `lifecycle_store.prepare_lifecycle()`) that removes a dead lifecycle's
+  exactly attributed, labeled container by immutable id and confirms its
+  absence with a fresh listing (Slice 3B-5). None of this is **wired**: no
+  CLI or controller path calls `prepare_lifecycle()` or constructs a
+  lifecycle-aware `DockerVerifier`, and the default `DockerVerifier` path
+  still creates unlabeled, UUID-suffixed `codeagent-verify-*` containers
+  that reconciliation never targets. ADR 0005 (cooperative cancellation,
+  entrypoint-owned SIGINT/SIGTERM) is not implemented. Spike evidence:
+  S1's spike already demonstrates clean removal in the
   *normal* (non-crash) path — 3/3 trials showed no leftover containers.
   The dedicated Stage-2 interruption spike (S5) has since run on
   macOS/arm64 against a real Docker daemon and disposable worktree,
@@ -767,22 +783,32 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   (ownership labels, durable lifecycle projection, advisory locks,
   exact attribution, fail-closed pre-run reconciliation) and
   `docs/adr/0005-cancellation-and-signal-ownership.md` (cooperative
-  cancellation, entrypoint-owned SIGINT/SIGTERM). None of it is
-  implemented in `src/codeagent/executor.py`,
-  `src/codeagent/workspace.py`, or anywhere else in production code;
-  S5's spike harness is throwaway evidence-gathering code, not a
-  production mechanism
-- Evidence/future test: S5's macOS and Linux evidence as described
-  above; then the implementation and production acceptance tests
-  required by ADR 0004 and ADR 0005
+  cancellation, entrypoint-owned SIGINT/SIGTERM). Remaining: production
+  wiring (a composition path that calls `prepare_lifecycle()` and uses the
+  lifecycle-aware `DockerVerifier`) and all of ADR 0005. S5's spike
+  harness is throwaway evidence-gathering code, not a production mechanism
+- Evidence/future test: S5's macOS and Linux spike evidence as described
+  above. Production automated tests cover the unwired mechanisms: real
+  Docker SIGKILL tests in `tests/integration/test_slice_3b6.py` (a process
+  killed after its durable `creating`, `present`, or `removing` container
+  record, each resolved by a fresh reconciliation pass) and real SIGKILL
+  crash-resume tests in `tests/unit/test_reconciliation.py`, run locally
+  and on GitHub-hosted `ubuntu-24.04` x86_64 CI — automated-test evidence,
+  not a security review. Still required: production acceptance tests for
+  the wired path and for ADR 0005
 - Residual risk: a signal handler cannot guarantee cleanup against SIGKILL
   (which cannot be caught) — the only honest mitigation is a startup-time
-  reconciliation sweep, not prevention. Accepting ADR 0004/0005 does not
-  mitigate or resolve this threat in production: it remains open until
-  those mechanisms are implemented and their production acceptance
-  tests pass on both platforms
-- Owning milestone/spike: ADR 0004/0005 (accepted) — implemented as
-  Milestone 3 lifecycle work after Milestone 2; not started
+  reconciliation sweep, not prevention. T-F1 remains open: the ADR 0004
+  container mechanisms are implemented but unwired, containers from the
+  default `DockerVerifier` path are not attributable, ADR 0005 is not
+  implemented, and reconciliation runs only when a later mutating run
+  starts in the same repository (ADR 0004 §15 gives no bound for a
+  repository that is never run again). End-to-end mitigation still
+  requires production wiring plus production acceptance tests on both
+  platforms
+- Owning milestone/spike: ADR 0004/0005 (accepted) — Milestone 3
+  lifecycle work; ADR 0004's container mechanisms implemented but unwired;
+  ADR 0005 not started
 
 **T-F2 — Orphaned disposable worktree after crash.**
 - Asset/objective: O7, O1
@@ -1683,8 +1709,12 @@ scan for:
   event-schema half (`test_events.py`, canonical-JSON rejection), T-J1's
   event-schema half (`test_events.py`/`test_domain.py`, `BudgetExceeded`/
   `BudgetKind`).
+- **Partial production tests exist, for mechanisms not yet wired into a
+  real entry point:** T-F1 (`test_slice_3b6.py`, `test_reconciliation.py`)
+  and T-F2 (`test_reconciliation.py`, `test_worktree_publication.py`); see
+  each entry for exactly what is and isn't covered.
 - **Tests owned by an already-named, unstarted Stage-2 spike:** T-B12,
-  T-F1, T-F2, T-H2, T-J4, T-J5, T-J6, T-J7, T-K2, T-K3, T-N1.
+  T-H2, T-J4, T-J5, T-J6, T-J7, T-K2, T-K3, T-N1.
 - **Tests owned by a not-yet-scheduled design step:** T-G1 (redaction —
   itself a security gate, see §7), T-F3/T-F4 (EventSink durability/
   recovery), T-I2/T-I3/T-I4 (approval provider).

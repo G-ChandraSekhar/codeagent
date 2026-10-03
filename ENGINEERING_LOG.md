@@ -5755,3 +5755,25 @@ T-F2, T-F1, or T-E1 mitigation claim.
 
 `docs/threat-model.md` was inspected: it holds no Amendment-12-specific CI
 statement, so it is unchanged. `uv.lock` untouched.
+
+## 2026-10-02 — Threat model T-F1: stale status corrected (documentation-only)
+
+T-F1 still said ADR 0004/0005's container mechanisms were implemented
+"nowhere … in production code", that its owning work was "not started", and
+that its only implemented control was spike evidence. That was stale since
+Slices 3B-5/3B-6: labels and deterministic names, durable write-ahead
+container records, locks, and fail-closed pre-run reconciliation that
+removes an attributed container all exist in production code, with real
+Docker SIGKILL tests confirmed on GitHub-hosted `ubuntu-24.04` x86_64 CI.
+
+Corrected to "partially addressed at the substrate/reconciler level only;
+not mitigated end to end". What stays open, stated explicitly: nothing is
+wired (no CLI or controller path calls `prepare_lifecycle()` or uses the
+lifecycle-aware `DockerVerifier`); the default `DockerVerifier` path still
+creates unlabeled, UUID-suffixed containers reconciliation never targets;
+ADR 0005 is not implemented; reconciliation only runs when a later mutating
+run starts in the same repository. The threat-model test index also listed
+T-F1 and T-F2 under "unstarted Stage-2 spike"; both now sit under a
+"partial production tests" line instead. Other entries in that index were
+not reviewed in this pass. No code, tests, ADRs, or `CLAUDE.md` changed
+(none repeat the false claim). `uv.lock` untouched.
