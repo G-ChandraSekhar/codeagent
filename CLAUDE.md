@@ -2872,9 +2872,12 @@ Stage 2 (of the four-stage planning process in
     reconciler-level coverage only. Not wired to any entry point.
 - **Ledger D1: abandonment, explicit reconciliation, and the
   maintenance-only `codeagent reconcile` command**, per ADR 0004
-  "Amendment 18 (**Accepted** 2026-10-05)". **Implemented and locally
-  validated on macOS (2026-10-04); no Linux CI evidence yet.** Amendment 18
-  was accepted after joint review on 2026-10-05.
+  "Amendment 18 (**Accepted** 2026-10-05)". **Implemented, locally
+  validated on macOS (2026-10-04), committed as `e0474af` (ordinary
+  fast-forward), and confirmed on GitHub-hosted Linux CI** (run
+  [37333036614](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37333036614);
+  evidence in Amendment 18 §12). Amendment 18 was accepted after joint
+  review on 2026-10-05.
   - **What it adds:** `src/codeagent/cli.py` (`reconcile` only; exit codes
     0 clean, 1 internal, 2 invalid invocation, 3 unresolved acknowledged,
     4 blocked/refused); `maintenance.py` (presence decision, explicit
@@ -2897,10 +2900,20 @@ Stage 2 (of the four-stage planning process in
     byte-for-byte. A same-day correction pass fixed six confirmed
     joint-review findings (setup descriptor leak, release sequencing,
     argparse echo, own-cleanup failures during inspection, trace-presence
-    reporting, a test-helper leak); full suite 3,748 passed, 0 skipped.
-  - **Not done:** Linux CI; D2 and D3 (Gate O stays
-    unsatisfied); the run-time admission warning (a mandatory D6 test).
-    T-E1, T-F1 and T-F2 are not newly mitigated.
+    reporting, a test-helper leak); full suite 3,748 passed, 0 skipped at
+    that pass. A 2026-10-05 precision pass (cause/context classifier) left
+    the final local total at 3,758 passed, 0 skipped.
+  - **Linux CI:** commit `e0474af`, run
+    [37333036614](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37333036614)
+    succeeded; exact evidence in ADR 0004 Amendment 18 §12. Limits: the
+    dedicated Docker step's file holds no D1 test, and `pytest -q` names no
+    tests, so D1's tests running is inferred from the matching total, not
+    named in the log; GitHub-hosted `ubuntu-24.04` x86_64 automated-test
+    evidence only, not a security review.
+  - **Not done:** D2 and D3 (Gate O stays unsatisfied); the run-time
+    admission warning (a mandatory D6 test). The A4 same-user race stays
+    open; T-E1, T-F1 and T-F2 are not newly mitigated; abandonment still
+    refuses while an observer's own cleanup cannot be confirmed.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

@@ -697,8 +697,8 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   reconciliation for a non-absent dead-run shape (Slice 3B-5 implements
   this for containers only — worktree and checkpoint-ref removal remain
   unimplemented) — still unimplemented. Abandonment (ADR 0004 §11) is
-  implemented locally by ADR 0004 Amendment 18 (**Accepted** 2026-10-05; Linux CI
-  pending) as the maintenance-only `codeagent reconcile` command, which
+  implemented by ADR 0004 Amendment 18 (**Accepted** 2026-10-05; confirmed
+  on GitHub-hosted Linux CI, run 37333036614) as the maintenance-only `codeagent reconcile` command, which
   takes the repository lock non-blocking and refuses (exit 4, no writes)
   while another process holds it; it never runs a task
 - Evidence/future test: adversarial test starting two *live* runs
@@ -715,8 +715,8 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   residual risk: a crash inside `prepare_lifecycle()` between run-
   directory creation and initial-projection publish leaves a run
   directory with no valid `lifecycle.json`, which reconciliation
-  correctly refuses rather than adopts. Amendment 18 (Accepted 2026-10-05, locally
-  verified, Linux CI pending) gives that shape an operator exit:
+  correctly refuses rather than adopts. Amendment 18 (Accepted 2026-10-05; confirmed
+  on GitHub-hosted Linux CI, run 37333036614) gives that shape an operator exit:
   `codeagent reconcile --abandon <lifecycle-id>` records an `ABANDONED`
   marker once fresh inspection confirms nothing attributable remains.
 - Owning milestone/spike: Stage-2 worktree spike (S1's successor),
@@ -821,8 +821,8 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   starts in the same repository (ADR 0004 §15 gives no bound for a
   repository that is never run again). End-to-end mitigation still
   requires production wiring plus production acceptance tests on both
-  platforms. ADR 0004 Amendment 18 (**Accepted** 2026-10-05; locally verified, Linux
-  CI pending) adds the operator exit for a refused shape: `codeagent
+  platforms. ADR 0004 Amendment 18 (**Accepted** 2026-10-05; confirmed on GitHub-hosted
+  Linux CI, run 37333036614) adds the operator exit for a refused shape: `codeagent
   reconcile --abandon` records an administrative disposition only. It
   never removes, adopts, or changes a container; a forced
   `ABANDONED_UNRESOLVED` acknowledgement means the container may stay
@@ -905,7 +905,7 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   lifetime nothing bounds. End-to-end mitigation still requires production wiring
   plus production acceptance tests on both platforms. T-F1 remains open
   as stated in its own entry. ADR 0004 Amendment 18 (**Accepted** 2026-10-05;
-  locally verified, Linux CI pending) adds the operator exit for refused
+  confirmed on GitHub-hosted Linux CI, run 37333036614) adds the operator exit for refused
   worktree shapes (`codeagent reconcile --abandon`): it records a
   disposition and never removes, adopts, or changes a worktree,
   registration, or leaf directory, so it is not a mitigation of T-F2

@@ -5148,7 +5148,8 @@ This evidence changes none of §6's non-claims:
 ## Amendment 18 (Accepted 2026-10-05): abandonment, explicit reconciliation, and the maintenance-only `codeagent reconcile` command
 
 **Status: Accepted 2026-10-05** after joint review (proposed 2026-10-04).
-Implemented and verified locally (macOS); no Linux CI evidence yet. Ledger
+Implemented and verified locally (macOS); landed as commit `e0474af` and
+confirmed on GitHub-hosted Linux CI (run 37333036614; see §12). Ledger
 deliverable D1; Gate O item "abandonment". Gate O remains unsatisfied until D2
 and D3.
 
@@ -5394,11 +5395,12 @@ semantics, presence rules, exit-code meanings, or threat status:
   incomplete).
 - **F6** a test helper leaked a descriptor → closed; assertions unchanged.
 
-### 12. Evidence (local only)
+### 12. Evidence (local and Linux CI)
 
 Verified locally on macOS (Python 3.12.14, Git 2.54.0, Docker 29.8.0 already
 running), 2026-10-04. Implementation and automated-test evidence only, not a
-security review; no Linux CI evidence yet.
+security review. The Linux CI evidence is recorded in the final bullet of this
+section.
 
 - Initial implementation, new test files: `tests/unit/test_abandonment.py` 78,
   `test_maintenance.py` 60, `test_cli.py` 32,
@@ -5448,3 +5450,36 @@ security review; no Linux CI evidence yet.
   interrupt). Directly affected set: 1,404 passed, forward and reverse. The
   reviewer's 6 probes pass unchanged. Full suite with
   `CODEAGENT_REQUIRE_DOCKER=1` and bytecode disabled: 3,758 passed, 0 skipped.
+- **Linux CI (2026-10-05).** Commit `e0474af9cb76efcdda161c3fd2401a749851f0a1`
+  (ordinary fast-forward `304bcb1..e0474af`), run
+  [37333036614](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37333036614),
+  re-verified from the Actions API and a freshly fetched raw log:
+  - push-triggered, exact head SHA, `completed` / `success`; job "Test
+    (ubuntu-24.04, Python 3.12)", all 13 reported steps `success`, zero
+    `##[error]` lines;
+  - Ubuntu 24.04.5 LTS (runner image `ubuntu-24.04`), CPython 3.12.14,
+    pytest 9.1.1, Git 2.55.0, Docker Engine - Community client and server
+    28.0.4;
+  - the pinned image
+    `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`
+    reported `linux/amd64`;
+  - `python -m pytest tests/integration/test_slice_c.py -v` with
+    `CODEAGENT_REQUIRE_DOCKER: 1`: `4 passed in 2.88s`, all four named
+    `PASSED`. That file contains no D1-specific test;
+  - `python -m pytest -q` with `CODEAGENT_REQUIRE_DOCKER: 1` in that step's own
+    environment: `3755 passed, 3 skipped in 125.09s`, 0 failed; 3,755 + 3 =
+    3,758, matching the final local total;
+  - the anchored `^codeagent-(verify-|baseline-|verification-)` filter over a
+    full `docker ps -a` name listing printed nothing, and the step succeeded.
+
+  **Limits.** `pytest -q` names no tests: the three skips are not identified,
+  and no D1 test is named. That D1's tests ran is an inference from the
+  whole-suite command, the matching collected total, and the successful
+  result, not named-test log evidence. Docker was required and available in
+  that step, so the skips are not attributable to Docker being unavailable.
+
+  **Unchanged boundaries.** Gate O remains unsatisfied until D2 and D3; the A4
+  same-user race remains open; T-E1, T-F1 and T-F2 are not newly mitigated;
+  abandonment still refuses while an observer's own cleanup cannot be
+  confirmed. This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test
+  evidence, not a security review.

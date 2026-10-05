@@ -6515,3 +6515,29 @@ correction and precision passes. Current status text in ADR 0004, `CLAUDE.md`,
 total, threat conclusion or estimate changed. Acceptance is not Linux CI
 evidence: D1 remains Linux-CI-pending, and Gate O remains unsatisfied until D2
 and D3.
+
+## 2026-10-05 — D1 / ADR 0004 Amendment 18: Linux CI evidence reconciliation
+
+**What.** A documentation-only pass recording that commit `e0474af` (ordinary
+fast-forward `304bcb1..e0474af`, no force) passed GitHub Actions run
+[37333036614](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37333036614),
+independently re-verified from the Actions API and a freshly fetched raw log.
+Per the ledger's rule 5 the exact counts, timings, environment and image
+evidence are recorded once, in ADR 0004 Amendment 18 §12. No code, test,
+workflow, configuration, dependency, design or threat-status change.
+
+**Limits.** The dedicated Docker step's file holds no D1 test, and `pytest -q`
+names no tests: that D1's tests ran is an inference from the whole-suite
+command, the matching total and the successful result, not named-test log
+evidence.
+
+**Updated (current status only):** ADR 0004 Amendment 18 (status line and
+§12), `CLAUDE.md` (D1 entry), `docs/V1_COMPLETION_LEDGER.md` (D1 rows and
+status), and the current Amendment 18 parentheticals in `docs/threat-model.md`.
+The correction pass's historical 3,748 local total in `CLAUDE.md` is kept, with
+the final local total added beside it.
+
+**Boundaries unchanged.** Gate O remains unsatisfied until D2 and D3; A4 stays
+open; T-E1, T-F1 and T-F2 are not newly mitigated; abandonment still refuses
+on unconfirmed own cleanup. GitHub-hosted `ubuntu-24.04` x86_64 automated-test
+evidence, not a security review. `uv.lock` untouched.
