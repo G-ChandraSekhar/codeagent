@@ -1731,3 +1731,73 @@ def test_materialized_observer_setup_close_failure_raises_never_unknown(abandone
     assert isinstance(excinfo.value.__cause__, sr._LeafObservationDiagnostic)
     assert len(calls) == 1
     assert _open_fd_count() == before
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 18: open_existing_state_root never creates anything
+# ---------------------------------------------------------------------------
+
+
+def _context_elsewhere(tmp_path):
+    return sr.TrustedRepositoryContext(working_tree_root=str(tmp_path / "repo"), common_dir=str(tmp_path / "repo" / ".git"))
+
+
+def test_open_existing_state_root_absent_creates_nothing(tmp_path):
+    location = _explicit_location(tmp_path / "missing" / "root")
+    assert sr.open_existing_state_root(location, _context_elsewhere(tmp_path)) is None
+    assert not (tmp_path / "missing").exists()
+
+
+def test_open_existing_state_root_empty_creates_no_identity_file(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    assert sr.open_existing_state_root(_explicit_location(root), _context_elsewhere(tmp_path)) is None
+    assert os.listdir(root) == []
+
+
+def test_open_existing_state_root_content_without_identity_is_refused(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    (root / "repos").mkdir(mode=0o700)
+    with pytest.raises(lf.LifecycleFsError) as excinfo:
+        sr.open_existing_state_root(_explicit_location(root), _context_elsewhere(tmp_path))
+    assert excinfo.value.reason is lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE
+    assert sorted(os.listdir(root)) == ["repos"]
+
+
+def test_open_existing_state_root_partial_identity_is_refused(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    (root / sr.STATE_ROOT_JSON_FILENAME).write_bytes(b"")
+    (root / sr.STATE_ROOT_JSON_FILENAME).chmod(0o600)
+    with pytest.raises(lf.LifecycleFsError):
+        sr.open_existing_state_root(_explicit_location(root), _context_elsewhere(tmp_path))
+
+
+def test_open_existing_state_root_valid_returns_owned_root(tmp_path):
+    root = tmp_path / "root"
+    fd, canonical = sr.open_or_create_canonical_root(_explicit_location(root))
+    created = sr.init_state_root(fd, canonical)
+    created.close()
+    opened = sr.open_existing_state_root(_explicit_location(root), _context_elsewhere(tmp_path))
+    try:
+        assert opened.state_root_id == created.state_root_id
+    finally:
+        opened.close()
+
+
+def test_open_existing_state_root_containment_refused(tmp_path):
+    root = tmp_path / "repo" / "root"
+    root.mkdir(parents=True, mode=0o700)
+    with pytest.raises(lf.LifecycleFsError):
+        sr.open_existing_state_root(_explicit_location(root), _context_elsewhere(tmp_path))
+
+
+def test_if_present_openers_never_create(tmp_path):
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    try:
+        assert state_root.open_repo_locks_dir_if_present() is None
+        assert state_root.open_repo_dir_if_present("a" * 32) is None
+        assert sorted(os.listdir(tmp_path / "root")) == [sr.STATE_ROOT_JSON_FILENAME]
+    finally:
+        state_root.close()

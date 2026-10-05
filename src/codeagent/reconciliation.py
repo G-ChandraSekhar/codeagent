@@ -64,7 +64,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum, unique
 
-from ._bounded_subprocess import BoundedProcessError, run_bounded_stdout
+from ._bounded_subprocess import BoundedProcessError, BoundedProcessFailure, run_bounded_stdout
 from ._docker_ownership import (
     CONTAINER_ID_HEX_RE as _CONTAINER_ID_HEX_RE,
 )
@@ -95,6 +95,17 @@ from ._lifecycle_fs import (
     validate_hex32,
     validate_safe_owned_directory_stat,
     write_all_eintr_safe,
+)
+from .abandonment import (
+    ABANDONMENT_TEMP_MAX,
+    MARKER_FILENAME,
+    MARKER_TEMP_RE,
+    RESOURCE_FIELDS,
+    AbandonmentDisposition,
+    AbandonmentMarkerError,
+    AbandonmentMarkerFailure,
+    count_stale_marker_temps,
+    load_abandonment_marker,
 )
 from .checkpoint_ref import LIFECYCLE_ID_RE, CheckpointRef, CheckpointRefError, CheckpointRefFailure, MutationOutcome
 from .checkpoint_session import ABSENT_TRANSITION, CheckpointIntent, CheckpointTransition
@@ -178,6 +189,14 @@ _ADMIN_NAME_RE = re.compile(rb"^(?P<id>[0-9a-f]{32})(?P<suffix>[0-9]+)?$")
 
 
 @unique
+class MaintenanceTrigger(str, Enum):
+    """ADR 0004 section 12 / Amendment 18: why a maintenance trace exists."""
+
+    PRE_RUN = "pre_run"
+    EXPLICIT = "explicit"
+
+
+@unique
 class ReconciliationEntryOutcome(str, Enum):
     RECONCILED = "reconciled"
     SKIPPED_TERMINAL = "skipped_terminal"
@@ -185,6 +204,10 @@ class ReconciliationEntryOutcome(str, Enum):
     REFUSED = "refused"
     FAILED = "failed"
     SUBSTRATE_UNAVAILABLE = "substrate_unavailable"
+    # ADR 0004 section 10 / Amendment 18: a valid final abandonment
+    # marker; zero lock, Docker, or Git calls, and never blocking.
+    SKIPPED_ABANDONED = "skipped_abandoned"
+    SKIPPED_ABANDONED_UNRESOLVED = "skipped_abandoned_unresolved"
 
 
 @dataclass(frozen=True)
@@ -241,6 +264,14 @@ class ReconciliationEntryResult:
     # (the chained row's second listing, or Amendment 16's single listing).
     checkpoint_ref_gate_observation: str | None = None
     checkpoint_ref_container_gate: str = "not_attempted"
+    # ADR 0004 Amendment 18. The disposition and categorical summary of a
+    # valid final marker -- never the operator's reason, which is persisted
+    # only in abandonment.json. `abandonment_temp_leftovers` counts
+    # recognized stale temporary marker files (stops at 17; 0 whenever a
+    # final marker decided the entry).
+    abandonment_disposition: str | None = None
+    abandonment_remaining: dict | None = None
+    abandonment_temp_leftovers: int = 0
 
 
 @dataclass(frozen=True)
@@ -270,10 +301,14 @@ class ReconciliationError(Exception):
     `reason` is the stable, matchable identifier; `message` is fixed,
     sanitized categorical text only."""
 
-    def __init__(self, reason: ReconciliationFailure, message: str) -> None:
+    def __init__(self, reason: ReconciliationFailure, message: str, *, maintenance_id: str | None = None) -> None:
         super().__init__(message)
         self.reason = reason
         self.message = message
+        # ADR 0004 Amendment 18: set when a maintenance-trace file for this
+        # pass already exists on disk (so callers report its presence
+        # truthfully); None means no trace file was created.
+        self.maintenance_id = maintenance_id
 
 
 def _require_repository_lock_scope(repository_lock: LockHandle, repo_key: str) -> None:
@@ -791,11 +826,19 @@ def _analyze_worktree_listing(records: tuple[_WorktreeRecord, ...], *, target_pa
     return _WorktreeListingAnalysis(_TargetRegistration("present", 1, False, only.locked, only.prunable))
 
 
-def _observe_target_registration(working_tree_root: str, *, oid_hex_len: int, target_path: str) -> _TargetRegistration:
+def _observe_target_registration(
+    working_tree_root: str, *, oid_hex_len: int, target_path: str, cleanup_failures: list[str] | None = None
+) -> _TargetRegistration:
+    """`cleanup_failures` (ADR 0004 Amendment 18, read-only inspection only):
+    when given, a listing failure caused by CodeAgent's own unconfirmed
+    process or descriptor cleanup is also recorded there, so it is never
+    reduced to an ordinary "unknown" observation. Existing callers omit it."""
     try:
         records = _parse_worktree_listing(_run_worktree_listing(working_tree_root), oid_hex_len=oid_hex_len)
         return _analyze_worktree_listing(records, target_path=target_path).registration
-    except _WorktreeListingError:
+    except _WorktreeListingError as exc:
+        if cleanup_failures is not None and _is_own_cleanup_failure(exc):
+            cleanup_failures.append("worktree_listing")
         return _UNKNOWN_REGISTRATION
 
 
@@ -1033,7 +1076,7 @@ def _validate_recognized_inner_entry(run_dir_fd: int, name: str) -> tuple[Reconc
     return None, None
 
 
-def _check_inner_entries(run_dir_fd: int) -> _InnerEntriesCheck:
+def _check_inner_entries(run_dir_fd: int, names: list[str] | None = None) -> _InnerEntriesCheck:
     """Enumerate and validate a validated run directory's own
     contents. Only `lifecycle.json`, `lifecycle.lock`, and the exact
     recognized temp-publication pattern are ever recognized by name;
@@ -1043,14 +1086,22 @@ def _check_inner_entries(run_dir_fd: int) -> _InnerEntriesCheck:
     trusted. A recognized temp-publication leftover is never opened,
     trusted, or deleted, but its presence is reported via
     `has_temp_leftover` so the caller can carry it into the
-    maintenance trace."""
-    try:
-        names = list_directory_entries(run_dir_fd)
-    except LifecycleFsError:
-        return _InnerEntriesCheck(False, ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "run directory contents could not be listed")
+    maintenance trace.
+
+    `names` is the caller's single listing (ADR 0004 Amendment 18); when
+    omitted the directory is listed here. Recognized abandonment temporary
+    files are validated separately (`count_stale_marker_temps`) and are
+    skipped here, never treated as unrecognized."""
+    if names is None:
+        try:
+            names = list_directory_entries(run_dir_fd)
+        except LifecycleFsError:
+            return _InnerEntriesCheck(False, ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "run directory contents could not be listed")
 
     has_temp_leftover = False
     for name in names:
+        if MARKER_TEMP_RE.fullmatch(name):
+            continue
         is_temp_leftover = bool(_TEMP_LEFTOVER_RE.fullmatch(name))
         if name not in ("lifecycle.json", "lifecycle.lock") and not is_temp_leftover:
             return _InnerEntriesCheck(has_temp_leftover, ReconciliationEntryOutcome.REFUSED, "run directory contains an unrecognized inner entry")
@@ -2515,6 +2566,99 @@ def _creating_row_mutate(*, run_dir_fd, projection, leaf, lifecycle_id, trace) -
     return _CreatingRowPhase(projection, attempts, (outcome, f"worktree leaf removal: {removal.kind.value}"))
 
 
+@dataclass(frozen=True)
+class _MarkerCheck:
+    """ADR 0004 Amendment 18: the outcome of the marker-first check over a
+    run directory's single listing. `result` is set when the entry is
+    already decided (a final marker, valid or not, or an unsafe/over-bound
+    temporary file); otherwise classification continues with `names`."""
+
+    result: ReconciliationEntryResult | None
+    names: list[str]
+    temp_count: int
+
+
+def _check_abandonment(
+    run_dir_fd: int, *, lifecycle_id: str, state_root, identity: RepositoryIdentity
+) -> _MarkerCheck:
+    try:
+        names = list_directory_entries(run_dir_fd)
+    except LifecycleFsError:
+        return _MarkerCheck(
+            ReconciliationEntryResult(
+                lifecycle_id, ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "run directory contents could not be listed"
+            ),
+            [],
+            0,
+        )
+    if MARKER_FILENAME in names:
+        # Only a final marker decides the marker path -- and it decides it
+        # before the inner-entry check or the projection (an entry abandoned
+        # because those are corrupt must stay abandoned).
+        try:
+            marker = load_abandonment_marker(
+                run_dir_fd,
+                names=names,
+                expected_lifecycle_id=lifecycle_id,
+                expected_repo_key=identity.repo_key,
+                expected_state_root_id=state_root.state_root_id,
+            )
+        except AbandonmentMarkerError as exc:
+            outcome = (
+                ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE
+                if exc.reason is AbandonmentMarkerFailure.SUBSTRATE_UNAVAILABLE
+                else ReconciliationEntryOutcome.REFUSED
+            )
+            return _MarkerCheck(ReconciliationEntryResult(lifecycle_id, outcome, "abandonment.json is invalid or unreadable"), names, 0)
+        if marker is None:
+            return _MarkerCheck(
+                ReconciliationEntryResult(
+                    lifecycle_id,
+                    ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+                    "abandonment.json vanished between listing and inspection",
+                ),
+                names,
+                0,
+            )
+        if marker.disposition is AbandonmentDisposition.ABANDONED:
+            result = ReconciliationEntryResult(
+                lifecycle_id,
+                ReconciliationEntryOutcome.SKIPPED_ABANDONED,
+                "abandoned entry: no attributable resource remained when it was abandoned",
+                abandonment_disposition=marker.disposition.value,
+            )
+        else:
+            result = ReconciliationEntryResult(
+                lifecycle_id,
+                ReconciliationEntryOutcome.SKIPPED_ABANDONED_UNRESOLVED,
+                "abandoned entry with acknowledged unresolved resources; never clean",
+                abandonment_disposition=marker.disposition.value,
+                abandonment_remaining=dict(marker.remaining),
+            )
+        return _MarkerCheck(result, names, 0)
+    try:
+        temp_count = count_stale_marker_temps(run_dir_fd, names)
+    except AbandonmentMarkerError as exc:
+        outcome = (
+            ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE
+            if exc.reason is AbandonmentMarkerFailure.SUBSTRATE_UNAVAILABLE
+            else ReconciliationEntryOutcome.REFUSED
+        )
+        return _MarkerCheck(ReconciliationEntryResult(lifecycle_id, outcome, "an abandonment temporary file is unsafe"), names, 0)
+    if temp_count > ABANDONMENT_TEMP_MAX:
+        return _MarkerCheck(
+            ReconciliationEntryResult(
+                lifecycle_id,
+                ReconciliationEntryOutcome.REFUSED,
+                "more abandonment temporary files exist than CodeAgent can create",
+                abandonment_temp_leftovers=temp_count,
+            ),
+            names,
+            temp_count,
+        )
+    return _MarkerCheck(None, names, temp_count)
+
+
 def _process_open_entry(
     *,
     run_dir_fd: int,
@@ -2523,16 +2667,22 @@ def _process_open_entry(
     identity: RepositoryIdentity,
     context: TrustedRepositoryContext,
 ) -> ReconciliationEntryResult:
-    """Validates the run directory's own recognized contents, then
-    delegates to `_process_open_entry_body` for the terminal-peek/lock/
-    reconcile flow. `has_temp_leftover` is determined once, up front,
-    and applied to whichever result the body returns (including its
-    own early inner-entry refusal), so every code path's maintenance-
-    trace entry carries the same observed evidence."""
-    inner_check = _check_inner_entries(run_dir_fd)
+    """Marker-first (ADR 0004 Amendment 18), then validates the run
+    directory's own recognized contents, then delegates to
+    `_process_open_entry_body` for the terminal-peek/lock/reconcile flow.
+    `has_temp_leftover` and `abandonment_temp_leftovers` are determined
+    once, up front, and applied to whichever result the body returns."""
+    marker_check = _check_abandonment(run_dir_fd, lifecycle_id=lifecycle_id, state_root=state_root, identity=identity)
+    if marker_check.result is not None:
+        return marker_check.result
+    inner_check = _check_inner_entries(run_dir_fd, marker_check.names)
     if inner_check.outcome is not None:
         return ReconciliationEntryResult(
-            lifecycle_id, inner_check.outcome, inner_check.detail, has_temp_leftover=inner_check.has_temp_leftover
+            lifecycle_id,
+            inner_check.outcome,
+            inner_check.detail,
+            has_temp_leftover=inner_check.has_temp_leftover,
+            abandonment_temp_leftovers=marker_check.temp_count,
         )
 
     result = _process_open_entry_body(
@@ -2542,17 +2692,24 @@ def _process_open_entry(
         identity=identity,
         context=context,
     )
-    return replace(result, has_temp_leftover=inner_check.has_temp_leftover)
+    return replace(
+        result, has_temp_leftover=inner_check.has_temp_leftover, abandonment_temp_leftovers=marker_check.temp_count
+    )
 
 
-def _process_open_entry_body(
-    *,
-    run_dir_fd: int,
-    lifecycle_id: str,
-    state_root,
-    identity: RepositoryIdentity,
-    context: TrustedRepositoryContext,
-) -> ReconciliationEntryResult:
+@dataclass(frozen=True)
+class _Classification:
+    result: ReconciliationEntryResult | None
+    peek: LifecycleProjection | None
+
+
+def _classify_open_entry(
+    *, run_dir_fd: int, lifecycle_id: str, state_root, identity: RepositoryIdentity
+) -> _Classification:
+    """The pre-lock part of entry processing, shared by the real pass and
+    the dry-run planner (ADR 0004 Amendment 18): returns a decided result
+    for a terminal, refused, or unloadable entry, or `result=None` with the
+    peeked projection for a reconciliation-eligible one."""
     # Pre-lock terminal peek: zero lock/inspection calls for a
     # recognized clean-final entry (ADR 0004 section 10's own
     # requirement). Never trusted for anything beyond this decision —
@@ -2566,35 +2723,62 @@ def _process_open_entry_body(
             expected_state_root_id=state_root.state_root_id,
         )
     except LifecycleStoreError as exc:
-        return ReconciliationEntryResult(
-            lifecycle_id, _classify_projection_load_failure(exc), "lifecycle.json could not be loaded"
+        return _Classification(
+            ReconciliationEntryResult(lifecycle_id, _classify_projection_load_failure(exc), "lifecycle.json could not be loaded"),
+            None,
         )
 
     if peek.state in (LifecycleState.COMPLETE, LifecycleState.RECONCILED):
         if is_projection_fully_absent_shape(peek):
-            return ReconciliationEntryResult(
+            return _Classification(
+                ReconciliationEntryResult(
+                    lifecycle_id,
+                    ReconciliationEntryOutcome.SKIPPED_TERMINAL,
+                    "terminal entry recognized with fully absent attribution",
+                    run_id=peek.run_id,
+                    attempt_number=peek.reconciliation.attempts_total,
+                ),
+                peek,
+            )
+        return _Classification(
+            ReconciliationEntryResult(
                 lifecycle_id,
-                ReconciliationEntryOutcome.SKIPPED_TERMINAL,
-                "terminal entry recognized with fully absent attribution",
+                ReconciliationEntryOutcome.REFUSED,
+                "terminal entry has non-absent attribution or a populated failure",
                 run_id=peek.run_id,
                 attempt_number=peek.reconciliation.attempts_total,
-            )
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.REFUSED,
-            "terminal entry has non-absent attribution or a populated failure",
-            run_id=peek.run_id,
-            attempt_number=peek.reconciliation.attempts_total,
+            ),
+            peek,
         )
 
     if not _is_reconciliation_eligible(peek):
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.REFUSED,
-            "entry state or attribution is not recognized by this slice",
-            run_id=peek.run_id,
-            attempt_number=peek.reconciliation.attempts_total,
+        return _Classification(
+            ReconciliationEntryResult(
+                lifecycle_id,
+                ReconciliationEntryOutcome.REFUSED,
+                "entry state or attribution is not recognized by this slice",
+                run_id=peek.run_id,
+                attempt_number=peek.reconciliation.attempts_total,
+            ),
+            peek,
         )
+    return _Classification(None, peek)
+
+
+def _process_open_entry_body(
+    *,
+    run_dir_fd: int,
+    lifecycle_id: str,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+) -> ReconciliationEntryResult:
+    classification = _classify_open_entry(
+        run_dir_fd=run_dir_fd, lifecycle_id=lifecycle_id, state_root=state_root, identity=identity
+    )
+    if classification.result is not None:
+        return classification.result
+    peek = classification.peek
 
     try:
         lock = acquire_lifecycle_lock(
@@ -2707,6 +2891,7 @@ class _MaintenanceEventType(str, Enum):
     STARTED = "ReconciliationStarted"
     ENTRY_RECORDED = "ReconciliationEntryRecorded"
     FINISHED = "ReconciliationFinished"
+    ABANDONMENT_RECORDED = "AbandonmentRecorded"
 
 
 def _timestamp() -> str:
@@ -2733,11 +2918,20 @@ class _MaintenanceTraceWriter:
     individually `fsync`ed; the containing directory is `fsync`ed once,
     at file-creation time."""
 
-    def __init__(self, *, fd: int, maintenance_id: str, state_root_id: str, repo_key: str) -> None:
+    def __init__(
+        self,
+        *,
+        fd: int,
+        maintenance_id: str,
+        state_root_id: str,
+        repo_key: str,
+        trigger: MaintenanceTrigger = MaintenanceTrigger.PRE_RUN,
+    ) -> None:
         self._fd = fd
         self._maintenance_id = maintenance_id
         self._state_root_id = state_root_id
         self._repo_key = repo_key
+        self._trigger = MaintenanceTrigger(trigger).value
 
     def _write_event(self, event: dict) -> None:
         line = canonical_json_dumps(event) + b"\n"
@@ -2762,7 +2956,7 @@ class _MaintenanceTraceWriter:
                 "maintenance_id": self._maintenance_id,
                 "state_root_id": self._state_root_id,
                 "repo_key": self._repo_key,
-                "trigger": "pre_run",
+                "trigger": self._trigger,
                 "timestamp": _timestamp(),
             }
         )
@@ -2776,7 +2970,7 @@ class _MaintenanceTraceWriter:
                 "maintenance_id": self._maintenance_id,
                 "state_root_id": self._state_root_id,
                 "repo_key": self._repo_key,
-                "trigger": "pre_run",
+                "trigger": self._trigger,
                 "timestamp": _timestamp(),
                 "lifecycle_id": result.lifecycle_id,
                 "run_id": _bounded(result.run_id, RUN_ID_MAX_ENCODED_BYTES),
@@ -2828,6 +3022,12 @@ class _MaintenanceTraceWriter:
                     "container_gate": result.checkpoint_ref_container_gate,
                 },
                 "has_recognized_temp_leftover": result.has_temp_leftover,
+                "abandonment": (
+                    None
+                    if result.abandonment_disposition is None
+                    else {"disposition": result.abandonment_disposition, "remaining": result.abandonment_remaining}
+                ),
+                "abandonment_temp_leftovers": min(result.abandonment_temp_leftovers, ABANDONMENT_TEMP_MAX + 1),
                 "detail": _bounded(result.detail, _DETAIL_MAX_BYTES),
             }
         )
@@ -2843,7 +3043,7 @@ class _MaintenanceTraceWriter:
                 "maintenance_id": self._maintenance_id,
                 "state_root_id": self._state_root_id,
                 "repo_key": self._repo_key,
-                "trigger": "pre_run",
+                "trigger": self._trigger,
                 "timestamp": _timestamp(),
                 "entries_total": len(entries),
                 "entries_reconciled": counts[ReconciliationEntryOutcome.RECONCILED],
@@ -2852,7 +3052,45 @@ class _MaintenanceTraceWriter:
                 "entries_refused": counts[ReconciliationEntryOutcome.REFUSED],
                 "entries_failed": counts[ReconciliationEntryOutcome.FAILED],
                 "entries_substrate_unavailable": counts[ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE],
+                "entries_skipped_abandoned": counts[ReconciliationEntryOutcome.SKIPPED_ABANDONED],
+                "entries_skipped_abandoned_unresolved": counts[ReconciliationEntryOutcome.SKIPPED_ABANDONED_UNRESOLVED],
                 "blocked": blocked,
+            }
+        )
+
+    def abandonment_recorded(
+        self,
+        *,
+        lifecycle_id: str,
+        disposition: AbandonmentDisposition,
+        run_id: str | None,
+        projection_status: str,
+        remaining: dict,
+        reason_recorded: bool,
+        marker_publication: str,
+        abandonment_temp_leftovers: int,
+    ) -> None:
+        """ADR 0004 section 12 / Amendment 18. Retrospective: written only
+        after the marker's hard link succeeded. Deliberately takes no reason
+        argument -- the operator's free-form reason is persisted only in
+        abandonment.json; this event records `reason_recorded` alone."""
+        self._write_event(
+            {
+                "schema_version": 1,
+                "event_type": _MaintenanceEventType.ABANDONMENT_RECORDED.value,
+                "maintenance_id": self._maintenance_id,
+                "state_root_id": self._state_root_id,
+                "repo_key": self._repo_key,
+                "trigger": self._trigger,
+                "timestamp": _timestamp(),
+                "lifecycle_id": lifecycle_id,
+                "run_id": _bounded(run_id, RUN_ID_MAX_ENCODED_BYTES),
+                "disposition": AbandonmentDisposition(disposition).value,
+                "projection_status": projection_status,
+                "remaining": {key: remaining[key] for key in RESOURCE_FIELDS},
+                "reason_recorded": bool(reason_recorded),
+                "marker_publication": marker_publication,
+                "abandonment_temp_leftovers": min(abandonment_temp_leftovers, ABANDONMENT_TEMP_MAX + 1),
             }
         )
 
@@ -2869,7 +3107,25 @@ class _MaintenanceTraceWriter:
             ) from exc
 
 
-def _open_maintenance_trace(state_root, repo_dir_fd: int, repo_key: str) -> _MaintenanceTraceWriter:
+def _open_maintenance_trace(
+    state_root, repo_dir_fd: int, repo_key: str, *, trigger: MaintenanceTrigger = MaintenanceTrigger.PRE_RUN
+) -> _MaintenanceTraceWriter:
+    """Create this pass's exclusive trace file (see `_open_maintenance_trace_file`).
+    Any `ReconciliationError` raised once the file exists carries its
+    `maintenance_id` (Amendment 18), so "a trace file exists but its setup
+    was not confirmed" is never reported as "no trace was created"."""
+    created: list[str] = []
+    try:
+        return _open_maintenance_trace_file(state_root, repo_dir_fd, repo_key, trigger=trigger, created=created)
+    except ReconciliationError as exc:
+        if created and exc.maintenance_id is None:
+            exc.maintenance_id = created[0]
+        raise
+
+
+def _open_maintenance_trace_file(
+    state_root, repo_dir_fd: int, repo_key: str, *, trigger: MaintenanceTrigger, created: list[str]
+) -> _MaintenanceTraceWriter:
     """Open (create) this pass's exclusive maintenance-trace file.
 
     Descriptor ownership is explicit: `maintenance_dir_fd` is never
@@ -2896,10 +3152,24 @@ def _open_maintenance_trace(state_root, repo_dir_fd: int, repo_key: str) -> _Mai
     try:
         try:
             fd = open_private_create_exclusive_at(maintenance_dir_fd, f"{maintenance_id}.jsonl", 0o600)
-        except (FileExistsError, LifecycleFsError) as exc:
+        except FileExistsError as exc:
+            # An entry with this fresh random name already existed: not ours.
             raise ReconciliationError(
                 ReconciliationFailure.SUBSTRATE_UNAVAILABLE, "the maintenance-trace file could not be created"
             ) from exc
+        except LifecycleFsError as exc:
+            # The exclusive create may have succeeded before a later step
+            # (mode/ownership verification) failed; report what is on disk.
+            try:
+                os.lstat(f"{maintenance_id}.jsonl", dir_fd=maintenance_dir_fd)
+            except OSError:
+                pass
+            else:
+                created.append(maintenance_id)
+            raise ReconciliationError(
+                ReconciliationFailure.SUBSTRATE_UNAVAILABLE, "the maintenance-trace file could not be created"
+            ) from exc
+        created.append(maintenance_id)
         try:
             fsync_fd(maintenance_dir_fd)
         except LifecycleFsError as exc:
@@ -2951,8 +3221,20 @@ def _open_maintenance_trace(state_root, repo_dir_fd: int, repo_key: str) -> _Mai
             ) from exc
 
     return _MaintenanceTraceWriter(
-        fd=fd, maintenance_id=maintenance_id, state_root_id=state_root.state_root_id, repo_key=repo_key
+        fd=fd,
+        maintenance_id=maintenance_id,
+        state_root_id=state_root.state_root_id,
+        repo_key=repo_key,
+        trigger=trigger,
     )
+
+
+def open_maintenance_trace(
+    state_root, repo_dir_fd: int, repo_key: str, *, trigger: MaintenanceTrigger
+) -> _MaintenanceTraceWriter:
+    """Public entry to the exclusive maintenance-trace opener, for the
+    explicit maintenance commands (ADR 0004 Amendment 18)."""
+    return _open_maintenance_trace(state_root, repo_dir_fd, repo_key, trigger=trigger)
 
 
 def reconcile_repository(
@@ -2961,6 +3243,7 @@ def reconcile_repository(
     identity: RepositoryIdentity,
     context: TrustedRepositoryContext,
     repository_lock: LockHandle,
+    trigger: MaintenanceTrigger = MaintenanceTrigger.PRE_RUN,
 ) -> ReconciliationPassResult:
     """Automatic pre-run reconciliation (ADR 0004 Amendment 1 section
     10, Amendment 2), called by `lifecycle_store.prepare_lifecycle()`
@@ -2970,7 +3253,38 @@ def reconcile_repository(
     failure (an unusable `runs/`/`maintenance/` namespace, an
     unconfirmed cleanup, or a wrong locking precondition) — the caller
     treats that identically to `blocked=True`.
+
+    `trigger` is `PRE_RUN` for admission and `EXPLICIT` for
+    `codeagent reconcile` (ADR 0004 section 11 / Amendment 18); the pass
+    itself is identical.
     """
+    trigger = MaintenanceTrigger(trigger)
+    trace_ids: list[str] = []
+    try:
+        return _reconcile_repository_pass(
+            state_root=state_root,
+            identity=identity,
+            context=context,
+            repository_lock=repository_lock,
+            trigger=trigger,
+            trace_ids=trace_ids,
+        )
+    except ReconciliationError as exc:
+        # A pass that fails after its trace file exists reports that file.
+        if trace_ids and exc.maintenance_id is None:
+            exc.maintenance_id = trace_ids[0]
+        raise
+
+
+def _reconcile_repository_pass(
+    *,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+    repository_lock: LockHandle,
+    trigger: MaintenanceTrigger,
+    trace_ids: list[str],
+) -> ReconciliationPassResult:
     _require_repository_lock_scope(repository_lock, identity.repo_key)
     validate_hex32(identity.repo_key, field_name="repo_key")
 
@@ -2985,8 +3299,9 @@ def reconcile_repository(
     blocked = True
     maintenance_id = ""
     try:
-        trace = _open_maintenance_trace(state_root, repo_dir_fd, identity.repo_key)
+        trace = _open_maintenance_trace(state_root, repo_dir_fd, identity.repo_key, trigger=trigger)
         maintenance_id = trace.maintenance_id
+        trace_ids.append(maintenance_id)
         try:
             trace.started()
 
@@ -3056,3 +3371,381 @@ def reconcile_repository(
         raise body_exc
 
     return ReconciliationPassResult(maintenance_id=maintenance_id, entries=entries, blocked=blocked)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 18: read-only resource inspection and dry-run planning.
+# Nothing below writes, creates, removes, or publishes anything.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RemainingResources:
+    """A fresh, read-only observation of every attributable resource of one
+    lifecycle, derived only from trusted identities and deterministic names.
+    Each field is "absent", "present", or "unknown" (inspection failed);
+    "unknown" is never absence.
+
+    `cleanup_unconfirmed` is separate from resource presence: it names each
+    observer ("docker_listing", "worktree_listing", "admin_scan",
+    "leaf_observation") whose failure was CodeAgent's *own* unconfirmed
+    process or descriptor cleanup. Forced abandonment may acknowledge an
+    ordinary "unknown"; it never acknowledges this (Amendment 18)."""
+
+    baseline_container: str
+    verification_container: str
+    worktree_registration: str
+    worktree_admin_entry: str
+    worktree_directory: str
+    checkpoint_ref: str
+    cleanup_unconfirmed: tuple[str, ...] = ()
+
+    @property
+    def all_absent(self) -> bool:
+        return all(value == "absent" for value in self.to_summary().values())
+
+    def to_summary(self) -> dict[str, str]:
+        return {name: getattr(self, name) for name in RESOURCE_FIELDS}
+
+
+_CLEANUP_CHAIN_MAX_OBJECTS = 32
+
+
+def _is_own_cleanup_failure(exc: BaseException) -> bool:
+    """True when `exc`, or any exception reachable from it through
+    `__cause__` *or* `__context__`, reports that CodeAgent's own process or
+    descriptor cleanup could not be confirmed -- as distinct from an
+    ordinary failed observation.
+
+    Both links are followed (an explicit cause does not hide the context),
+    including a context suppressed by `raise ... from ...`, because it may
+    hold the same real cleanup failure. The traversal is iterative, protects
+    against cycles by object identity, and inspects at most
+    `_CLEANUP_CHAIN_MAX_OBJECTS` distinct exceptions."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending and len(seen) < _CLEANUP_CHAIN_MAX_OBJECTS:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, LifecycleFsError) and current.reason is LifecycleFsFailure.CLEANUP_UNCONFIRMED:
+            return True
+        if isinstance(current, BoundedProcessError) and current.reason in (
+            BoundedProcessFailure.TERMINATION_UNCONFIRMED,
+            BoundedProcessFailure.CLEANUP_UNCONFIRMED,
+        ):
+            return True
+        if isinstance(current, GitSafetyError) and current.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED:
+            return True
+        for link in (current.__context__, current.__cause__):
+            if link is not None and id(link) not in seen:
+                pending.append(link)
+    return False
+
+
+_ADMIN_SCAN_SUMMARY = {
+    _AdminScanResult.NONE_FOUND: "absent",
+    _AdminScanResult.MATCH_FOUND: "present",
+}
+
+_LEAF_SUMMARY = {
+    MaterializedLeafObservation.ABSENT: "absent",
+    MaterializedLeafObservation.MATERIALIZED: "present",
+    MaterializedLeafObservation.CONFLICT: "present",
+}
+
+
+def inspect_remaining_resources(
+    *,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+    lifecycle_id: str,
+    projection: LifecycleProjection | None,
+) -> RemainingResources:
+    """ADR 0004 section 11's fresh exact inspection for abandonment and the
+    dry run. Uses only read-only observers: one Docker listing, one Git
+    worktree listing, one bounded admin-name scan, one descriptor-relative
+    leaf observation, and one checkpoint-ref observation. With an
+    unreadable projection (`None`) any container at a role name counts as
+    remaining; with a readable one, a recorded container id listed under any
+    name also counts. Never raises for an inspection failure: it reports
+    "unknown"."""
+    validate_hex32(lifecycle_id, field_name="lifecycle_id")
+    cleanup: list[str] = []
+    baseline = verification = "unknown"
+    try:
+        name_to_id, id_to_name = _docker_ps_all_id_name_pairs()
+    except _DockerListingError as exc:
+        if _is_own_cleanup_failure(exc):
+            cleanup.append("docker_listing")
+    else:
+
+        def _container(role: str, recorded_id: str | None) -> str:
+            if f"codeagent-{role}-{lifecycle_id}" in name_to_id:
+                return "present"
+            if recorded_id is not None and recorded_id in id_to_name:
+                return "present"
+            return "absent"
+
+        baseline = _container("baseline", projection.baseline.id if projection is not None else None)
+        verification = _container("verification", projection.verification.id if projection is not None else None)
+
+    target_path = os.path.normpath(os.path.join(state_root.path, "worktrees", identity.repo_key, lifecycle_id))
+    registration = _observe_target_registration(
+        context.working_tree_root,
+        oid_hex_len=ObjectFormat(identity.object_format).hex_length,
+        target_path=target_path,
+        cleanup_failures=cleanup,
+    ).state
+
+    try:
+        admin = _ADMIN_SCAN_SUMMARY.get(_scan_worktree_admin_entries(identity.canonical_common_dir, lifecycle_id), "unknown")
+    except LifecycleFsError as exc:
+        admin = "unknown"
+        if _is_own_cleanup_failure(exc):
+            cleanup.append("admin_scan")
+
+    try:
+        directory = _LEAF_SUMMARY.get(state_root.observe_materialized_worktree_leaf(identity.repo_key, lifecycle_id), "unknown")
+    except LifecycleFsError as exc:
+        directory = "unknown"
+        if _is_own_cleanup_failure(exc):
+            cleanup.append("leaf_observation")
+
+    ref = "unknown"
+    try:
+        checkpoint_ref = CheckpointRef(context.working_tree_root, lifecycle_id)
+    except (ValueError, CheckpointRefError):
+        checkpoint_ref = None
+    if checkpoint_ref is not None and checkpoint_ref.object_format.value == identity.object_format:
+        try:
+            ref = "present" if checkpoint_ref.observe().present else "absent"
+        except CheckpointRefError as exc:
+            ref = "present" if exc.reason is CheckpointRefFailure.SYMBOLIC_REF else "unknown"
+
+    return RemainingResources(
+        baseline_container=baseline,
+        verification_container=verification,
+        worktree_registration=registration,
+        worktree_admin_entry=admin,
+        worktree_directory=directory,
+        checkpoint_ref=ref,
+        cleanup_unconfirmed=tuple(cleanup),
+    )
+
+
+@unique
+class PlanEntryOutcome(str, Enum):
+    """Dry-run vocabulary (ADR 0004 Amendment 18). Never persisted and never
+    part of a `ReconciliationPassResult`. `PENDING` means "eligible for a
+    real reconciliation pass, whose outcome is not predicted"; it blocks."""
+
+    SKIPPED_TERMINAL = "skipped_terminal"
+    SKIPPED_ABANDONED = "skipped_abandoned"
+    SKIPPED_ABANDONED_UNRESOLVED = "skipped_abandoned_unresolved"
+    SKIPPED_ACTIVE = "skipped_active"
+    REFUSED = "refused"
+    SUBSTRATE_UNAVAILABLE = "substrate_unavailable"
+    PENDING = "pending"
+
+
+_PLAN_BLOCKING = frozenset(
+    {
+        PlanEntryOutcome.SKIPPED_ACTIVE,
+        PlanEntryOutcome.REFUSED,
+        PlanEntryOutcome.SUBSTRATE_UNAVAILABLE,
+        PlanEntryOutcome.PENDING,
+    }
+)
+
+
+@dataclass(frozen=True)
+class PlanEntry:
+    lifecycle_id: str
+    outcome: PlanEntryOutcome
+    detail: str
+    run_id: str | None = None
+    remaining: RemainingResources | None = None
+    abandonment_disposition: str | None = None
+    abandonment_remaining: dict | None = None
+    abandonment_temp_leftovers: int = 0
+
+
+@dataclass(frozen=True)
+class ReconciliationPlan:
+    """A dry-run result. Deliberately has no `maintenance_id`: a dry run
+    creates no maintenance trace and therefore has no maintenance identity."""
+
+    entries: tuple[PlanEntry, ...]
+    blocked: bool
+
+
+def _plan_entry_from(result: ReconciliationEntryResult, *, outcome: PlanEntryOutcome | None = None, temps: int = 0) -> PlanEntry:
+    return PlanEntry(
+        lifecycle_id=result.lifecycle_id,
+        outcome=outcome or PlanEntryOutcome(result.outcome.value),
+        detail=result.detail,
+        run_id=result.run_id,
+        abandonment_disposition=result.abandonment_disposition,
+        abandonment_remaining=result.abandonment_remaining,
+        abandonment_temp_leftovers=temps or result.abandonment_temp_leftovers,
+    )
+
+
+def _plan_open_entry(
+    *, run_dir_fd: int, lifecycle_id: str, state_root, identity: RepositoryIdentity, context: TrustedRepositoryContext
+) -> PlanEntry:
+    marker_check = _check_abandonment(run_dir_fd, lifecycle_id=lifecycle_id, state_root=state_root, identity=identity)
+    if marker_check.result is not None:
+        entry = _plan_entry_from(marker_check.result)
+        if entry.outcome in (PlanEntryOutcome.SKIPPED_ABANDONED, PlanEntryOutcome.SKIPPED_ABANDONED_UNRESOLVED):
+            return entry  # zero further calls, exactly as the real pass
+        return replace(entry, remaining=_inspect_for_plan(state_root, identity, context, lifecycle_id, None))
+    temps = marker_check.temp_count
+    inner = _check_inner_entries(run_dir_fd, marker_check.names)
+    if inner.outcome is not None:
+        return PlanEntry(
+            lifecycle_id,
+            PlanEntryOutcome(inner.outcome.value),
+            inner.detail,
+            remaining=_inspect_for_plan(state_root, identity, context, lifecycle_id, None),
+            abandonment_temp_leftovers=temps,
+        )
+    classification = _classify_open_entry(
+        run_dir_fd=run_dir_fd, lifecycle_id=lifecycle_id, state_root=state_root, identity=identity
+    )
+    if classification.result is not None:
+        entry = _plan_entry_from(classification.result, temps=temps)
+        if entry.outcome is PlanEntryOutcome.SKIPPED_TERMINAL:
+            return entry
+        return replace(entry, remaining=_inspect_for_plan(state_root, identity, context, lifecycle_id, classification.peek))
+    peek = classification.peek
+    try:
+        lock = acquire_lifecycle_lock(
+            run_dir_fd,
+            repo_key=identity.repo_key,
+            lifecycle_id=lifecycle_id,
+            diagnostic_path=f"<state-root>/repos/{identity.repo_key}/{RUNS_DIRNAME}/{lifecycle_id}/lifecycle.lock",
+            create=False,  # a dry run never creates a lock file
+        )
+    except LockError as exc:
+        if exc.reason is LockFailure.BUSY:
+            return PlanEntry(
+                lifecycle_id,
+                PlanEntryOutcome.SKIPPED_ACTIVE,
+                "the lifecycle lock is held by a live process",
+                run_id=peek.run_id,
+                abandonment_temp_leftovers=temps,
+            )
+        outcome, detail = (
+            (PlanEntryOutcome.REFUSED, "lifecycle.lock is missing beside a valid projection")
+            if exc.reason is LockFailure.ABSENT
+            else (PlanEntryOutcome.SUBSTRATE_UNAVAILABLE, "the lifecycle lock could not be probed")
+        )
+        return PlanEntry(
+            lifecycle_id,
+            outcome,
+            detail,
+            run_id=peek.run_id,
+            remaining=_inspect_for_plan(state_root, identity, context, lifecycle_id, peek),
+            abandonment_temp_leftovers=temps,
+        )
+    try:
+        lock.release()
+    except LockError as exc:
+        raise ReconciliationError(
+            ReconciliationFailure.SUBSTRATE_UNAVAILABLE, "the lifecycle lock probe could not be confirmed released"
+        ) from exc
+    return PlanEntry(
+        lifecycle_id,
+        PlanEntryOutcome.PENDING,
+        "eligible for reconciliation; run codeagent reconcile (outcome not predicted)",
+        run_id=peek.run_id,
+        remaining=_inspect_for_plan(state_root, identity, context, lifecycle_id, peek),
+        abandonment_temp_leftovers=temps,
+    )
+
+
+def _inspect_for_plan(state_root, identity, context, lifecycle_id, projection) -> RemainingResources:
+    return inspect_remaining_resources(
+        state_root=state_root, identity=identity, context=context, lifecycle_id=lifecycle_id, projection=projection
+    )
+
+
+def plan_repository(
+    *,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+    repository_lock: LockHandle,
+) -> ReconciliationPlan:
+    """`codeagent reconcile --dry-run` (ADR 0004 section 11, Amendment 18):
+    the real pass's classification plus read-only resource observation,
+    without any write. Never opens or creates `maintenance/` or `runs/`,
+    never creates a lock file (lifecycle locks are probed with
+    `create=False` and released at once), never writes a projection, a
+    marker, or a trace, and never predicts a row's outcome: an eligible
+    entry is `PENDING` and blocks. Raises `ReconciliationError` for a
+    whole-namespace problem, exactly as the real pass."""
+    _require_repository_lock_scope(repository_lock, identity.repo_key)
+    validate_hex32(identity.repo_key, field_name="repo_key")
+    try:
+        runs_fd = open_existing_directory_chain_if_present(state_root.root_fd, ["repos", identity.repo_key, RUNS_DIRNAME])
+    except LifecycleFsError as exc:
+        raise ReconciliationError(_classify_pass_level_fs_failure(exc), "the runs/ directory could not be opened") from exc
+    if runs_fd is None:
+        return ReconciliationPlan(entries=(), blocked=False)
+
+    body_exc: BaseException | None = None
+    entries: list[PlanEntry] = []
+    try:
+        for lifecycle_id in _enumerate_runs(runs_fd):
+            entries.append(
+                _plan_entry(runs_fd=runs_fd, lifecycle_id=lifecycle_id, state_root=state_root, identity=identity, context=context)
+            )
+    except BaseException as exc:  # noqa: BLE001 - runs_fd is still closed below
+        body_exc = exc
+    try:
+        close_confirmed([runs_fd])
+    except LifecycleFsError as close_exc:
+        raise ReconciliationError(
+            ReconciliationFailure.SUBSTRATE_UNAVAILABLE, "the runs/ directory descriptor could not be confirmed closed"
+        ) from (body_exc if body_exc is not None else close_exc)
+    if body_exc is not None:
+        raise body_exc
+    return ReconciliationPlan(entries=tuple(entries), blocked=any(e.outcome in _PLAN_BLOCKING for e in entries))
+
+
+def _plan_entry(
+    *, runs_fd: int, lifecycle_id: str, state_root, identity: RepositoryIdentity, context: TrustedRepositoryContext
+) -> PlanEntry:
+    try:
+        run_dir_fd = open_existing_directory_chain_if_present(runs_fd, [lifecycle_id])
+    except LifecycleFsError as exc:
+        return PlanEntry(
+            lifecycle_id, PlanEntryOutcome(_classify_entry_fs_failure(exc).value), "the run directory could not be safely opened"
+        )
+    if run_dir_fd is None:
+        return PlanEntry(
+            lifecycle_id, PlanEntryOutcome.SUBSTRATE_UNAVAILABLE, "the run directory vanished between enumeration and opening"
+        )
+    body_exc: BaseException | None = None
+    entry: PlanEntry | None = None
+    try:
+        entry = _plan_open_entry(
+            run_dir_fd=run_dir_fd, lifecycle_id=lifecycle_id, state_root=state_root, identity=identity, context=context
+        )
+    except BaseException as exc:  # noqa: BLE001 - the descriptor is still closed below
+        body_exc = exc
+    try:
+        close_confirmed([run_dir_fd])
+    except LifecycleFsError as close_exc:
+        raise ReconciliationError(
+            ReconciliationFailure.SUBSTRATE_UNAVAILABLE, "a run-directory descriptor could not be confirmed closed"
+        ) from (body_exc if body_exc is not None else close_exc)
+    if body_exc is not None:
+        raise body_exc
+    assert entry is not None
+    return entry

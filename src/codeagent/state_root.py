@@ -290,6 +290,15 @@ class StateRoot:
         validate_hex32(repo_key, field_name="repo_key")
         return open_managed_directory_chain(self.root_fd, ["repos", repo_key])
 
+    def open_repo_locks_dir_if_present(self) -> int | None:
+        """Peek at (never create) `repo-locks/` (ADR 0004 Amendment 18)."""
+        return open_existing_directory_chain_if_present(self.root_fd, ["repo-locks"])
+
+    def open_repo_dir_if_present(self, repo_key: str) -> int | None:
+        """Peek at (never create) `repos/<repo_key>/` (ADR 0004 Amendment 18)."""
+        validate_hex32(repo_key, field_name="repo_key")
+        return open_existing_directory_chain_if_present(self.root_fd, ["repos", repo_key])
+
     def open_worktrees_repo_dir_if_present(self, repo_key: str) -> int | None:
         """Peek at (never create) `worktrees/<repo_key>/`, for
         `repo_identity.py`'s `repo.json` creation precondition (ADR
@@ -1131,6 +1140,56 @@ def _open_abandoned_leaf(state_root: "StateRoot", repo_key: str, lifecycle_id: s
         AbandonedLeafObservation.EMPTY_PRIVATE_DIRECTORY,
         _AbandonedWorktreeLeaf(parent_fd=parent_fd, leaf_fd=leaf_fd, leaf_name=lifecycle_id),
     )
+
+
+def open_existing_state_root(location: StateRootLocation, context: TrustedRepositoryContext) -> StateRoot | None:
+    """The maintenance commands' read-only counterpart of
+    `open_or_create_canonical_root` + `init_state_root` (ADR 0004
+    Amendment 18, presence rows P1/P2). Never creates anything: no
+    ancestor, no state-root directory, no `state-root.json`.
+
+    Returns `None` when there is no recorded state at all -- the
+    state-root path is absent, or it is an existing directory with no
+    entries. A valid `state-root.json` returns an owned `StateRoot`.
+    Anything else (content without a valid identity file, a partial or
+    invalid identity file, an unsafe directory, a containment failure)
+    raises `LifecycleFsError(SUBSTRATE_UNAVAILABLE)`; it is never
+    treated as empty."""
+    try:
+        os.lstat(location.path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise LifecycleFsError(
+            LifecycleFsFailure.SUBSTRATE_UNAVAILABLE, "the state-root path could not be inspected"
+        ) from None
+
+    root_fd, canonical = canonicalize_directory(location.path)
+    try:
+        try:
+            root_stat = os.fstat(root_fd)
+        except OSError:
+            raise LifecycleFsError(
+                LifecycleFsFailure.SUBSTRATE_UNAVAILABLE, "the state-root directory could not be inspected"
+            ) from None
+        validate_safe_owned_directory_stat(root_stat)
+        validate_state_root_containment(canonical, context)
+        outcome = _probe_once(root_fd)
+        if outcome.kind is StateRootProbe.VALID:
+            return _build_state_root(root_fd, canonical, outcome.payload)
+        empty = outcome.kind is StateRootProbe.ABSENT and not list_directory_entries(root_fd)
+    except BaseException as exc:
+        _dominant_cleanup([root_fd], exc)
+        raise
+    if empty:
+        close_confirmed([root_fd])
+        return None
+    refusal = LifecycleFsError(
+        LifecycleFsFailure.SUBSTRATE_UNAVAILABLE,
+        "the state root has content but no valid identity file",
+    )
+    _dominant_cleanup([root_fd], refusal)
+    raise refusal
 
 
 def _build_state_root(root_fd: int, canonical_path: str, payload: dict) -> StateRoot:

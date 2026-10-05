@@ -2870,6 +2870,37 @@ Stage 2 (of the four-stage planning process in
     x86_64 automated-test evidence, not a security review.
   - **Threats:** T-E1 and T-F1 unchanged. T-F2 and T-M1 gain partial,
     reconciler-level coverage only. Not wired to any entry point.
+- **Ledger D1: abandonment, explicit reconciliation, and the
+  maintenance-only `codeagent reconcile` command**, per ADR 0004
+  "Amendment 18 (**Accepted** 2026-10-05)". **Implemented and locally
+  validated on macOS (2026-10-04); no Linux CI evidence yet.** Amendment 18
+  was accepted after joint review on 2026-10-05.
+  - **What it adds:** `src/codeagent/cli.py` (`reconcile` only; exit codes
+    0 clean, 1 internal, 2 invalid invocation, 3 unresolved acknowledged,
+    4 blocked/refused); `maintenance.py` (presence decision, explicit
+    reconcile, dry run, abandonment); leaf `abandonment.py` (marker schema,
+    reason rules, temp-plus-hard-link publication); `[project.scripts]
+    codeagent`. Narrow changes to `reconciliation.py` (trigger, final-marker-
+    first classification, stale-temp counting, read-only planner and
+    resource inspector, `AbandonmentRecorded`), `lifecycle_store.py`
+    (`LifecycleLease.unresolved_acknowledged`), and no-create variants in
+    `state_root.py`, `state_locks.py`, `repo_identity.py`, `_lifecycle_fs.py`.
+  - **Invariants:** abandonment never deletes, adopts, rebinds, or mutates a
+    container, worktree, registration, ref, or projection; normal
+    abandonment needs all six fresh observations absent; forced
+    acknowledgement needs at least one present or unknown; the reason is
+    persisted only in `abandonment.json`; the dry run writes nothing and has
+    no maintenance identity; a missing repository lock beside recorded
+    state is `BLOCKED`; no-state repositories get nothing created.
+  - **Verified locally:** see `ENGINEERING_LOG.md`'s 2026-10-04 entries for
+    exact totals; all 28 mutation checks caught and sources restored
+    byte-for-byte. A same-day correction pass fixed six confirmed
+    joint-review findings (setup descriptor leak, release sequencing,
+    argparse echo, own-cleanup failures during inspection, trace-presence
+    reporting, a test-helper leak); full suite 3,748 passed, 0 skipped.
+  - **Not done:** Linux CI; D2 and D3 (Gate O stays
+    unsatisfied); the run-time admission warning (a mandatory D6 test).
+    T-E1, T-F1 and T-F2 are not newly mitigated.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

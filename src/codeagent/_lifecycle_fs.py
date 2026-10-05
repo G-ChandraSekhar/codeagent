@@ -970,3 +970,103 @@ def publish_private_file_atomically_at(
             LifecycleFsFailure.INSTALLED_DURABILITY_UNCONFIRMED,
             "the publication file was installed but its directory entry's durability could not be confirmed",
         ) from exc
+
+
+@dataclass(frozen=True)
+class ExclusivePublication:
+    """The outcome of a `publish_private_file_exclusively_at` call whose
+    final hard link succeeded (ADR 0004 Amendment 18). The file is
+    logically installed in every case; `durable` is true only when both
+    directory `fsync`s succeeded, and `temp_removed` only when the exact
+    temporary twin was confirmed removed."""
+
+    durable: bool
+    temp_removed: bool
+
+
+def publish_private_file_exclusively_at(
+    dir_fd: int, final_basename: str, data: bytes, *, mode: int = 0o600
+) -> ExclusivePublication:
+    """Publish `data` as `final_basename` beneath `dir_fd` without ever
+    replacing an existing entry (ADR 0004 Amendment 18, refining ADR
+    0004 section 11's `O_EXCL` wording):
+
+    1. create a private, randomly-suffixed same-directory temporary file
+       (`.<final>.tmp-<16 hex>`), write it completely, `fsync`, close;
+    2. `os.link` it to `final_basename` -- a no-replace operation, so an
+       existing final name raises `FileExistsError` and nothing is
+       replaced. **Link success is the moment the file is logically
+       installed**;
+    3. `fsync` the directory (until this succeeds, durability of the new
+       entry is unconfirmed);
+    4. remove the exact temporary name, only after confirming it is
+       still the same inode as the installed file;
+    5. `fsync` the directory again.
+
+    Before the link, every failure removes the exact temporary file this
+    call created (a cleanup failure dominates as `CLEANUP_UNCONFIRMED`
+    and leaves that one temporary file) and raises: `FileExistsError`
+    (unmodified, no filename) for an existing final name, otherwise a
+    sanitized `LifecycleFsError`. After the link nothing raises: the
+    result reports which later stage could not be confirmed. A crash
+    between steps 2 and 4 leaves the installed file with a same-inode
+    temporary twin (`st_nlink == 2`); readers must account for that.
+    """
+    _validate_path_component(final_basename)
+    temp_basename = f".{final_basename}.tmp-{secrets.token_hex(8)}"
+    try:
+        fd = open_private_create_exclusive_at(dir_fd, temp_basename, mode)
+    except FileExistsError:
+        raise LifecycleFsError(
+            LifecycleFsFailure.SUBSTRATE_UNAVAILABLE,
+            "a private temporary publication file could not be created",
+        ) from None
+
+    try:
+        try:
+            write_all_eintr_safe(fd, data)
+            fsync_fd(fd)
+        except BaseException as exc:
+            _dominant_cleanup([fd], exc)
+            raise
+        else:
+            close_confirmed([fd])
+    except BaseException as exc:
+        _cleanup_publication_temp_file(dir_fd, temp_basename, exc)
+        raise
+
+    try:
+        os.link(temp_basename, final_basename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except FileExistsError:
+        exists_error = FileExistsError()
+        _cleanup_publication_temp_file(dir_fd, temp_basename, exists_error)
+        raise exists_error from None
+    except OSError:
+        link_error = LifecycleFsError(
+            LifecycleFsFailure.SUBSTRATE_UNAVAILABLE,
+            "a publication temporary file could not be linked into place",
+        )
+        _cleanup_publication_temp_file(dir_fd, temp_basename, link_error)
+        raise link_error from None
+
+    durable = True
+    try:
+        fsync_fd(dir_fd)
+    except LifecycleFsError:
+        durable = False
+
+    temp_removed = False
+    try:
+        temp_stat = os.lstat(temp_basename, dir_fd=dir_fd)
+        final_stat = os.lstat(final_basename, dir_fd=dir_fd)
+        if os.path.samestat(temp_stat, final_stat):
+            os.unlink(temp_basename, dir_fd=dir_fd)
+            temp_removed = True
+    except OSError:
+        temp_removed = False
+
+    try:
+        fsync_fd(dir_fd)
+    except LifecycleFsError:
+        durable = False
+    return ExclusivePublication(durable=durable, temp_removed=temp_removed)

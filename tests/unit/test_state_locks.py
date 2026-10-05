@@ -684,3 +684,64 @@ def test_real_lifecycle_lock_acquirable_after_holder_sigkilled(tmp_path):
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 18: create=False never creates a lock file
+# ---------------------------------------------------------------------------
+
+
+def test_create_false_repository_lock_absent_creates_nothing(tmp_path):
+    state_root = _make_state_root(tmp_path)
+    try:
+        with pytest.raises(sl.LockError) as excinfo:
+            sl.acquire_repository_lock(state_root, "a" * 32, create=False)
+        assert excinfo.value.reason is sl.LockFailure.ABSENT
+        assert not (tmp_path / "state-root" / "repo-locks").exists()
+        (tmp_path / "state-root" / "repo-locks").mkdir(mode=0o700)
+        with pytest.raises(sl.LockError) as excinfo:
+            sl.acquire_repository_lock(state_root, "a" * 32, create=False)
+        assert excinfo.value.reason is sl.LockFailure.ABSENT
+        assert os.listdir(tmp_path / "state-root" / "repo-locks") == []
+    finally:
+        state_root.close()
+
+
+def test_create_false_repository_lock_existing_is_acquired(tmp_path):
+    state_root = _make_state_root(tmp_path)
+    try:
+        sl.acquire_repository_lock(state_root, "a" * 32).release()  # creates the file
+        handle = sl.acquire_repository_lock(state_root, "a" * 32, create=False)
+        assert handle.is_held
+        handle.release()
+    finally:
+        state_root.close()
+
+
+def test_create_false_lifecycle_lock_absent_creates_nothing(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(mode=0o700)
+    fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(sl.LockError) as excinfo:
+            sl.acquire_lifecycle_lock(fd, repo_key="a" * 32, lifecycle_id="b" * 32, diagnostic_path="x", create=False)
+        assert excinfo.value.reason is sl.LockFailure.ABSENT
+        assert os.listdir(run_dir) == []
+        sl.acquire_lifecycle_lock(fd, repo_key="a" * 32, lifecycle_id="b" * 32, diagnostic_path="x").release()
+        assert os.listdir(run_dir) == ["lifecycle.lock"]
+    finally:
+        os.close(fd)
+
+
+def test_create_false_symlinked_lock_is_refused_not_absent(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(mode=0o700)
+    (tmp_path / "target").write_bytes(b"")
+    (run_dir / "lifecycle.lock").symlink_to(tmp_path / "target")
+    fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(sl.LockError) as excinfo:
+            sl.acquire_lifecycle_lock(fd, repo_key="a" * 32, lifecycle_id="b" * 32, diagnostic_path="x", create=False)
+        assert excinfo.value.reason is sl.LockFailure.SUBSTRATE_UNAVAILABLE
+    finally:
+        os.close(fd)

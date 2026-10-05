@@ -1422,3 +1422,58 @@ def test_publish_private_file_atomically_at_no_fd_leak_on_success(tmp_path):
         assert fd_count_after == fd_count_before
     finally:
         os.close(parent_fd)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 18: publish_private_file_exclusively_at
+# ---------------------------------------------------------------------------
+
+
+def _dir_fd(path):
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+
+
+def test_exclusive_publication_installs_private_single_link_file(tmp_path):
+    fd = _dir_fd(tmp_path)
+    try:
+        result = lf.publish_private_file_exclusively_at(fd, "final.json", b"data")
+    finally:
+        os.close(fd)
+    assert result == lf.ExclusivePublication(durable=True, temp_removed=True)
+    assert os.listdir(tmp_path) == ["final.json"]
+    st = os.stat(tmp_path / "final.json")
+    assert st.st_nlink == 1 and stat.S_IMODE(st.st_mode) == 0o600
+    assert (tmp_path / "final.json").read_bytes() == b"data"
+
+
+def test_exclusive_publication_never_replaces(tmp_path):
+    (tmp_path / "final.json").write_bytes(b"original")
+    fd = _dir_fd(tmp_path)
+    try:
+        with pytest.raises(FileExistsError) as excinfo:
+            lf.publish_private_file_exclusively_at(fd, "final.json", b"new")
+    finally:
+        os.close(fd)
+    assert excinfo.value.filename is None
+    assert (tmp_path / "final.json").read_bytes() == b"original"
+    assert os.listdir(tmp_path) == ["final.json"]
+
+
+def test_exclusive_publication_does_not_unlink_a_swapped_temp(tmp_path, monkeypatch):
+    """The exact-temp unlink happens only while the temp is still the
+    installed file's inode."""
+    real_link = os.link
+
+    def link(src, dst, **kw):
+        real_link(src, dst, **kw)
+        os.unlink(src, dir_fd=kw["src_dir_fd"])
+        os.open(src, os.O_CREAT | os.O_WRONLY, 0o600, dir_fd=kw["src_dir_fd"])  # a different inode
+
+    monkeypatch.setattr(lf.os, "link", link)
+    fd = _dir_fd(tmp_path)
+    try:
+        result = lf.publish_private_file_exclusively_at(fd, "final.json", b"data")
+    finally:
+        os.close(fd)
+    assert result.temp_removed is False
+    assert len(os.listdir(tmp_path)) == 2

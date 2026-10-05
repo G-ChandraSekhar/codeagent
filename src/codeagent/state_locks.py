@@ -127,6 +127,10 @@ class LockFailure(str, Enum):
     SUBSTRATE_UNAVAILABLE = "substrate_unavailable"
     RELEASE_UNCONFIRMED = "release_unconfirmed"
     NOT_HELD = "not_held"
+    # ADR 0004 Amendment 18: a `create=False` acquisition found no lock
+    # file at all. Distinct from SUBSTRATE_UNAVAILABLE so a caller can
+    # apply its own presence rule; nothing was created.
+    ABSENT = "absent"
 
 
 class LockError(Exception):
@@ -216,10 +220,16 @@ def _validate_lock_file_stat(st: os.stat_result) -> None:
         raise LockError(LockFailure.SUBSTRATE_UNAVAILABLE, "a lock file has unsafe permissions")
 
 
-def _open_lock_file_at(parent_fd: int, basename: str) -> int:
-    flags = os.O_RDWR | os.O_CREAT | _nofollow_flag() | _cloexec_flag()
+def _open_lock_file_at(parent_fd: int, basename: str, *, create: bool = True) -> int:
+    flags = os.O_RDWR | _nofollow_flag() | _cloexec_flag()
+    if create:
+        flags |= os.O_CREAT
     try:
         fd = os.open(basename, flags, 0o600, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if create:
+            raise LockError(LockFailure.SUBSTRATE_UNAVAILABLE, "a lock file could not be opened") from None
+        raise LockError(LockFailure.ABSENT, "the lock file does not exist") from None
     except OSError:
         raise LockError(
             LockFailure.SUBSTRATE_UNAVAILABLE,
@@ -251,6 +261,7 @@ def acquire_lock_nonblocking_at(
     *,
     scope: LockScope,
     diagnostic_path: str,
+    create: bool = True,
 ) -> LockHandle:
     """Acquire a nonblocking advisory lock on `basename` beneath
     `parent_fd`. Never `O_TRUNC`, never unlinks/renames/replaces the
@@ -260,6 +271,9 @@ def acquire_lock_nonblocking_at(
     permissions are private (no group/other bit at all) — otherwise a
     different process could lock a different, unsafe, or substituted
     inode at the same pathname undetected.
+
+    `create=False` (ADR 0004 Amendment 18) never creates the lock file:
+    a missing file raises `LockError(ABSENT)` and nothing is written.
 
     If the lock itself is acquired but the caller-owned `parent_fd`
     cleanup later fails, the caller (not this function) is responsible
@@ -271,7 +285,7 @@ def acquire_lock_nonblocking_at(
     except LifecycleFsError as exc:
         raise LockError(LockFailure.SUBSTRATE_UNAVAILABLE, "a lock file name is not a valid path component") from exc
 
-    fd = _open_lock_file_at(parent_fd, basename)
+    fd = _open_lock_file_at(parent_fd, basename, create=create)
     try:
         _flock_exclusive_nonblocking(fd)
 
@@ -324,7 +338,7 @@ def acquire_lock_nonblocking_at(
         raise
 
 
-def acquire_repository_lock(state_root, repo_key: str) -> LockHandle:
+def acquire_repository_lock(state_root, repo_key: str, *, create: bool = True) -> LockHandle:
     """Acquire the repository lock `repo-locks/<repo_key>.lock` beneath
     `state_root`. If the lock itself is successfully acquired but
     cleanup of the short-lived `repo-locks/` parent-directory
@@ -338,7 +352,13 @@ def acquire_repository_lock(state_root, repo_key: str) -> LockHandle:
     scope = LockScope(kind=LockKind.REPOSITORY, repo_key=repo_key)
     basename = f"{repo_key}.lock"
 
-    parent_fd = state_root.open_repo_locks_dir()
+    if create:
+        parent_fd = state_root.open_repo_locks_dir()
+    else:
+        # ADR 0004 Amendment 18: never create `repo-locks/` either.
+        parent_fd = state_root.open_repo_locks_dir_if_present()
+        if parent_fd is None:
+            raise LockError(LockFailure.ABSENT, "the lock file does not exist")
     handle: LockHandle | None = None
     try:
         handle = acquire_lock_nonblocking_at(
@@ -346,6 +366,7 @@ def acquire_repository_lock(state_root, repo_key: str) -> LockHandle:
             basename,
             scope=scope,
             diagnostic_path=f"<state-root>/repo-locks/{basename}",
+            create=create,
         )
     except LockError as acquisition_exc:
         # If cleaning up the parent-fd itself fails here too, the
@@ -370,7 +391,7 @@ def acquire_repository_lock(state_root, repo_key: str) -> LockHandle:
 
 
 def acquire_lifecycle_lock(
-    run_dir_fd: int, *, repo_key: str, lifecycle_id: str, diagnostic_path: str
+    run_dir_fd: int, *, repo_key: str, lifecycle_id: str, diagnostic_path: str, create: bool = True
 ) -> LockHandle:
     """Acquire the lifecycle lock `lifecycle.lock` beneath the caller's
     own already-open, long-lived `run_dir_fd` — the run directory
@@ -390,6 +411,7 @@ def acquire_lifecycle_lock(
         "lifecycle.lock",
         scope=scope,
         diagnostic_path=diagnostic_path,
+        create=create,
     )
 
 

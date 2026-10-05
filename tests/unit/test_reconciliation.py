@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import errno
+import inspect
 import json
 import multiprocessing
 import os
@@ -6008,3 +6009,610 @@ def test_a17_trace_is_categorical_only(a17):
     raw = _a17_raw_trace(h)
     for secret in (h.A, h.B, cid, f"codeagent-baseline-{_A13_ID}", str(_a13_leaf(h)), str(h.state_dir), str(h.repo)):
         assert secret not in raw
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 18 (ledger D1): abandonment markers, stale temps,
+# the explicit trigger, the dry-run planner, and read-only inspection.
+# ---------------------------------------------------------------------------
+
+from codeagent import abandonment as ab  # noqa: E402
+
+_REASON_SENTINEL = "/Users/SENTINEL-REASON-9b1c/secret"
+_UNRESOLVED_SUMMARY = {
+    "baseline_container": "present",
+    "verification_container": "absent",
+    "worktree_registration": "absent",
+    "worktree_admin_entry": "absent",
+    "worktree_directory": "absent",
+    "checkpoint_ref": "unknown",
+}
+
+
+def _write_marker(h, run_dir, lifecycle_id, disposition=ab.AbandonmentDisposition.ABANDONED, *, mode=0o600):
+    unresolved = disposition is ab.AbandonmentDisposition.ABANDONED_UNRESOLVED
+    marker = ab.AbandonmentMarker(
+        lifecycle_id=lifecycle_id,
+        repo_key=h.identity.repo_key,
+        state_root_id=h.state_root.state_root_id,
+        disposition=disposition,
+        maintenance_id="e" * 32,
+        timestamp="2026-10-04T00:00:00Z",
+        reason=_REASON_SENTINEL if unresolved else None,
+        remaining=dict(_UNRESOLVED_SUMMARY) if unresolved else None,
+    )
+    path = run_dir / ab.MARKER_FILENAME
+    path.write_bytes(ab.marker_to_bytes(marker))
+    path.chmod(mode)
+    return marker
+
+
+def _write_temps(run_dir, count, start=0):
+    for i in range(start, start + count):
+        p = run_dir / f".abandonment.json.tmp-{i:016x}"
+        p.write_bytes(f"stale-{i}".encode())
+        p.chmod(0o600)
+
+
+def _forbid_inspection(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("an abandoned entry must receive zero lock/Docker/Git/projection calls")
+
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _boom)
+    monkeypatch.setattr(rc, "_worktree_registered_paths", _boom)
+    monkeypatch.setattr(rc, "_observe_target_registration", _boom)
+    monkeypatch.setattr(rc.CheckpointRef, "observe", _boom)
+    monkeypatch.setattr(rc, "acquire_lifecycle_lock", _boom)
+    monkeypatch.setattr(rc, "load_lifecycle_projection", _boom)
+
+
+def _trace_events(h, result):
+    path = h.repo_dir() / "maintenance" / f"{result.maintenance_id}.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()], path.read_text()
+
+
+@pytest.mark.parametrize(
+    "disposition,outcome",
+    [
+        (ab.AbandonmentDisposition.ABANDONED, rc.ReconciliationEntryOutcome.SKIPPED_ABANDONED),
+        (ab.AbandonmentDisposition.ABANDONED_UNRESOLVED, rc.ReconciliationEntryOutcome.SKIPPED_ABANDONED_UNRESOLVED),
+    ],
+)
+def test_a18_valid_marker_skips_with_zero_calls_and_never_blocks(harness, monkeypatch, disposition, outcome):
+    lifecycle_id = "a" * 32
+    run_dir = _seed_run_dir(harness, lifecycle_id, _initial_projection(harness, lifecycle_id))
+    _write_marker(harness, run_dir, lifecycle_id, disposition)
+    _forbid_inspection(monkeypatch)
+    result = harness.reconcile()
+    (entry,) = result.entries
+    assert entry.outcome is outcome
+    assert not result.blocked
+    events, text = _trace_events(harness, result)
+    finished = events[-1]
+    assert finished["blocked"] is False
+    assert finished["entries_skipped_abandoned"] == (outcome is rc.ReconciliationEntryOutcome.SKIPPED_ABANDONED)
+    assert finished["entries_skipped_abandoned_unresolved"] == (
+        outcome is rc.ReconciliationEntryOutcome.SKIPPED_ABANDONED_UNRESOLVED
+    )
+    entry_event = events[1]
+    assert entry_event["abandonment"]["disposition"] == disposition.value
+    assert entry_event["abandonment_temp_leftovers"] == 0
+    # C2: the reason never reaches the trace or the result object.
+    assert _REASON_SENTINEL not in text
+    assert "reason" not in entry_event["abandonment"]
+    assert _REASON_SENTINEL not in repr(entry)
+    if disposition is ab.AbandonmentDisposition.ABANDONED_UNRESOLVED:
+        assert entry.abandonment_remaining == _UNRESOLVED_SUMMARY
+        assert entry_event["abandonment"]["remaining"] == _UNRESOLVED_SUMMARY
+    else:
+        assert entry.abandonment_remaining is None
+
+
+@pytest.mark.parametrize("shape", ["unrecognized_inner", "missing_projection", "corrupt_projection", "ineligible"])
+def test_a18_final_marker_beats_inner_and_projection_classification(harness, monkeypatch, shape):
+    """M7: an entry abandoned because it was refused stays abandoned."""
+    lifecycle_id = "a" * 32
+    projection = _initial_projection(harness, lifecycle_id)
+    if shape == "missing_projection":
+        run_dir = _seed_run_dir(harness, lifecycle_id)
+    elif shape == "ineligible":
+        projection = dataclasses.replace(projection, failure=ls.FailureDetail(phase="p", detail="d"))
+        run_dir = _seed_run_dir(harness, lifecycle_id, projection)
+    else:
+        run_dir = _seed_run_dir(harness, lifecycle_id, projection)
+    if shape == "unrecognized_inner":
+        (run_dir / "unexpected-file").write_text("x")
+    if shape == "corrupt_projection":
+        (run_dir / ls.LIFECYCLE_JSON_FILENAME).write_bytes(b"{not json")
+    _write_marker(harness, run_dir, lifecycle_id)
+    _forbid_inspection(monkeypatch)
+    result = harness.reconcile()
+    assert result.entries[0].outcome is rc.ReconciliationEntryOutcome.SKIPPED_ABANDONED
+    assert not result.blocked
+
+
+def test_a18_corrupt_final_marker_is_refused_and_blocks(harness):
+    lifecycle_id = "a" * 32
+    run_dir = _seed_run_dir(harness, lifecycle_id, _initial_projection(harness, lifecycle_id))
+    (run_dir / ab.MARKER_FILENAME).write_bytes(b"{}")
+    (run_dir / ab.MARKER_FILENAME).chmod(0o600)
+    result = harness.reconcile()
+    assert result.entries[0].outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert result.blocked
+
+
+def test_a18_unsafe_final_marker_mode_is_refused(harness):
+    lifecycle_id = "a" * 32
+    run_dir = _seed_run_dir(harness, lifecycle_id, _initial_projection(harness, lifecycle_id))
+    _write_marker(harness, run_dir, lifecycle_id, mode=0o644)
+    result = harness.reconcile()
+    assert result.entries[0].outcome is rc.ReconciliationEntryOutcome.REFUSED
+
+
+def test_a18_unreadable_final_marker_is_substrate_unavailable(harness, monkeypatch):
+    lifecycle_id = "a" * 32
+    run_dir = _seed_run_dir(harness, lifecycle_id, _initial_projection(harness, lifecycle_id))
+    _write_marker(harness, run_dir, lifecycle_id)
+    real = ab.os.lstat
+
+    def lstat(name, *a, **k):
+        if name == ab.MARKER_FILENAME:
+            raise PermissionError(13, "denied")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(ab.os, "lstat", lstat)
+    result = harness.reconcile()
+    assert result.entries[0].outcome is rc.ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE
+    assert result.blocked
+
+
+@pytest.mark.parametrize("count", [1, 16])
+def test_a18_stale_temps_alone_never_skip_refuse_or_block(harness, monkeypatch, count):
+    """C1 / M17 / M18 / M19: temps are counted and reported, the entry is
+    reconciled normally, and every temp is left byte-identical."""
+    lifecycle_id = "a" * 32
+    run_dir = _seed_run_dir(harness, lifecycle_id, _initial_projection(harness, lifecycle_id))
+    _write_temps(run_dir, count)
+    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.name.startswith(".abandonment")}
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+    result = harness.reconcile()
+    (entry,) = result.entries
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED
+    assert entry.abandonment_temp_leftovers == count
+    assert not result.blocked
+    after = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.name.startswith(".abandonment")}
+    assert after == before
+    events, _ = _trace_events(harness, result)
+    assert events[1]["abandonment_temp_leftovers"] == count
+    assert events[1]["abandonment"] is None
+
+
+def test_a18_more_than_sixteen_temps_fail_closed(harness, monkeypatch):
+    """M20: more than CodeAgent can create."""
+    lifecycle_id = "a" * 32
+    run_dir = _seed_run_dir(harness, lifecycle_id, _initial_projection(harness, lifecycle_id))
+    _write_temps(run_dir, 17)
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+    result = harness.reconcile()
+    (entry,) = result.entries
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert entry.abandonment_temp_leftovers == 17
+    assert result.blocked
+
+
+@pytest.mark.parametrize("shape", ["symlink", "mode", "nlink"])
+def test_a18_unsafe_stale_temp_is_refused(harness, monkeypatch, tmp_path, shape):
+    lifecycle_id = "a" * 32
+    run_dir = _seed_run_dir(harness, lifecycle_id, _initial_projection(harness, lifecycle_id))
+    temp = run_dir / (".abandonment.json.tmp-" + "0" * 16)
+    if shape == "symlink":
+        temp.symlink_to(tmp_path)
+    else:
+        temp.write_bytes(b"x")
+        temp.chmod(0o644 if shape == "mode" else 0o600)
+        if shape == "nlink":
+            os.link(temp, tmp_path / "other-link")
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+    result = harness.reconcile()
+    assert result.entries[0].outcome is rc.ReconciliationEntryOutcome.REFUSED
+
+
+def test_a18_explicit_trigger_in_every_event(harness, monkeypatch):
+    """M11."""
+    lifecycle_id = "a" * 32
+    _seed_run_dir(harness, lifecycle_id, _initial_projection(harness, lifecycle_id))
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+    result = rc.reconcile_repository(
+        state_root=harness.state_root,
+        identity=harness.identity,
+        context=harness.context,
+        repository_lock=harness.repository_lock,
+        trigger=rc.MaintenanceTrigger.EXPLICIT,
+    )
+    events, _ = _trace_events(harness, result)
+    assert [e["trigger"] for e in events] == ["explicit"] * 3
+
+
+def test_a18_default_trigger_stays_pre_run(harness):
+    result = harness.reconcile()
+    events, _ = _trace_events(harness, result)
+    assert {e["trigger"] for e in events} == {"pre_run"}
+
+
+def test_a18_trace_writer_abandonment_event_takes_no_reason_parameter():
+    """C2 / M21."""
+    params = inspect.signature(rc._MaintenanceTraceWriter.abandonment_recorded).parameters
+    assert not any("reason" in name and name != "reason_recorded" for name in params)
+
+
+def test_a18_abandonment_event_fits_bound_with_every_field_maximal(tmp_path):
+    fd = os.open(tmp_path / "t.jsonl", os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        writer = rc._MaintenanceTraceWriter(
+            fd=fd, maintenance_id="f" * 32, state_root_id="s" * 32, repo_key="r" * 32, trigger=rc.MaintenanceTrigger.EXPLICIT
+        )
+        writer.abandonment_recorded(
+            lifecycle_id="a" * 32,
+            disposition=ab.AbandonmentDisposition.ABANDONED_UNRESOLVED,
+            run_id="☃" * 200,
+            projection_status="unavailable",
+            remaining={k: "unknown" for k in ab.RESOURCE_FIELDS},
+            reason_recorded=True,
+            marker_publication="temp_cleanup_unconfirmed",
+            abandonment_temp_leftovers=15,
+        )
+    finally:
+        os.close(fd)
+    (event,) = [json.loads(line) for line in (tmp_path / "t.jsonl").read_text().splitlines()]
+    assert event["event_type"] == "AbandonmentRecorded" and event["trigger"] == "explicit"
+    assert event["reason_recorded"] is True and "reason" not in event
+
+
+# --- planner ---------------------------------------------------------------
+
+
+def _plan(h):
+    return rc.plan_repository(
+        state_root=h.state_root, identity=h.identity, context=h.context, repository_lock=h.repository_lock
+    )
+
+
+def _tree(root):
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            p = os.path.join(dirpath, name)
+            st = os.lstat(p)
+            out[os.path.relpath(p, root)] = (st.st_mode, st.st_size, st.st_ino, st.st_mtime_ns)
+    return out
+
+
+def test_a18_plan_result_has_no_maintenance_identity(harness):
+    """C4 / M25."""
+    plan = _plan(harness)
+    assert isinstance(plan, rc.ReconciliationPlan)
+    assert not hasattr(plan, "maintenance_id")
+    assert plan.entries == () and not plan.blocked
+
+
+def test_a18_plan_classifies_like_the_pass_and_writes_nothing(harness, monkeypatch):
+    """M1/M15: every shape, one tree snapshot -- nothing created or changed."""
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+    ids = {name: c * 32 for name, c in zip(
+        ["eligible", "terminal", "abandoned", "unresolved", "refused", "temp_alone", "no_lock"], "abcdef0"
+    )}
+    _seed_run_dir(harness, ids["eligible"], _initial_projection(harness, ids["eligible"]))
+    (harness.runs_dir() / ids["eligible"] / "lifecycle.lock").write_bytes(b"")
+    (harness.runs_dir() / ids["eligible"] / "lifecycle.lock").chmod(0o600)
+    _seed_run_dir(
+        harness,
+        ids["terminal"],
+        dataclasses.replace(_initial_projection(harness, ids["terminal"]), state=ls.LifecycleState.COMPLETE),
+    )
+    _write_marker(harness, _seed_run_dir(harness, ids["abandoned"]), ids["abandoned"])
+    _write_marker(
+        harness,
+        _seed_run_dir(harness, ids["unresolved"]),
+        ids["unresolved"],
+        ab.AbandonmentDisposition.ABANDONED_UNRESOLVED,
+    )
+    _seed_run_dir(harness, ids["refused"])  # 3B-1 residual: no projection
+    temp_dir = _seed_run_dir(harness, ids["temp_alone"], _initial_projection(harness, ids["temp_alone"]))
+    (temp_dir / "lifecycle.lock").write_bytes(b"")
+    (temp_dir / "lifecycle.lock").chmod(0o600)
+    _write_temps(temp_dir, 2)
+    _seed_run_dir(harness, ids["no_lock"], _initial_projection(harness, ids["no_lock"]))
+
+    before = _tree(harness.state_dir)
+    plan = _plan(harness)
+    assert _tree(harness.state_dir) == before
+    assert not (harness.repo_dir() / "maintenance").exists()
+
+    by_id = {e.lifecycle_id: e for e in plan.entries}
+    O = rc.PlanEntryOutcome
+    assert by_id[ids["eligible"]].outcome is O.PENDING
+    assert by_id[ids["terminal"]].outcome is O.SKIPPED_TERMINAL
+    assert by_id[ids["abandoned"]].outcome is O.SKIPPED_ABANDONED
+    assert by_id[ids["unresolved"]].outcome is O.SKIPPED_ABANDONED_UNRESOLVED
+    assert by_id[ids["refused"]].outcome is O.REFUSED
+    assert by_id[ids["temp_alone"]].outcome is O.PENDING  # C1: never a skip
+    assert by_id[ids["temp_alone"]].abandonment_temp_leftovers == 2
+    assert by_id[ids["no_lock"]].outcome is O.REFUSED
+    assert not (harness.runs_dir() / ids["no_lock"] / "lifecycle.lock").exists()
+    assert plan.blocked
+    # Remaining resources are attached for undecided entries only.
+    assert by_id[ids["eligible"]].remaining is not None
+    assert by_id[ids["abandoned"]].remaining is None
+    assert _REASON_SENTINEL not in repr(plan)
+
+
+def test_a18_plan_busy_lifecycle_lock_is_skipped_active(harness, monkeypatch):
+    import fcntl
+
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+    lifecycle_id = "a" * 32
+    run_dir = _seed_run_dir(harness, lifecycle_id, _initial_projection(harness, lifecycle_id))
+    lock_path = run_dir / "lifecycle.lock"
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o600)
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        plan = _plan(harness)
+    finally:
+        os.close(fd)
+    assert plan.entries[0].outcome is rc.PlanEntryOutcome.SKIPPED_ACTIVE
+    assert plan.blocked
+
+
+def test_a18_plan_never_opens_the_real_reconciliation_rows(harness, monkeypatch):
+    lifecycle_id = "a" * 32
+    run_dir = _seed_run_dir(harness, lifecycle_id, _initial_projection(harness, lifecycle_id))
+    (run_dir / "lifecycle.lock").write_bytes(b"")
+    (run_dir / "lifecycle.lock").chmod(0o600)
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+
+    def _boom(*a, **k):
+        raise AssertionError("the planner must never reach a mutating path")
+
+    for name in ("_reconcile_locked_entry", "_publish_projection_state", "_open_maintenance_trace", "reconcile_repository"):
+        monkeypatch.setattr(rc, name, _boom)
+    assert _plan(harness).entries[0].outcome is rc.PlanEntryOutcome.PENDING
+
+
+# --- inspect_remaining_resources ---------------------------------------------
+
+
+def _inspect(h, lifecycle_id, projection=None):
+    return rc.inspect_remaining_resources(
+        state_root=h.state_root, identity=h.identity, context=h.context, lifecycle_id=lifecycle_id, projection=projection
+    )
+
+
+def test_a18_inspection_all_absent_for_a_clean_lifecycle(harness, monkeypatch):
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+    result = _inspect(harness, "a" * 32)
+    assert result.all_absent
+    assert set(result.to_summary()) == set(ab.RESOURCE_FIELDS)
+
+
+def test_a18_inspection_container_by_role_name(harness, monkeypatch):
+    lid = "a" * 32
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: _listing({f"codeagent-verification-{lid}": "1" * 64}))
+    result = _inspect(harness, lid)
+    assert result.verification_container == "present" and result.baseline_container == "absent"
+
+
+def test_a18_inspection_recorded_id_under_another_name(harness, monkeypatch):
+    lid = "a" * 32
+    projection = dataclasses.replace(
+        _initial_projection(harness, lid),
+        baseline=ls.ContainerAttribution(intent=ls.ContainerIntent.PRESENT, id="2" * 64),
+    )
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: _listing({"renamed-elsewhere": "2" * 64}))
+    assert _inspect(harness, lid, projection).baseline_container == "present"
+    assert _inspect(harness, lid, None).baseline_container == "absent"  # unreadable: names only
+
+
+def test_a18_inspection_listing_failure_is_unknown_never_absent(harness, monkeypatch):
+    """M3."""
+    def _fail():
+        raise rc._DockerListingError("down")
+
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _fail)
+    monkeypatch.setattr(rc, "_observe_target_registration", lambda *a, **k: rc._UNKNOWN_REGISTRATION)
+    monkeypatch.setattr(rc, "_scan_worktree_admin_entries", lambda *a, **k: rc._AdminScanResult.INSPECTION_FAILED)
+    result = _inspect(harness, "a" * 32)
+    assert result.baseline_container == result.verification_container == "unknown"
+    assert result.worktree_registration == "unknown" and result.worktree_admin_entry == "unknown"
+    assert not result.all_absent
+
+
+def test_a18_inspection_symbolic_ref_is_present_and_format_mismatch_unknown(harness, monkeypatch):
+    lid = "a" * 32
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+
+    def symbolic(self):
+        raise rc.CheckpointRefError(rc.CheckpointRefFailure.SYMBOLIC_REF, "symbolic")
+
+    monkeypatch.setattr(rc.CheckpointRef, "observe", symbolic)
+    assert _inspect(harness, lid).checkpoint_ref == "present"
+    other = dataclasses.replace(harness.identity, object_format="sha256" if harness.identity.object_format == "sha1" else "sha1")
+    monkeypatch.setattr(harness, "identity", other)
+    assert _inspect(harness, lid).checkpoint_ref == "unknown"
+
+
+def test_a18_inspection_real_leaf_directory_is_present(harness, monkeypatch):
+    lid = "a" * 32
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+    leaf = harness.state_dir / "worktrees" / harness.identity.repo_key / lid
+    leaf.mkdir(parents=True, mode=0o700)
+    assert _inspect(harness, lid).worktree_directory == "present"
+
+
+def test_a18_read_only_paths_call_no_mutation_helper():
+    """AST pin over the inspector and planner bodies (I16)."""
+    forbidden_prefixes = ("_reconcile_", "_remove_", "_attempt_", "_publish_", "_mutate_")
+    forbidden = {"delete", "remove_if_still_empty", "unlink", "rmdir", "rename", "replace_file", "reconcile_repository"}
+    for func in (rc.inspect_remaining_resources, rc.plan_repository, rc._plan_entry, rc._plan_open_entry, rc._inspect_for_plan):
+        for node in ast.walk(ast.parse(inspect.getsource(func))):
+            if isinstance(node, ast.Call):
+                name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+                assert not name.startswith(forbidden_prefixes) and name not in forbidden, (func.__name__, name)
+
+
+# --- D1 correction pass: F4 classifier, F5 opener --------------------------
+
+
+def test_f4_ordinary_failure_is_unknown_without_a_cleanup_stage(harness, monkeypatch):
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+    monkeypatch.setattr(
+        rc,
+        "_scan_worktree_admin_entries",
+        lambda *a, **k: (_ for _ in ()).throw(lf.LifecycleFsError(lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE, "x")),
+    )
+    result = _inspect(harness, "a" * 32)
+    assert result.worktree_admin_entry == "unknown" and result.cleanup_unconfirmed == ()
+
+
+def test_f4_own_cleanup_failure_is_kept_separately(harness, monkeypatch):
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", _empty_listing)
+    monkeypatch.setattr(
+        rc,
+        "_scan_worktree_admin_entries",
+        lambda *a, **k: (_ for _ in ()).throw(lf.LifecycleFsError(lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED, "x")),
+    )
+    result = _inspect(harness, "a" * 32)
+    assert result.worktree_admin_entry == "unknown" and result.cleanup_unconfirmed == ("admin_scan",)
+    assert set(result.to_summary()) == set(ab.RESOURCE_FIELDS)  # the marker schema is unchanged
+
+
+def test_f4_cleanup_classifier_follows_the_cause_chain_and_is_cycle_safe():
+    try:
+        try:
+            raise BoundedProcessError(BoundedProcessFailure.CLEANUP_UNCONFIRMED, "x")
+        except BoundedProcessError as inner:
+            raise rc._DockerListingError("listing") from inner
+    except rc._DockerListingError as outer:
+        assert rc._is_own_cleanup_failure(outer)
+    plain = rc._DockerListingError("listing")
+    assert not rc._is_own_cleanup_failure(plain)
+    a, b = RuntimeError("a"), RuntimeError("b")
+    a.__cause__, b.__cause__ = b, a
+    assert not rc._is_own_cleanup_failure(a)
+
+
+def test_f5_opener_failure_after_creation_carries_the_maintenance_id(harness, monkeypatch):
+    repo_dir_fd = harness.state_root.open_repo_dir(harness.identity.repo_key)
+    real = rc.fsync_fd
+    calls = []
+
+    def fsync_fd(fd):
+        calls.append(fd)
+        raise lf.LifecycleFsError(lf.LifecycleFsFailure.FSYNC_FAILED, "x")
+
+    monkeypatch.setattr(rc, "fsync_fd", fsync_fd)
+    try:
+        with pytest.raises(rc.ReconciliationError) as excinfo:
+            rc._open_maintenance_trace(harness.state_root, repo_dir_fd, harness.identity.repo_key)
+    finally:
+        os.close(repo_dir_fd)
+    monkeypatch.setattr(rc, "fsync_fd", real)
+    (trace,) = (harness.repo_dir() / "maintenance").iterdir()
+    assert excinfo.value.maintenance_id == trace.stem
+
+
+def test_f5_pass_failure_after_creation_carries_the_maintenance_id(harness, monkeypatch):
+    monkeypatch.setattr(
+        rc._MaintenanceTraceWriter,
+        "started",
+        lambda self: (_ for _ in ()).throw(rc.ReconciliationError(rc.ReconciliationFailure.SUBSTRATE_UNAVAILABLE, "x")),
+    )
+    with pytest.raises(rc.ReconciliationError) as excinfo:
+        harness.reconcile()
+    (trace,) = (harness.repo_dir() / "maintenance").iterdir()
+    assert excinfo.value.maintenance_id == trace.stem
+
+
+# --- D1 precision pass: the classifier follows both cause and context ------
+
+
+def _cleanup_error():
+    return lf.LifecycleFsError(lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED, "x")
+
+
+def test_classifier_cause_only_cleanup_failure():
+    top = RuntimeError("top")
+    top.__cause__ = _cleanup_error()
+    assert rc._is_own_cleanup_failure(top)
+
+
+def test_classifier_context_only_cleanup_failure():
+    top = RuntimeError("top")
+    top.__context__ = _cleanup_error()
+    assert rc._is_own_cleanup_failure(top)
+
+
+def test_classifier_ordinary_cause_with_cleanup_in_context():
+    top = rc._DockerListingError("listing")
+    top.__cause__ = RuntimeError("ordinary")
+    top.__context__ = _cleanup_error()
+    assert rc._is_own_cleanup_failure(top)
+
+
+def test_classifier_cleanup_cause_with_ordinary_context():
+    top = rc._DockerListingError("listing")
+    top.__cause__ = _cleanup_error()
+    top.__context__ = RuntimeError("ordinary")
+    assert rc._is_own_cleanup_failure(top)
+
+
+def test_classifier_inspects_a_suppressed_context():
+    try:
+        try:
+            raise _cleanup_error()
+        except lf.LifecycleFsError:
+            raise rc._DockerListingError("listing") from RuntimeError("ordinary")
+    except rc._DockerListingError as top:
+        assert top.__suppress_context__ is True
+        assert isinstance(top.__context__, lf.LifecycleFsError)
+        assert rc._is_own_cleanup_failure(top)
+
+
+def test_classifier_self_cycle_terminates():
+    top = RuntimeError("self")
+    top.__cause__ = top
+    top.__context__ = top
+    assert not rc._is_own_cleanup_failure(top)
+
+
+def test_classifier_two_exception_cycle_terminates():
+    a, b = RuntimeError("a"), RuntimeError("b")
+    a.__cause__, a.__context__ = b, b
+    b.__cause__, b.__context__ = a, a
+    assert not rc._is_own_cleanup_failure(a)
+    b.__context__ = _cleanup_error()
+    assert rc._is_own_cleanup_failure(a)
+
+
+def test_classifier_no_cleanup_failure_anywhere():
+    top = RuntimeError("top")
+    top.__cause__ = rc._DockerListingError("listing")
+    top.__context__ = lf.LifecycleFsError(lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE, "ordinary")
+    top.__cause__.__context__ = BoundedProcessError(BoundedProcessFailure.TIMED_OUT, "ordinary")
+    assert not rc._is_own_cleanup_failure(top)
+
+
+def _chain(length: int, cleanup_at: int) -> BaseException:
+    """A linear `__cause__` chain; position 1 is the head."""
+    nodes = [RuntimeError(f"n{i}") for i in range(1, length + 1)]
+    nodes[cleanup_at - 1] = _cleanup_error()
+    for upper, lower in zip(nodes, nodes[1:]):
+        upper.__cause__ = lower
+    return nodes[0]
+
+
+def test_classifier_respects_the_32_object_bound():
+    assert rc._CLEANUP_CHAIN_MAX_OBJECTS == 32
+    assert rc._is_own_cleanup_failure(_chain(40, 32))
+    assert not rc._is_own_cleanup_failure(_chain(40, 33))

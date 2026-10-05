@@ -5142,3 +5142,309 @@ This evidence changes none of §6's non-claims:
   reconciler-level coverage.
 - This is GitHub-hosted `ubuntu-24.04` x86_64, automated-test evidence, not a
   security review.
+
+---
+
+## Amendment 18 (Accepted 2026-10-05): abandonment, explicit reconciliation, and the maintenance-only `codeagent reconcile` command
+
+**Status: Accepted 2026-10-05** after joint review (proposed 2026-10-04).
+Implemented and verified locally (macOS); no Linux CI evidence yet. Ledger
+deliverable D1; Gate O item "abandonment". Gate O remains unsatisfied until D2
+and D3.
+
+**Scope.** Implements §11 (explicit reconcile and abandonment) and the parts of
+§10 and §12 that depend on it:
+
+- `codeagent reconcile --repo PATH` (trigger `explicit`);
+- `codeagent reconcile --repo PATH --dry-run`;
+- `codeagent reconcile --repo PATH --abandon ID`;
+- `codeagent reconcile --repo PATH --abandon ID --acknowledge-unresolved --reason TEXT`;
+- the `codeagent` console script (`codeagent.cli:main`), exposing only
+  `reconcile`.
+
+It never runs a task, mints a lifecycle id, or creates a run directory. Gate O
+remains unsatisfied (the worktree-plus-container row and ADR 0005 do not exist).
+
+### 1. Refinement of §11's marker wording
+
+§11 says both forms "write `abandonment.json` … with `O_EXCL` (+ `fsync`)". A
+crash between an `O_EXCL` create and its write would leave an empty marker that
+is `REFUSED` forever and can never be replaced, permanently blocking the
+repository. This amendment keeps §11's exclusivity and refines the mechanism
+(`_lifecycle_fs.publish_private_file_exclusively_at`):
+
+1. create a private (0600) same-directory temporary file
+   `.abandonment.json.tmp-<16 hex>`, write it completely, `fsync`, close;
+2. `os.link` it to `abandonment.json` — no-replace; an existing final name is
+   never replaced. **The marker is logically installed when the link
+   succeeds;**
+3. `fsync` the run directory — until this succeeds, the marker's durability is
+   unconfirmed;
+4. remove the exact temporary name, only while it is still the marker's inode;
+5. `fsync` the run directory again.
+
+Before step 2 succeeds, a failure removes the exact temporary file (a cleanup
+failure leaves one stale temp and is reported) and nothing is installed.
+
+### 2. Marker and temporary-file reading rules
+
+- Only a final `abandonment.json`, valid or not, decides the marker path, and it
+  is checked **before** the inner-entry check and the projection: an entry
+  abandoned because those are corrupt must stay abandoned.
+- A valid final marker is a private regular file (0600, owner) with
+  `st_nlink == 1`, or `st_nlink == 2` with exactly one recognized temporary twin
+  of the same inode (a crash between steps 2 and 4). Anything else is `REFUSED`;
+  an inspection failure is `SUBSTRATE_UNAVAILABLE`.
+- A recognized temporary file alone never proves abandonment, is never
+  `already_abandoned`, and by itself never refuses reconciliation or a retry. It
+  is validated as a private regular file with `st_nlink == 1`, counted from the
+  run directory's single existing listing, reported, and never opened, trusted,
+  or deleted. A retry uses a new random name beside it.
+- Bound `ABANDONMENT_TEMP_MAX = 16`: 0–15 safe stale temps never refuse or
+  block; 16 refuses a new abandonment attempt (so CodeAgent itself never creates
+  a 17th); more than 16 makes reconciliation fail closed (`REFUSED`). Counting
+  stops at 17.
+
+### 3. Marker schema (`schema_version` 1, ≤4096 bytes, canonical JSON)
+
+`schema_version, lifecycle_id, repo_key, state_root_id, disposition
+(ABANDONED | ABANDONED_UNRESOLVED), maintenance_id, timestamp
+(%Y-%m-%dT%H:%M:%SZ)`; for `ABANDONED_UNRESOLVED` only, also `reason` and
+`remaining` (six categorical fields: `baseline_container`,
+`verification_container`, `worktree_registration`, `worktree_admin_entry`,
+`worktree_directory`, `checkpoint_ref`, each `absent`/`present`/`unknown`, at
+least one not `absent`). Exact key set per disposition; identity must match the
+marker's location. No path, SHA, container id, `run_id`, or source path.
+
+**Reason.** Validated by rejection, never truncation: nonempty after stripping,
+at most 256 UTF-8 bytes, no Unicode category Cc, Cf, Zl, Zp, or Cs. It is
+persisted **only** in `abandonment.json`, as §11 requires. Because it is
+operator-controlled and may contain a path, it never appears in the maintenance
+trace (`reason_recorded: true` only), CLI output or warnings, result objects,
+the lease, or `AbandonmentMarker.__repr__`. A future run report (D6) may display
+it only under its accepted redaction rules.
+
+### 4. Presence decision (no initialization)
+
+Every maintenance mode first decides, with no-create opens only, whether the
+repository has recorded state. Nothing is created for a repository CodeAgent
+never ran in.
+
+| # | Observation | Reconcile / dry run | Abandon |
+|---|---|---|---|
+| P1 | State-root directory absent, or present and empty | `CLEAN`, `no_recorded_state` | refused |
+| P2 | State root with content but no valid `state-root.json` | `BLOCKED` | refused |
+| P3 | No repository lock file; `repos/<key>/` and `worktrees/<key>/` absent or empty | `CLEAN`, `no_recorded_state` | refused |
+| P4 | No repository lock file beside any repository-owned state | `BLOCKED` (`repository_lock_missing_with_state`) | refused |
+| P5 | Lock file present → acquired with `create=False` (busy → `BLOCKED`); no namespace state | `CLEAN`, `no_recorded_state` | refused |
+| P6 | `repo.json` absent beside state, corrupt, or identity-mismatched | `BLOCKED` (namespace refused; mismatched field names only) | refused |
+| P7 | `repo.json` valid | proceed | proceed |
+
+A deleted lock file beside recorded state therefore never yields `CLEAN` and
+never permits abandonment.
+
+### 5. Normal and forced abandonment
+
+Order, under the repository lock: the `runs/` trust boundary
+(`_enumerate_runs`), the target run directory, a final marker (refuse
+`already_abandoned` / `marker_invalid`), stale temps (unsafe → refuse; 16 →
+refuse), the target's lifecycle lock (busy or not inode-verified → refuse; a
+missing lock file is created by the established primitive — real abandonment
+only), clean-final (refuse), then a fresh read-only inspection
+(`reconciliation.inspect_remaining_resources`: one Docker listing, one Git
+worktree listing, the bounded admin scan, the descriptor-relative leaf
+observation, the checkpoint-ref observation; with an unreadable projection,
+any container at a role name counts).
+
+- **Normal:** records `ABANDONED` only when all six observations are `absent`;
+  otherwise refused (`resources_remain` or `inspection_failed`), nothing written.
+- **Forced:** records `ABANDONED_UNRESOLVED` only when at least one observation
+  is `present` or `unknown`; when all six are `absent` it is refused
+  (`nothing_remains_use_normal_abandonment`), so no permanent unresolved state
+  is created without a reason.
+- **CodeAgent's own unconfirmed cleanup during inspection** (a descriptor or
+  child process an observer could not confirm released) is reported
+  separately from resource presence (`RemainingResources.cleanup_unconfirmed`)
+  and is never an acknowledgeable "unknown": both forms refuse
+  (`inspection_cleanup_unconfirmed`) before any trace or marker is written,
+  naming `inspection_<observer>` as an unconfirmed stage (exit 4). Ordinary
+  inspection uncertainty stays acknowledgeable by the forced form.
+- Neither form deletes, adopts, rebinds, renames, or mutates a container,
+  worktree, registration, ref, or projection. A refused namespace is never
+  abandoned.
+- Write order: maintenance trace file (exclusive) → marker (§1) →
+  `AbandonmentRecorded`. A refusal before the trace file exists writes nothing
+  except, possibly, a missing `lifecycle.lock`. Once the trace file exists --
+  including when its own setup (mode verification, directory `fsync`) then
+  fails -- the result is `NOT_RECORDED` with that file's `maintenance_id`
+  (`maintenance_trace_unconfirmed` when the trace setup failed): no
+  disposition is recorded, an empty trace file remains, and a retry is
+  possible. Explicit reconciliation likewise reports the id of a trace file
+  that exists when the pass fails, marked incomplete.
+
+### 6. Maintenance trace (`schema_version` stays 1, additive)
+
+- `trigger` is `explicit` for every maintenance command; `pre_run` is unchanged
+  for admission.
+- `ReconciliationEntryRecorded` may carry the outcomes `skipped_abandoned` and
+  `skipped_abandoned_unresolved`, plus `abandonment` (`null` or
+  `{disposition, remaining}`) and `abandonment_temp_leftovers` (0–17).
+- `ReconciliationFinished` gains `entries_skipped_abandoned` and
+  `entries_skipped_abandoned_unresolved`.
+- New `AbandonmentRecorded`: `lifecycle_id`, diagnostic `run_id` (valid
+  projection only), `disposition`, `projection_status`
+  (`valid`/`invalid`/`unavailable`), `remaining`, `reason_recorded`,
+  `marker_publication` (`confirmed`/`durability_unconfirmed`/
+  `temp_cleanup_unconfirmed`), `abandonment_temp_leftovers`. No reason, path, or
+  SHA. Written only after the link succeeded.
+
+### 7. Administratively final entries during admission
+
+Both dispositions are `SKIPPED_ABANDONED*` with zero lock, Docker, or Git calls
+and never block (§10, I11, I14). The pass result carries each unresolved
+entry's `lifecycle_id` and recorded summary (never the reason), and
+`prepare_lifecycle` exposes them as `LifecycleLease.unresolved_acknowledged`.
+The prominent warning is printed today only by `codeagent reconcile`; printing
+it on a run's CLI and in its report is a **mandatory D6 acceptance test** (no run
+CLI exists yet).
+
+### 8. Dry run
+
+A separate read-only planner (`reconciliation.plan_repository`), because the
+real pass creates `maintenance/`, `runs/`, and the trace before it inspects and
+its rows interleave inspection with mutation. The planner shares the real pass's
+classification, probes existing lifecycle locks with `create=False` (released
+at once), attaches the read-only inspection to undecided entries, and reports an
+eligible entry as `PENDING`, which blocks; it never predicts a row's outcome. It
+writes nothing anywhere (no lock file, trace, projection, marker, or directory)
+and has no maintenance identity: it returns `ReconciliationPlan`, which has no
+`maintenance_id`, and the CLI prints `maintenance trace: none`.
+
+### 9. Exit codes and output
+
+| Code | Meaning |
+|---|---|
+| 0 | `CLEAN` (reconcile/dry run), or `ABANDONED` recorded with every stage confirmed |
+| 1 | unexpected internal error (fixed text and exception type name only) |
+| 2 | invalid invocation (grammar, `LIFECYCLE_ID`, reason, or `--repo` not a supported repository) |
+| 3 | `UNRESOLVED_ACKNOWLEDGED`, or `ABANDONED_UNRESOLVED` recorded with every stage confirmed |
+| 4 | `BLOCKED`; any abandonment refusal or `NOT_RECORDED`; or a recorded disposition with any later stage unconfirmed (the disposition is preserved and reported) |
+
+Overall precedence stays `BLOCKED > UNRESOLVED_ACKNOWLEDGED > CLEAN`. One
+ownership boundary starts at the first acquired resource (the state root),
+including setup: every acquired resource receives exactly one release attempt,
+in reverse order, outside any exception handler, even when the body or another
+release raises anything at all. A release failure is recorded by categorical
+stage name (never its message) and makes the result `4`. If an exception is
+already propagating, it is re-raised unchanged after every release, carrying
+the unconfirmed stage names (attribute `codeagent_unconfirmed_stages` and a
+PEP 678 note); the CLI prints them after its fixed internal-error line. The
+first failure is primary and later failures are named (the D1 plan's rule): a
+body exception, including an interrupt (`KeyboardInterrupt`/`SystemExit`),
+always propagates after every release was attempted. An interrupt raised by a
+release propagates in the same way only when no exception was already
+propagating; otherwise it is recorded by stage name, like any other release
+failure, and the body exception remains the one raised (ADR 0005, D3). argparse's own diagnostics are replaced by fixed text plus the usage line
+(exit 2), so an unknown command, extra argument, or malformed option is never
+echoed. Output carries
+identifiers, outcome tokens, fixed details, and categorical summaries only —
+never a host path, the `--repo` value, raw exception text, Git or Docker output,
+or the reason.
+
+### 10. Deferred, with non-claims
+
+- Cross-repository informational reporting (§10's "other repositories … are
+  reported") is deferred.
+- Abandonment never removes resources and never claims cleanup; resources behind
+  `ABANDONED_UNRESOLVED` may stay leaked, and markers are permanent (no
+  retention), so such a repository is never reported clean again.
+- Shapes abandonment cannot clear: a malformed `runs/` entry, a refused
+  namespace, a hostile `lifecycle.lock`, a corrupt final marker, an invalid state
+  root, 16 stale temps. They need manual archival.
+- Stale temps and empty trace files from crashed attempts are never cleaned. A
+  trace may lack `AbandonmentRecorded` after a crash; the marker is
+  authoritative.
+- A missing repository lock beside recorded state blocks maintenance until a run
+  recreates the lock.
+- A4 same-user races remain (including the exact-temp unlink).
+- No `solve`, operator run, model, approval, cancellation, or container chaining.
+- T-E1, T-F1, and T-F2 are not newly mitigated.
+
+### 11. Correction pass (2026-10-04, independent joint review)
+
+An independent review reported six findings; each was reproduced against the
+implementation before any change, by its external probes and by new
+regression tests, and each is corrected without changing scope, abandonment
+semantics, presence rules, exit-code meanings, or threat status:
+
+- **F1** setup leaked the state-root descriptor when `repo-locks/` was unsafe
+  (`LifecycleFsError` outside the `LockError` path) → one setup ownership
+  boundary; that refusal is `repository_lock_unavailable` (`BLOCKED`).
+- **F2** an unexpected release exception stopped later releases, and stages
+  were dropped when a body exception propagated → every release attempted;
+  stages attached to the propagating exception.
+- **F3** argparse echoed operator input → sanitized parser, including
+  subparsers.
+- **F4** inspection collapsed CodeAgent's own `CLEANUP_UNCONFIRMED` into an
+  acknowledgeable `unknown` (forced abandonment exited 3) → kept separately;
+  both forms refuse with a named stage (exit 4). Settled as a refusal, not a
+  recorded disposition, because it occurs before the trace or marker exists.
+- **F5** a trace file created before its setup failed was reported as absent
+  → its `maintenance_id` is carried and reported (`NOT_RECORDED` /
+  incomplete).
+- **F6** a test helper leaked a descriptor → closed; assertions unchanged.
+
+### 12. Evidence (local only)
+
+Verified locally on macOS (Python 3.12.14, Git 2.54.0, Docker 29.8.0 already
+running), 2026-10-04. Implementation and automated-test evidence only, not a
+security review; no Linux CI evidence yet.
+
+- Initial implementation, new test files: `tests/unit/test_abandonment.py` 78,
+  `test_maintenance.py` 60, `test_cli.py` 32,
+  `tests/integration/test_reconcile_cli.py` 36 (real
+  subprocess CLI; real T36, partial-removal, real `COMPLETE` and T37 shapes;
+  real cross-process lock contention; six real SIGKILL publication windows;
+  hostile symlink and hard-link shapes; output and reason sanitization; the
+  console script). Additions: `test_reconciliation.py` +30; +23 across
+  `test_lifecycle_store.py`, `test_state_locks.py`, `test_state_root.py`,
+  `test_repo_identity.py`, `test_lifecycle_fs.py`. No existing test was edited.
+- Directly affected set (10 files): 1,347 passed, forward and reverse.
+- The 17-file focused Milestone-3 set plus the 4 new files: 2,105 passed in
+  reverse. The first forward run had 1 failure in the pre-existing, unmodified
+  `test_skipped_active_via_inconsistent_lock_holder` (its spawned child did
+  not signal readiness within the test's 10 s wait; it passes 5/5 in
+  isolation, with cold starts of 7.4 s and 5.0 s); a forward re-run passed
+  2,105.
+- Full suite: 3,701 passed, 0 skipped with `CODEAGENT_REQUIRE_DOCKER=1`, and
+  3,701 passed, 0 skipped without it (up from 3,442).
+- 28 mutation checks: each failed every named test (run without `-x`); every
+  source file restored byte-for-byte (SHA-256 verified).
+- No leftover CodeAgent containers (all three name families), worktrees,
+  `refs/codeagent` refs, child processes, or default state root;
+  `git diff --check` clean.
+
+- **Correction pass (§11), current totals.** +47 regression tests
+  (`test_maintenance.py` +27 → 87, `test_cli.py` +14 → 46,
+  `test_reconciliation.py` +5, `test_reconcile_cli.py` +1 → 37); the F6 helper
+  in this slice's own `test_maintenance.py` was corrected (descriptor closed,
+  assertions unchanged); no pre-D1 test was edited. The reviewer's external
+  probes: 6 failed before the corrections and 6 passed unmodified after.
+  Directly affected set (10 files): 1,394 passed, forward and reverse. Full
+  suite with `CODEAGENT_REQUIRE_DOCKER=1`: 3,748 passed, 0 skipped. Reverting
+  each correction makes its regression tests fail (10 revert checks); the 28
+  original mutation checks still fail every named test, with sources restored
+  byte-for-byte. These checks and the final runs used `python -B` /
+  `PYTHONDONTWRITEBYTECODE=1`: a first run after the mutation checks loaded a
+  stale `.pyc` from a same-size mutation (M12) restored within the same
+  second; the ignored `__pycache__` was cleared and everything re-run.
+- **Precision pass (2026-10-05).** `_is_own_cleanup_failure` walked only
+  `__cause__` when both links existed, so a cleanup failure in the context
+  branch beside an ordinary explicit cause was missed (independently
+  reproduced). It now traverses both links iteratively, including a
+  suppressed context, with identity-based cycle protection and the unchanged
+  32-object bound. +10 tests (9 classifier cases, three of which fail under the
+  old walk; 1 pinning that a body exception stays primary over a release-time
+  interrupt). Directly affected set: 1,404 passed, forward and reverse. The
+  reviewer's 6 probes pass unchanged. Full suite with
+  `CODEAGENT_REQUIRE_DOCKER=1` and bytecode disabled: 3,758 passed, 0 skipped.

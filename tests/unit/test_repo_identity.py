@@ -647,3 +647,82 @@ def test_repo_json_serialization_under_lock_survives_reread(tmp_path):
         assert payload["object_format"] == identity.object_format
     finally:
         state_root.close()
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 18: load_existing_repo_json never creates
+# ---------------------------------------------------------------------------
+
+
+def test_load_existing_repo_json_absent_with_no_state_returns_none(tmp_path):
+    repo = _make_repo(tmp_path)
+    state_root = _make_state_root(tmp_path)
+    try:
+        identity, lock = _identity_and_lock(tmp_path, state_root, repo)
+        try:
+            assert ri.load_existing_repo_json(state_root, identity, lock) is None
+            assert not (tmp_path / "state-root" / "repos").exists()
+            (tmp_path / "state-root" / "repos" / identity.repo_key).mkdir(parents=True, mode=0o700)
+            assert ri.load_existing_repo_json(state_root, identity, lock) is None
+            assert os.listdir(tmp_path / "state-root" / "repos" / identity.repo_key) == []
+        finally:
+            lock.release()
+    finally:
+        state_root.close()
+
+
+@pytest.mark.parametrize("where", ["repos", "worktrees"])
+def test_load_existing_repo_json_missing_beside_state_is_refused(tmp_path, where):
+    """C3 / M24: missing repo.json beside repository-owned state is never empty."""
+    repo = _make_repo(tmp_path)
+    state_root = _make_state_root(tmp_path)
+    try:
+        identity, lock = _identity_and_lock(tmp_path, state_root, repo)
+        try:
+            (tmp_path / "state-root" / where / identity.repo_key / "runs").mkdir(parents=True, mode=0o700)
+            with pytest.raises(ri.RepoIdentityError) as excinfo:
+                ri.load_existing_repo_json(state_root, identity, lock)
+            assert excinfo.value.reason is ri.RepoIdentityFailure.SUBSTRATE_UNAVAILABLE
+            assert not (tmp_path / "state-root" / "repos" / identity.repo_key / "repo.json").exists()
+        finally:
+            lock.release()
+    finally:
+        state_root.close()
+
+
+def test_load_existing_repo_json_validates_and_names_mismatch(tmp_path):
+    repo = _make_repo(tmp_path)
+    state_root = _make_state_root(tmp_path)
+    try:
+        identity, lock = _identity_and_lock(tmp_path, state_root, repo)
+        try:
+            ri.load_or_create_repo_json(state_root, identity, lock)
+            assert ri.load_existing_repo_json(state_root, identity, lock) == identity
+            other = ri.RepositoryIdentity(**{**identity.__dict__, "st_ino": identity.st_ino + 1})
+            with pytest.raises(ri.RepoIdentityError) as excinfo:
+                ri.load_existing_repo_json(state_root, other, lock)
+            assert excinfo.value.reason is ri.RepoIdentityFailure.IDENTITY_MISMATCH
+            assert excinfo.value.mismatched_fields == frozenset({"st_ino"})
+        finally:
+            lock.release()
+    finally:
+        state_root.close()
+
+
+def test_load_existing_repo_json_corrupt_is_refused(tmp_path):
+    repo = _make_repo(tmp_path)
+    state_root = _make_state_root(tmp_path)
+    try:
+        identity, lock = _identity_and_lock(tmp_path, state_root, repo)
+        try:
+            path = tmp_path / "state-root" / "repos" / identity.repo_key / "repo.json"
+            path.parent.mkdir(parents=True, mode=0o700)
+            path.write_bytes(b"{corrupt")
+            path.chmod(0o600)
+            with pytest.raises(ri.RepoIdentityError):
+                ri.load_existing_repo_json(state_root, identity, lock)
+            assert path.read_bytes() == b"{corrupt"
+        finally:
+            lock.release()
+    finally:
+        state_root.close()

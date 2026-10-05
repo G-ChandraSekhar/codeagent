@@ -3,6 +3,11 @@ name = "codeagent"
 version = "0.0.0"
 requires-python = ">=3.12"
 
+# ADR 0004 Amendment 18 (ledger D1): the maintenance-only CLI. It exposes
+# only `codeagent reconcile`; it never runs a task.
+[project.scripts]
+codeagent = "codeagent.cli:main"
+
 [project.optional-dependencies]
 # Pins the test-runner dependency to the exact version this project's
 # test suite is developed and verified against (see

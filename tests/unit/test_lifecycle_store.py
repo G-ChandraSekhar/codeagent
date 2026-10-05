@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import multiprocessing
 import os
 import signal
@@ -4915,3 +4916,79 @@ def test_a17_shape_is_true_for_every_materialized_worktree_and_non_absent_ref(wt
 def test_a17_shape_excludes_containers_failures_and_absent_resources(mutate):
     projection = mutate(_a17_projection(wl.WorktreeIntent.PRESENT, "present"))
     assert not ls.is_projection_worktree_then_checkpoint_ref_reconciliation_shape(projection)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 18: admission past abandonment markers
+# ---------------------------------------------------------------------------
+
+
+def _seed_abandoned_run(tmp_path, monkeypatch, disposition, *, corrupt=False):
+    from codeagent import abandonment as ab
+    from codeagent import reconciliation as rc
+
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: ({}, {}))
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    lifecycle_id, repo_key = lease.lifecycle_id, lease.repo_key
+    state_root_id = lease.state_root.state_root_id
+    lease.close()
+    run_dir = tmp_path / "state-root" / "repos" / repo_key / "runs" / lifecycle_id
+    (run_dir / "lifecycle.json").write_bytes(b"{unrecoverable")  # would be REFUSED without the marker
+    unresolved = disposition is ab.AbandonmentDisposition.ABANDONED_UNRESOLVED
+    marker = ab.AbandonmentMarker(
+        lifecycle_id=lifecycle_id,
+        repo_key=repo_key,
+        state_root_id=state_root_id,
+        disposition=disposition,
+        maintenance_id="e" * 32,
+        timestamp="2026-10-04T00:00:00Z",
+        reason="/Users/SENTINEL-REASON-9b1c/secret" if unresolved else None,
+        remaining={**{k: "absent" for k in ab.RESOURCE_FIELDS}, "baseline_container": "present"} if unresolved else None,
+    )
+    data = b"{}" if corrupt else ab.marker_to_bytes(marker)
+    (run_dir / ab.MARKER_FILENAME).write_bytes(data)
+    (run_dir / ab.MARKER_FILENAME).chmod(0o600)
+    return lifecycle_id
+
+
+def test_admission_proceeds_past_abandoned_without_warning(tmp_path, monkeypatch):
+    from codeagent import abandonment as ab
+
+    _seed_abandoned_run(tmp_path, monkeypatch, ab.AbandonmentDisposition.ABANDONED)
+    with ls.prepare_lifecycle(str(tmp_path / "repo"), run_id="after") as lease:
+        assert lease.unresolved_acknowledged == ()
+
+
+def test_admission_proceeds_past_unresolved_and_exposes_it_without_reason(tmp_path, monkeypatch):
+    from codeagent import abandonment as ab
+
+    lifecycle_id = _seed_abandoned_run(tmp_path, monkeypatch, ab.AbandonmentDisposition.ABANDONED_UNRESOLVED)
+    with ls.prepare_lifecycle(str(tmp_path / "repo"), run_id="after") as lease:
+        (ack,) = lease.unresolved_acknowledged
+        assert ack.lifecycle_id == lifecycle_id
+        assert ack.remaining["baseline_container"] == "present"
+        assert "SENTINEL-REASON" not in repr(lease.unresolved_acknowledged)
+
+
+def test_admission_blocks_on_a_corrupt_marker(tmp_path, monkeypatch):
+    from codeagent import abandonment as ab
+
+    _seed_abandoned_run(tmp_path, monkeypatch, ab.AbandonmentDisposition.ABANDONED, corrupt=True)
+    with pytest.raises(ls.LifecycleStoreError) as excinfo:
+        ls.prepare_lifecycle(str(tmp_path / "repo"), run_id="after")
+    assert excinfo.value.reason is ls.LifecycleStoreFailure.RECONCILIATION_BLOCKED
+
+
+def test_admission_reconciles_a_temp_alone_entry_normally(tmp_path, monkeypatch):
+    from codeagent import reconciliation as rc
+
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: ({}, {}))
+    lease = _prepared_lease(tmp_path, monkeypatch)
+    run_dir = tmp_path / "state-root" / "repos" / lease.repo_key / "runs" / lease.lifecycle_id
+    lease.close()
+    temp = run_dir / (".abandonment.json.tmp-" + "0" * 16)
+    temp.write_bytes(b"stale")
+    temp.chmod(0o600)
+    ls.prepare_lifecycle(str(tmp_path / "repo"), run_id="after").close()
+    assert json.loads((run_dir / "lifecycle.json").read_text())["state"] == "RECONCILED"
+    assert temp.read_bytes() == b"stale"

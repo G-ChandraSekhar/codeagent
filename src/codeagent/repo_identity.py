@@ -512,3 +512,108 @@ def _load_or_create_repo_json_using_dir_fd(
                 "repo.json's descriptor could not be confirmed closed",
             ) from cleanup_exc
         return result
+
+
+def load_existing_repo_json(
+    state_root, identity: RepositoryIdentity, repo_lock: LockHandle
+) -> RepositoryIdentity | None:
+    """The maintenance commands' validate-only counterpart of
+    `load_or_create_repo_json` (ADR 0004 Amendment 18, presence rows
+    P5/P6). Never creates `repos/<repo-key>/` or `repo.json`.
+
+    Returns `None` only when `repo.json` is absent **and** neither
+    `repos/<repo-key>/` nor `worktrees/<repo-key>/` holds any other
+    state -- the same "no state" shape `load_or_create_repo_json` would
+    initialize. A missing `repo.json` beside any repository-owned state
+    is `SUBSTRATE_UNAVAILABLE` (ADR 0004 section 4), never treated as
+    empty; an existing file is validated exactly as on every run."""
+    _require_repository_lock(repo_lock, identity.repo_key)
+
+    dir_fd = state_root.open_repo_dir_if_present(identity.repo_key)
+    if dir_fd is None:
+        worktrees_fd = state_root.open_worktrees_repo_dir_if_present(identity.repo_key)
+        if worktrees_fd is None:
+            return None
+        try:
+            has_state = bool(list_directory_entries(worktrees_fd))
+        except BaseException as exc:
+            try:
+                close_confirmed([worktrees_fd])
+            except LifecycleFsError:
+                raise RepoIdentityError(
+                    RepoIdentityFailure.SUBSTRATE_UNAVAILABLE,
+                    "the worktrees namespace descriptor could not be confirmed closed",
+                ) from exc
+            raise
+        try:
+            close_confirmed([worktrees_fd])
+        except LifecycleFsError as cleanup_exc:
+            raise RepoIdentityError(
+                RepoIdentityFailure.SUBSTRATE_UNAVAILABLE,
+                "the worktrees namespace descriptor could not be confirmed closed",
+            ) from cleanup_exc
+        if has_state:
+            raise RepoIdentityError(
+                RepoIdentityFailure.SUBSTRATE_UNAVAILABLE,
+                "repo.json is missing while repository-owned state exists",
+            )
+        return None
+
+    try:
+        result = _load_existing_repo_json_using_dir_fd(state_root, dir_fd, identity)
+    except BaseException as exc:
+        try:
+            close_confirmed([dir_fd])
+        except LifecycleFsError:
+            raise RepoIdentityError(
+                RepoIdentityFailure.SUBSTRATE_UNAVAILABLE,
+                "repo.json's parent directory descriptor could not be confirmed closed",
+            ) from exc
+        raise
+    try:
+        close_confirmed([dir_fd])
+    except LifecycleFsError as cleanup_exc:
+        raise RepoIdentityError(
+            RepoIdentityFailure.SUBSTRATE_UNAVAILABLE,
+            "repo.json's parent directory descriptor could not be confirmed closed",
+        ) from cleanup_exc
+    return result
+
+
+def _load_existing_repo_json_using_dir_fd(
+    state_root, dir_fd: int, identity: RepositoryIdentity
+) -> RepositoryIdentity | None:
+    flags = os.O_RDONLY | _nofollow_flag() | _cloexec_flag()
+    try:
+        fd = os.open(REPO_JSON_FILENAME, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        if _namespace_has_other_state(state_root, dir_fd, identity):
+            raise RepoIdentityError(
+                RepoIdentityFailure.SUBSTRATE_UNAVAILABLE,
+                "repo.json is missing while repository-owned state exists",
+            ) from None
+        return None
+    except OSError:
+        raise RepoIdentityError(
+            RepoIdentityFailure.SUBSTRATE_UNAVAILABLE, "repo.json could not be opened"
+        ) from None
+
+    try:
+        result = _validate_existing_repo_json(fd, identity)
+    except BaseException as exc:
+        try:
+            close_confirmed([fd])
+        except LifecycleFsError:
+            raise RepoIdentityError(
+                RepoIdentityFailure.SUBSTRATE_UNAVAILABLE,
+                "repo.json's descriptor could not be confirmed closed",
+            ) from exc
+        raise
+    try:
+        close_confirmed([fd])
+    except LifecycleFsError as cleanup_exc:
+        raise RepoIdentityError(
+            RepoIdentityFailure.SUBSTRATE_UNAVAILABLE,
+            "repo.json's descriptor could not be confirmed closed",
+        ) from cleanup_exc
+    return result

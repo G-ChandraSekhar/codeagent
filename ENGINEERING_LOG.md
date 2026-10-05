@@ -6348,3 +6348,170 @@ statement, so it is unchanged. Boundaries are unchanged: no cross-resource
 atomicity, A4 races open, T36 still blocks, the deferred work stays deferred.
 GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence, not a security
 review. `uv.lock` untouched.
+
+## 2026-10-04 — Ledger D1: abandonment, explicit reconciliation, and `codeagent reconcile` (ADR 0004 Amendment 18, Proposed)
+
+**What.** Implements the approved revision-2 D1 plan: explicit reconciliation
+(trigger `explicit`), a truthful read-only dry run, normal and forced
+abandonment, the maintenance trace's `AbandonmentRecorded`, administratively
+final markers during admission, and the maintenance-only `codeagent` console
+script (`reconcile` only; it never runs a task). Unstaged for joint review; not
+committed or pushed. Amendment 18 is **Proposed**.
+
+**Decisions (joint review, recorded in Amendment 18):** dry run classifies and
+observes but never predicts (eligible = `PENDING`, blocking); §11's `O_EXCL`
+refined to temp + no-replace hard link + dir fsync + exact-temp unlink + dir
+fsync; disposition-based abandon exits (0/3/4); forced acknowledgement refused
+when nothing remains; no initialization for no-state repositories; any
+unconfirmed stage after the link → exit 4 with the disposition preserved; the
+run-time warning is a D6 test; cross-repository reporting deferred; the reason
+is persisted only in the marker; real abandonment may create a missing
+lifecycle lock, the dry run never does.
+
+**Ordinary coding discoveries, resolved within the design:**
+- The trace writer, the dry run, and the presence decision all needed
+  no-create variants (`StateRoot.open_existing_state_root`,
+  `open_repo_dir_if_present`, `open_repo_locks_dir_if_present`,
+  `acquire_*_lock(create=False)` → `LockFailure.ABSENT`,
+  `load_existing_repo_json`).
+- `load_abandonment_marker` takes the caller's single run-directory listing
+  (the twin rule needs it), so marker, temp, and inner-entry checks share one
+  listing.
+- `maintenance.py` also imports `reconciliation._enumerate_runs`, for row 1's
+  `runs/` trust boundary; the import-name pin lists it explicitly.
+- Publication durability is conservative: either directory `fsync` failing
+  reports `durability_unconfirmed`.
+- An explicit pass that raises after creating its trace reports
+  `maintenance_id: None` (the id is never returned); the trace exists on disk.
+
+**Test corrections in this slice's own new tests (none to existing tests):**
+the T36 crash point precedes checkpoint-ref creation, so the T36 test asserts
+refs *unchanged* rather than present, and the dry-run invariance test gained a
+real T37 case (worktree + checkpoint ref) to cover a real ref; `prepare_lifecycle`
+setup writes its own `pre_run` traces, so "no trace written" assertions count
+only explicit traces.
+
+**Ledger arithmetic.** D1 24–40 h and Gate O 54–102 h as approved; the later
+cumulative rows and the public-v1 total move by the same +8 h (282–562) so the
+table stays internally consistent.
+
+**Environment.** At preflight `docker info` could not reach the daemon; it
+became reachable moments later without any action from this session (Docker
+was not started or restarted here).
+
+**Verified (macOS, Docker already running).** New files: abandonment 78,
+maintenance 60, CLI 32, real-substrate CLI integration 36; `test_reconciliation.py`
++30; +23 across the five substrate test files; no existing test edited.
+Directly affected set 1,347 passed forward and reverse. 17-file focused set plus
+the 4 new files: 2,105 in reverse; the first forward run had one failure in the
+pre-existing, unmodified `test_skipped_active_via_inconsistent_lock_holder` (a
+spawned child missed its 10 s readiness wait; 5/5 in isolation with cold starts
+of 7.4 s and 5.0 s), and a forward re-run passed 2,105. Full suite 3,701 passed,
+0 skipped, with and without `CODEAGENT_REQUIRE_DOCKER=1` (up from 3,442). All 28
+mutations caught by every named test and restored byte-for-byte. No leftover
+containers, worktrees, refs, processes, or default state root; `git diff
+--check` clean. Not committed, not pushed, no Linux CI. `uv.lock` untouched.
+
+## 2026-10-04 — D1 correction pass (independent joint review F1–F6; Amendment 18 still Proposed)
+
+**What.** An independent review reported six findings against the unstaged D1
+implementation. Each was treated as evidence, not authority: all six were
+reproduced first (the reviewer's external probes failed 6/6; the cause was
+then confirmed in source) and all six were confirmed and corrected. Scope,
+abandonment semantics, presence rules, exit-code meanings and threat status are
+unchanged.
+
+- **F1 (confirmed)** `_open_session` caught only `LockError`; an unsafe
+  `repo-locks/` raised `LifecycleFsError` from `open_repo_locks_dir_if_present`
+  after the state root was held, leaking it and reaching the CLI as exit 1.
+  Fix: one ownership boundary from the first acquired resource
+  (`_acquire_session` inside it); that refusal is `repository_lock_unavailable`.
+- **F2 (confirmed)** `_attempt` caught four declared types, so an unexpected
+  release exception skipped later releases; stages were dropped when a body
+  exception propagated. Fix: every release attempted; `Exception`s become
+  categorical stage names; a release-time interrupt is recorded and
+  re-raised after all releases only when no body exception is already
+  propagating (first failure is primary; later failures are named, per the
+  D1 plan); a propagating exception keeps its identity and carries
+  `codeagent_unconfirmed_stages` plus a PEP 678 note, which the CLI prints.
+- **F3 (confirmed)** argparse's own diagnostics echoed input. Fix: a
+  sanitizing parser class (inherited by subparsers): fixed text, usage, exit 2.
+- **F4 (confirmed)** inspection reduced CodeAgent's own `CLEANUP_UNCONFIRMED`
+  (and, by the same path, `BoundedProcessError` termination/cleanup and Git
+  process-cleanup failures) to an acknowledgeable `unknown`; forced
+  abandonment exited 3. Fix: `RemainingResources.cleanup_unconfirmed`, kept
+  apart from presence; both forms refuse before any write with
+  `inspection_<observer>` stages (exit 4); the dry run names them. Decision:
+  refuse rather than record-with-stage, since it happens before the trace or
+  marker exists. Ordinary inspection uncertainty stays acknowledgeable.
+- **F5 (confirmed)** the opener could create the trace file and then fail
+  (directory `fsync`, or mode verification after the exclusive create)
+  without returning its id. Fix: `ReconciliationError.maintenance_id`, set
+  whenever a trace file exists (opener and pass level); abandonment reports
+  `NOT_RECORDED` / `maintenance_trace_unconfirmed` with the id; explicit
+  reconcile reports the id as incomplete.
+- **F6 (confirmed)** `_assert_recorded` leaked a descriptor; now closed, with
+  its assertions unchanged.
+
+**Docs (bounded):** the ledger's status line now records its acceptance and
+commit (`304bcb1`) without rewriting its evidence; §2.1 says there is no other
+*task-running* entry point; the abandonment row's "every blocked entry has an
+operator exit" is qualified by its trusted-namespace preconditions. Amendment
+18 gained the corrected rules and a correction-pass section; it stays Proposed.
+
+**Process finding.** The first post-correction run failed 40 CLI tests with
+exit codes 3/4 swapped although the source was correct: mutation M12 swaps two
+same-length digits, and its byte-restore landed in the same second, so Python's
+mtime+size `.pyc` check reused the mutated bytecode. The ignored `__pycache__`
+was cleared, the mutation/revert scripts and verification now run with
+`-B`/`PYTHONDONTWRITEBYTECODE=1`, and everything was re-run.
+
+**Verified (macOS, Docker 29.8.0 already running).** +47 regression tests; the
+reviewer's 6 probes pass unmodified; directly affected set 1,394 passed forward
+and reverse; full suite 3,748 passed, 0 skipped with
+`CODEAGENT_REQUIRE_DOCKER=1`; 10 revert checks and the 28 mutation checks all
+caught, sources restored byte-for-byte. No leftover containers, worktrees,
+refs, processes, fixture directories or default state root; `git diff --check`
+clean; nothing staged. `uv.lock` untracked and untouched.
+
+## 2026-10-05 — D1 precision pass (Amendment 18 still Proposed)
+
+**Finding (confirmed by independent reproduction).** `_is_own_cleanup_failure`
+advanced with `current.__cause__ or current.__context__`, so with both links
+present it followed only the cause; a `LifecycleFsError(CLEANUP_UNCONFIRMED)`
+in the context branch beside an ordinary explicit cause returned `False`. Fix:
+an iterative traversal of both links (a suppressed context included, since it
+may hold the real cleanup failure), cycle-safe by object identity, bounded at
+32 distinct exceptions (`_CLEANUP_CHAIN_MAX_OBJECTS`, unchanged). Ordinary
+inspection uncertainty is unchanged: still acknowledgeable by the forced form;
+own-cleanup failures still refuse with exit 4.
+
+**Tests.** 9 classifier cases: cause-only, context-only, both branch
+arrangements, suppressed context, self-cycle, two-exception cycle, no failure,
+and the 32-object bound; 3 of them fail under the old walk (checked by
+temporary revert, byte-restored). One more pins the documented precedence
+below.
+
+**Wording corrected.** Amendment 18, the 2026-10-04 correction entry and the
+`_Releases` docstring implied a release-time interrupt always propagates. The
+implementation follows the D1 plan's rule — the first failure is primary,
+later failures are named: a release-time interrupt propagates only when no
+body exception is already propagating; otherwise it is recorded by stage. No
+precedence change. The accepted ledger's "Once approved, this ledger is…" is
+now present tense.
+
+**Verified (macOS, Docker 29.8.0 already running, bytecode disabled).**
+Directly affected set 1,404 passed forward and reverse; reviewer probes 6/6
+unchanged; full suite 3,758 passed, 0 skipped with
+`CODEAGENT_REQUIRE_DOCKER=1`; `git diff --check` clean; no leftovers. Not
+committed or pushed; no Linux CI. `uv.lock` untouched.
+
+## 2026-10-05 — D1 joint acceptance (ADR 0004 Amendment 18 Accepted)
+
+Joint review accepted ADR 0004 Amendment 18 and the D1 implementation after the
+correction and precision passes. Current status text in ADR 0004, `CLAUDE.md`,
+`docs/V1_COMPLETION_LEDGER.md` and `docs/threat-model.md` now says "Accepted
+2026-10-05"; earlier entries here are unchanged. No behavior, API, test,
+total, threat conclusion or estimate changed. Acceptance is not Linux CI
+evidence: D1 remains Linux-CI-pending, and Gate O remains unsatisfied until D2
+and D3.

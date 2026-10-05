@@ -955,6 +955,19 @@ def _classify_publication_failure(exc: LifecycleFsError) -> LifecycleStoreError:
     )
 
 
+@dataclass(frozen=True)
+class UnresolvedAcknowledgement:
+    """An `ABANDONED_UNRESOLVED` entry the automatic pass admitted past (ADR
+    0004 section 10, Amendment 18). Carries the `lifecycle_id` and the
+    recorded categorical remaining-resource summary only -- never the
+    operator's reason, which is persisted only in abandonment.json. A run
+    admitted past such an entry must surface a prominent warning naming
+    each one (the run CLI/report warning is a D6 acceptance test)."""
+
+    lifecycle_id: str
+    remaining: dict
+
+
 class LifecycleLease:
     """Owns every resource `prepare_lifecycle` acquires, for the
     caller's required lifetime: the state-root descriptor, the
@@ -996,6 +1009,9 @@ class LifecycleLease:
         # (Slice 3B-2, ADR 0004 Amendment 3) — never inferred from a
         # caller-supplied SHA or from untrusted projection content.
         self.object_format = object_format
+        # ADR 0004 Amendment 18: entries admitted past only because the
+        # operator acknowledged their unresolved resources.
+        self.unresolved_acknowledged: tuple[UnresolvedAcknowledgement, ...] = ()
         self._closed = False
 
     def __enter__(self) -> "LifecycleLease":
@@ -2337,6 +2353,11 @@ def prepare_lifecycle(source_repo_path: Path | str, *, run_id: str) -> Lifecycle
                 LifecycleStoreFailure.RECONCILIATION_BLOCKED,
                 "automatic pre-run reconciliation found an unresolved entry and blocked this run",
             )
+        lease.unresolved_acknowledged = tuple(
+            UnresolvedAcknowledgement(lifecycle_id=entry.lifecycle_id, remaining=dict(entry.abandonment_remaining))
+            for entry in reconciliation_result.entries
+            if entry.abandonment_disposition == "ABANDONED_UNRESOLVED"
+        )
 
         lifecycle_id = new_lifecycle_id()
 
