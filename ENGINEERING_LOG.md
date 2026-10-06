@@ -6688,3 +6688,44 @@ available" errors, not code failures.
 
 Not committed; no Linux CI. `uv.lock` untouched. The estimate and arithmetic
 are unchanged, and Gate O remains unsatisfied until D3.
+
+## 2026-10-06 — D2 / ADR 0004 Amendment 19: Linux CI evidence reconciliation
+
+**What.** A documentation-only pass recording that commit `639fdc5` (an
+ordinary fast-forward, `851598d..639fdc5`, not forced) passed GitHub Actions
+run
+[37527217946](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37527217946).
+I re-verified it independently from the Actions API and a freshly fetched raw
+job log. The complete counts, environment and image evidence are recorded once,
+in ADR 0004 Amendment 19 §13. There is no code, test, workflow, configuration,
+dependency, design or threat-status change.
+
+**Limits.**
+
+- The dedicated Docker step's file holds no D2 test.
+- `pytest -q` names no tests: that T36, T48–T52, the refusal tests and the
+  reconciler SIGKILL tests ran is an inference from the complete-suite
+  command, the matching collected total and the successful result.
+- The skips are not identified and not attributed to Docker.
+
+**Updated (current status only).**
+
+- ADR 0004 Amendment 19: the status line, the §11 pending sentence, and a new
+  §13.
+- `CLAUDE.md`: the D2 entry.
+- `docs/V1_COMPLETION_LEDGER.md`:
+  - D2 is done and Linux-CI-confirmed;
+  - D3 is the next release-blocking dependency;
+  - the live-container row is now `MECHANISM_VERIFIED`;
+  - the documented-shapes row's remaining gap moves to the C-1 mid-recreate
+    shape (D5) and the operator path.
+- `docs/threat-model.md`: the Amendment 19 sentences in T-F1.
+
+Earlier entries and historical CI records are unchanged.
+
+**Boundaries unchanged.** No cross-resource atomicity; A4 stays open; a late
+orphaned Docker child can still force a refusal; abandonment is unchanged.
+T-F1 has only partial, reconciler-level coverage for the two accepted shapes;
+T-E1 and T-F2 are unchanged. This is GitHub-hosted `ubuntu-24.04` x86_64
+automated-test evidence, not a security review. Gate O remains unsatisfied
+until D3 lands. `uv.lock` untouched.

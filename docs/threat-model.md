@@ -777,15 +777,17 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   `lifecycle_store.prepare_lifecycle()`) that removes a dead lifecycle's
   exactly attributed, labeled container by immutable id and confirms its
   absence with a fresh listing (Slice 3B-5). ADR 0004 Amendment 19
-  (Accepted 2026-10-05; ledger D2) extends that removal to the one further
-  shape a dead owner leaves when killed mid-verification, or when its
-  container cleanup is unconfirmed: one owned non-absent container beside a
+  (Accepted 2026-10-05; ledger D2) extends that removal to the two further
+  owner-producible chained shapes a dead owner leaves when killed during a
+  baseline or verification run, or when its container cleanup is unconfirmed: one owned non-absent container beside a
   `present` worktree -- a baseline with the checkpoint ref absent, or a
   verification with the ref non-absent (the only two shapes the owner can
   produce; both roles together, a baseline with a ref, or a verification
   without one are refused). It removes the container, then the worktree, then
   the ref, each phase behind a fresh gate, with no cross-resource atomicity. This is partial, reconciler-level coverage for
-  that exact shape only, verified locally; Linux CI is pending. None of this is **wired**: no
+  those two exact shapes only, confirmed on GitHub-hosted `ubuntu-24.04` x86_64 CI
+  (commit `639fdc5`, run 37527217946; full evidence and limits in ADR 0004
+  Amendment 19 §13). None of this is **wired**: no
   CLI or controller path calls `prepare_lifecycle()` or constructs a
   lifecycle-aware `DockerVerifier`, and the default `DockerVerifier` path
   still creates unlabeled, UUID-suffixed `codeagent-verify-*` containers
@@ -822,7 +824,9 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   not a security review. Amendment 19 adds real-Docker owner crashes beside
   a live worktree (`test_lifecycle_run.py` T36, T48-T52, including a
   running container and an unlabeled impostor) and real reconciler SIGKILL
-  boundaries; local only so far. Still required: production acceptance tests for
+  boundaries. These also ran in the complete suite of CI run 37527217946,
+  though `pytest -q` names no tests, so their execution there is inferred
+  from the matching total. Still required: production acceptance tests for
   the wired path and for ADR 0005
 - Residual risk: a signal handler cannot guarantee cleanup against SIGKILL
   (which cannot be caught) — the only honest mitigation is a startup-time

@@ -2916,8 +2916,12 @@ Stage 2 (of the four-stage planning process in
     open; T-E1, T-F1 and T-F2 are not newly mitigated; abandonment still
     refuses while an observer's own cleanup cannot be confirmed.
 - **Ledger D2: live-container → worktree → checkpoint-ref reconciliation**,
-  per ADR 0004 "Amendment 19 (**Accepted** 2026-10-05)". **Implemented and
-  locally validated on macOS (2026-10-05); uncommitted, Linux CI pending.**
+  per ADR 0004 "Amendment 19 (**Accepted** 2026-10-05)". **Implemented,
+  locally validated on macOS (2026-10-05, corrected 2026-10-06), committed
+  (`639fdc51c88edca5c9354818a7bf2ee58fd6cbff`) as an ordinary fast-forward over
+  `851598d`, and confirmed on GitHub-hosted Linux CI** (run
+  [37527217946](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37527217946),
+  `completed` / `success`; full evidence in Amendment 19 §13).
   - **What it adds:** a chained reconciliation row
     (`reconciliation._reconcile_container_then_worktree_entry`) for exactly
     two owner-producible shapes beside a `present` worktree, in
@@ -2969,9 +2973,16 @@ Stage 2 (of the four-stage planning process in
     - 23-file focused set: 2,473 passed, forward and reverse;
     - full suite: 3,994 passed, 0 skipped (`CODEAGENT_REQUIRE_DOCKER=1`);
     - no leftovers.
+  - **Linux CI limits:** the complete suite's collected total matched the
+    local total. `pytest -q` names no tests, so the execution of T36,
+    T48–T52, the refusal tests and the reconciler SIGKILL tests is inferred,
+    not named. The skipped tests are not identified and are not attributable
+    to Docker. Exact counts and timings are only in Amendment 19 §13. The dedicated Docker step's `test_slice_c.py`
+    holds no D2 test. This is GitHub-hosted `ubuntu-24.04` x86_64
+    automated-test evidence, not a security review.
   - **Boundaries:** no cross-resource atomicity; A4 races remain open; a late
     orphaned Docker child can still force a refusal; abandonment is unchanged.
-    T-F1 gains partial, reconciler-level coverage for this shape only. **Gate
+    T-F1 gains partial, reconciler-level coverage for these two accepted shapes only. **Gate
     O remains unsatisfied until D3.**
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first

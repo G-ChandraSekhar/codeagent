@@ -5496,7 +5496,8 @@ section.
 
 **Status: Accepted 2026-10-05** after joint review (proposed 2026-10-05),
 with an implementation-time correction on 2026-10-06 (§12) made before D2 was
-staged or committed. Ledger deliverable D2. Gate O remains unsatisfied after D2, because D3 (ADR 0005
+staged or committed. Committed as `639fdc5` and confirmed on GitHub-hosted
+Linux CI (run 37527217946; §13). Ledger deliverable D2. Gate O remains unsatisfied after D2, because D3 (ADR 0005
 cancellation and the CLI signal boundary) is still missing.
 
 **Purpose.** Every existing worktree or ref row (Amendments 12, 13, 16, 17)
@@ -5875,8 +5876,8 @@ container name, path, SHA, command output or exception text is ever recorded.
 ### 11. Implementation status (2026-10-05, corrected 2026-10-06)
 
 Implemented and verified locally (macOS, Docker 29.8.0, `CODEAGENT_REQUIRE_DOCKER=1`).
-Uncommitted and not pushed; **Linux CI is pending**, and nothing here is CI
-evidence.
+The local results below are local evidence only. The commit and Linux CI
+evidence are in §13.
 
 **Production changes.** Only two production files changed:
 
@@ -6015,3 +6016,61 @@ matching pre-lock refusal cases:
 
 C1, the Gate A → C → W → R order, the trace semantics, the D2 estimate and
 arithmetic, every non-claim, and Gate O's unsatisfied status are unchanged.
+
+### 13. Linux CI evidence (2026-10-06)
+
+**Confirmed on GitHub-hosted Linux CI.** Commit
+`639fdc51c88edca5c9354818a7bf2ee58fd6cbff` ("feat: chain live-container
+reconciliation") was pushed as an ordinary fast-forward (`851598d..639fdc5`,
+not forced). Run
+[37527217946](https://github.com/G-ChandraSekhar/codeagent/actions/runs/37527217946)
+was independently re-verified from the Actions API and a freshly fetched raw
+job log.
+
+- **Run:** push-triggered on `main`; exact head SHA; attempt 1;
+  `completed` / `success`.
+- **Job:** exactly one, "Test (ubuntu-24.04, Python 3.12)". All 13 reported
+  steps `success`; zero `##[error]` lines in the raw log.
+- **Environment:**
+  - runner image `ubuntu-24.04`, version 20260927.320.1 (Ubuntu 24.04.5 LTS);
+  - CPython 3.12.14 and pytest 9.1.1;
+  - Git 2.55.0;
+  - Docker Engine - Community 28.0.4, client and server.
+- **Image:** the pinned
+  `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`,
+  which reported platform `linux/amd64`.
+- **Dedicated Docker step:**
+  `python -m pytest tests/integration/test_slice_c.py -v` with
+  `CODEAGENT_REQUIRE_DOCKER: 1` gave `4 passed in 2.80s`, all four named
+  `PASSED`. That file contains no D2-specific test.
+- **Complete suite:** `python -m pytest -q`, with `CODEAGENT_REQUIRE_DOCKER: 1`
+  in that step's own environment, gave `3991 passed, 3 skipped in 160.22s`,
+  0 failed. 3,991 + 3 = 3,994, matching the local collected total (all 3,994
+  passed locally, 0 skipped).
+- **Leftover-container check:** a full `docker ps -a --format '{{.Names}}'`
+  listing filtered through the anchored
+  `grep -E '^codeagent-(verify-|baseline-|verification-)'`, covering all three
+  CodeAgent container families (detection only). It printed nothing, and the
+  step succeeded.
+
+**Limits.**
+
+- `pytest -q` names no tests, so the log gives no named evidence for T36,
+  T48–T52, the non-producible-shape refusal tests, or the reconciler SIGKILL
+  tests. That they ran is an inference from the complete-suite command, the
+  matching 3,994-test total, and the successful run.
+- The three skipped tests are not identified, and are not guessed here. They
+  are not attributable to Docker, which was required and available in that
+  step.
+- This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence, not a
+  security review.
+
+**Boundaries unchanged by this evidence.**
+
+- There is no cross-resource atomicity, and the A4 same-user races remain open.
+- A late orphaned Docker child can still force a refusal.
+- Abandonment is unchanged.
+- T-F1 gains only partial, reconciler-level coverage for the two accepted
+  shapes; T-E1, T-F2 and every other threat are unchanged.
+- Nothing is wired to an operator entry point, and **Gate O remains
+  unsatisfied until D3 lands**.
