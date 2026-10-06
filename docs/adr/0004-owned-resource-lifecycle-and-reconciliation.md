@@ -5007,6 +5007,9 @@ name or id, path, Docker or Git output, or exception text is recorded.
 - **Still blocking:** a live container alongside a worktree (T36), every
   Amendment 13 and 16 refusal, a never-registered `creating` worktree with a
   ref, and abandonment-only cases.
+  *Superseded in part (Amendment 19, Accepted 2026-10-05): the T36 shape, and
+  container chaining generally, are now reconciled; the other cases still
+  block. Historical text kept.*
 - **Not implemented:** live-container cleanup or container chaining,
   Amendment 12-plus-ref recovery, abandonment, ADR 0005 cancellation, CLI or
   operator wiring, ref sweeping, `git prune`, or any live-owner change.
@@ -5138,6 +5141,9 @@ This evidence changes none of §6's non-claims:
 - T36 still blocks. Live-container chaining, Amendment 12-plus-ref recovery,
   abandonment, ADR 0005 cancellation, CLI wiring and operator wiring remain
   unimplemented.
+  *Superseded in part: abandonment was implemented by Amendment 18, and T36
+  and live-container chaining by Amendment 19 (Accepted 2026-10-05).
+  Historical text kept.*
 - T-E1 and T-F1 are unchanged; T-F2 and T-M1 have only partial,
   reconciler-level coverage.
 - This is GitHub-hosted `ubuntu-24.04` x86_64, automated-test evidence, not a
@@ -5483,3 +5489,529 @@ section.
   abandonment still refuses while an observer's own cleanup cannot be
   confirmed. This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test
   evidence, not a security review.
+
+---
+
+## Amendment 19 (Accepted 2026-10-05): chaining a dead run's owned containers into its worktree and checkpoint-ref removal; correcting Amendment 5's worktree-absence check
+
+**Status: Accepted 2026-10-05** after joint review (proposed 2026-10-05),
+with an implementation-time correction on 2026-10-06 (§12) made before D2 was
+staged or committed. Ledger deliverable D2. Gate O remains unsatisfied after D2, because D3 (ADR 0005
+cancellation and the CLI signal boundary) is still missing.
+
+**Purpose.** Every existing worktree or ref row (Amendments 12, 13, 16, 17)
+requires both container records `absent`. The only container-removal row
+(Amendment 5) requires the worktree and the ref `absent`. A dead run with an
+owned, non-absent container beside a `present` worktree therefore blocks
+admission until abandonment. This is T36: the owner SIGKILLed after baseline
+`present(id)`, with a real container in state `Created`, the worktree
+`present`, and the ref `absent`.
+
+This amendment recovers exactly the two owner-producible container shapes
+beside a `present` worktree (§1, §2), in §9's order: **containers → worktree
+→ checkpoint ref**. T36 becomes reconcilable.
+
+What this amendment changes, precisely:
+
+- no accepted ownership or ordering rule is relaxed;
+- it adds one chained reconciliation row;
+- it corrects Amendment 5's unsafe worktree-absence implementation (§5);
+- it updates T36 and D1's evidence as disclosed corrections (§7).
+
+### 1. Owner-producible shapes (basis for eligibility)
+
+Traced from `controller.py` and `_terminate()`:
+
+- A container exists only during a `DockerVerifier` invocation. The worktree
+  record is `present` for that whole period: `GitWorktree.__enter__` raises
+  if its `present` publication fails, so no verifier runs after it.
+- `activate()` (`PREPARING -> ACTIVE`) precedes the baseline, and a failed
+  activation never reaches a verifier. No container exists in `PREPARING`.
+- When the lifecycle-aware verifier cannot confirm a container's cleanup, its
+  result is `ENVIRONMENT_FAILURE` (`executor.py`). For the baseline, the
+  controller then terminates before any patch or verification
+  (`controller.py`); for a verification, the run also terminates. So a
+  non-absent baseline is never followed by a ref or a verification
+  container, and a verification container exists only after a patch has
+  created the ref. *(Corrected 2026-10-06: this bullet previously said, wrongly,
+  that an unconfirmed baseline cleanup only sets a flag and the run
+  continues.)*
+- The owner can therefore leave exactly two container shapes beside a
+  `present` worktree:
+  - **baseline family:** baseline non-absent, verification absent, ref
+    absent;
+  - **verification family:** baseline absent, verification non-absent, ref
+    non-absent.
+- **Non-crash route.** If teardown finds a verifier cleanup unconfirmed, it
+  calls `preserve()`, skips ref deletion, and never calls `complete()`. This
+  leaves `CLEANING`, one non-absent container (of either family), and a
+  `present` worktree. This row recovers that shape too.
+- No owner path produces a non-absent container with a `creating`,
+  `disposing` or `absent` worktree record.
+
+### 2. Eligibility
+
+New predicate,
+`lifecycle_store.is_projection_container_then_worktree_reconciliation_shape`:
+
+- the state is exactly `ACTIVE`, `CLEANING` or `RECONCILING`;
+- the worktree record is exactly `present`, with its origin commit;
+- `failure` is null;
+- and exactly one of the two families:
+  - **baseline family:** the baseline record is non-absent (`creating`,
+    `present(id)` or `removing(id)`), the verification record is exactly
+    `absent` with no id, and the checkpoint-ref record is exactly the absent
+    transition;
+  - **verification family:** the baseline record is exactly `absent` with no
+    id, the verification record is non-absent, and the checkpoint-ref record
+    is non-absent (any of `creating`, `present`, `advancing`, `removing`).
+
+It is disjoint from the Amendment 5, 12, 13, 16 and 17 shapes. It is added by
+union to `_is_reconciliation_eligible`, which governs both the pre-lock peek
+and the locked re-read.
+
+**Explicitly excluded** (peek `REFUSED`, unchanged message; refused before
+acquiring the lifecycle-entry lock, with no Docker, Git, or projection-write
+calls; the repository lock is already held by the caller of
+`reconcile_repository()`):
+
+- `PREPARING` with any non-absent container. It is not owner-producible, and
+  destructive reconciliation does not admit an impossible shape for uniformity
+  with other rows;
+- both container records non-absent, with any ref;
+- a non-absent baseline with any non-absent ref;
+- a non-absent verification with an absent ref;
+- a non-absent container with a `creating`, `disposing` or `absent` worktree
+  record, except the existing Amendment 5 shape (worktree and ref both
+  `absent`), whose admitted states are unchanged;
+- a populated `failure`;
+- every other shape the owner cannot produce.
+
+**Routing.** A new first branch in the locked re-read routes on the exact
+predicate, ahead of Amendment 17's branch, so this row only ever receives one
+of the two single-role families. The shared container helpers still process
+both roles for the Amendment 5 row.
+
+### 3. Sequence (one locked pass, one reconciliation cycle)
+
+**Gate A. Read-only; zero mutation if it stops. Every resource is inspected
+before the first mutation.**
+
+1. **Containers.** One fresh, strict listing, then `_classify_container` for
+   baseline and verification. Each candidate gets an ownership-proof
+   `docker inspect` by immutable id: the exact id, the exact `/name`, and all
+   four required labels. Both roles' decisions are completed before any stop
+   is taken.
+2. **Worktree.** A fresh registration observation, then Amendment 13's
+   complete inspection (admin entries, leaf, pre-removal table). The action
+   must be `remove`.
+3. **Ref.** For a non-absent record: the object format, then
+   `_inspect_owned_checkpoint_ref` classified against
+   `checkpoint_ref_deletion_candidates`; this gate never supplies the deletion
+   SHA. For an absent record: `_observe_checkpoint_ref_absent`, where a live
+   ref is `REFUSED`.
+
+**Phase C (containers).**
+
+4. Enter `RECONCILING`, once. `attempts_total` is +1 only on a fresh cycle
+   (`ACTIVE` or `CLEANING`); a resumed `RECONCILING` keeps its count. This is
+   the pass's only increment.
+5. Write-ahead for the one non-absent role (the other role's decision is a
+   no-op), through
+   `_publish_reconciler_container_transition` with the count unchanged:
+   `removing(id)` for an owned live container, or for a persisted
+   `present`/`removing` whose container is already confirmed absent;
+   `creating -> absent` for a direct confirmed absence.
+6. Removal of that role: `_remove_and_confirm_absent`
+   (`docker rm --force <id>`, whose exit status is never trusted; a fresh
+   listing; a re-inspect if the container survived), then `absent`. Anything
+   short of confirmed absence stops the pass.
+
+**Gate W. Zero worktree mutation if it stops.**
+
+7. A fresh, complete container listing (`_container_gate`). Both
+   deterministic names must be absent. This covers roles that had no
+   post-removal listing, and a late container from an orphaned owner process.
+8. A fresh registration, admin scan and leaf observation through Amendment
+   13's inspection. Gate A's worktree result is never reused here.
+
+**Phase W (worktree).**
+
+9. Amendment 13's M2–M5, unchanged: write-ahead `disposing`; one
+   `git worktree remove --force <exact path>`; three fresh observations;
+   `disposing -> absent`.
+
+**Gate R and Phase R** (only when the ref record is non-absent). Amendment
+17's Gate B and Amendment 16's M2–M4, unchanged:
+
+10. A fresh `_container_gate`, then a fresh, authoritative ref observation.
+    This is the only source of the deletion SHA.
+11. Write-ahead `removing(X)`, one `CheckpointRef.delete(expected_oid=X)`, then
+    `absent` only after a normal return.
+
+**Finish.**
+
+12. `RECONCILED`, exactly once and last.
+
+Projection writes per pass are bounded by family, never ten in one pass:
+
+- **verification family**, at most eight: `RECONCILING`, verification
+  `removing`, verification `absent`, worktree `disposing`, worktree `absent`,
+  ref `removing`, ref `absent`, `RECONCILED`;
+- **baseline family**, at most six: `RECONCILING`, baseline `removing`,
+  baseline `absent`, worktree `disposing`, worktree `absent`, `RECONCILED`.
+
+The union of the two covers ten distinct fault-injection positions.
+
+**What this claims.** Every resource is inspected (Gate A) before the first
+mutation, and each destructive phase has its own fresh gate immediately before
+it. Gate A only refuses up front; it never by itself authorizes a later phase.
+
+### 4. Outcomes and resume
+
+| Phase | Condition | Outcome | Durable effect |
+|---|---|---|---|
+| Gate A | A Docker, Git, admin, leaf or ref observation failed or timed out | `SUBSTRATE_UNAVAILABLE` | none |
+| Gate A | Ownership, identity, label or pairing conflict; any Amendment 13 refusal; ref unexpected or symbolic; live ref against an absent record | `REFUSED` | none |
+| Phase C | A projection write failed or is durability-unconfirmed | `FAILED` | as installed |
+| Phase C | Still present after `rm` (including an `rm` timeout; the listing decides) | `FAILED` | role `removing(id)` |
+| Phase C | Post-removal conflict (a replaced container or changed labels) | `REFUSED` | role `removing(id)` |
+| Phase C | Post-removal listing or inspect failed | `SUBSTRATE_UNAVAILABLE` | role `removing(id)` |
+| Gate W | A deterministic name is present again | `REFUSED` | containers `absent`, worktree `present` |
+| Gate W | Listing failed, or the fresh worktree inspection fails or refuses | as Amendment 13 | as above |
+| Phase W, Gate R, Phase R | — | as Amendments 13, 16, 17 | as Amendments 13, 16, 17 |
+| end | Everything confirmed | `RECONCILED` | all absent |
+
+**Resume ownership.** No resume increments `attempts_total` again.
+
+| Boundary | Next pass |
+|---|---|
+| Before `RECONCILING` | this row, fresh cycle (+1) |
+| Any partial container progress (`RECONCILING`, the role `removing(id)` before or after `rm`, or a reconciler killed during `rm`) | this row; a same-id `removing` write is a no-op, and the fresh listing decides |
+| Container durably `absent`, worktree `present`, ref `absent` (baseline family) | Amendment 13 |
+| Container durably `absent`, worktree `present`, ref non-absent (verification family) | Amendment 17 |
+| Worktree `disposing`, or after the Git removal | Amendment 13 or 17, per their own resume tables |
+| Worktree `absent`, ref non-absent | Amendment 16 |
+| Worktree and ref records both `absent`, before `RECONCILED` | the corrected Amendment 5 row (§5), only as this later resume/terminal route |
+| `RECONCILED` installed but unconfirmed | `SKIPPED_TERMINAL` |
+
+Partial progress fails closed. A stop after Phase C leaves the containers
+durably removed and admission blocked until a later pass completes.
+
+### 5. Correction (C1): Amendment 5's worktree-absence check
+
+**Disclosed defect.** Amendment 5's row confirms worktree absence with
+`os.path.lexists` on the recomputed leaf path and performs no Git admin-entry
+scan. `os.path.lexists` reports *any* `OSError`, including `EACCES` on an
+unreadable parent, as absence. Amendment 16 already rejected this exact call
+for the same reason. Because that row is this amendment's final resume route,
+the defect could let an entry reach `RECONCILED` while its leaf or admin entry
+survives.
+
+**Correction.** The row's worktree check becomes `_check_worktree_unregistered`
+(a fresh bounded registration listing plus the bounded admin scan) followed by
+`state_root.observe_materialized_worktree_leaf` (descriptor-relative,
+no-follow). It stays at the same point in the row: after the ref check, before
+the container listing.
+
+| Observation | Outcome |
+|---|---|
+| The exact path is registered | `REFUSED` |
+| One or more matching Git admin entries remain | `REFUSED` |
+| Listing or admin scan failed | `SUBSTRATE_UNAVAILABLE` |
+| Leaf `unknown`, or a substrate `LifecycleFsError` (for example `EACCES`) | `SUBSTRATE_UNAVAILABLE` |
+| Dangling symlink, conflicting leaf, or anything else not `absent` | `REFUSED` |
+| Confirmed absent | continue |
+
+None of these may be treated as confirmed absence. No row may infer physical
+leaf absence from `os.path.lexists`.
+
+**Scope of the correction.** The corrected check applies to every entry that
+reaches the Amendment 5 row, not only to this amendment's resumes. That
+includes Amendment 2's initial all-absent shape and Amendment 5's
+container-only shape in any state that row already admits (including
+`PREPARING`); the row's admitted states are unchanged.
+
+This deliberately changes that one check's behaviour and detail strings (to
+the helper's and the leaf observer's existing messages), and it adds one admin
+scan and one leaf observation per pass of the row. Every other part of the
+Amendment 5 row (messages, outcomes, listing counts, write counts, its lazy
+`RECONCILING` on the first container write) is rebuilt unchanged from shared
+container helpers.
+
+### 6. Maintenance trace
+
+`schema_version` remains 1. The new fields are additive and categorical:
+
+| Location | Field | Values |
+|---|---|---|
+| `containers.<role>` | `initial_persisted_intent` | `absent`, `creating`, `present`, `removing`, or `null` when not reached |
+| `containers.<role>` | `decision` | `noop`, `confirmed_absent`, `owned_remove`, `refused`, `substrate_unavailable`, or `null` |
+| `containers.<role>` | `removal` | `not_attempted`, `confirmed_absent`, `still_present`, `conflict`, `substrate_unavailable` |
+| `containers.<role>` | `removing_transition_confirmed_this_pass` | boolean |
+| `containers.<role>` | `absent_transition_confirmed_this_pass` | boolean |
+| `worktree` | `container_gate` | Gate W's listing: `not_attempted`, `confirmed_absent`, `present`, `unknown` |
+
+The existing `containers.<role>.id` and `confirmed_absent` fields, and the
+worktree and `checkpoint_ref` field sets, keep their meanings.
+`checkpoint_ref.container_gate` remains the listing that gates Phase R. No
+container name, path, SHA, command output or exception text is ever recorded.
+
+### 7. Disclosed evidence corrections (made when D2 lands)
+
+- T36 (`test_lifecycle_run.py`) changes from `BLOCKED` to `RECONCILED` and is
+  renamed accordingly.
+- D1's real T36 abandonment test (`test_reconcile_cli.py`) is adapted without
+  weakening abandonment coverage. Its pre-abandonment `reconcile -> 4` becomes
+  `--dry-run -> 4` with the world unchanged (the entry is now `PENDING`, still
+  blocking). After forced abandonment, `reconcile -> 3` and the container must
+  still be present: marker-first classification keeps this row off abandoned
+  entries.
+- Historical evidence stays historical. Amendment 17 §6 and §7 ("T36 still
+  blocks"), Amendment 18's evidence, and the ledger's D1 acceptance (a) and
+  evidence row are labelled as historical, superseded by this amendment, and
+  are not silently rewritten.
+
+### 8. Non-claims
+
+- **No cross-resource atomicity.** The gates narrow the A4 same-user races;
+  they do not close them.
+- **Late orphaned Docker child activity may still cause refusal.** A dead
+  owner's orphaned `docker create` or `docker start --attach` may act after a
+  gate passes. A late container is caught as "role recorded absent while its
+  name is occupied": `REFUSED`, cleared only by abandonment.
+- **Partial progress** may remove containers while admission remains blocked.
+  Nothing is removed when Gate A refuses.
+- **Abandonment is unchanged.** It records a disposition and never removes a
+  resource.
+- **Still blocking:** a container in `PREPARING`; a container beside a
+  `creating`/`disposing` worktree, or beside an absent worktree when a ref is
+  present; every Amendment 13 and 16 refusal; an Amendment 12 record with a
+  ref.
+- **Amendment 16's residuals carry over:** the two-command observation
+  window, no compare-and-swap for an observed-absent ref, observation bounded
+  by time but not by bytes. Ref deletion makes checkpoint commits collectable.
+- **Threats.** T-E1 is unchanged. T-F1 gains partial, reconciler-level
+  coverage for this exact chained shape only. T-F2 and T-M1 claim nothing
+  beyond it.
+- **Gate O remains unsatisfied** until D3.
+- **Not wired:** no `solve`, model, approval, reporting, cancellation, signal
+  or operator-run wiring.
+- **Evidence** will be implementation and automated-test evidence, not a
+  security review.
+
+### 9. Planned verification
+
+- **C1 regressions on the corrected Amendment 5 row:**
+  - R1: an unreadable leaf parent (a real `chmod 000` where root semantics
+    allow it, otherwise an injected `EACCES`) gives `SUBSTRATE_UNAVAILABLE`;
+  - R2: a dangling symlink gives `REFUSED`;
+  - R3: any other conflicting leaf gives `REFUSED`;
+  - R4: a matching admin entry with the path unregistered gives `REFUSED`;
+  - R5: a failed admin scan gives `SUBSTRATE_UNAVAILABLE`;
+  - R6: R1, R2 or R4 with an owned live container recorded `present`; the
+    container must still exist afterwards;
+  - R7: a genuinely absent leaf with zero admin entries still reaches
+    `RECONCILED`.
+
+  R1–R6 also assert no `RECONCILED`, no Docker listing, inspect or `rm`, and
+  unchanged projection bytes.
+- **Predicate:** true for the baseline family × {`creating`, `present`,
+  `removing`} with the absent ref, and the verification family × the same
+  intents × the four non-absent refs, each × {`ACTIVE`, `CLEANING`,
+  `RECONCILING`}; false for both roles, a baseline with any ref, and a
+  verification without a ref; false for `PREPARING` and terminal states, for a
+  non-`present` worktree, for all-absent containers, and for a failure;
+  disjoint from every existing predicate.
+- **Ownership and refusal cases:** unlabeled, foreign-labeled or wrong-label
+  containers; id/name disagreement; a role recorded absent with its name
+  occupied; inspect identity disagreeing with the listing; every Gate A
+  worktree and ref refusal; a held lifecycle lock; `PREPARING` refused
+  before acquiring the lifecycle-entry lock, with no Docker, Git, or
+  projection-write calls. Each with zero mutation.
+- **Ordering:** a spy over Docker, Git and projection writes asserts the §3
+  sequence and listing counts, no write before Gate A completes, no Git
+  worktree removal before the container's `absent` write, and no ref delete
+  before the worktree `absent` write.
+- **Write faults:** each write position of each family (eight and six; ten
+  distinct positions in their union) × {publication failed, durability
+  unconfirmed} gives `FAILED` with no later mutation, then resumes to
+  `RECONCILED` (or `SKIPPED_TERMINAL`) with `attempts_total` 1.
+- **Real Docker owner crashes:** T36; `baseline_creating`;
+  `verification_present` (container, worktree and ref); a running
+  verification container killed through `rm --force`; the non-crash
+  `CLEANING` route; an unlabeled impostor at the deterministic name (blocked,
+  nothing touched).
+- **Real reconciler SIGKILL** on the verification family (the full chain)
+  after `RECONCILING`, container `removing`, `rm` before `absent`, container
+  `absent`, worktree `disposing`, worktree `absent`, and ref `removing`; each
+  resumes with no re-increment.
+- **Mutation checks 1–19**, each caught and the source restored byte-for-byte
+  (SHA-256 verified): phase order swaps (1, 2); ownership inspect and label
+  check removed (3, 4); Gate A worktree inspection dropped (5); Gate W listing
+  removed or reusing the first listing (6, 7); Phase W reusing Gate A's
+  observation (8); a Phase C failure not stopping (9); a second increment (10);
+  early `RECONCILED` (11); `attempt_rm` forced for confirmed absence (12); the
+  predicate admitting a non-`present` worktree (13) or `PREPARING` (14); the
+  predicate dropped from the union (15); the rebuilt Amendment 5 row listing
+  twice or writing a separate `RECONCILING` (16); `os.path.lexists` restored
+  (17, R1/R2 must fail); the admin scan omitted (18, R4/R5 must fail); the C1
+  check moved after the container listing (19, R6 must fail).
+- **Totals:** the focused Milestone 3 set forward and reverse; the full suite
+  with `CODEAGENT_REQUIRE_DOCKER=1` and zero skips; `git diff --check`;
+  leftover containers (all three families), worktrees, refs, processes and
+  state roots; then GitHub-hosted Linux CI, with the usual `pytest -q` limits.
+
+### 10. Planning
+
+- D2 is re-estimated at **24–40 focused hours** (previously 10–22: +14 at the
+  low end, +18 at the high end).
+- Prospective ledger arithmetic, recorded here only: Gate O 68–120; first
+  operator run 167–306; internal alpha 234–441; public v1 296–580.
+- Frozen v1 scope is unchanged.
+- `docs/V1_COMPLETION_LEDGER.md` is not modified until implementation changes
+  D2's status.
+
+### 11. Implementation status (2026-10-05, corrected 2026-10-06)
+
+Implemented and verified locally (macOS, Docker 29.8.0, `CODEAGENT_REQUIRE_DOCKER=1`).
+Uncommitted and not pushed; **Linux CI is pending**, and nothing here is CI
+evidence.
+
+**Production changes.** Only two production files changed:
+
+- `src/codeagent/lifecycle_store.py`: the predicate
+  `is_projection_container_then_worktree_reconciliation_shape`, encoding the
+  two exact families of §2.
+- `src/codeagent/reconciliation.py`:
+  - C1: a shared `_confirm_worktree_absent`, used by both the Amendment 16 row
+    (same messages) and the corrected Amendment 5 row;
+  - container helpers `_inspect_containers` and `_mutate_containers`, extracted
+    from the Amendment 5 row (which is rebuilt from them and still processes
+    both roles);
+  - the chained row `_reconcile_container_then_worktree_entry`, the eligibility
+    union, and a first routing branch on the exact predicate;
+  - the §6 trace fields.
+
+The ownership proof (an immutable-id inspect plus all four labels), `docker rm`
+by id only, and the single `docker rm --force` argv literal are unchanged.
+
+**Tests.** 236 new tests against `851598d`; full suite 3,758 → 3,994
+passed, 0 skipped.
+
+- `test_reconciliation.py`, +108 (469 → 577):
+  - 12 C1 regressions (R1, R1b, R2, R3×3, R4, R5, R6×3, R7);
+  - 96 Amendment 19 tests:
+    - 11 success cases;
+    - 10 pre-lock refusals of non-producible shapes (§12);
+    - ownership and Gate A refusals;
+    - Phase C and Gate W stops;
+    - two ordering tests, one per family;
+    - 28 write-fault cases (16 + 12) and a write-position coverage test;
+    - trace, dry run and SHA-256;
+    - the real-Docker impostor test and seven real reconciler SIGKILL
+      boundaries.
+- `test_lifecycle_store.py`, +122 predicate tests.
+- `test_lifecycle_run.py`, +5: T48–T52. T36 is renamed and now expects
+  `RECONCILED`. T41's Docker set is T30–T38 and T46–T52.
+- `test_reconcile_cli.py`, +1: an explicit reconcile of the real T36 shape.
+  The D1 T36 abandonment test is corrected as §7 describes.
+
+**Mutation checks.** 25 concrete mutation runs, all caught, each source
+restored byte for byte (verified by SHA-256): 19 numbered plan categories,
+with categories 16 and 17 each exercised through one additional variant (16
+as 16a and 16b; 17 as 17 and the full revert 17b), giving 21 concrete runs,
+plus the predicate broadenings B1–B4 of §12 (4 runs).
+
+**Disclosed deviations from the plan's wording.**
+
+- **R2 cannot catch a restored `os.path.lexists`.** `lexists` correctly
+  reports a dangling symlink as present. Mutation 17 is caught by R1, R1b,
+  R6[eacces] and R7. A full revert of the Amendment 5 block catches R2 and R3
+  only through their detail strings, and R1, R4, R5 and R6 through their
+  outcomes.
+- **Mutation 7.** Gate A has no container gate whose result could be reused,
+  so mutation 7 was defined as Gate W deriving its result from Phase C's
+  results instead of a fresh listing.
+- **T51's shape.** T51 leaves only the verification cleanup unconfirmed:
+  `CLEANING`, baseline `absent`, verification `removing(id)`, worktree
+  `present`, ref `present`. An unconfirmed baseline cleanup ends the run
+  before any patch (§1).
+
+**Historical evidence labelled, not rewritten.**
+
+- **Labelled in place:** Amendment 17 §6 and §7, which were current-status
+  text.
+- **Left as dated history and superseded by this amendment:**
+  - Amendment 14's test table ("T36 … blocks");
+  - Amendment 16 §7 and its evidence ("T36 and T37 still block");
+  - Amendment 18's evidence ("real T36" as a blocked fixture).
+
+### 12. Implementation-time correction (2026-10-06)
+
+This correction was made to this accepted amendment before D2 was staged or
+committed. Joint review confirmed the contradiction found during
+implementation.
+
+**The defect.** §1 said an unconfirmed baseline cleanup "only sets a flag; the
+run continues", so a non-absent baseline, a non-absent verification and a
+non-absent ref could coexist. That is false:
+
+- an unconfirmed cleanup makes the verifier's result `ENVIRONMENT_FAILURE`;
+- for the baseline, the controller then terminates before any patch or
+  verification.
+
+§2 accordingly admitted, and the first implementation accepted, three shapes
+the owner cannot produce:
+
+- both container records non-absent;
+- a non-absent baseline with a non-absent ref;
+- a non-absent verification with an absent ref.
+
+**Corrected.**
+
+- §1 now states the true behaviour.
+- §2 and the predicate now admit exactly the baseline family and the
+  verification family.
+- Routing uses the exact predicate, so this row never receives both roles.
+- §3's write accounting is per family: at most eight writes on the
+  verification path and six on the baseline path, with ten distinct fault
+  positions in their union. No pass performs ten writes.
+- The resume table and §9 drop the derived both-roles claims.
+
+**Converted tests.** Two former synthetic success cases used impossible shapes
+and are now refused before acquiring the lifecycle-entry lock, with no Docker,
+Git, or projection-write calls, and every byte unchanged:
+
+- `both_roles_non_absent` became `both_roles_with_ref`;
+- `resumed_reconciling` (a baseline with a ref) became
+  `resumed_baseline_with_ref`.
+
+They join eight further refusal cases covering:
+
+- both roles, without a ref and in `CLEANING`;
+- a baseline beside each non-absent ref intent;
+- a verification without a ref, in `ACTIVE` and in `CLEANING`.
+
+Other tests that used impossible shapes were moved onto a valid family:
+
+- ownership refusals → the baseline family;
+- Gate A, Gate W, the trace test and the reconciler SIGKILL test → the
+  verification family;
+- the both-roles Phase C ordering test was removed; that ordering remains an
+  Amendment 5 row property, covered by its existing tests;
+- ordering and write-fault coverage → one variant per family.
+
+Two valid resumed `RECONCILING` success cases were added.
+
+**Load-bearing mutations.** Each was caught by the predicate tests and by the
+matching pre-lock refusal cases:
+
+- B1 broadens the predicate back to "any non-absent container" (all 10 peek
+  refusals fail);
+- B2 admits both roles (3);
+- B3 admits a baseline with a ref (5);
+- B4 admits a verification without a ref (2).
+
+C1, the Gate A → C → W → R order, the trace semantics, the D2 estimate and
+arithmetic, every non-claim, and Gate O's unsatisfied status are unchanged.

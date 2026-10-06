@@ -135,6 +135,7 @@ from .lifecycle_store import (
     _publish_reconciler_worktree_transition,
     checkpoint_ref_deletion_candidates,
     is_projection_checkpoint_ref_reconciliation_shape,
+    is_projection_container_then_worktree_reconciliation_shape,
     is_projection_materialized_worktree_reconciliation_shape,
     is_projection_worktree_then_checkpoint_ref_reconciliation_shape,
     is_projection_fully_absent_shape,
@@ -229,6 +230,18 @@ class ReconciliationEntryResult:
     # no well-formed candidate was ever positively observed.
     baseline_id: str | None = None
     verification_id: str | None = None
+    # ADR 0004 Amendment 19 (categorical only): per-role container progress
+    # in this pass. `None` means "not reached in this pass", never invented.
+    baseline_initial_persisted_intent: str | None = None
+    baseline_decision: str | None = None
+    baseline_removal: str = "not_attempted"
+    baseline_removing_transition_confirmed_this_pass: bool = False
+    baseline_absent_transition_confirmed_this_pass: bool = False
+    verification_initial_persisted_intent: str | None = None
+    verification_decision: str | None = None
+    verification_removal: str = "not_attempted"
+    verification_removing_transition_confirmed_this_pass: bool = False
+    verification_absent_transition_confirmed_this_pass: bool = False
     # ADR 0004 Amendment 12 (maintenance-trace `worktree` fields).
     # `initial_persisted_intent` comes only from the locked authoritative
     # re-read -- `None` when the pass stopped before it (never the pre-lock
@@ -264,6 +277,9 @@ class ReconciliationEntryResult:
     # (the chained row's second listing, or Amendment 16's single listing).
     checkpoint_ref_gate_observation: str | None = None
     checkpoint_ref_container_gate: str = "not_attempted"
+    # ADR 0004 Amendment 19: the fresh container listing that gates the
+    # chained row's worktree phase (Gate W); `not_attempted` elsewhere.
+    worktree_container_gate: str = "not_attempted"
     # ADR 0004 Amendment 18. The disposition and categorical summary of a
     # valid final marker -- never the operator's reason, which is persisted
     # only in abandonment.json. `abandonment_temp_leftovers` counts
@@ -1000,6 +1016,32 @@ def _check_worktree_unregistered(
     return _ADMIN_SCAN_OUTCOMES[scan]
 
 
+def _confirm_worktree_absent(
+    *, lifecycle_id: str, state_root, identity: RepositoryIdentity, context: TrustedRepositoryContext
+) -> tuple[ReconciliationEntryOutcome | None, str | None]:
+    """I5: the worktree confirmed absent -- unregistered, zero Git admin
+    entries, and the leaf name observed descriptor-relative and no-follow
+    (Amendment 13's observer). `(None, None)` only on confirmed absence.
+    `os.path.lexists` is never used: it reports *any* `OSError` (e.g. an
+    unreadable parent) as absence, which would mistake an inspection
+    failure for proof (ADR 0004 Amendments 16 and 19)."""
+    expected_path = os.path.normpath(os.path.join(state_root.path, "worktrees", identity.repo_key, lifecycle_id))
+    outcome, detail = _check_worktree_unregistered(
+        lifecycle_id=lifecycle_id, expected_path=expected_path, identity=identity, context=context
+    )
+    if outcome is not None:
+        return outcome, detail
+    try:
+        leaf = state_root.observe_materialized_worktree_leaf(identity.repo_key, lifecycle_id)
+    except LifecycleFsError as exc:
+        return _classify_entry_fs_failure(exc), "the worktree leaf could not be inspected"
+    if leaf is MaterializedLeafObservation.UNKNOWN:
+        return ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the worktree leaf could not be inspected"
+    if leaf is not MaterializedLeafObservation.ABSENT:
+        return ReconciliationEntryOutcome.REFUSED, "the recomputed worktree leaf is present"
+    return None, None
+
+
 def _enumerate_runs(runs_fd: int) -> list[str]:
     """Prevalidate the complete `runs/` namespace, sorted, before any
     legitimate entry is touched. A positively observed malformed name,
@@ -1136,15 +1178,18 @@ _RECONCILER_ELIGIBLE_STATES = (
 def _is_reconciliation_eligible(projection: LifecycleProjection) -> bool:
     """The one eligibility rule used by BOTH the pre-lock peek and the
     locked authoritative re-read (ADR 0004 Amendment 12): an owner-writable
-    or RECONCILING state, with either the absent-worktree shape (existing;
-    includes a resumed RECONCILING whose worktree was already collapsed) or
-    the narrow `creating`-worktree shape. `present`/`disposing` worktrees
-    are admitted by neither predicate."""
+    or RECONCILING state, with one of the recognized shapes: the
+    absent-worktree shape (includes a resumed RECONCILING whose worktree was
+    already collapsed), Amendment 13's materialized worktree, Amendment 16's
+    ref, Amendment 17's worktree-then-ref, or Amendment 19's
+    container-then-worktree shape (whose own predicate also excludes
+    PREPARING)."""
     return projection.state in _RECONCILER_ELIGIBLE_STATES and (
         is_projection_reconciliation_eligible_shape(projection)
         or is_projection_materialized_worktree_reconciliation_shape(projection)
         or is_projection_checkpoint_ref_reconciliation_shape(projection)
         or is_projection_worktree_then_checkpoint_ref_reconciliation_shape(projection)
+        or is_projection_container_then_worktree_reconciliation_shape(projection)
     )
 
 
@@ -1186,9 +1231,11 @@ def _reconcile_locked_entry(
     context: TrustedRepositoryContext,
 ) -> ReconciliationEntryResult:
     """Load and validate the projection under the lifecycle lock, then
-    route by its worktree intent: the narrow `creating` row (ADR 0004
-    Amendment 12) or the existing absent-worktree path. Every result after
-    the locked re-read carries the worktree intent that re-read found."""
+    route: a non-absent container beside a non-absent worktree goes to
+    Amendment 19's chained row; a non-absent ref to Amendment 17 or 16; a
+    non-absent worktree to Amendment 12 or 13; otherwise the absent-worktree
+    (Amendment 5) row. Every result after the locked re-read carries the
+    worktree intent that re-read found."""
     try:
         projection = load_lifecycle_projection(
             run_dir_fd,
@@ -1215,7 +1262,18 @@ def _reconcile_locked_entry(
             worktree_initial_persisted_intent=initial_intent,
         )
 
-    if projection.checkpoint_ref.intent is not CheckpointIntent.ABSENT and (
+    if is_projection_container_then_worktree_reconciliation_shape(projection):
+        # ADR 0004 Amendment 19: routed on the exact predicate, so this row
+        # only ever receives one of its two single-role families.
+        result = _reconcile_container_then_worktree_entry(
+            run_dir_fd=run_dir_fd,
+            lifecycle_id=lifecycle_id,
+            projection=projection,
+            state_root=state_root,
+            identity=identity,
+            context=context,
+        )
+    elif projection.checkpoint_ref.intent is not CheckpointIntent.ABSENT and (
         projection.worktree.intent is not WorktreeIntent.ABSENT
     ):
         # ADR 0004 Amendment 17: eligibility guarantees a materialized
@@ -1525,24 +1583,11 @@ def _reconcile_checkpoint_ref_entry(
 
     # I5: the worktree confirmed absent -- unregistered, zero admin entries,
     # and no entry at the deterministic leaf path (not followed).
-    expected_path = os.path.normpath(os.path.join(state_root.path, "worktrees", identity.repo_key, lifecycle_id))
-    outcome, detail = _check_worktree_unregistered(
-        lifecycle_id=lifecycle_id, expected_path=expected_path, identity=identity, context=context
+    outcome, detail = _confirm_worktree_absent(
+        lifecycle_id=lifecycle_id, state_root=state_root, identity=identity, context=context
     )
     if outcome is not None:
         return result(outcome, detail)
-    # The leaf name, observed descriptor-relative and no-follow (Amendment 13's
-    # observer): only a genuinely missing name is absence. `os.path.lexists`
-    # is not used -- it reports *any* `OSError` (e.g. an unreadable parent) as
-    # absence, which would mistake an inspection failure for I5's proof.
-    try:
-        leaf = state_root.observe_materialized_worktree_leaf(identity.repo_key, lifecycle_id)
-    except LifecycleFsError as exc:
-        return result(_classify_entry_fs_failure(exc), "the worktree leaf could not be inspected")
-    if leaf is MaterializedLeafObservation.UNKNOWN:
-        return result(ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the worktree leaf could not be inspected")
-    if leaf is not MaterializedLeafObservation.ABSENT:
-        return result(ReconciliationEntryOutcome.REFUSED, "the recomputed worktree leaf is present")
 
     stop, ref, removal_sha = _inspect_owned_checkpoint_ref(
         lifecycle_id=lifecycle_id, transition=transition, identity=identity, context=context,
@@ -1563,6 +1608,163 @@ def _reconcile_checkpoint_ref_entry(
     if stop is not None:
         return result(*stop)
     return result(ReconciliationEntryOutcome.RECONCILED, "confirmed absent and durably reconciled", **_RECONCILED_FLAGS)
+
+
+_CONTAINER_ROLES = ("baseline", "verification")
+
+
+def _container_trace() -> dict:
+    """ADR 0004 Amendment 19's categorical per-role container trace. `None`
+    means "not reached in this pass", never invented."""
+    return {
+        role: {"initial": None, "decision": None, "removal": "not_attempted", "removing": False, "absent": False}
+        for role in _CONTAINER_ROLES
+    }
+
+
+def _container_result_fields(trace: dict, decisions: dict | None) -> dict:
+    """The retrospective observed ids (Slice 3B-5) plus Amendment 19's
+    categorical per-role fields."""
+    fields: dict = {}
+    for role in _CONTAINER_ROLES:
+        t = trace[role]
+        fields[f"{role}_id"] = decisions[role].observed_id if decisions is not None else None
+        fields[f"{role}_initial_persisted_intent"] = t["initial"]
+        fields[f"{role}_decision"] = t["decision"]
+        fields[f"{role}_removal"] = t["removal"]
+        fields[f"{role}_removing_transition_confirmed_this_pass"] = t["removing"]
+        fields[f"{role}_absent_transition_confirmed_this_pass"] = t["absent"]
+    return fields
+
+
+def _role_attribution(projection: LifecycleProjection, role: str) -> ContainerAttribution:
+    return projection.baseline if role == "baseline" else projection.verification
+
+
+def _inspect_containers(*, projection: LifecycleProjection, lifecycle_id: str, state_root, trace: dict):
+    """Amendment 5's container inspection; mutates nothing. One fresh,
+    strict listing, then both roles classified (each candidate proven by an
+    ownership inspect by immutable id) before any stop is taken. Returns
+    `(stop, decisions)`; `decisions` is `None` only when the listing
+    failed."""
+    for role in _CONTAINER_ROLES:
+        trace[role]["initial"] = _role_attribution(projection, role).intent.value
+    try:
+        name_to_id, id_to_name = _docker_ps_all_id_name_pairs()
+    except _DockerListingError:
+        return (ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "container listing failed"), None
+
+    decisions: dict[str, _ContainerDecision] = {}
+    for role in _CONTAINER_ROLES:
+        decisions[role] = _classify_container(
+            attribution=_role_attribution(projection, role),
+            role=role,
+            expected_name=f"codeagent-{role}-{lifecycle_id}",
+            name_to_id=name_to_id,
+            id_to_name=id_to_name,
+            state_root_id=state_root.state_root_id,
+            lifecycle_id=lifecycle_id,
+        )
+        trace[role]["decision"] = decisions[role].outcome.value
+
+    for role in _CONTAINER_ROLES:
+        decision = decisions[role]
+        if decision.outcome is _ContainerDecisionOutcome.REFUSED:
+            return (ReconciliationEntryOutcome.REFUSED, f"{role} container: {decision.detail}"), decisions
+        if decision.outcome is _ContainerDecisionOutcome.SUBSTRATE_UNAVAILABLE:
+            return (ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, f"{role} container: {decision.detail}"), decisions
+    return None, decisions
+
+
+_REMOVAL_STOPS = {
+    _DockerRemovalOutcome.STILL_PRESENT: ReconciliationEntryOutcome.FAILED,
+    _DockerRemovalOutcome.CONFLICT: ReconciliationEntryOutcome.REFUSED,
+    _DockerRemovalOutcome.SUBSTRATE_UNAVAILABLE: ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+}
+
+
+def _mutate_containers(
+    *,
+    run_dir_fd: int,
+    projection: LifecycleProjection,
+    attempts_total: int,
+    decisions: dict,
+    lifecycle_id: str,
+    state_root,
+    trace: dict,
+):
+    """Amendment 5's container mutation, for two conflict-free decisions.
+    Write-ahead first, baseline then verification, entirely before any
+    `docker rm`; then removal, baseline first, each confirmed by a fresh
+    independent listing (and a re-inspect of a survivor) before `absent`.
+    Verification is never removed unless baseline reached durable absence
+    this pass. Only `decision.removal_id` is ever written or removed.
+    Returns `(stop, projection)`."""
+    pending_removal: dict[str, str] = {}
+    for role in _CONTAINER_ROLES:
+        decision = decisions[role]
+        if decision.outcome is _ContainerDecisionOutcome.NOOP:
+            continue
+        if decision.outcome is _ContainerDecisionOutcome.CONFIRMED_ABSENT and decision.direct_to_absent:
+            try:
+                projection = _publish_reconciler_container_transition(
+                    run_dir_fd, projection, role=role, intent=ContainerIntent.ABSENT, id=None, attempts_total=attempts_total
+                )
+            except LifecycleStoreError as exc:
+                return (
+                    (ReconciliationEntryOutcome.FAILED, f"the {role} confirmed-absent write failed ({exc.reason.value})"),
+                    projection,
+                )
+            trace[role]["absent"] = True
+            continue
+
+        # OWNED_REMOVE, or CONFIRMED_ABSENT-while-persisted-present: both
+        # require a REMOVING write-ahead write before absence can be
+        # declared (no direct PRESENT/CREATING->ABSENT edge exists).
+        assert decision.removal_id is not None
+        already_removing = _role_attribution(projection, role).intent is ContainerIntent.REMOVING
+        try:
+            projection = _publish_reconciler_container_transition(
+                run_dir_fd,
+                projection,
+                role=role,
+                intent=ContainerIntent.REMOVING,
+                id=decision.removal_id,
+                attempts_total=attempts_total,
+            )
+        except LifecycleStoreError as exc:
+            return (
+                (ReconciliationEntryOutcome.FAILED, f"the {role} removing write-ahead write failed ({exc.reason.value})"),
+                projection,
+            )
+        trace[role]["removing"] = not already_removing
+        pending_removal[role] = decision.removal_id
+
+    for role in _CONTAINER_ROLES:
+        if role not in pending_removal:
+            continue
+        outcome, detail = _remove_and_confirm_absent(
+            removal_id=pending_removal[role],
+            expected_name=f"codeagent-{role}-{lifecycle_id}",
+            role=role,
+            state_root_id=state_root.state_root_id,
+            lifecycle_id=lifecycle_id,
+            attempt_rm=decisions[role].live_present,
+        )
+        trace[role]["removal"] = outcome.value
+        if outcome is not _DockerRemovalOutcome.CONFIRMED_ABSENT:
+            return (_REMOVAL_STOPS[outcome], f"{role} container: {detail}"), projection
+        try:
+            projection = _publish_reconciler_container_transition(
+                run_dir_fd, projection, role=role, intent=ContainerIntent.ABSENT, id=None, attempts_total=attempts_total
+            )
+        except LifecycleStoreError as exc:
+            return (
+                (ReconciliationEntryOutcome.FAILED, f"the {role} absent collapse write failed ({exc.reason.value})"),
+                projection,
+            )
+        trace[role]["absent"] = True
+    return None, projection
 
 
 def _reconcile_absent_worktree_entry(
@@ -1599,255 +1801,84 @@ def _reconcile_absent_worktree_entry(
             attempt_number=projection.reconciliation.attempts_total,
         )
 
-    expected_worktree_path = os.path.normpath(
-        os.path.join(state_root.path, "worktrees", identity.repo_key, lifecycle_id)
+    # ADR 0004 Amendment 19 (C1): the same I5 proof as Amendment 16 --
+    # registration, admin entries, and a descriptor-relative no-follow leaf
+    # observation -- before any container is listed or inspected.
+    wt_outcome, wt_detail = _confirm_worktree_absent(
+        lifecycle_id=lifecycle_id, state_root=state_root, identity=identity, context=context
     )
-    try:
-        registered_paths = _worktree_registered_paths(context.working_tree_root)
-    except _GitWorktreeListingError:
+    if wt_outcome is not None:
         return ReconciliationEntryResult(
             lifecycle_id,
-            ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
-            "worktree listing failed",
-            run_id=projection.run_id,
-            attempt_number=projection.reconciliation.attempts_total,
-        )
-    if expected_worktree_path in registered_paths or os.path.lexists(expected_worktree_path):
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.REFUSED,
-            "the recomputed worktree is registered or present",
+            wt_outcome,
+            wt_detail,
             run_id=projection.run_id,
             attempt_number=projection.reconciliation.attempts_total,
         )
 
-    baseline_name = f"codeagent-baseline-{lifecycle_id}"
-    verification_name = f"codeagent-verification-{lifecycle_id}"
-    try:
-        name_to_id, id_to_name = _docker_ps_all_id_name_pairs()
-    except _DockerListingError:
+    trace = _container_trace()
+    stop, decisions = _inspect_containers(
+        projection=projection, lifecycle_id=lifecycle_id, state_root=state_root, trace=trace
+    )
+    if stop is not None:
         return ReconciliationEntryResult(
             lifecycle_id,
-            ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
-            "container listing failed",
+            *stop,
             run_id=projection.run_id,
             attempt_number=projection.reconciliation.attempts_total,
+            **_container_result_fields(trace, decisions),
         )
-
-    decisions: dict[str, _ContainerDecision] = {}
-    for role, attribution, expected_name in (
-        ("baseline", projection.baseline, baseline_name),
-        ("verification", projection.verification, verification_name),
-    ):
-        decisions[role] = _classify_container(
-            attribution=attribution,
-            role=role,
-            expected_name=expected_name,
-            name_to_id=name_to_id,
-            id_to_name=id_to_name,
-            state_root_id=state_root.state_root_id,
-            lifecycle_id=lifecycle_id,
-        )
-
-    for role in ("baseline", "verification"):
-        decision = decisions[role]
-        if decision.outcome in (_ContainerDecisionOutcome.REFUSED, _ContainerDecisionOutcome.SUBSTRATE_UNAVAILABLE):
-            final_outcome = (
-                ReconciliationEntryOutcome.REFUSED
-                if decision.outcome is _ContainerDecisionOutcome.REFUSED
-                else ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE
-            )
-            return ReconciliationEntryResult(
-                lifecycle_id,
-                final_outcome,
-                f"{role} container: {decision.detail}",
-                run_id=projection.run_id,
-                attempt_number=projection.reconciliation.attempts_total,
-                baseline_id=decisions["baseline"].observed_id,
-                verification_id=decisions["verification"].observed_id,
-            )
 
     # Both roles' decisions are conflict-free. Compute the one
     # attempt-count increment this pass may perform (fresh cycle only;
-    # a resumed RECONCILING keeps its already-incremented value).
+    # a resumed RECONCILING keeps its already-incremented value). This row
+    # enters RECONCILING lazily, atomically with its first container write.
     fresh_cycle = projection.state is not LifecycleState.RECONCILING
     attempts_total = projection.reconciliation.attempts_total + 1 if fresh_cycle else projection.reconciliation.attempts_total
 
-    # Correction pass finding 2: both retrospective trace ids are
-    # derived immediately from both already-completed decisions, before
-    # any publication whatsoever -- every return from this point on,
-    # success or failure, retains these exact values unchanged. This is
-    # deliberately independent of `removal_id` (finding 1): a role that
-    # was never positively observed live (e.g. `CONFIRMED_ABSENT` while
-    # persisted `present`) still correctly reports `None` here, even
-    # though its `removal_id` is set for the write-ahead path.
-    observed_ids: dict[str, str | None] = {
-        "baseline": decisions["baseline"].observed_id,
-        "verification": decisions["verification"].observed_id,
-    }
-
-    # Write-ahead phase: baseline then verification, entirely before
-    # any `docker rm` is issued for either role.
-    pending_removal: dict[str, str] = {}
-    resolved_absent: dict[str, bool] = {"baseline": False, "verification": False}
-    for role in ("baseline", "verification"):
-        decision = decisions[role]
-        if decision.outcome is _ContainerDecisionOutcome.NOOP:
-            resolved_absent[role] = True
-            continue
-        if decision.outcome is _ContainerDecisionOutcome.CONFIRMED_ABSENT and decision.direct_to_absent:
-            try:
-                projection = _publish_reconciler_container_transition(
-                    run_dir_fd,
-                    projection,
-                    role=role,
-                    intent=ContainerIntent.ABSENT,
-                    id=None,
-                    attempts_total=attempts_total,
-                )
-            except LifecycleStoreError as exc:
-                return ReconciliationEntryResult(
-                    lifecycle_id,
-                    ReconciliationEntryOutcome.FAILED,
-                    f"the {role} confirmed-absent write failed ({exc.reason.value})",
-                    run_id=projection.run_id,
-                    attempt_number=attempts_total,
-                    baseline_id=observed_ids["baseline"],
-                    verification_id=observed_ids["verification"],
-                )
-            resolved_absent[role] = True
-            continue
-
-        # OWNED_REMOVE, or CONFIRMED_ABSENT-while-persisted-present:
-        # both require a REMOVING write-ahead write before absence can
-        # be declared (no direct PRESENT/CREATING->ABSENT edge exists).
-        # `observed_ids` was already fully derived above and is never
-        # touched here -- only `decision.removal_id` (the authorized
-        # write target) is used for the actual write.
-        assert decision.removal_id is not None
-        try:
-            projection = _publish_reconciler_container_transition(
-                run_dir_fd,
-                projection,
-                role=role,
-                intent=ContainerIntent.REMOVING,
-                id=decision.removal_id,
-                attempts_total=attempts_total,
-            )
-        except LifecycleStoreError as exc:
-            return ReconciliationEntryResult(
-                lifecycle_id,
-                ReconciliationEntryOutcome.FAILED,
-                f"the {role} removing write-ahead write failed ({exc.reason.value})",
-                run_id=projection.run_id,
-                attempt_number=attempts_total,
-                baseline_id=observed_ids["baseline"],
-                verification_id=observed_ids["verification"],
-            )
-        pending_removal[role] = decision.removal_id
-
-    # Removal phase: baseline first, then verification — only after
-    # baseline reaches durable absence.
-    for role in ("baseline", "verification"):
-        if role not in pending_removal:
-            continue
-        removal_id = pending_removal[role]
-        expected_name = baseline_name if role == "baseline" else verification_name
-        outcome, detail = _remove_and_confirm_absent(
-            removal_id=removal_id,
-            expected_name=expected_name,
-            role=role,
-            state_root_id=state_root.state_root_id,
-            lifecycle_id=lifecycle_id,
-            attempt_rm=decisions[role].live_present,
-        )
-        if outcome is _DockerRemovalOutcome.CONFIRMED_ABSENT:
-            try:
-                projection = _publish_reconciler_container_transition(
-                    run_dir_fd,
-                    projection,
-                    role=role,
-                    intent=ContainerIntent.ABSENT,
-                    id=None,
-                    attempts_total=attempts_total,
-                )
-            except LifecycleStoreError as exc:
-                return ReconciliationEntryResult(
-                    lifecycle_id,
-                    ReconciliationEntryOutcome.FAILED,
-                    f"the {role} absent collapse write failed ({exc.reason.value})",
-                    run_id=projection.run_id,
-                    attempt_number=attempts_total,
-                    baseline_id=observed_ids["baseline"],
-                    verification_id=observed_ids["verification"],
-                )
-            resolved_absent[role] = True
-            continue
-
-        final_outcome = {
-            _DockerRemovalOutcome.STILL_PRESENT: ReconciliationEntryOutcome.FAILED,
-            _DockerRemovalOutcome.CONFLICT: ReconciliationEntryOutcome.REFUSED,
-            _DockerRemovalOutcome.SUBSTRATE_UNAVAILABLE: ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
-        }[outcome]
+    def result(outcome, detail, **extra) -> ReconciliationEntryResult:
         return ReconciliationEntryResult(
             lifecycle_id,
-            final_outcome,
-            f"{role} container: {detail}",
+            outcome,
+            detail,
             run_id=projection.run_id,
             attempt_number=attempts_total,
-            baseline_id=observed_ids["baseline"],
-            verification_id=observed_ids["verification"],
+            **_container_result_fields(trace, decisions),
+            **extra,
         )
+
+    stop, projection = _mutate_containers(
+        run_dir_fd=run_dir_fd,
+        projection=projection,
+        attempts_total=attempts_total,
+        decisions=decisions,
+        lifecycle_id=lifecycle_id,
+        state_root=state_root,
+        trace=trace,
+    )
+    if stop is not None:
+        return result(*stop)
 
     # Both containers (and the worktree/checkpoint ref, already
     # confirmed above) are now durably absent: enter RECONCILING if a
     # container write did not already do so, then collapse to
     # RECONCILED.
-    assert resolved_absent["baseline"] and resolved_absent["verification"]
     if projection.state is not LifecycleState.RECONCILING:
         try:
             projection = _publish_projection_state(
                 run_dir_fd, projection, state=LifecycleState.RECONCILING, attempts_total=attempts_total
             )
         except LifecycleStoreError as exc:
-            return ReconciliationEntryResult(
-                lifecycle_id,
-                ReconciliationEntryOutcome.FAILED,
-                f"the RECONCILING projection write failed ({exc.reason.value})",
-                run_id=projection.run_id,
-                attempt_number=attempts_total,
-                baseline_id=observed_ids["baseline"],
-                verification_id=observed_ids["verification"],
-            )
+            return result(ReconciliationEntryOutcome.FAILED, f"the RECONCILING projection write failed ({exc.reason.value})")
 
     try:
         _publish_projection_state(
             run_dir_fd, projection, state=LifecycleState.RECONCILED, attempts_total=attempts_total
         )
     except LifecycleStoreError as exc:
-        return ReconciliationEntryResult(
-            lifecycle_id,
-            ReconciliationEntryOutcome.FAILED,
-            f"the RECONCILED projection write failed ({exc.reason.value})",
-            run_id=projection.run_id,
-            attempt_number=attempts_total,
-            baseline_id=observed_ids["baseline"],
-            verification_id=observed_ids["verification"],
-        )
+        return result(ReconciliationEntryOutcome.FAILED, f"the RECONCILED projection write failed ({exc.reason.value})")
 
-    return ReconciliationEntryResult(
-        lifecycle_id,
-        ReconciliationEntryOutcome.RECONCILED,
-        "confirmed absent and durably reconciled",
-        run_id=projection.run_id,
-        attempt_number=attempts_total,
-        baseline_confirmed_absent=True,
-        verification_confirmed_absent=True,
-        worktree_confirmed_absent=True,
-        checkpoint_ref_confirmed_absent=True,
-        baseline_id=observed_ids["baseline"],
-        verification_id=observed_ids["verification"],
-    )
+    return result(ReconciliationEntryOutcome.RECONCILED, "confirmed absent and durably reconciled", **_RECONCILED_FLAGS)
 
 
 # ---------------------------------------------------------------------------
@@ -2370,6 +2401,154 @@ def _reconcile_worktree_then_checkpoint_ref_entry(
     )
     if stop is not None:
         return result(*stop)
+    stop = _publish_reconciled(run_dir_fd, projection, attempts)
+    if stop is not None:
+        return result(*stop)
+    return result(ReconciliationEntryOutcome.RECONCILED, "confirmed absent and durably reconciled", **_RECONCILED_FLAGS)
+
+
+def _reconcile_container_then_worktree_entry(
+    *,
+    run_dir_fd: int,
+    lifecycle_id: str,
+    projection: LifecycleProjection,
+    state_root,
+    identity: RepositoryIdentity,
+    context: TrustedRepositoryContext,
+) -> ReconciliationEntryResult:
+    """ADR 0004 Amendment 19: one owned non-absent container beside a
+    `present` worktree -- a baseline with the ref absent, or a verification
+    with the ref non-absent -- in one locked pass and one reconciliation
+    cycle, in section 9's order.
+
+    - Gate A (read-only; zero mutation if it stops): one listing and both
+      roles' ownership-proven decisions; a fresh registration and Amendment
+      13's complete worktree inspection; the ref (Amendment 17's read-only
+      gate for a non-absent record, or confirmed absence for an absent one).
+      Every resource is inspected before the first mutation.
+    - Phase C: RECONCILING (+1 only on a fresh cycle, the pass's only
+      increment), then Amendment 5's container write-ahead and removal for
+      the one non-absent role (the other role's decision is a no-op).
+    - Gate W: a fresh complete container listing and a fresh worktree
+      inspection; Gate A's worktree result is never reused.
+    - Phase W: Amendment 13's M2-M5.
+    - Gate R and Phase R (non-absent ref only): Amendment 17's Gate B and
+      Amendment 16's M2-M4.
+    - RECONCILED, exactly once and last.
+
+    Not cross-resource atomicity. A stop after Phase C leaves a shape an
+    existing row resumes (Amendment 13 or 17, then 16, then Amendment 5)."""
+    transition = projection.checkpoint_ref
+    attempts = projection.reconciliation.attempts_total
+    target_path = os.path.normpath(os.path.join(state_root.path, "worktrees", identity.repo_key, lifecycle_id))
+    oid_hex_len = ObjectFormat(identity.object_format).hex_length
+    container_trace = _container_trace()
+    decisions: dict | None = None
+    wt_trace: dict | None = None
+    ref_trace = _checkpoint_ref_trace()
+    worktree_gate = "not_attempted"
+
+    def result(outcome, detail, **extra) -> ReconciliationEntryResult:
+        fields = _worktree_result_fields(wt_trace) if wt_trace is not None else {}
+        return ReconciliationEntryResult(
+            lifecycle_id,
+            outcome,
+            detail,
+            run_id=projection.run_id,
+            attempt_number=attempts,
+            **fields,
+            **_checkpoint_ref_result_fields(transition, ref_trace),
+            **_container_result_fields(container_trace, decisions),
+            worktree_container_gate=worktree_gate,
+            **extra,
+        )
+
+    def inspect_worktree():
+        """A fresh registration plus Amendment 13's inspection. Returns a
+        stop, or `None` when the only legal action (`remove`) is decided."""
+        nonlocal wt_trace
+        registration = _observe_target_registration(
+            context.working_tree_root, oid_hex_len=oid_hex_len, target_path=target_path
+        )
+        wt_trace = _worktree_trace(registration)
+        if registration.state == "unknown":
+            return ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "worktree listing failed"
+        stop, action = _inspect_materialized_worktree(
+            lifecycle_id=lifecycle_id, intent=WorktreeIntent.PRESENT, registration=registration,
+            state_root=state_root, identity=identity, trace=wt_trace,
+        )
+        if stop is not None:
+            return stop
+        assert action == "remove"  # `collapse` requires a `disposing` record
+        return None
+
+    # Gate A: containers, worktree, ref -- before any mutation.
+    stop, decisions = _inspect_containers(
+        projection=projection, lifecycle_id=lifecycle_id, state_root=state_root, trace=container_trace
+    )
+    if stop is not None:
+        return result(*stop)
+    stop = inspect_worktree()
+    if stop is not None:
+        return result(*stop)
+    if transition.intent is not CheckpointIntent.ABSENT:
+        stop, _, _ = _inspect_owned_checkpoint_ref(
+            lifecycle_id=lifecycle_id, transition=transition, identity=identity, context=context,
+            trace=ref_trace, key="gate", record_role=False,
+        )
+        if stop is not None:
+            return result(*stop)
+    else:
+        outcome, detail = _observe_checkpoint_ref_absent(lifecycle_id=lifecycle_id, identity=identity, context=context)
+        if outcome is not None:
+            return result(outcome, detail)
+
+    # Phase C.
+    stop, projection, attempts = _enter_reconciling(run_dir_fd, projection)
+    if stop is not None:
+        return result(*stop)
+    stop, projection = _mutate_containers(
+        run_dir_fd=run_dir_fd, projection=projection, attempts_total=attempts, decisions=decisions,
+        lifecycle_id=lifecycle_id, state_root=state_root, trace=container_trace,
+    )
+    if stop is not None:
+        return result(*stop)
+
+    # Gate W: fresh evidence for the worktree phase.
+    worktree_gate = _container_gate(lifecycle_id)
+    if worktree_gate != "confirmed_absent":
+        return result(*_CONTAINER_GATE_STOPS[worktree_gate])
+    stop = inspect_worktree()
+    if stop is not None:
+        return result(*stop)
+
+    # Phase W.
+    stop, projection = _mutate_materialized_worktree(
+        run_dir_fd=run_dir_fd, projection=projection, attempts=attempts, intent=WorktreeIntent.PRESENT,
+        action="remove", lifecycle_id=lifecycle_id, target_path=target_path, state_root=state_root,
+        identity=identity, context=context, trace=wt_trace,
+    )
+    if stop is not None:
+        return result(*stop)
+
+    # Gate R and Phase R (Amendment 17's Gate B, Amendment 16's M2-M4).
+    if transition.intent is not CheckpointIntent.ABSENT:
+        ref_trace["container_gate"] = _container_gate(lifecycle_id)
+        if ref_trace["container_gate"] != "confirmed_absent":
+            return result(*_CONTAINER_GATE_STOPS[ref_trace["container_gate"]])
+        stop, ref, removal_sha = _inspect_owned_checkpoint_ref(
+            lifecycle_id=lifecycle_id, transition=transition, identity=identity, context=context,
+            trace=ref_trace, key="pre", record_role=True,
+        )
+        if stop is not None:
+            return result(*stop)
+        stop, projection = _mutate_checkpoint_ref(
+            run_dir_fd=run_dir_fd, projection=projection, attempts=attempts, ref=ref,
+            removal_sha=removal_sha, trace=ref_trace,
+        )
+        if stop is not None:
+            return result(*stop)
+
     stop = _publish_reconciled(run_dir_fd, projection, attempts)
     if stop is not None:
         return result(*stop)
@@ -2977,14 +3156,20 @@ class _MaintenanceTraceWriter:
                 "outcome": result.outcome.value,
                 "attempt_number": result.attempt_number,
                 "containers": {
-                    "baseline": {
-                        "id": _bounded(result.baseline_id, _CONTAINER_ID_MAX_BYTES),
-                        "confirmed_absent": result.baseline_confirmed_absent,
-                    },
-                    "verification": {
-                        "id": _bounded(result.verification_id, _CONTAINER_ID_MAX_BYTES),
-                        "confirmed_absent": result.verification_confirmed_absent,
-                    },
+                    role: {
+                        "id": _bounded(getattr(result, f"{role}_id"), _CONTAINER_ID_MAX_BYTES),
+                        "confirmed_absent": getattr(result, f"{role}_confirmed_absent"),
+                        "initial_persisted_intent": getattr(result, f"{role}_initial_persisted_intent"),
+                        "decision": getattr(result, f"{role}_decision"),
+                        "removal": getattr(result, f"{role}_removal"),
+                        "removing_transition_confirmed_this_pass": getattr(
+                            result, f"{role}_removing_transition_confirmed_this_pass"
+                        ),
+                        "absent_transition_confirmed_this_pass": getattr(
+                            result, f"{role}_absent_transition_confirmed_this_pass"
+                        ),
+                    }
+                    for role in _CONTAINER_ROLES
                 },
                 "worktree": {
                     "confirmed_absent": result.worktree_confirmed_absent,
@@ -3004,6 +3189,7 @@ class _MaintenanceTraceWriter:
                     "disposing_transition_confirmed_this_pass": (
                         result.worktree_disposing_transition_confirmed_this_pass
                     ),
+                    "container_gate": result.worktree_container_gate,
                 },
                 "checkpoint_ref": {
                     "ref_name": ref_name,

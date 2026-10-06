@@ -4992,3 +4992,122 @@ def test_admission_reconciles_a_temp_alone_entry_normally(tmp_path, monkeypatch)
     ls.prepare_lifecycle(str(tmp_path / "repo"), run_id="after").close()
     assert json.loads((run_dir / "lifecycle.json").read_text())["state"] == "RECONCILED"
     assert temp.read_bytes() == b"stale"
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 19: the container-then-worktree shape (ledger D2).
+# ---------------------------------------------------------------------------
+
+_A19_STATES = [ls.LifecycleState.ACTIVE, ls.LifecycleState.CLEANING, ls.LifecycleState.RECONCILING]
+_A19_CONTAINER_INTENTS = [ls.ContainerIntent.CREATING, ls.ContainerIntent.PRESENT, ls.ContainerIntent.REMOVING]
+_A19_OTHER_PREDICATES = (
+    ls.is_projection_reconciliation_eligible_shape,
+    ls.is_projection_creating_worktree_reconciliation_shape,
+    ls.is_projection_materialized_worktree_reconciliation_shape,
+    ls.is_projection_checkpoint_ref_reconciliation_shape,
+    ls.is_projection_worktree_then_checkpoint_ref_reconciliation_shape,
+)
+_A19_NON_ABSENT_REFS = ("creating", "present", "advancing", "removing")
+
+
+def _a19_ref_records():
+    return [cs.ABSENT_TRANSITION] + [_a16_ref_record(i) for i in _A19_NON_ABSENT_REFS]
+
+
+def _a19_projection(state, roles, container_intent, ref):
+    projection = dataclasses.replace(
+        _base_projection(state=state),
+        worktree=wl.WorktreeTransition(intent=wl.WorktreeIntent.PRESENT, expected_head=_ORIGIN),
+        checkpoint_ref=ref,
+    )
+    cid = None if container_intent is ls.ContainerIntent.CREATING else "9" * 64
+    for role in roles:
+        projection = _with_role(projection, role=role, intent=container_intent, id=cid)
+    return projection
+
+
+def _a19_assert_admitted(projection):
+    assert ls.is_projection_container_then_worktree_reconciliation_shape(projection)
+    for other in _A19_OTHER_PREDICATES:
+        assert not other(projection), other.__name__
+
+
+@pytest.mark.parametrize("state", _A19_STATES)
+@pytest.mark.parametrize("container_intent", _A19_CONTAINER_INTENTS)
+def test_a19_baseline_family_is_admitted_only_with_an_absent_ref(state, container_intent):
+    _a19_assert_admitted(_a19_projection(state, ("baseline",), container_intent, cs.ABSENT_TRANSITION))
+
+
+@pytest.mark.parametrize("state", _A19_STATES)
+@pytest.mark.parametrize("container_intent", _A19_CONTAINER_INTENTS)
+@pytest.mark.parametrize("ref_intent", _A19_NON_ABSENT_REFS)
+def test_a19_verification_family_is_admitted_only_with_a_non_absent_ref(state, container_intent, ref_intent):
+    _a19_assert_admitted(_a19_projection(state, ("verification",), container_intent, _a16_ref_record(ref_intent)))
+
+
+@pytest.mark.parametrize("state", _A19_STATES)
+@pytest.mark.parametrize("container_intent", _A19_CONTAINER_INTENTS)
+def test_a19_both_roles_non_absent_is_refused_for_every_ref(state, container_intent):
+    for ref in _a19_ref_records():
+        projection = _a19_projection(state, ("baseline", "verification"), container_intent, ref)
+        assert not ls.is_projection_container_then_worktree_reconciliation_shape(projection)
+
+
+@pytest.mark.parametrize("state", _A19_STATES)
+@pytest.mark.parametrize("container_intent", _A19_CONTAINER_INTENTS)
+@pytest.mark.parametrize("ref_intent", _A19_NON_ABSENT_REFS)
+def test_a19_baseline_with_any_non_absent_ref_is_refused(state, container_intent, ref_intent):
+    projection = _a19_projection(state, ("baseline",), container_intent, _a16_ref_record(ref_intent))
+    assert not ls.is_projection_container_then_worktree_reconciliation_shape(projection)
+
+
+@pytest.mark.parametrize("state", _A19_STATES)
+@pytest.mark.parametrize("container_intent", _A19_CONTAINER_INTENTS)
+def test_a19_verification_with_an_absent_ref_is_refused(state, container_intent):
+    projection = _a19_projection(state, ("verification",), container_intent, cs.ABSENT_TRANSITION)
+    assert not ls.is_projection_container_then_worktree_reconciliation_shape(projection)
+
+
+@pytest.mark.parametrize("roles", [("baseline",), ("verification",), ("baseline", "verification")])
+@pytest.mark.parametrize("container_intent", _A19_CONTAINER_INTENTS)
+def test_a19_shape_rejects_preparing_for_every_container_and_ref(roles, container_intent):
+    for ref in _a19_ref_records():
+        projection = _a19_projection(ls.LifecycleState.PREPARING, roles, container_intent, ref)
+        assert not ls.is_projection_container_then_worktree_reconciliation_shape(projection)
+
+
+@pytest.mark.parametrize(
+    "state", [ls.LifecycleState.PREPARING, ls.LifecycleState.COMPLETE, ls.LifecycleState.RECONCILED,
+              ls.LifecycleState.RECONCILIATION_FAILED],
+)
+def test_a19_shape_rejects_every_non_admitted_state(state):
+    projection = _a19_projection(state, ("baseline",), ls.ContainerIntent.PRESENT, cs.ABSENT_TRANSITION)
+    assert not ls.is_projection_container_then_worktree_reconciliation_shape(projection)
+
+
+@pytest.mark.parametrize("family", ["baseline", "verification"])
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda p: dataclasses.replace(p, worktree=wl.WorktreeTransition(intent=wl.WorktreeIntent.CREATING, expected_head=_ORIGIN)),
+            id="worktree-creating",
+        ),
+        pytest.param(
+            lambda p: dataclasses.replace(p, worktree=wl.WorktreeTransition(intent=wl.WorktreeIntent.DISPOSING, expected_head=_ORIGIN)),
+            id="worktree-disposing",
+        ),
+        pytest.param(lambda p: dataclasses.replace(p, worktree=wl.ABSENT_WORKTREE_TRANSITION), id="worktree-absent"),
+        pytest.param(
+            lambda p: _with_role(_with_role(p, role="baseline", intent=ls.ContainerIntent.ABSENT, id=None),
+                                 role="verification", intent=ls.ContainerIntent.ABSENT, id=None),
+            id="containers-absent",
+        ),
+        pytest.param(lambda p: dataclasses.replace(p, failure=ls.FailureDetail(phase="p", detail="d")), id="failure-set"),
+    ],
+)
+def test_a19_shape_excludes_non_present_worktrees_absent_containers_and_failures(family, mutate):
+    ref = cs.ABSENT_TRANSITION if family == "baseline" else _a16_ref_record("present")
+    base = _a19_projection(ls.LifecycleState.ACTIVE, (family,), ls.ContainerIntent.PRESENT, ref)
+    assert ls.is_projection_container_then_worktree_reconciliation_shape(base)
+    assert not ls.is_projection_container_then_worktree_reconciliation_shape(mutate(base))

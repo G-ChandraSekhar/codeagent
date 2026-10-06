@@ -266,14 +266,24 @@ def test_forced_with_nothing_remaining_is_refused(plain):
 
 @requires_docker
 def test_t36_shape_normal_refused_forced_records_and_nothing_is_touched(env):
-    """M2 / M4 / M5 / M13."""
+    """M2 / M4 / M5 / M13.
+
+    Disclosed correction (ADR 0004 Amendment 19): T36 is now reconcilable,
+    so the pre-abandonment check is a dry run (PENDING, still blocking,
+    exit 4, nothing changed) instead of a real reconcile, which would now
+    remove the resources this test needs to keep. Abandonment coverage is
+    unchanged, and after forced abandonment a real reconcile must leave the
+    container alone (marker-first classification)."""
     repo_key, lifecycle_id, proj = _crash(env, "baseline_present")
     run_dir = env.state / "repos" / repo_key / "runs" / lifecycle_id
     container = f"codeagent-baseline-{lifecycle_id}"
     projection_bytes = (run_dir / "lifecycle.json").read_bytes()
     worktrees_before, refs_before = _registered_worktrees(env.repo), _codeagent_refs(env.repo)
     assert worktrees_before != set()  # T36: a live container plus a worktree (no ref yet at this crash point)
-    assert _cli(env.state, "--repo", str(env.repo)).returncode == 4
+    world_before = _world(env.state, env.repo, [lifecycle_id])
+    dry = _cli(env.state, "--repo", str(env.repo), "--dry-run")
+    assert dry.returncode == 4 and f"entry {lifecycle_id}: pending" in dry.stdout
+    assert _world(env.state, env.repo, [lifecycle_id]) == world_before
 
     normal = _cli(env.state, "--repo", str(env.repo), "--abandon", lifecycle_id)
     assert normal.returncode == 4 and "refusal: resources_remain" in normal.stdout
@@ -295,6 +305,9 @@ def test_t36_shape_normal_refused_forced_records_and_nothing_is_touched(env):
     reconcile = _cli(env.state, "--repo", str(env.repo))
     assert reconcile.returncode == 3
     assert f"WARNING: run {lifecycle_id}" in reconcile.stderr
+    assert container in _container_names()  # an abandoned entry is never reconciled
+    assert _registered_worktrees(env.repo) == worktrees_before
+    assert (run_dir / "lifecycle.json").read_bytes() == projection_bytes
     assert "SENTINEL-REASON" not in reconcile.stdout + reconcile.stderr
     with ls.prepare_lifecycle(str(env.repo), run_id="after") as lease:
         assert [a.lifecycle_id for a in lease.unresolved_acknowledged] == [lifecycle_id]
@@ -530,6 +543,21 @@ def test_real_complete_run_cannot_be_abandoned(env):
 @requires_docker
 def test_explicit_reconcile_of_the_real_t37_shape(env):
     repo_key, lifecycle_id, proj = _crash(env, "ref_present")
+    result = _cli(env.state, "--repo", str(env.repo))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"entry {lifecycle_id}: reconciled" in result.stdout
+    (trace,) = _explicit_traces(env.state)
+    assert {json.loads(l)["trigger"] for l in trace.read_text().splitlines()} == {"explicit"}
+    assert _projection(env.state / "repos" / repo_key / "runs" / lifecycle_id)["state"] == "RECONCILED"
+    _assert_fully_clean(env, repo_key, lifecycle_id)
+
+
+@requires_docker
+def test_explicit_reconcile_of_the_real_t36_shape(env):
+    """ADR 0004 Amendment 19: the real T36 crash (a live container beside a
+    worktree) is reconciled by `codeagent reconcile`, exit 0."""
+    repo_key, lifecycle_id, proj = _crash(env, "baseline_present")
+    assert f"codeagent-baseline-{lifecycle_id}" in _container_names()
     result = _cli(env.state, "--repo", str(env.repo))
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"entry {lifecycle_id}: reconciled" in result.stdout
@@ -827,6 +855,7 @@ def test_exactly_the_real_docker_tests_carry_the_docker_marker():
         "test_t36_shape_normal_refused_forced_records_and_nothing_is_touched",
         "test_partial_removal_leftover_normal_refused_forced_records",
         "test_real_complete_run_cannot_be_abandoned",
+        "test_explicit_reconcile_of_the_real_t36_shape",
         "test_explicit_reconcile_of_the_real_t37_shape",
         "test_sigkill_publication_windows",
         "test_sigkill_with_stale_temp_alone_then_reconcile_reconciles_normally",

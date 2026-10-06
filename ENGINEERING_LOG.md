@@ -6541,3 +6541,150 @@ the final local total added beside it.
 open; T-E1, T-F1 and T-F2 are not newly mitigated; abandonment still refuses
 on unconfirmed own cleanup. GitHub-hosted `ubuntu-24.04` x86_64 automated-test
 evidence, not a security review. `uv.lock` untouched.
+
+## 2026-10-05 — Ledger D2: container → worktree → ref reconciliation (ADR 0004 Amendment 19, Accepted)
+
+**What.** One chained reconciliation row for an owned, non-absent container
+beside a `present` worktree, with any checkpoint-ref intent, in `ACTIVE`,
+`CLEANING` or `RECONCILING`.
+
+- **Sequence:** Gate A (every resource inspected) → containers → Gate W (fresh
+  listing and fresh worktree inspection) → the Amendment 13 worktree phase →
+  Gate R and the Amendment 16/17 ref phase → `RECONCILED` once and last.
+- **Resume:** partial progress resumes through the existing rows.
+- **Scope:** `reconciliation.py` and `lifecycle_store.py` only.
+
+**C1, done first.** The Amendment 5 row inferred worktree absence with
+`os.path.lexists`, which reports `EACCES` as absence, and it had no admin
+scan. It now uses `_confirm_worktree_absent`, shared with Amendment 16 and
+returning the same messages.
+
+**Trade-offs.**
+
+- **Helpers extracted, not rewritten.** The Amendment 5 container logic was
+  extracted into `_inspect_containers`/`_mutate_containers`. The rebuilt row
+  keeps its lazy `RECONCILING`, its listing count and its messages; the
+  pre-existing tests pass unedited and caught both rebuild mutations (16a,
+  16b).
+- **Fresh gates.** Gate W re-lists containers and re-inspects the worktree,
+  rather than trusting Phase C or Gate A, at the cost of one listing and one
+  Git listing per pass.
+
+**Findings.**
+
+- **`lexists` and R2.** `lexists` is correct for a dangling symlink, so R2
+  cannot catch a restored `lexists`; R1, R1b and R6[eacces] do.
+- **Accepted ADR text is wrong.** An unconfirmed verifier cleanup returns
+  `ENVIRONMENT_FAILURE`, which aborts the run after the baseline. So:
+  - Amendment 19 §1 wrongly says the run continues;
+  - the predicate admits two combinations the owner cannot produce: both
+    roles non-absent, and a baseline beside a ref.
+
+  These are left for joint review, not narrowed silently.
+- **T51** therefore makes only the verification cleanup unconfirmed.
+
+**Incident (local only, fixed).** An early T51 draft called
+`monkeypatch.undo()`, which also reverted the fixture's `CODEAGENT_STATE_DIR`.
+Two `prepare_lifecycle` calls then created the real default state root
+(`~/Library/Application Support/CodeAgent`, born 16:18:59 today), containing
+only those two `r-after` admissions against deleted temporary fixture repos.
+After inspecting it, I removed it. The test now restores only its own patch
+and asserts the state-root variable before calling `prepare_lifecycle`.
+
+**Verified (macOS, Docker 29.8.0 already running, `CODEAGENT_REQUIRE_DOCKER=1`).**
+
+- **New tests: 140.**
+  - `test_reconciliation.py`, +89 (12 C1 and 77 Amendment 19);
+  - `test_lifecycle_store.py`, +45;
+  - `test_lifecycle_run.py`, +5 (T48–T52; T36 flipped to `RECONCILED`);
+  - `test_reconcile_cli.py`, +1.
+- **Mutations:** 21 concrete runs: the 19 numbered categories, with 16 run as
+  16a and 16b and 17 also run as the full revert 17b, all
+  caught; both sources restored to their pre-mutation SHA-256.
+- **Runs:**
+  - directly affected four files: 1,075 passed, forward and reverse;
+  - 23-file focused set: 2,377 passed, forward and reverse;
+  - full suite: 3,898 passed, 0 skipped (from 3,758).
+- **Checks:** `git diff --check` clean; no leftover containers in any of the
+  three families, worktrees, refs, processes, fixture directories or default
+  state root.
+
+Not committed; no Linux CI. `uv.lock` untouched.
+
+**Ledger arithmetic.** D2 moves from 10–22 to 24–40 hours (+14/+18). The
+cumulative ranges are now:
+
+- Gate O: 68–120;
+- first operator run: 167–306;
+- internal alpha: 234–441;
+- public v1: 296–580.
+
+Frozen scope is unchanged. Gate O remains unsatisfied until D3.
+
+## 2026-10-06 — D2 correction pass: exact producer families (Amendment 19 §12)
+
+**What.** Joint review confirmed the contradiction found during D2. An
+unconfirmed verifier cleanup returns `ENVIRONMENT_FAILURE`, and for the
+baseline the controller then terminates before any patch or verification. So
+Amendment 19 §1's "only sets a flag; the run continues" was false.
+
+The predicate now admits exactly two families, each requiring the state
+`ACTIVE`/`CLEANING`/`RECONCILING`, a `present` worktree with its origin
+commit, and a null `failure`:
+
+- **baseline family:** baseline non-absent, verification absent, ref absent;
+- **verification family:** baseline absent, verification non-absent, ref
+  non-absent.
+
+The pre-lock peek now refuses these before acquiring the lifecycle-entry
+lock, with no Docker, Git, or projection-write calls (the repository lock is
+already held by the caller of `reconcile_repository()`):
+
+- both roles non-absent;
+- a baseline with any non-absent ref;
+- a verification with an absent ref.
+
+The locked re-read routes on the exact predicate. The shared container
+helpers still handle both roles for the Amendment 5 row.
+
+**Trade-off.** Breadth would have been harmless at runtime, since the row
+handled both roles correctly. It was narrowed anyway, for the reason J5 gave:
+destructive reconciliation does not admit shapes the owner cannot produce.
+
+**Write accounting corrected.** At most eight writes on the verification path
+and six on the baseline path; the union covers ten distinct fault positions.
+No pass performs ten writes.
+
+**Tests converted.**
+
+- **Became refusals:** `both_roles_non_absent` → `both_roles_with_ref`, and
+  `resumed_reconciling` (a baseline with a ref) → `resumed_baseline_with_ref`.
+  Together with eight more, these are 10 load-bearing pre-lock refusals.
+- **Moved to a valid family:**
+  - ownership tests → baseline family;
+  - Gate A, Gate W, trace and reconciler SIGKILL → verification family;
+  - ordering and write faults → one variant per family (28 fault cases, from
+    20).
+- **Removed:** the both-roles Phase C ordering test; that ordering remains an
+  Amendment 5 row property.
+- **Added:** two valid resumed success cases.
+- **Predicate tests:** 45 → 122.
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** Docker Desktop had stopped
+overnight. It was started with a plain `open -a Docker` (29.8.0); no admin
+dialog appeared, and the first 11 real-Docker failures were "daemon not
+available" errors, not code failures.
+
+- **Mutations:** 25 concrete mutation runs, all caught: 19 numbered plan
+  categories, with categories 16 and 17 each exercised through one additional
+  variant (21 concrete runs), plus predicate broadenings B1–B4 (4 runs). B1 failed all
+  10 peek refusals; B2, B3 and B4 failed exactly their families (3, 5, 2).
+  Both sources were restored to their pre-run SHA-256.
+- **Runs:**
+  - directly affected four files: 1,171 passed, forward and reverse;
+  - 23-file focused set: 2,473 passed, forward and reverse;
+  - full suite: 3,994 passed, 0 skipped (236 new against `851598d`).
+- **Checks:** no leftovers; `git diff --check` clean.
+
+Not committed; no Linux CI. `uv.lock` untouched. The estimate and arithmetic
+are unchanged, and Gate O remains unsatisfied until D3.

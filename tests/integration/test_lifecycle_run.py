@@ -2,12 +2,13 @@
 aware run composition, `codeagent._lifecycle_run.run_lifecycle_aware()`.
 
 Test numbers (T1..T45, T17b) map to the 46 named specifications in the
-slice plan; T46 (ADR 0004 Amendment 15) and T47 (Amendment 16) were added
-later, and T34 was corrected by Amendment 16 from BLOCKED to RECONCILED. Most tests are Docker-free: an injected owner-state
+slice plan; T46 (ADR 0004 Amendment 15), T47 (Amendment 16) and T48-T52
+(Amendment 19) were added later; T34 was corrected by Amendment 16 and T36
+by Amendment 19 from BLOCKED to RECONCILED. Most tests are Docker-free: an injected owner-state
 `activate()` failure sends `run()` straight to `_terminate()` (real
 evidence capture, real worktree disposal, no baseline), and
 `DockerVerifier.__init__` makes no Docker call. Only the end-to-end and
-crash-boundary tests (T30-T38, T47) and the T46 regression carry `requires_docker`; the exact set is
+crash-boundary tests (T30-T38, T47-T52) and the T46 regression carry `requires_docker`; the exact set is
 pinned by T41.
 
 Every `LifecycleRunCleanupError` assertion also checks the message is
@@ -1181,12 +1182,14 @@ def _child_run_and_sigkill(repo, state_dir, evidence, point):
                 die()
 
         ls_c.LifecycleWorktreePublisher.publish = publish
-    elif point == "baseline_present":
+    elif point in ("baseline_present", "baseline_creating", "verification_present"):
         real = ls_c.LifecycleContainerPublisher.publish
+        want_role = ContainerRole.VERIFICATION if point.startswith("verification") else ContainerRole.BASELINE
+        want_intent = ContainerIntent.CREATING if point.endswith("creating") else ContainerIntent.PRESENT
 
         def publish(self, *, role, intent, id):
             real(self, role=role, intent=intent, id=id)
-            if role is ContainerRole.BASELINE and intent is ContainerIntent.PRESENT:
+            if role is want_role and intent is want_intent:
                 die()
 
         ls_c.LifecycleContainerPublisher.publish = publish
@@ -1237,13 +1240,165 @@ def test_t35_sigkill_after_worktree_present_is_reconciled(env):
     _assert_fully_clean(env, repo_key, lifecycle_id)
 
 
+def _assert_reconciled_once(env, repo_key, lifecycle_id):
+    dead = _projection(env.state / "repos" / repo_key / "runs" / lifecycle_id)
+    assert dead["state"] == "RECONCILED"
+    assert dead["reconciliation"]["attempts_total"] == 1
+    assert dead["containers"]["baseline"]["intent"] == "absent"
+    assert dead["containers"]["verification"]["intent"] == "absent"
+    assert dead["worktree"]["intent"] == "absent" and dead["checkpoint_ref"]["intent"] == "absent"
+    _assert_fully_clean(env, repo_key, lifecycle_id)
+
+
 @requires_docker
-def test_t36_sigkill_after_baseline_present_blocks(env):
-    """T36: worktree plus container — no reconciliation row exists."""
+def test_t36_sigkill_after_baseline_present_is_reconciled(env):
+    """T36 (ADR 0004 Amendment 19; previously pinned BLOCKED): the owner dies
+    with a real created-but-never-started baseline container beside a
+    `present` worktree. The next run's reconciliation removes the container,
+    then the worktree, in one pass and one cycle."""
     repo_key, lifecycle_id, proj = _crash(env, "baseline_present")
+    assert proj["state"] == "ACTIVE"
     assert proj["containers"]["baseline"]["intent"] == "present" and proj["worktree"]["intent"] == "present"
+    assert proj["checkpoint_ref"]["intent"] == "absent"
     assert f"codeagent-baseline-{lifecycle_id}" in _container_names()
+    ls.prepare_lifecycle(str(env.repo), run_id="r-after").close()
+    _assert_reconciled_once(env, repo_key, lifecycle_id)
+
+
+@requires_docker
+def test_t48_sigkill_after_baseline_creating_is_reconciled(env):
+    """T48 (Amendment 19): the owner dies right after the baseline's durable
+    `creating`, before `docker create`; nothing is live at the name."""
+    repo_key, lifecycle_id, proj = _crash(env, "baseline_creating")
+    assert proj["containers"]["baseline"]["intent"] == "creating" and proj["worktree"]["intent"] == "present"
+    ls.prepare_lifecycle(str(env.repo), run_id="r-after").close()
+    _assert_reconciled_once(env, repo_key, lifecycle_id)
+
+
+@requires_docker
+def test_t49_sigkill_after_verification_present_is_reconciled(env):
+    """T49 (Amendment 19): container, worktree and checkpoint ref together —
+    the full container -> worktree -> ref chain."""
+    repo_key, lifecycle_id, proj = _crash(env, "verification_present")
+    assert proj["containers"]["verification"]["intent"] == "present"
+    assert proj["worktree"]["intent"] == "present" and proj["checkpoint_ref"]["intent"] == "present"
+    assert f"codeagent-verification-{lifecycle_id}" in _container_names()
+    assert _codeagent_refs(env.repo) == [f"refs/codeagent/runs/{lifecycle_id}/checkpoint"]
+    ls.prepare_lifecycle(str(env.repo), run_id="r-after").close()
+    _assert_reconciled_once(env, repo_key, lifecycle_id)
+
+
+def _child_run_with_sleeping_verification(repo, state_dir, evidence):
+    """Module-level (picklable) child: the baseline fails fast (the bug), and
+    post-patch verification passes and then sleeps, so the verification
+    container is genuinely running when the parent SIGKILLs this process."""
+    os.environ["CODEAGENT_STATE_DIR"] = state_dir
+    from codeagent import _lifecycle_run as lr_c
+
+    lr_c.run_lifecycle_aware(
+        repo,
+        run_id="r-kill-running",
+        task_statement="fix retry bug",
+        approval_mode=domain.ApprovalMode.INTERACTIVE,
+        evidence_root=evidence,
+        patch_operations=(PatchOperation("jobs/worker.py", BUGGY, FIXED),),
+        model=MarkerGatedFakeModel(read_path="jobs/worker.py", marker=BUG_MARKER, plan=PLAN),
+        approval=FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
+        verify_command=("sh", "-c", " ".join(FIXTURE_VERIFY_COMMAND) + " && exec sleep 600"),
+    )
+
+
+def _running(name) -> bool:
+    out = subprocess.run(["docker", "inspect", "--format", "{{.State.Running}}", name], capture_output=True, text=True)
+    return out.returncode == 0 and out.stdout.strip() == "true"
+
+
+@requires_docker
+def test_t50_sigkill_while_verification_container_runs_is_reconciled(env):
+    """T50 (Amendment 19): the parent SIGKILLs the owner while its
+    verification container is running; `docker rm --force` by immutable id
+    must stop and remove it."""
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(target=_child_run_with_sleeping_verification, args=(str(env.repo), str(env.state), str(env.evidence)))
+    proc.start()
+    try:
+        name = None
+        for _ in range(900):
+            dirs = _run_dirs(env.state)
+            if dirs and _running(f"codeagent-verification-{dirs[0].name}"):
+                name = f"codeagent-verification-{dirs[0].name}"
+                break
+            if not proc.is_alive():
+                break
+            subprocess.run(["sleep", "0.2"])
+        assert name is not None, "the verification container never ran"
+        proc.kill()
+        proc.join(timeout=30)
+        assert proc.exitcode == -signal.SIGKILL
+    finally:
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=10)
+    repo_key, lifecycle_id, proj = _only_run(env.state)
+    assert proj["containers"]["verification"]["intent"] == "present"
+    assert _running(name)
+    ls.prepare_lifecycle(str(env.repo), run_id="r-after").close()
+    _assert_reconciled_once(env, repo_key, lifecycle_id)
+
+
+@requires_docker
+def test_t51_unconfirmed_container_cleanup_leaves_cleaning_and_is_reconciled(env, monkeypatch):
+    """T51 (Amendment 19), the non-crash route: the verification container's
+    removal is left unconfirmed (its `docker rm` is never performed), so the
+    owner records it `removing(id)`, preserves the worktree, keeps the ref,
+    and stops in CLEANING. The next run's reconciliation recovers all of it.
+    (An unconfirmed *baseline* cleanup instead aborts the run before any
+    patch, so the ref would be absent.)"""
+    from codeagent import executor as ex
+
+    real_cleanup = ex.DockerVerifier._cleanup_by_id
+    monkeypatch.setattr(
+        ex.DockerVerifier,
+        "_cleanup_by_id",
+        lambda self, cid, name: False if name.startswith("codeagent-verification-") else real_cleanup(self, cid, name),
+    )
+    result = _invoke(env)
+    assert result.finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert result.finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+    repo_key, lifecycle_id, proj = _only_run(env.state)
+    assert proj["state"] == "CLEANING"
+    assert proj["containers"]["baseline"]["intent"] == "absent"
+    assert proj["containers"]["verification"]["intent"] == "removing"
+    assert proj["worktree"]["intent"] == "present" and proj["checkpoint_ref"]["intent"] == "present"
+    assert f"codeagent-verification-{lifecycle_id}" in _container_names()
+    # Restore only this patch: `monkeypatch.undo()` would also revert the
+    # fixture's isolated CODEAGENT_STATE_DIR.
+    monkeypatch.setattr(ex.DockerVerifier, "_cleanup_by_id", real_cleanup)
+    assert os.environ["CODEAGENT_STATE_DIR"] == str(env.state)
+    ls.prepare_lifecycle(str(env.repo), run_id="r-after").close()
+    _assert_reconciled_once(env, repo_key, lifecycle_id)
+
+
+@requires_docker
+def test_t52_unlabeled_impostor_at_the_deterministic_name_blocks_and_is_untouched(env):
+    """T52 (Amendment 19): after a T36 crash the owned container is replaced
+    by an unlabeled one at the same name. Ownership is unproven: admission
+    is blocked and the impostor, worktree and projection are untouched."""
+    repo_key, lifecycle_id, _ = _crash(env, "baseline_present")
+    name = f"codeagent-baseline-{lifecycle_id}"
+    subprocess.run(["docker", "rm", "--force", name], capture_output=True, check=True)
+    impostor = subprocess.run(
+        ["docker", "create", "--name", name, DEFAULT_IMAGE, "python3", "-c", "pass"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    run_dir = env.state / "repos" / repo_key / "runs" / lifecycle_id
+    before = (run_dir / "lifecycle.json").read_bytes()
+    worktrees = _registered_worktrees(env.repo)
     _blocked(env.repo)
+    assert (run_dir / "lifecycle.json").read_bytes() == before
+    assert _registered_worktrees(env.repo) == worktrees != set()
+    listed = subprocess.run(["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}"], capture_output=True, text=True, check=True)
+    assert impostor in listed.stdout.split()
 
 
 @requires_docker
@@ -1419,7 +1574,7 @@ def _calls_named(tree, name):
 def test_t41_scope_and_marker_pins():
     """T41: no bundled module imports the internal composition; only it calls
     `prepare_lifecycle(`/`create_shared_lifecycle_publishers(`; and exactly
-    the T30-T38, T46 and T47 tests require Docker."""
+    the T30-T38 and T46-T52 tests require Docker."""
     importers, callers = [], {"prepare_lifecycle": set(), "create_shared_lifecycle_publishers": set()}
     for module in sorted(_SRC.glob("*.py")):
         tree = ast.parse(module.read_text())
@@ -1446,5 +1601,5 @@ def test_t41_scope_and_marker_pins():
 
     docker_tests = {n for n in dir(this) if n.startswith("test_") and marked(getattr(this, n))}
     assert docker_tests == {
-        n for n in dir(this) if n.startswith(tuple(f"test_t{i}_" for i in (*range(30, 39), 46, 47)))
+        n for n in dir(this) if n.startswith(tuple(f"test_t{i}_" for i in (*range(30, 39), *range(46, 53))))
     }

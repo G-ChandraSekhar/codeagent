@@ -2754,7 +2754,7 @@ Stage 2 (of the four-stage planning process in
       reported an unreadable parent (`EACCES`) as absence and deleted the ref.
       It now uses the accepted observer, with a load-bearing regression.
   - **New test:** T47, an owner SIGKILL in teardown, is reconciled. T36 and T37
-    still block.
+    still block (at the time; both are now reconciled, by Amendments 17 and 19).
   - **Verified:** 125 new tests; ten mutations caught; full suite 3,244 → 3,369
     passed, 0 skipped; focused set 1,848 forward and reverse; no leftovers.
   - **Linux CI evidence (run
@@ -2830,7 +2830,8 @@ Stage 2 (of the four-stage planning process in
     `checkpoint_ref.container_gate`; `schema_version` unchanged; no SHAs,
     names, ids or paths.
   - **Tests:** 73 new. T37 now expects `RECONCILED` with full cleanup
-    assertions (it previously expected `BLOCKED`); T36 still blocks.
+    assertions (it previously expected `BLOCKED`); T36 still blocks (at the
+    time; reconciled since Amendment 19).
   - **Verified:** ten mutations caught and sources restored byte-for-byte;
     targeted 981 and focused 1,921, forward and reverse; full suite 3,369 →
     3,442 passed, 0 skipped (`CODEAGENT_REQUIRE_DOCKER=1`); no leftovers.
@@ -2866,7 +2867,7 @@ Stage 2 (of the four-stage planning process in
     cross-resource atomicity; the A4 same-user race is narrowed, not closed.
     A stop after Phase W can leave the worktree removed while admission
     stays blocked. Amendment 16's observation and deletion limits carry
-    over. T36 still blocks. The CI evidence is GitHub-hosted `ubuntu-24.04`
+    over. T36 still blocks (at the time; reconciled since Amendment 19). The CI evidence is GitHub-hosted `ubuntu-24.04`
     x86_64 automated-test evidence, not a security review.
   - **Threats:** T-E1 and T-F1 unchanged. T-F2 and T-M1 gain partial,
     reconciler-level coverage only. Not wired to any entry point.
@@ -2914,6 +2915,64 @@ Stage 2 (of the four-stage planning process in
     admission warning (a mandatory D6 test). The A4 same-user race stays
     open; T-E1, T-F1 and T-F2 are not newly mitigated; abandonment still
     refuses while an observer's own cleanup cannot be confirmed.
+- **Ledger D2: live-container → worktree → checkpoint-ref reconciliation**,
+  per ADR 0004 "Amendment 19 (**Accepted** 2026-10-05)". **Implemented and
+  locally validated on macOS (2026-10-05); uncommitted, Linux CI pending.**
+  - **What it adds:** a chained reconciliation row
+    (`reconciliation._reconcile_container_then_worktree_entry`) for exactly
+    two owner-producible shapes beside a `present` worktree, in
+    `ACTIVE`/`CLEANING`/`RECONCILING` only (never `PREPARING`): a non-absent
+    baseline with the ref absent, or a non-absent verification with the ref
+    non-absent. Both roles together, a baseline with a ref, or a verification
+    without one are refused before acquiring the lifecycle-entry lock, with
+    no Docker, Git, or projection-write calls. Gate A
+    inspects the container (immutable-id inspect plus four labels), the
+    worktree and the ref before any mutation. Then:
+    - the container;
+    - Gate W (a fresh listing plus a fresh worktree inspection);
+    - the Amendment 13 worktree phase;
+    - Gate R and the Amendment 16/17 ref phase;
+    - `RECONCILED` once and last.
+
+    There is one increment per cycle. Partial progress resumes through the
+    existing rows.
+  - **C1 correction:** the Amendment 5 row no longer infers worktree absence
+    from `os.path.lexists`. It uses `_confirm_worktree_absent` (registration,
+    admin scan, no-follow leaf observation), shared with Amendment 16. EACCES
+    is now `SUBSTRATE_UNAVAILABLE`; an admin entry or a conflicting leaf is
+    `REFUSED`.
+  - **Refactor:** the Amendment 5 container logic is extracted into
+    `_inspect_containers`/`_mutate_containers` with unchanged behaviour. The
+    trace gains additive categorical per-role fields and
+    `worktree.container_gate`; `schema_version` stays 1.
+  - **Implementation-time correction (2026-10-06, before staging):**
+    Amendment 19 §1 wrongly said an unconfirmed baseline cleanup lets the run
+    continue. It ends the run (`ENVIRONMENT_FAILURE`), so the predicate now
+    admits exactly the two families; three non-producible shapes are refused
+    (Amendment 19 §12).
+  - **Tests:** 236 new tests against `851598d`. Highlights:
+    - T36 is now `RECONCILED`;
+    - T48–T52 cover a running container, the non-crash `CLEANING` route, and
+      an impostor;
+    - 10 pre-lock refusals of non-producible shapes;
+    - seven real reconciler SIGKILL boundaries;
+    - 28 write faults (8- and 6-write paths; ten distinct positions).
+
+    The D1 T36 abandonment test was corrected (dry run instead of a real
+    reconcile).
+  - **Verified:**
+    - 25 concrete mutation runs, all caught: 19 numbered plan categories,
+      with categories 16 and 17 each exercised through one additional variant
+      (21 concrete runs), plus predicate broadenings B1–B4 (4 runs); sources
+      restored byte for byte;
+    - directly affected files: 1,171 passed, forward and reverse;
+    - 23-file focused set: 2,473 passed, forward and reverse;
+    - full suite: 3,994 passed, 0 skipped (`CODEAGENT_REQUIRE_DOCKER=1`);
+    - no leftovers.
+  - **Boundaries:** no cross-resource atomicity; A4 races remain open; a late
+    orphaned Docker child can still force a refusal; abandonment is unchanged.
+    T-F1 gains partial, reconciler-level coverage for this shape only. **Gate
+    O remains unsatisfied until D3.**
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

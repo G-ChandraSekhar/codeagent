@@ -33,10 +33,10 @@ Labels used throughout:
 | Current milestone | **Milestone 3 (hardened execution), late.** Milestones 2 and 5 are partial; Milestones 4, 6 and 7 are not started (§5). |
 | Milestone 3 substrate progress | **~65–80%** [inference]. This measures the lifecycle/executor *substrate* only and **must not be read as product progress**. |
 | Total product completion | **~25–35%** [inference]. **None** of the 11 frozen v1 criteria (§1.2) has objective evidence through the operator path; several are partially supported by internal mechanisms. |
-| Strongest completed capability | **Mechanism-verified** resource lifecycle safety: a real worktree, an owned checkpoint ref, and a lifecycle-labelled Docker verifier with durable write-ahead state. Automatic reconciliation covers the documented single-resource and worktree→ref crash shapes, proven with real Git, Docker and SIGKILL tests in Linux CI. It is reachable only through test-called internal code. |
+| Strongest completed capability | **Mechanism-verified** resource lifecycle safety: a real worktree, an owned checkpoint ref, and a lifecycle-labelled Docker verifier with durable write-ahead state. Automatic reconciliation covers the documented single-resource and worktree→ref crash shapes, proven with real Git, Docker and SIGKILL tests in Linux CI; D2's container→worktree→ref shape (ADR 0004 Amendment 19) is implemented and verified locally only, with Linux CI pending. It is reachable only through test-called internal code. |
 | Largest missing product capability | **No model drives a run.** There is no model adapter [absent], no multi-tool loop, and no list/search tools. The patch applied is **supplied by the caller at construction** (`_lifecycle_run.run_lifecycle_aware(patch_operations=...)`), not proposed by a model. |
-| Next release-blocking dependency | **D2 — live-container chaining** (container → worktree → ref reconciliation), followed by D3. Gate O remains unsatisfied until D2 and D3 both land. (D1 is complete, accepted as ADR 0004 Amendment 18 on 2026-10-05, and Linux-CI-confirmed: commit `e0474af`, run 37333036614.) |
-| Remaining effort, frozen scope | **~282–562 focused hours to public v1** (§7; D1 re-estimated to 24–40 h on 2026-10-04). These are planning ranges, not commitments. |
+| Next release-blocking dependency | **D2 — live-container chaining** (container → worktree → ref reconciliation): implemented locally on 2026-10-05 under ADR 0004 Amendment 19 (Accepted 2026-10-05), but not yet committed or Linux-CI-confirmed. **D3** follows. Gate O remains unsatisfied until D3 lands and D2 is confirmed. (D1 is complete, accepted as ADR 0004 Amendment 18 on 2026-10-05, and Linux-CI-confirmed: commit `e0474af`, run 37333036614.) |
+| Remaining effort, frozen scope | **~296–580 focused hours to public v1** (§7; D1 re-estimated to 24–40 h on 2026-10-04, D2 to 24–40 h on 2026-10-05). These are planning ranges, not commitments. |
 | Readiness | **Not operator-ready.** The only CLI is the maintenance-only `codeagent reconcile` (D1, Linux-CI-confirmed; it never runs a task); there is no `solve` [absent]. The only end-to-end path, `_lifecycle_run.run_lifecycle_aware`, is imported by no production module (verified call graph, §2.1). |
 
 **Gates, which must not be conflated:**
@@ -45,15 +45,16 @@ Labels used throughout:
   No CLI or operator path may run the lifecycle-aware composition until all of
   the following exist:
   - a dead-run checkpoint-ref row (**done**, Amendment 16);
-  - a worktree-plus-container row (**not done**);
+  - a worktree-plus-container row (**implemented locally by D2**, ADR 0004
+    Amendment 19 Accepted 2026-10-05; not yet committed or Linux-CI-confirmed);
   - abandonment (**done by D1**, ADR 0004 Amendment 18 Accepted
     2026-10-05; Linux-CI-confirmed, run 37333036614);
   - ADR 0005 cancellation (**not done**).
 
   The `codeagent reconcile` maintenance command (D1) is the recovery
   prerequisite itself and never runs the composition. **Gate O remains
-  unsatisfied**: the worktree-plus-container row (D2) and ADR 0005
-  cancellation (D3) do not exist.
+  unsatisfied**: ADR 0005 cancellation (D3) does not exist, and D2's row is
+  not yet Linux-CI-confirmed.
 - **Gate α — internal alpha**: brief criteria 1–7 met with objective evidence.
   This is **not** a release and is never published as "v1".
 - **Gate v1 — public v1**: **all** brief criteria 1–11 (§1.2) met, each with
@@ -307,9 +308,9 @@ path.
 | Lifecycle state root and locks | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | `state_root.py`, `state_locks.py`; T40 [CI] | Operator path | Gate O | Proven via `solve` | D6 |
 | Owner/container/worktree/ref publication | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | Shared cursor + 4 publishers (Amendments 6–11) [CI] | Operator path | Gate O | Proven via `solve` | D6 |
 | Lifecycle-aware composition | PARTIAL | WIRED_INTERNAL_ONLY | `run_lifecycle_aware`, T30–T47 [CI]; **caller-supplied patch** | Model-driven tools; operator path | D4–D6, Gate O | `solve` drives it with model-supplied patches | D6 |
-| Reconciliation, documented shapes | PARTIAL | WIRED_INTERNAL_ONLY | Rows: all-absent, containers, A12, A13, A16, A17 [CI]; T33–T35, T37, T47 | Container + worktree (+ ref) | D2 | See §4 | D2 |
-| Live-container → worktree → ref | NONE | NOT_STARTED | T36 asserts BLOCKED [test] | Chained row | — | T36 → RECONCILED, full cleanup | D2 |
-| Abandonment / explicit reconcile | MECHANISM_VERIFIED | VERIFIED_LINUX_CI (maintenance path only; not COMPLETE_FOR_V1) | ADR 0004 Amendment 18 (Accepted 2026-10-05); `abandonment.py`, `maintenance.py`, `cli.py`; `tests/unit/test_{abandonment,maintenance,cli}.py`, `tests/integration/test_reconcile_cli.py` (real T36, partial-removal, T37, SIGKILL, lock contention); Linux CI run 37333036614 | — | — | Every blocked entry in a trusted, valid repository namespace has an operator exit (preconditions: a valid state root and `state-root.json`, the repository lock file, a valid identity-matched `repo.json`, and a well-formed `runs/`; corrupt or missing trusted metadata, a hostile `lifecycle.lock`, or a corrupt final marker intentionally block maintenance too and need manual archival): `ABANDONED` only after confirmed absence; `ABANDONED_UNRESOLVED` only by explicit acknowledgement, never `CLEAN`; no resource deleted; exit codes pinned | D1 |
+| Reconciliation, documented shapes | PARTIAL | WIRED_INTERNAL_ONLY | Rows: all-absent, containers, A12, A13, A16, A17 [CI]; T33–T35, T37, T47; A19 chained row and the C1 correction [local] | Linux CI for A19 | D2 | See §4 | D2 |
+| Live-container → worktree → ref | PARTIAL (mechanism complete; Linux CI pending) | WIRED_INTERNAL_ONLY | ADR 0004 Amendment 19 (Accepted 2026-10-05); T36 → RECONCILED, T48–T52 (running container, non-crash `CLEANING`, impostor), real reconciler SIGKILL, write-fault matrix [local]. Before D2, T36 asserted BLOCKED (historical). | Linux CI | — | T36 → RECONCILED, full cleanup | D2 |
+| Abandonment / explicit reconcile | MECHANISM_VERIFIED | VERIFIED_LINUX_CI (maintenance path only; not COMPLETE_FOR_V1) | ADR 0004 Amendment 18 (Accepted 2026-10-05); `abandonment.py`, `maintenance.py`, `cli.py`; `tests/unit/test_{abandonment,maintenance,cli}.py`, `tests/integration/test_reconcile_cli.py` (real T36, partial-removal, T37, SIGKILL, lock contention; historical: after Amendment 19 the T36 abandonment test checks the dry run instead of a real reconcile); Linux CI run 37333036614 | — | — | Every blocked entry in a trusted, valid repository namespace has an operator exit (preconditions: a valid state root and `state-root.json`, the repository lock file, a valid identity-matched `repo.json`, and a well-formed `runs/`; corrupt or missing trusted metadata, a hostile `lifecycle.lock`, or a corrupt final marker intentionally block maintenance too and need manual archival): `ABANDONED` only after confirmed absence; `ABANDONED_UNRESOLVED` only by explicit acknowledgement, never `CLEAN`; no resource deleted; exit codes pinned | D1 |
 | ADR 0005 cancellation | DESIGNED | NOT_STARTED | ADR 0005 "not implemented"; no `CancellationToken` or `signal.signal` in `src/` [absent] | Whole feature, including CLI-owned handlers | D1 (CLI package) | Real SIGINT/SIGTERM tests → `CANCELLED`, resources confirmed absent | D3 |
 | Operator lifecycle wiring | NONE | NOT_STARTED | `_lifecycle_run` AST-pinned as unimported (T41) | `solve` | Gate O | `solve` is the only run caller | D6 |
 | Deterministic fake-model e2e CI | PARTIAL | WIRED_INTERNAL_ONLY | T30 with a fake model and **preconfigured patch** [CI] | Through the CLI, model-driven | D4–D6 | CI drives `codeagent solve` with a scripted fake model emitting the patch | D6 |
@@ -334,7 +335,7 @@ evidence at most.
 | Threat / failure | v1 obligation | Current evidence | Missing | Blocks |
 |---|---|---|---|---|
 | T-E1 concurrent runs | **Fail closed** | Repository lock for the whole internal run; T40 | Operator path | Gate O / criterion 1 |
-| T-F1 orphaned containers | **Automatic recovery for the verification-phase shape** (Gate O row); for any other refused shape, abandonment is the operator exit (it records a disposition and never removes resources) | 3B-5 row; `test_slice_3b6.py` SIGKILL [CI] | Container + worktree (+ ref) row | Gate O |
+| T-F1 orphaned containers | **Automatic recovery for the verification-phase shape** (Gate O row); for any other refused shape, abandonment is the operator exit (it records a disposition and never removes resources) | 3B-5 row; `test_slice_3b6.py` SIGKILL [CI]; A19 container → worktree → ref row, T36/T48–T52 [local] | Linux CI for the A19 row | Gate O |
 | T-F2 orphaned worktree | **Fail closed**; abandonment is the operator exit for refused shapes (a recorded disposition, never resource removal) | A12/A13/A17 rows; T35/T37 [CI] | Abandonment; mid-recreate crash shape (C-1) | Gate O; D5 |
 | T-M1 shared `.git` metadata | **Fully mitigate original-checkout integrity**; document ref visibility | Exact `worktree remove`, no prune (AST-pinned); CAS ref delete | Per-file hash snapshot (criterion 7); benchmark integrity check (J-7) | 7 |
 | Cancellation | **Implement** (ADR 0005) | None; T34's `KeyboardInterrupt` path reconciles on the next run | Whole ADR | Gate O |
@@ -427,8 +428,8 @@ acceptance tests must include the named failure paths.
 
 | ID | Deliverable | Acceptance tests (minimum) | Failure boundaries | Depends | User-visible | Hours |
 |---|---|---|---|---|---|---|
-| **D1** | Abandonment (ADR 0004 §11) + explicit reconcile + `codeagent reconcile [--dry-run] [--abandon ID [--acknowledge-unresolved --reason]]`; console-script packaging skeleton | (a) A blocked entry (invalid run directory, T36 shape, partial-removal leftover) makes `reconcile` report `BLOCKED`. (b) Normal `--abandon` **succeeds only** when fresh inspection confirms no attributable resource or registration remains: it records `ABANDONED`, reconcile reports `CLEAN`, and admission proceeds. (c) Normal `--abandon` with resources remaining, or with inspection failing, is **refused**: no marker, still `BLOCKED`. (d) Only `--abandon ID --acknowledge-unresolved --reason ...` records `ABANDONED_UNRESOLVED`: later admission proceeds **with the required warning** on CLI and report, and reconcile returns `UNRESOLVED_ACKNOWLEDGED`, **never `CLEAN`**. (e) `--dry-run` writes nothing. (f) A busy repository or lifecycle lock is refused, nonzero. (g) Exit codes are pinned. | Neither abandonment form deletes or mutates containers, worktrees, refs or registrations. Never runs a task. Refuses an active lifecycle. | — | Yes | 24–40 (re-estimated 2026-10-04: no-create opens, a separate dry-run planner, and the marker crash design) |
-| **D2** | Container (+ worktree, + ref) chained reconciliation | T36 → RECONCILED with full physical cleanup; unproven container owner → REFUSED; write-fault and SIGKILL resume matrix | Order containers → worktree → ref; each phase gated; no atomicity claim | — | Indirect | 10–22 |
+| **D1** | Abandonment (ADR 0004 §11) + explicit reconcile + `codeagent reconcile [--dry-run] [--abandon ID [--acknowledge-unresolved --reason]]`; console-script packaging skeleton | (a) A blocked entry (invalid run directory, T36 shape [historical: reconcilable since ADR 0004 Amendment 19], partial-removal leftover) makes `reconcile` report `BLOCKED`. (b) Normal `--abandon` **succeeds only** when fresh inspection confirms no attributable resource or registration remains: it records `ABANDONED`, reconcile reports `CLEAN`, and admission proceeds. (c) Normal `--abandon` with resources remaining, or with inspection failing, is **refused**: no marker, still `BLOCKED`. (d) Only `--abandon ID --acknowledge-unresolved --reason ...` records `ABANDONED_UNRESOLVED`: later admission proceeds **with the required warning** on CLI and report, and reconcile returns `UNRESOLVED_ACKNOWLEDGED`, **never `CLEAN`**. (e) `--dry-run` writes nothing. (f) A busy repository or lifecycle lock is refused, nonzero. (g) Exit codes are pinned. | Neither abandonment form deletes or mutates containers, worktrees, refs or registrations. Never runs a task. Refuses an active lifecycle. | — | Yes | 24–40 (re-estimated 2026-10-04: no-create opens, a separate dry-run planner, and the marker crash design) |
+| **D2** | Container (+ worktree, + ref) chained reconciliation | T36 → RECONCILED with full physical cleanup; unproven container owner → REFUSED; write-fault and SIGKILL resume matrix | Order containers → worktree → ref; each phase gated; no atomicity claim | — | Indirect | 24–40 (re-estimated 2026-10-05 from 10–22: Amendment 5 helper extraction, the C1 correction, real-Docker owner-crash and reconciler-SIGKILL matrices, ten write-fault points, the D1 test correction) |
 | **D3** | CLI ownership boundary (`codeagent` `main` owning SIGINT/SIGTERM per ADR 0005 §2) + cancellation token, safe points, interruptible verifier, `CANCELLED`, `start_new_session` | Real SIGINT/SIGTERM during baseline, verification and approval wait → `CANCELLED`, containers and worktree confirmed absent, next admission clean; repeated signals idempotent | Library modules never call `signal.signal`; patch apply non-interruptible | D1 | Yes | 20–40 |
 | **D4** | General multi-tool model protocol + scripted fake; `list_directory`, ranged/paginated `read_file` (64 KiB per call, C-6), `search_text`; dispatcher with policy events; tool-call and wall-clock budgets; failure feedback; reapproval on material change | Fake CI: fail → feedback → revised plan → reapproval → pass; escape, size and pagination refusals; illegal-state calls fail closed; each budget kind ends the run | Model output untrusted (A1); reads path-safe | — | Indirect | 30–55 |
 | **D5** | Transactional patch protocol (§1.2). **Substrate:** add/update/delete/rename, whole-proposal pre-write validation, syntax guard, test-file rules, `.gitattributes` refusal kept, ADR 0003 discard-and-recreate on the continue path via a fresh reservation and new incarnation (C-1). **Integration:** model-supplied operations through D4's tool loop. | Each op incl. rename/delete; a pre-write validation refusal leaves the worktree unchanged; a post-write handled failure → contaminated → confirmed disposal and leaf absence → fresh reservation → new incarnation at the last checkpoint → repair continues (real Git); disposal or recreate unconfirmed → structured error; mid-recreate SIGKILL reconciles or blocks with an abandonment exit; scripted-fake model supplies the ops end to end | No claim of filesystem atomicity or invisible intermediate writes; never per-file rollback; never trust a contaminated worktree; never reuse a consumed reservation; ref kept across recreation | Substrate: the C-1 ADR amendment only. Integration: D4. | Yes | 35–65 |
@@ -443,16 +444,19 @@ That is **11 deliverables**, all mandatory for public v1. The precision
 corrections in this revision change wording, dependencies and acceptance
 tests, not scope, so the estimate was unchanged at 274–554 hours. **D1 was
 re-estimated from 16–32 to 24–40 hours on 2026-10-04** (planning review of the
-implemented design); every cumulative range below moves by +8 hours.
+implemented design); every cumulative range below moves by +8 hours. **D2 was
+re-estimated from 10–22 to 24–40 hours on 2026-10-05** (ADR 0004 Amendment
+19); every cumulative range below moves by a further +14 (low) / +18 (high)
+hours. Frozen v1 scope is unchanged.
 
 **Cumulative planning ranges** [inference]:
 
 | Gate reached | Deliverables | Hours |
 |---|---|---|
-| Gate O satisfied | D1–D3 | **54–102** |
-| First operator run (fake model, model-driven tools) | + D4–D6 | **153–288** |
-| Internal alpha (Gate α, criteria 1–7) | + D7, D8a | **220–423** |
-| Public v1 (Gate v1, criteria 1–11) | + D8b, D9, D10 | **282–562** |
+| Gate O satisfied | D1–D3 | **68–120** |
+| First operator run (fake model, model-driven tools) | + D4–D6 | **167–306** |
+| Internal alpha (Gate α, criteria 1–7) | + D7, D8a | **234–441** |
+| Public v1 (Gate v1, criteria 1–11) | + D8b, D9, D10 | **296–580** |
 
 **Uncertainty drivers:**
 - real-model behaviour, cost and the chance a genuine repair iteration
@@ -502,8 +506,10 @@ implemented design); every cumulative range below moves by +8 hours.
 
 ## 9. Immediate recommendation
 
-**Next: D2 (live-container chaining), then D3 (CLI ownership boundary and
-ADR 0005 cancellation).** Gate O remains unsatisfied until both land.
+**Next: D3 (CLI ownership boundary and ADR 0005 cancellation), after D2 is
+committed and Linux-CI-confirmed.** D2 (live-container chaining, ADR 0004
+Amendment 19 Accepted 2026-10-05) is implemented and verified locally,
+uncommitted, with Linux CI pending. Gate O remains unsatisfied until D3 lands.
 
 **Done (2026-10-05): D1** — ADR 0004 §11 abandonment and explicit reconcile,
 with the narrow `codeagent reconcile` maintenance command and console-script
@@ -517,7 +523,7 @@ Why D1 came first on the critical path:
     since Slice 3B-1);
   - partial-removal leftovers (Amendment 13);
   - locked registrations;
-  - T36.
+  - T36 (at the time; reconciled automatically since ADR 0004 Amendment 19).
 - **It was the first item of Gate O**, with its design already accepted (ADR
   0004 §10–11).
 - **It created the CLI package that D3 needs** for real signal ownership, through
@@ -554,7 +560,8 @@ Why the others come after:
 - **Operator gate:** ADR 0004 Amendment 14 "Gate"; `_lifecycle_run.py`
   module docstring; T41.
 - **Lifecycle evidence:** `tests/integration/test_lifecycle_run.py` T30–T47
-  (T36 BLOCKED, T37 RECONCILED); `tests/unit/test_reconciliation.py`; CI run
-  37158716812.
+  (historically T36 BLOCKED, T37 RECONCILED); `tests/unit/test_reconciliation.py`; CI run
+  37158716812. Since ADR 0004 Amendment 19 (local, uncommitted): T36
+  RECONCILED, T48–T52 added.
 - **Isolation:** `spikes/s4/S4_RESULT.md`; `executor._SECURITY_FLAGS`;
   Amendment 15.

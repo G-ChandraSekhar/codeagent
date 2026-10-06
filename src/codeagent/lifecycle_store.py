@@ -401,6 +401,54 @@ def is_projection_worktree_then_checkpoint_ref_reconciliation_shape(projection: 
     )
 
 
+# ADR 0004 Amendment 19: the only states in which the owner can leave a
+# non-absent container beside a `present` worktree (`activate()` precedes the
+# baseline, so no container exists in PREPARING), plus a resumed RECONCILING.
+_CONTAINER_THEN_WORKTREE_STATES = frozenset(
+    {LifecycleState.ACTIVE, LifecycleState.CLEANING, LifecycleState.RECONCILING}
+)
+
+
+def _container_record_absent(attribution: ContainerAttribution) -> bool:
+    return attribution.intent is ContainerIntent.ABSENT and attribution.id is None
+
+
+def is_projection_container_then_worktree_reconciliation_shape(projection: LifecycleProjection) -> bool:
+    """ADR 0004 Amendment 19: the two owner-producible container shapes
+    beside a `present` worktree (with its origin commit), in `ACTIVE`,
+    `CLEANING` or `RECONCILING` (never `PREPARING`), with a null `failure`:
+
+    - baseline family: baseline non-absent, verification exactly absent,
+      checkpoint ref exactly absent (the baseline runs before any patch);
+    - verification family: baseline exactly absent, verification non-absent,
+      checkpoint ref non-absent (verification runs only after a patch).
+
+    An unconfirmed verifier cleanup returns `ENVIRONMENT_FAILURE`, which ends
+    the run, so the owner never leaves both roles non-absent, a baseline
+    beside a ref, or a verification without one; each is refused. Disjoint
+    from every other reconciliation shape."""
+    if not (
+        projection.state in _CONTAINER_THEN_WORKTREE_STATES
+        and projection.worktree.intent is WorktreeIntent.PRESENT
+        and projection.worktree.expected_head is not None
+        and projection.failure is None
+    ):
+        return False
+    baseline_absent = _container_record_absent(projection.baseline)
+    verification_absent = _container_record_absent(projection.verification)
+    baseline_family = (
+        projection.baseline.intent is not ContainerIntent.ABSENT
+        and verification_absent
+        and projection.checkpoint_ref == ABSENT_TRANSITION
+    )
+    verification_family = (
+        baseline_absent
+        and projection.verification.intent is not ContainerIntent.ABSENT
+        and projection.checkpoint_ref.intent is not CheckpointIntent.ABSENT
+    )
+    return baseline_family or verification_family
+
+
 def checkpoint_ref_deletion_candidates(transition: CheckpointTransition) -> tuple[tuple[str, str], ...]:
     """ADR 0004 section 8's deletion candidates for a persisted
     checkpoint-ref record, as `(role, sha)` pairs in a fixed order:

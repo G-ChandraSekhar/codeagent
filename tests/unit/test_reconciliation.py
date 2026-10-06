@@ -6616,3 +6616,1129 @@ def test_classifier_respects_the_32_object_bound():
     assert rc._CLEANUP_CHAIN_MAX_OBJECTS == 32
     assert rc._is_own_cleanup_failure(_chain(40, 32))
     assert not rc._is_own_cleanup_failure(_chain(40, 33))
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 19, C1: the Amendment 5 row's worktree-absence check.
+# R1-R7. `os.path.lexists` reported any `OSError` as absence and the row had
+# no admin scan; the corrected check is `_confirm_worktree_absent`.
+# ---------------------------------------------------------------------------
+
+_C1_ID = "c1" * 16
+_C1_LIVE = "7" * 64
+
+
+def _c1_seed(h, *, container=True):
+    projection = dataclasses.replace(_initial_projection(h, _C1_ID), state=ls.LifecycleState.ACTIVE)
+    if container:
+        projection = _with_container(projection, role="baseline", intent=ls.ContainerIntent.PRESENT, id=_C1_LIVE)
+    return _seed_run_dir(h, _C1_ID, projection)
+
+
+def _c1_parent(h) -> _Path:
+    parent = _Path(h.state_root.path) / "worktrees" / h.identity.repo_key
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (parent.parent).chmod(0o700)
+    parent.chmod(0o700)
+    return parent
+
+
+def _c1_docker_spy(monkeypatch):
+    """Records every container-side call; returns the call list. The Docker
+    listing returns the live baseline so an unwanted pass would proceed."""
+    calls: list[str] = []
+
+    def listing():
+        calls.append("listing")
+        return _listing({f"codeagent-baseline-{_C1_ID}": _C1_LIVE})
+
+    def inspect_(cid):
+        calls.append("inspect")
+        raise rc._DockerInspectError("not reached in a correct pass")
+
+    def bounded(argv, **kw):
+        calls.append("docker:" + argv[1])
+        return BoundedProcessResult(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", listing)
+    monkeypatch.setattr(rc, "_docker_inspect_ownership", inspect_)
+    monkeypatch.setattr(rc, "run_bounded_stdout", bounded)
+    return calls
+
+
+def _c1_assert_stopped(h, run_dir, before, result, outcome, detail, calls):
+    (entry,) = result.entries
+    assert entry.outcome is outcome
+    assert entry.detail == detail
+    assert result.blocked
+    assert calls == []  # stopped before any container listing, inspect, or rm
+    assert (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes() == before
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions; R1b covers the injected form")
+def test_c1_r1_unreadable_leaf_parent_is_substrate_unavailable_never_absence(harness, monkeypatch):
+    """R1: a real EACCES (the leaf's parent is mode 000). `os.path.lexists`
+    reported this as absence."""
+    run_dir = _c1_seed(harness)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    parent = _c1_parent(harness)
+    (parent / _C1_ID).mkdir(mode=0o700)
+    calls = _c1_docker_spy(monkeypatch)
+    parent.chmod(0o000)
+    try:
+        assert not os.path.lexists(parent / _C1_ID)  # the defect being corrected
+        result = harness.reconcile()
+    finally:
+        parent.chmod(0o700)
+    _c1_assert_stopped(
+        harness, run_dir, before, result,
+        rc.ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the worktree leaf could not be inspected", calls,
+    )
+
+
+def test_c1_r1b_injected_leaf_inspection_failure_is_substrate_unavailable(harness, monkeypatch):
+    """R1 (injected form, runs as any user): an inspection failure raised by
+    the leaf observer is never absence."""
+    run_dir = _c1_seed(harness)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    calls = _c1_docker_spy(monkeypatch)
+
+    def boom(self, repo_key, lifecycle_id):
+        raise lf.LifecycleFsError(lf.LifecycleFsFailure.SUBSTRATE_UNAVAILABLE, "EACCES")
+
+    monkeypatch.setattr(sr.StateRoot, "observe_materialized_worktree_leaf", boom)
+    result = harness.reconcile()
+    _c1_assert_stopped(
+        harness, run_dir, before, result,
+        rc.ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE, "the worktree leaf could not be inspected", calls,
+    )
+
+
+def test_c1_r2_dangling_symlink_leaf_is_refused(harness, monkeypatch):
+    run_dir = _c1_seed(harness)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    parent = _c1_parent(harness)
+    os.symlink(parent / "nowhere", parent / _C1_ID)
+    calls = _c1_docker_spy(monkeypatch)
+    result = harness.reconcile()
+    _c1_assert_stopped(
+        harness, run_dir, before, result,
+        rc.ReconciliationEntryOutcome.REFUSED, "the recomputed worktree leaf is present", calls,
+    )
+
+
+@pytest.mark.parametrize("kind", ["file", "wrong_mode_dir", "materialized_dir"])
+def test_c1_r3_conflicting_or_present_leaf_is_refused(harness, monkeypatch, kind):
+    run_dir = _c1_seed(harness)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    leaf = _c1_parent(harness) / _C1_ID
+    if kind == "file":
+        leaf.write_text("x")
+    else:
+        leaf.mkdir(mode=0o700)
+        if kind == "wrong_mode_dir":
+            leaf.chmod(0o755)
+        else:
+            (leaf / ".git").write_text("gitdir: elsewhere\n")
+    calls = _c1_docker_spy(monkeypatch)
+    result = harness.reconcile()
+    _c1_assert_stopped(
+        harness, run_dir, before, result,
+        rc.ReconciliationEntryOutcome.REFUSED, "the recomputed worktree leaf is present", calls,
+    )
+
+
+def test_c1_r4_matching_admin_entry_with_path_unregistered_is_refused(harness, monkeypatch):
+    run_dir = _c1_seed(harness)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    admin = _Path(harness.identity.canonical_common_dir) / "worktrees" / _C1_ID
+    admin.mkdir(parents=True)
+    calls = _c1_docker_spy(monkeypatch)
+    assert rc._worktree_registered_paths(harness.context.working_tree_root) == {harness.context.working_tree_root}
+    result = harness.reconcile()
+    _c1_assert_stopped(
+        harness, run_dir, before, result,
+        rc.ReconciliationEntryOutcome.REFUSED, "a git worktree admin entry exists for this lifecycle", calls,
+    )
+
+
+def test_c1_r5_failed_admin_scan_is_substrate_unavailable(harness, monkeypatch):
+    run_dir = _c1_seed(harness)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    monkeypatch.setattr(rc, "_scan_worktree_admin_entries", lambda *a: rc._AdminScanResult.INSPECTION_FAILED)
+    calls = _c1_docker_spy(monkeypatch)
+    result = harness.reconcile()
+    _c1_assert_stopped(
+        harness, run_dir, before, result,
+        rc.ReconciliationEntryOutcome.SUBSTRATE_UNAVAILABLE,
+        "the git worktree admin directory could not be inspected",
+        calls,
+    )
+
+
+@pytest.mark.skipif(not (_docker_available() or REQUIRE_DOCKER), reason="real Docker daemon not available")
+@pytest.mark.parametrize("condition", ["eacces", "dangling_symlink", "admin_entry"])
+def test_c1_r6_owned_live_container_survives_every_stop(harness, monkeypatch, condition):
+    """R6: with a real, owned container recorded `present`, each C1 stop
+    happens before any container listing, inspect or removal, and the
+    container still exists afterwards."""
+    if REQUIRE_DOCKER and not _docker_available():
+        pytest.fail("CODEAGENT_REQUIRE_DOCKER=1 but a real Docker daemon is not available")
+    if condition == "eacces" and os.geteuid() == 0:
+        condition = "dangling_symlink"  # root ignores mode 000
+    name = f"codeagent-baseline-{_C1_ID}"
+    container_id = _create_owned_container(
+        name=name, state_root_id=harness.state_root.state_root_id, lifecycle_id=_C1_ID, role="baseline"
+    )
+    try:
+        projection = dataclasses.replace(_initial_projection(harness, _C1_ID), state=ls.LifecycleState.ACTIVE)
+        projection = _with_container(projection, role="baseline", intent=ls.ContainerIntent.PRESENT, id=container_id)
+        run_dir = _seed_run_dir(harness, _C1_ID, projection)
+        before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+        calls: list[str] = []
+        real_listing, real_inspect, real_bounded = (
+            rc._docker_ps_all_id_name_pairs, rc._docker_inspect_ownership, rc.run_bounded_stdout,
+        )
+        monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: (calls.append("listing"), real_listing())[1])
+        monkeypatch.setattr(rc, "_docker_inspect_ownership", lambda c: (calls.append("inspect"), real_inspect(c))[1])
+        monkeypatch.setattr(rc, "run_bounded_stdout", lambda argv, **kw: (calls.append(argv[1]), real_bounded(argv, **kw))[1])
+        parent = _c1_parent(harness)
+        if condition == "eacces":
+            (parent / _C1_ID).mkdir(mode=0o700)
+            parent.chmod(0o000)
+        elif condition == "dangling_symlink":
+            os.symlink(parent / "nowhere", parent / _C1_ID)
+        else:
+            (_Path(harness.identity.canonical_common_dir) / "worktrees" / _C1_ID).mkdir(parents=True)
+        try:
+            result = harness.reconcile()
+        finally:
+            parent.chmod(0o700)
+        (entry,) = result.entries
+        assert entry.outcome is not rc.ReconciliationEntryOutcome.RECONCILED
+        assert calls == []
+        assert (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes() == before
+        listed = subprocess.run(
+            ["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}"], capture_output=True, text=True, check=True
+        ).stdout.split()
+        assert container_id in listed
+    finally:
+        _force_remove_container(container_id)
+
+
+def test_c1_r7_genuinely_absent_leaf_and_no_admin_entry_still_reconciles(harness, monkeypatch):
+    run_dir = _c1_seed(harness, container=False)
+    observed: list[str] = []
+    real_observe = sr.StateRoot.observe_materialized_worktree_leaf
+    real_scan = rc._scan_worktree_admin_entries
+
+    def observe(self, repo_key, lifecycle_id):
+        observed.append("leaf")
+        return real_observe(self, repo_key, lifecycle_id)
+
+    def scan(common, lifecycle_id):
+        observed.append("admin")
+        return real_scan(common, lifecycle_id)
+
+    monkeypatch.setattr(sr.StateRoot, "observe_materialized_worktree_leaf", observe)
+    monkeypatch.setattr(rc, "_scan_worktree_admin_entries", scan)
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", lambda: _empty_listing())
+    result = harness.reconcile()
+    (entry,) = result.entries
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED
+    assert observed == ["admin", "leaf"]
+    assert _read_projection_dict(run_dir)["state"] == "RECONCILED"
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 19 (ledger D2): owned non-absent containers beside a
+# `present` worktree, with any checkpoint-ref intent. Real Git throughout.
+# The `d2` fixture's stateful fake Docker (listing, ownership inspect, and
+# `docker rm`) logs into the same ordered `h.log` as Amendment 17's ref
+# calls, alongside every projection write, worktree registration
+# observation, and Git worktree removal. Real-Docker tests follow.
+# ---------------------------------------------------------------------------
+
+_A19_ID1 = "1" * 64
+_A19_ID2 = "2" * 64
+_A19_ID3 = "3" * 64
+_A19_NAMES = {role: f"codeagent-{role}-{_A13_ID}" for role in ("baseline", "verification")}
+
+
+class _A19Docker:
+    def __init__(self, h, run_dir_getter):
+        self.h = h
+        self.run_dir = run_dir_getter
+        self.live: dict[str, tuple[str, dict]] = {}  # name -> (id, labels)
+        self.listing_hooks: list = []  # per listing call: None | exception | callable
+        self.rm_mode: dict[str, str] = {}
+        self.inspect_override: dict = {}
+
+    def owned(self, role, cid, *, name=None, **overrides):
+        labels = _owned_labels(state_root_id=self.h.state_root.state_root_id, lifecycle_id=_A13_ID, role=role)
+        labels.update(overrides)
+        self.live[name or _A19_NAMES[role]] = (cid, labels)
+
+    def _summary(self):
+        run_dir = self.run_dir()
+        if not (run_dir / ls.LIFECYCLE_JSON_FILENAME).exists():
+            return None
+        p = _read_projection_dict(run_dir)
+        c = p["containers"]
+        return (p["state"], c["baseline"]["intent"], c["verification"]["intent"], p["worktree"]["intent"],
+                p["checkpoint_ref"]["intent"])
+
+    def listing(self):
+        self.h.log.append(("listing", self._summary()))
+        hook = self.listing_hooks.pop(0) if self.listing_hooks else None
+        if isinstance(hook, BaseException):
+            raise hook
+        if callable(hook):
+            hook()
+        return _listing({name: cid for name, (cid, _) in self.live.items()})
+
+    def inspect(self, cid):
+        self.h.log.append(("inspect", cid))
+        override = self.inspect_override.get(cid)
+        if isinstance(override, BaseException):
+            raise override
+        if override is not None:
+            return override
+        for name, (live_id, labels) in self.live.items():
+            if live_id == cid:
+                return rc._InspectOwnership(id=cid, name=name, labels=dict(labels))
+        raise rc._DockerInspectError("no such container")
+
+    def bounded(self, argv, **kw):
+        assert argv[:3] == ["docker", "rm", "--force"], argv
+        cid = argv[3]
+        self.h.log.append(("rm", cid))
+        mode = self.rm_mode.get(cid, "remove")
+        if mode in ("remove", "timeout_remove", "replace"):
+            for name, (live_id, labels) in list(self.live.items()):
+                if live_id == cid:
+                    del self.live[name]
+                    if mode == "replace":
+                        self.live[name] = (_A19_ID3, labels)
+        if mode.startswith("timeout"):
+            raise BoundedProcessError(BoundedProcessFailure.TIMED_OUT, "injected")
+        return BoundedProcessResult(returncode=0, stdout=b"")
+
+
+@pytest.fixture
+def d2(a17, monkeypatch):
+    h = a17
+    run_dir = h.runs_dir() / _A13_ID
+    h.docker = _A19Docker(h, lambda: run_dir)
+    monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", h.docker.listing)
+    monkeypatch.setattr(rc, "_docker_inspect_ownership", h.docker.inspect)
+    monkeypatch.setattr(rc, "run_bounded_stdout", h.docker.bounded)
+
+    def logged(name, label):
+        real = getattr(rc, name)
+
+        def inner(*a, **k):
+            out = real(*a, **k)
+            h.log.append(("write", label(*a, **k)))
+            return out
+
+        monkeypatch.setattr(rc, name, inner)
+
+    logged("_publish_projection_state", lambda *a, **k: k["state"].value)
+    logged("_publish_reconciler_container_transition", lambda *a, **k: f"{k['role']}:{k['intent'].value}")
+    logged(
+        "_publish_reconciler_worktree_transition",
+        lambda *a, **k: "worktree:" + k.get("target", _wl.ABSENT_WORKTREE_TRANSITION).intent.value,
+    )
+    logged("_publish_reconciler_checkpoint_ref_transition", lambda *a, **k: "ref:" + k["target"].intent.value)
+    real_registration, real_remove = rc._observe_target_registration, rc._attempt_worktree_remove
+    monkeypatch.setattr(
+        rc, "_observe_target_registration",
+        lambda *a, **k: (h.log.append(("registration", None)), real_registration(*a, **k))[1],
+    )
+    monkeypatch.setattr(
+        rc, "_attempt_worktree_remove", lambda *a: (h.log.append(("git-remove", None)), real_remove(*a))[1]
+    )
+    yield h
+
+
+def _a19_seed(h, *, baseline=None, verification=None, ref=None, live=None, state=ls.LifecycleState.ACTIVE,
+              attempts=0, failure=None, materialize=True):
+    head = _run("git", "-C", str(h.repo), "rev-parse", "HEAD").stdout.strip()
+    projection = dataclasses.replace(
+        _initial_projection(h, _A13_ID),
+        state=state,
+        worktree=_wl.WorktreeTransition(intent=_wl.WorktreeIntent.PRESENT, expected_head=head),
+        checkpoint_ref=ref if ref is not None else cs.ABSENT_TRANSITION,
+        reconciliation=ls.ReconciliationSummary(attempts_total=attempts, recent_failures=()),
+        failure=failure,
+    )
+    for role, spec in (("baseline", baseline), ("verification", verification)):
+        if spec is not None:
+            projection = _with_container(projection, role=role, intent=ls.ContainerIntent(spec[0]), id=spec[1])
+    run_dir = _seed_run_dir(h, _A13_ID, projection)
+    if materialize:
+        _a13_materialize(h)
+    if live is not None:
+        _a16_set(h.repo, live, ref=_A17_REF)
+    return run_dir
+
+
+def _a19_tokens(h):
+    out = []
+    for kind, value in h.log:
+        out.append(f"write:{value}" if kind == "write" else kind)
+    return out
+
+
+def _a19_assert_untouched(h, run_dir, before, *, live_names, registered=True):
+    assert (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes() == before
+    assert not [x for x in h.log if x[0] in ("write", "rm", "git-remove", "delete")]
+    assert set(h.docker.live) == set(live_names)
+    assert _a13_registered(h) is registered
+
+
+def _a19_assert_reconciled(h, run_dir, *, attempts=1):
+    _a17_assert_fully_reconciled(h, run_dir, attempts=attempts)
+    assert h.docker.live == {}
+
+
+# (baseline, verification, ref intent, live ref, live containers {role: id}, state, attempts)
+_A19_SUCCESS = {
+    "t36_baseline_present": (("present", _A19_ID1), None, None, None, {"baseline": _A19_ID1}, "ACTIVE", 0),
+    "baseline_creating_nothing_live": (("creating", None), None, None, None, {}, "ACTIVE", 0),
+    "baseline_creating_owned_live": (("creating", None), None, None, None, {"baseline": _A19_ID1}, "ACTIVE", 0),
+    "baseline_removing_already_gone": (("removing", _A19_ID1), None, None, None, {}, "ACTIVE", 0),
+    "verification_present_ref_present": (None, ("present", _A19_ID2), "present", "A", {"verification": _A19_ID2}, "ACTIVE", 0),
+    "verification_present_ref_advancing_at_A": (None, ("present", _A19_ID2), "advancing", "A", {"verification": _A19_ID2}, "ACTIVE", 0),
+    "verification_present_ref_advancing_at_B": (None, ("present", _A19_ID2), "advancing", "B", {"verification": _A19_ID2}, "ACTIVE", 0),
+    "verification_present_ref_removing": (None, ("present", _A19_ID2), "removing", "A", {"verification": _A19_ID2}, "ACTIVE", 0),
+    "cleaning_with_preserved_worktree": (None, ("removing", _A19_ID2), "present", "A", {"verification": _A19_ID2}, "CLEANING", 0),
+    "resumed_reconciling_baseline": (("removing", _A19_ID1), None, None, None, {"baseline": _A19_ID1}, "RECONCILING", 1),
+    "resumed_reconciling_verification": (None, ("removing", _A19_ID2), "present", "A", {"verification": _A19_ID2}, "RECONCILING", 1),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_A19_SUCCESS))
+def test_a19_chained_row_removes_containers_then_worktree_then_ref(d2, case):
+    h = d2
+    baseline, verification, ref_intent, live, live_containers, state, attempts = _A19_SUCCESS[case]
+    for role, cid in live_containers.items():
+        h.docker.owned(role, cid)
+    run_dir = _a19_seed(
+        h, baseline=baseline, verification=verification,
+        ref=_a16_record(ref_intent, h.A, h.B) if ref_intent else None,
+        live=getattr(h, live) if live else None,
+        state=ls.LifecycleState(state), attempts=attempts,
+    )
+    result = h.reconcile()
+    entry = _a17_entry(result)
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+    assert not result.blocked
+    _a19_assert_reconciled(h, run_dir, attempts=max(attempts, 1))
+    # `docker rm` only for a live owned container, by id, baseline first.
+    assert [v for k, v in h.log if k == "rm"] == [
+        live_containers[r] for r in ("baseline", "verification") if r in live_containers
+    ]
+    tokens = _a19_tokens(h)
+    assert tokens.count("write:RECONCILED") == 1 and tokens[-1] == "write:RECONCILED"
+    assert tokens.count("write:RECONCILING") == (0 if state == "RECONCILING" else 1)
+    assert entry.worktree_container_gate == "confirmed_absent"
+    assert entry.worktree_removal_attempt == "exited_zero"
+    for role, spec in (("baseline", baseline), ("verification", verification)):
+        initial = getattr(entry, f"{role}_initial_persisted_intent")
+        assert initial == (spec[0] if spec else "absent")
+        assert getattr(entry, f"{role}_absent_transition_confirmed_this_pass") is (spec is not None)
+    event, _ = _a12_entry_event(h, result)
+    assert event["worktree"]["container_gate"] == "confirmed_absent"
+    assert event["containers"]["baseline"]["initial_persisted_intent"] == (baseline[0] if baseline else "absent")
+
+
+def test_a19_real_sha256_repository(tmp_path, monkeypatch):
+    repo = tmp_path / "repo256"
+    init = subprocess.run(["git", "init", "-q", "--object-format=sha256", str(repo)], capture_output=True, text=True)
+    if init.returncode != 0:
+        pytest.skip("installed git does not support --object-format=sha256")
+    _run("git", "-C", str(repo), "config", "user.email", "a@b.com")
+    _run("git", "-C", str(repo), "config", "user.name", "a")
+    (repo / "f.txt").write_text("x")
+    _run("git", "-C", str(repo), "add", ".")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    state_dir = _set_state_dir(monkeypatch, tmp_path, "state-256")
+    h = _Harness(repo, state_dir)
+    try:
+        assert h.identity.object_format == "sha256"
+        h.log = []
+        run_dir = h.runs_dir() / _A13_ID
+        h.docker = _A19Docker(h, lambda: run_dir)
+        monkeypatch.setattr(rc, "_docker_ps_all_id_name_pairs", h.docker.listing)
+        monkeypatch.setattr(rc, "_docker_inspect_ownership", h.docker.inspect)
+        monkeypatch.setattr(rc, "run_bounded_stdout", h.docker.bounded)
+        A = _a16_commit(repo, "A")
+        assert len(A) == 64
+        h.docker.owned("verification", _A19_ID2)
+        _a19_seed(h, verification=("present", _A19_ID2), ref=_a16_record("present", A), live=A)
+        entry = _a17_entry(h.reconcile())
+        assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+        _a19_assert_reconciled(h, run_dir)
+        _a16_assert_no_sha_in_trace(h, A)
+    finally:
+        if _a13_registered(h):
+            _run("git", "-C", str(repo), "worktree", "remove", "--force", str(_a13_leaf(h)), check=False)
+        h.close()
+
+
+def test_a19_preparing_is_refused_before_the_lifecycle_lock_with_no_docker_git_or_writes(d2, monkeypatch):
+    h = d2
+    h.docker.owned("baseline", _A19_ID1)
+    run_dir = _a19_seed(h, baseline=("present", _A19_ID1), state=ls.LifecycleState.PREPARING)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    monkeypatch.setattr(rc, "acquire_lifecycle_lock", lambda *a, **k: pytest.fail("PREPARING must not be locked"))
+    result = h.reconcile()
+    entry = _a17_entry(result)
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert entry.detail == "entry state or attribution is not recognized by this slice"
+    assert result.blocked
+    assert h.log == []  # no Docker, registration, ref, or write call
+    _a19_assert_untouched(h, run_dir, before, live_names=[_A19_NAMES["baseline"]])
+
+
+# Shapes the owner cannot produce (Amendment 19 correction): an unconfirmed
+# verifier cleanup returns ENVIRONMENT_FAILURE, which ends the run, so a
+# baseline is never followed by a ref or a verification container, and a
+# verification container never exists without a ref.
+# (baseline, verification, ref intent or None, state, attempts)
+_A19_FORBIDDEN = {
+    # converted from the former `both_roles_non_absent` success case
+    "both_roles_with_ref": (("removing", _A19_ID1), ("present", _A19_ID2), "present", "ACTIVE", 0),
+    "both_roles_without_ref": (("present", _A19_ID1), ("present", _A19_ID2), None, "ACTIVE", 0),
+    "both_roles_cleaning": (("removing", _A19_ID1), ("removing", _A19_ID2), "present", "CLEANING", 0),
+    "baseline_with_ref_creating": (("present", _A19_ID1), None, "creating", "ACTIVE", 0),
+    "baseline_with_ref_present": (("present", _A19_ID1), None, "present", "ACTIVE", 0),
+    "baseline_with_ref_advancing": (("present", _A19_ID1), None, "advancing", "ACTIVE", 0),
+    "baseline_with_ref_removing": (("present", _A19_ID1), None, "removing", "CLEANING", 0),
+    # converted from the former `resumed_reconciling` success case
+    "resumed_baseline_with_ref": (("present", _A19_ID1), None, "present", "RECONCILING", 1),
+    "verification_without_ref": (None, ("present", _A19_ID2), None, "ACTIVE", 0),
+    "verification_without_ref_cleaning": (None, ("removing", _A19_ID2), None, "CLEANING", 0),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_A19_FORBIDDEN))
+def test_a19_non_producible_shapes_are_refused_before_the_lifecycle_lock_with_no_docker_git_or_writes(d2, monkeypatch, case):
+    """Load-bearing: both roles non-absent, a baseline beside any non-absent
+    ref, and a verification with an absent ref are refused before acquiring
+    the lifecycle-entry lock, with no Docker, Git, or projection-write calls,
+    and every byte is unchanged. (The repository lock is already held by the
+    harness, as by every caller of `reconcile_repository()`.)"""
+    h = d2
+    baseline, verification, ref_intent, state, attempts = _A19_FORBIDDEN[case]
+    for role, spec in (("baseline", baseline), ("verification", verification)):
+        if spec is not None:
+            h.docker.owned(role, spec[1])
+    run_dir = _a19_seed(
+        h, baseline=baseline, verification=verification,
+        ref=_a16_record(ref_intent, h.A, h.B) if ref_intent else None,
+        live=h.A if ref_intent else None,
+        state=ls.LifecycleState(state), attempts=attempts,
+    )
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    live_before, ref_before = dict(h.docker.live), _a17_ref(h)
+    monkeypatch.setattr(rc, "acquire_lifecycle_lock", lambda *a, **k: pytest.fail("must not take the lifecycle lock"))
+    result = h.reconcile()
+    entry = _a17_entry(result)
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert entry.detail == "entry state or attribution is not recognized by this slice"
+    assert result.blocked
+    assert h.log == []  # no Docker listing/inspect/rm, registration, ref observation, or write
+    assert (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes() == before
+    assert h.docker.live == live_before and _a17_ref(h) == ref_before and _a13_registered(h)
+
+
+def _a19_unowned(h, kind):
+    """Seed one ownership-refusal world; returns (seed kwargs, live names)."""
+    b = ("present", _A19_ID1)
+    if kind == "unlabeled":
+        h.docker.live[_A19_NAMES["baseline"]] = (_A19_ID1, {})
+    elif kind in ("wrong_state_root", "wrong_lifecycle", "wrong_role"):
+        key = {"wrong_state_root": rc.CONTAINER_LABEL_STATE_ROOT_ID, "wrong_lifecycle": rc.CONTAINER_LABEL_ID,
+               "wrong_role": rc.CONTAINER_LABEL_ROLE}[kind]
+        h.docker.owned("baseline", _A19_ID1, **{key: "verification" if kind == "wrong_role" else "f" * 32})
+    elif kind == "persisted_id_differs":
+        h.docker.owned("baseline", _A19_ID3)
+    elif kind == "persisted_id_under_other_name":
+        h.docker.owned("baseline", _A19_ID1, name="someone-else")
+    elif kind == "absent_role_name_occupied":
+        h.docker.owned("baseline", _A19_ID1)
+        h.docker.owned("verification", _A19_ID2)
+    elif kind == "inspect_identity_disagrees":
+        h.docker.owned("baseline", _A19_ID1)
+        labels = _owned_labels(state_root_id=h.state_root.state_root_id, lifecycle_id=_A13_ID, role="baseline")
+        h.docker.inspect_override[_A19_ID1] = rc._InspectOwnership(id=_A19_ID1, name="codeagent-other", labels=labels)
+    return {"baseline": b}, list(h.docker.live)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["unlabeled", "wrong_state_root", "wrong_lifecycle", "wrong_role", "persisted_id_differs",
+     "persisted_id_under_other_name", "absent_role_name_occupied", "inspect_identity_disagrees"],
+)
+def test_a19_unproven_container_owner_is_refused_with_zero_mutation(d2, kind):
+    h = d2
+    seed, live_names = _a19_unowned(h, kind)
+    run_dir = _a19_seed(h, **seed)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    result = h.reconcile()
+    entry = _a17_entry(result)
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED, entry.detail
+    assert entry.detail.startswith(("baseline container:", "verification container:"))
+    assert result.blocked
+    _a19_assert_untouched(h, run_dir, before, live_names=live_names)
+    assert _a17_ref(h) is None
+    assert "registration" not in _a19_tokens(h)  # the container decision stopped Gate A first
+
+
+def _a19_lock(h):
+    _run("git", "-C", str(h.repo), "worktree", "lock", str(_a13_leaf(h)))
+
+
+@pytest.mark.parametrize(
+    "kind, outcome",
+    [
+        ("locked", "REFUSED"),
+        ("bare", "REFUSED"),
+        ("prunable", "REFUSED"),
+        ("admin_zero", "REFUSED"),
+        ("admin_many", "REFUSED"),
+        ("leaf_missing", "REFUSED"),
+        ("leaf_conflict", "REFUSED"),
+        ("ref_unexpected", "REFUSED"),
+        ("ref_symbolic", "REFUSED"),
+        ("live_ref_against_absent_record", "REFUSED"),
+        ("listing_failed", "SUBSTRATE_UNAVAILABLE"),
+        ("inspect_failed", "SUBSTRATE_UNAVAILABLE"),
+        ("registration_failed", "SUBSTRATE_UNAVAILABLE"),
+        ("admin_unknown", "SUBSTRATE_UNAVAILABLE"),
+        ("leaf_unknown", "SUBSTRATE_UNAVAILABLE"),
+        ("ref_observation_failed", "SUBSTRATE_UNAVAILABLE"),
+    ],
+)
+def test_a19_gate_a_stops_before_any_container_is_removed(d2, monkeypatch, kind, outcome):
+    h = d2
+    if kind == "live_ref_against_absent_record":
+        role, cid, ref_record, live = "baseline", _A19_ID1, None, h.A  # baseline family, ref recorded absent
+    else:
+        role, cid, ref_record, live = "verification", _A19_ID2, _a16_record("present", h.A), h.A
+    if kind == "ref_unexpected":
+        live = h.C
+    h.docker.owned(role, cid)
+    run_dir = _a19_seed(h, **{role: ("present", cid)}, ref=ref_record, live=live)
+    leaf = _a13_leaf(h)
+    if kind == "locked":
+        _a19_lock(h)
+    elif kind in ("bare", "prunable"):
+        reg = rc._TargetRegistration("present", 1, kind == "bare", None if kind == "bare" else False,
+                                     None if kind == "bare" else True)
+        real = rc._observe_target_registration
+        monkeypatch.setattr(rc, "_observe_target_registration", lambda *a, **k: (h.log.append(("registration", None)), reg)[1])
+    elif kind in ("admin_zero", "admin_many", "admin_unknown"):
+        value = {"admin_zero": 0, "admin_many": "many", "admin_unknown": "unknown"}[kind]
+        monkeypatch.setattr(rc, "_count_worktree_admin_entries", lambda *a: value)
+    elif kind == "leaf_missing":
+        _shutil.rmtree(leaf)
+    elif kind == "leaf_conflict":
+        leaf.chmod(0o755)
+    elif kind == "ref_symbolic":
+        _run("git", "-C", str(h.repo), "update-ref", "-d", _A17_REF)
+        _run("git", "-C", str(h.repo), "symbolic-ref", _A17_REF, "refs/heads/a19-does-not-exist")
+    elif kind == "listing_failed":
+        h.docker.listing_hooks.append(rc._DockerListingError("injected"))
+    elif kind == "inspect_failed":
+        h.docker.inspect_override[cid] = rc._DockerInspectError("injected")
+    elif kind == "registration_failed":
+        monkeypatch.setattr(rc, "_run_worktree_listing", lambda root: (_ for _ in ()).throw(rc._WorktreeListingError("x")))
+    elif kind == "leaf_unknown":
+        monkeypatch.setattr(sr.StateRoot, "observe_materialized_worktree_leaf",
+                            lambda self, *a: sr.MaterializedLeafObservation.UNKNOWN)
+    elif kind == "ref_observation_failed":
+        def boom(self):
+            raise cr.CheckpointRefError(cr.CheckpointRefFailure.AMBIGUOUS_OBSERVATION, "injected")
+        monkeypatch.setattr(rc.CheckpointRef, "observe", boom)
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    result = h.reconcile()
+    entry = _a17_entry(result)
+    assert entry.outcome is rc.ReconciliationEntryOutcome[outcome], entry.detail
+    assert result.blocked
+    assert (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes() == before
+    assert not [x for x in h.log if x[0] in ("write", "rm", "git-remove", "delete")]
+    assert _A19_NAMES[role] in h.docker.live
+    if kind == "locked":
+        _run("git", "-C", str(h.repo), "worktree", "unlock", str(leaf))
+    if kind == "leaf_conflict":
+        leaf.chmod(0o700)
+    if kind == "ref_symbolic":
+        _run("git", "-C", str(h.repo), "symbolic-ref", "-d", _A17_REF)
+
+
+def test_a19_failure_bearing_projection_is_refused_at_the_peek(d2):
+    h = d2
+    h.docker.owned("baseline", _A19_ID1)
+    run_dir = _a19_seed(h, baseline=("present", _A19_ID1), failure=ls.FailureDetail(phase="p", detail="d"))
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert h.log == []
+    _a19_assert_untouched(h, run_dir, before, live_names=[_A19_NAMES["baseline"]])
+
+
+def test_a19_held_lifecycle_lock_is_skipped_active(d2):
+    h = d2
+    h.docker.owned("baseline", _A19_ID1)
+    run_dir = _a19_seed(h, baseline=("present", _A19_ID1))
+    before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+    ctx = multiprocessing.get_context("spawn")
+    ready_evt, release_evt = ctx.Event(), ctx.Event()
+    proc = ctx.Process(target=_hold_lifecycle_lock_only, args=(str(run_dir), h.identity.repo_key, _A13_ID, ready_evt, release_evt))
+    proc.start()
+    try:
+        assert ready_evt.wait(timeout=10)
+        entry = _a17_entry(h.reconcile())
+    finally:
+        release_evt.set()
+        proc.join(timeout=10)
+    assert entry.outcome is rc.ReconciliationEntryOutcome.SKIPPED_ACTIVE
+    _a19_assert_untouched(h, run_dir, before, live_names=[_A19_NAMES["baseline"]])
+
+
+def test_a19_rm_timeout_with_confirmed_absence_still_reconciles(d2):
+    h = d2
+    h.docker.owned("baseline", _A19_ID1)
+    h.docker.rm_mode[_A19_ID1] = "timeout_remove"
+    run_dir = _a19_seed(h, baseline=("present", _A19_ID1))
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+    assert entry.baseline_removal == "confirmed_absent"
+    _a19_assert_reconciled(h, run_dir)
+
+
+def test_a19_rm_timeout_with_container_still_owned_fails_then_resumes(d2):
+    h = d2
+    h.docker.owned("baseline", _A19_ID1)
+    h.docker.rm_mode[_A19_ID1] = "timeout_keep"
+    run_dir = _a19_seed(h, baseline=("present", _A19_ID1))
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.FAILED
+    assert entry.detail == "baseline container: the owned container is still present after removal"
+    assert entry.baseline_removal == "still_present"
+    assert entry.baseline_removing_transition_confirmed_this_pass is True
+    payload = _read_projection_dict(run_dir)
+    assert payload["state"] == "RECONCILING" and payload["reconciliation"]["attempts_total"] == 1
+    assert payload["containers"]["baseline"] == {"intent": "removing", "id": _A19_ID1}
+    assert "git-remove" not in _a19_tokens(h) and _a13_registered(h)
+    h.docker.rm_mode[_A19_ID1] = "remove"
+    h.log.clear()
+    resumed = _a17_entry(h.reconcile())
+    assert resumed.outcome is rc.ReconciliationEntryOutcome.RECONCILED, resumed.detail
+    assert resumed.baseline_removing_transition_confirmed_this_pass is False  # already removing
+    assert "write:RECONCILING" not in _a19_tokens(h)
+    _a19_assert_reconciled(h, run_dir, attempts=1)
+
+
+def test_a19_container_replaced_after_rm_is_refused_and_worktree_untouched(d2):
+    h = d2
+    h.docker.owned("baseline", _A19_ID1)
+    h.docker.rm_mode[_A19_ID1] = "replace"
+    run_dir = _a19_seed(h, baseline=("present", _A19_ID1))
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+    assert entry.baseline_removal == "conflict"
+    assert _read_projection_dict(run_dir)["containers"]["baseline"] == {"intent": "removing", "id": _A19_ID1}
+    assert "git-remove" not in _a19_tokens(h) and _a13_registered(h)
+
+
+@pytest.mark.parametrize("kind", ["name_reappears", "worktree_locked", "listing_failed"])
+def test_a19_gate_w_stops_before_any_worktree_mutation(d2, kind):
+    """Listings: 1 = Gate A, 2 = post-`rm` confirmation, 3 = Gate W."""
+    h = d2
+    h.docker.owned("verification", _A19_ID2)
+    run_dir = _a19_seed(h, verification=("present", _A19_ID2), ref=_a16_record("present", h.A), live=h.A)
+    if kind == "name_reappears":
+        h.docker.listing_hooks[:] = [None, None, lambda: h.docker.owned("verification", _A19_ID3)]
+    elif kind == "worktree_locked":
+        h.docker.listing_hooks[:] = [None, lambda: _a19_lock(h)]
+    else:
+        h.docker.listing_hooks[:] = [None, None, rc._DockerListingError("injected")]
+    entry = _a17_entry(h.reconcile())
+    expected = {
+        "name_reappears": ("REFUSED", "a deterministic container name is present", "present"),
+        "worktree_locked": ("REFUSED", "the worktree registration is locked", "confirmed_absent"),
+        "listing_failed": ("SUBSTRATE_UNAVAILABLE", "container listing failed", "unknown"),
+    }[kind]
+    assert entry.outcome is rc.ReconciliationEntryOutcome[expected[0]]
+    assert entry.detail == expected[1]
+    assert entry.worktree_container_gate == expected[2]
+    assert entry.verification_absent_transition_confirmed_this_pass is True
+    payload = _read_projection_dict(run_dir)
+    assert payload["containers"]["verification"]["intent"] == "absent"
+    assert payload["worktree"]["intent"] == "present" and payload["checkpoint_ref"]["intent"] == "present"
+    assert "git-remove" not in _a19_tokens(h) and "write:worktree:disposing" not in _a19_tokens(h)
+    assert _a13_registered(h)
+    if kind == "worktree_locked":
+        _run("git", "-C", str(h.repo), "worktree", "unlock", str(_a13_leaf(h)))
+
+
+def _a19_order_tokens(h):
+    tokens = _a19_tokens(h)
+    if "delete" in tokens:
+        cut = tokens.index("delete") + 1
+        # `CheckpointRef.delete()` re-observes internally; those calls follow it.
+        tokens = tokens[:cut] + [t for t in tokens[cut:] if t != "observe"]
+    return tokens
+
+
+def test_a19_order_is_load_bearing_verification_family(d2):
+    """The exact Gate A -> C -> W -> R sequence for the verification family,
+    including listing counts."""
+    h = d2
+    h.docker.owned("verification", _A19_ID2)
+    _a19_seed(h, verification=("present", _A19_ID2), ref=_a16_record("present", h.A), live=h.A)
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+    assert _a19_order_tokens(h) == [
+        # Gate A
+        "listing", "inspect", "registration", "observe",
+        # Phase C
+        "write:RECONCILING", "write:verification:removing", "rm", "listing", "write:verification:absent",
+        # Gate W, Phase W
+        "listing", "registration",
+        "write:worktree:disposing", "git-remove", "registration", "write:worktree:absent",
+        # Gate R, Phase R
+        "listing", "observe", "write:ref:removing", "delete", "write:ref:absent",
+        "write:RECONCILED",
+    ]
+    assert h.log[0] == ("listing", ("ACTIVE", "absent", "present", "present", "present"))
+    assert h.log[9] == ("listing", ("RECONCILING", "absent", "absent", "present", "present"))
+
+
+def test_a19_order_is_load_bearing_baseline_family(d2):
+    """The baseline family has no Gate R: the ref is confirmed absent in
+    Gate A (one `observe`) and never touched again."""
+    h = d2
+    h.docker.owned("baseline", _A19_ID1)
+    _a19_seed(h, baseline=("present", _A19_ID1))
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+    assert _a19_order_tokens(h) == [
+        "listing", "inspect", "registration", "observe",
+        "write:RECONCILING", "write:baseline:removing", "rm", "listing", "write:baseline:absent",
+        "listing", "registration",
+        "write:worktree:disposing", "git-remove", "registration", "write:worktree:absent",
+        "write:RECONCILED",
+    ]
+    assert h.log[9] == ("listing", ("RECONCILING", "absent", "absent", "present", "absent"))
+
+
+# Projection writes per owner-producible pass, in order (state, baseline,
+# verification, worktree, ref installed after each failure). The
+# verification family writes at most eight: 1 RECONCILING, 2 verification
+# removing, 3 verification absent, 4 worktree disposing, 5 worktree absent,
+# 6 ref removing, 7 ref absent, 8 RECONCILED. The baseline family writes at
+# most six: 1 RECONCILING, 2 baseline removing, 3 baseline absent, 4 worktree
+# disposing, 5 worktree absent, 6 RECONCILED. No pass performs ten writes;
+# the union of both variants covers ten distinct fault positions.
+_R, _P = "RECONCILING", "present"
+_A19_WRITES_VERIFICATION = {
+    (1, "publication"): ("ACTIVE", "absent", _P, _P, _P),
+    (1, "durability"): (_R, "absent", _P, _P, _P),
+    (2, "publication"): (_R, "absent", _P, _P, _P),
+    (2, "durability"): (_R, "absent", "removing", _P, _P),
+    (3, "publication"): (_R, "absent", "removing", _P, _P),
+    (3, "durability"): (_R, "absent", "absent", _P, _P),
+    (4, "publication"): (_R, "absent", "absent", _P, _P),
+    (4, "durability"): (_R, "absent", "absent", "disposing", _P),
+    (5, "publication"): (_R, "absent", "absent", "disposing", _P),
+    (5, "durability"): (_R, "absent", "absent", "absent", _P),
+    (6, "publication"): (_R, "absent", "absent", "absent", _P),
+    (6, "durability"): (_R, "absent", "absent", "absent", "removing"),
+    (7, "publication"): (_R, "absent", "absent", "absent", "removing"),
+    (7, "durability"): (_R, "absent", "absent", "absent", "absent"),
+    (8, "publication"): (_R, "absent", "absent", "absent", "absent"),
+    (8, "durability"): ("RECONCILED", "absent", "absent", "absent", "absent"),
+}
+_A19_WRITES_BASELINE = {
+    (1, "publication"): ("ACTIVE", _P, "absent", _P, "absent"),
+    (1, "durability"): (_R, _P, "absent", _P, "absent"),
+    (2, "publication"): (_R, _P, "absent", _P, "absent"),
+    (2, "durability"): (_R, "removing", "absent", _P, "absent"),
+    (3, "publication"): (_R, "removing", "absent", _P, "absent"),
+    (3, "durability"): (_R, "absent", "absent", _P, "absent"),
+    (4, "publication"): (_R, "absent", "absent", _P, "absent"),
+    (4, "durability"): (_R, "absent", "absent", "disposing", "absent"),
+    (5, "publication"): (_R, "absent", "absent", "disposing", "absent"),
+    (5, "durability"): (_R, "absent", "absent", "absent", "absent"),
+    (6, "publication"): (_R, "absent", "absent", "absent", "absent"),
+    (6, "durability"): ("RECONCILED", "absent", "absent", "absent", "absent"),
+}
+_A19_WRITE_CASES = [("verification", i, k) for i, k in sorted(_A19_WRITES_VERIFICATION)] + [
+    ("baseline", i, k) for i, k in sorted(_A19_WRITES_BASELINE)
+]
+
+
+def test_a19_write_positions_cover_ten_distinct_writes_and_no_pass_writes_ten():
+    verification = ["RECONCILING", "verification:removing", "verification:absent", "worktree:disposing",
+                    "worktree:absent", "ref:removing", "ref:absent", "RECONCILED"]
+    baseline = ["RECONCILING", "baseline:removing", "baseline:absent", "worktree:disposing", "worktree:absent",
+                "RECONCILED"]
+    assert len({i for i, _ in _A19_WRITES_VERIFICATION}) == len(verification) == 8
+    assert len({i for i, _ in _A19_WRITES_BASELINE}) == len(baseline) == 6
+    assert len(set(verification) | set(baseline)) == 10
+
+
+@pytest.mark.parametrize("family, index, kind", _A19_WRITE_CASES)
+def test_a19_every_write_failure_is_failed_then_resumes(d2, monkeypatch, family, index, kind):
+    h = d2
+    if family == "verification":
+        h.docker.owned("verification", _A19_ID2)
+        run_dir = _a19_seed(h, verification=("present", _A19_ID2), ref=_a16_record("present", h.A), live=h.A)
+        table, last = _A19_WRITES_VERIFICATION, 8
+    else:
+        h.docker.owned("baseline", _A19_ID1)
+        run_dir = _a19_seed(h, baseline=("present", _A19_ID1))
+        table, last = _A19_WRITES_BASELINE, 6
+    fault = {"n": 0, "armed": True, "log_len": None}
+
+    def wrap(real):
+        def inner(*a, **k):
+            fault["n"] += 1
+            if fault["armed"] and fault["n"] == index:
+                if kind == "durability":
+                    real(*a, **k)
+                    reason = ls.LifecycleStoreFailure.PROJECTION_DURABILITY_UNCONFIRMED
+                else:
+                    reason = ls.LifecycleStoreFailure.PROJECTION_PUBLICATION_FAILED
+                fault["log_len"] = len(h.log)
+                raise ls.LifecycleStoreError(reason, "injected")
+            return real(*a, **k)
+
+        return inner
+
+    for name in (
+        "_publish_projection_state",
+        "_publish_reconciler_container_transition",
+        "_publish_reconciler_worktree_transition",
+        "_publish_reconciler_checkpoint_ref_transition",
+    ):
+        monkeypatch.setattr(rc, name, wrap(getattr(rc, name)))
+
+    entry = _a17_entry(h.reconcile())
+    assert entry.outcome is rc.ReconciliationEntryOutcome.FAILED, entry.detail
+    assert h.log[fault["log_len"]:] == []  # nothing listed, removed, observed, or written after it
+    tokens = _a19_tokens(h)
+    assert tokens.count("rm") == (0 if index <= 2 else 1)
+    assert tokens.count("git-remove") == (1 if index >= 5 else 0)
+    assert tokens.count("delete") == (1 if family == "verification" and index >= 7 else 0)
+    payload = _read_projection_dict(run_dir)
+    c = payload["containers"]
+    assert (payload["state"], c["baseline"]["intent"], c["verification"]["intent"], payload["worktree"]["intent"],
+            payload["checkpoint_ref"]["intent"]) == table[(index, kind)]
+
+    fault["armed"] = False
+    resumed = _a17_entry(h.reconcile())
+    expected = (
+        rc.ReconciliationEntryOutcome.SKIPPED_TERMINAL
+        if (index, kind) == (last, "durability")
+        else rc.ReconciliationEntryOutcome.RECONCILED
+    )
+    assert resumed.outcome is expected, resumed.detail
+    _a19_assert_reconciled(h, run_dir)
+
+
+def test_a19_trace_fields_full_and_partial_and_categorical_only(d2):
+    h = d2
+    h.docker.owned("verification", _A19_ID2)
+    h.docker.rm_mode[_A19_ID2] = "timeout_keep"
+    _a19_seed(h, verification=("removing", _A19_ID2), ref=_a16_record("advancing", h.A, h.B), live=h.B)
+    partial = h.reconcile()
+    event, raw = _a12_entry_event(h, partial)
+    assert event["outcome"] == "failed"
+    b, v = event["containers"]["baseline"], event["containers"]["verification"]
+    assert (b["initial_persisted_intent"], b["decision"], b["removal"]) == ("absent", "noop", "not_attempted")
+    assert (b["removing_transition_confirmed_this_pass"], b["absent_transition_confirmed_this_pass"]) == (False, False)
+    assert (v["initial_persisted_intent"], v["decision"], v["removal"]) == ("removing", "owned_remove", "still_present")
+    assert (v["removing_transition_confirmed_this_pass"], v["absent_transition_confirmed_this_pass"]) == (False, False)
+    assert event["worktree"]["container_gate"] == "not_attempted"
+    h.docker.rm_mode[_A19_ID2] = "remove"
+    full = h.reconcile()
+    event2, raw2 = _a12_entry_event(h, full)
+    assert event2["outcome"] == "reconciled"
+    v2 = event2["containers"]["verification"]
+    assert (v2["initial_persisted_intent"], v2["decision"], v2["removal"]) == ("removing", "owned_remove", "confirmed_absent")
+    assert event2["containers"]["baseline"]["decision"] == "noop"
+    assert event2["worktree"]["container_gate"] == "confirmed_absent"
+    for text in (raw, raw2):
+        for secret in (h.A, h.B, *_A19_NAMES.values(), str(_a13_leaf(h)), str(h.state_dir), str(h.repo)):
+            assert secret not in text
+
+
+def test_a19_dry_run_reports_pending_and_writes_nothing(d2):
+    h = d2
+    h.docker.owned("baseline", _A19_ID1)
+    run_dir = _a19_seed(h, baseline=("present", _A19_ID1))
+    (run_dir / "lifecycle.lock").write_bytes(b"")
+    (run_dir / "lifecycle.lock").chmod(0o600)
+    before = _tree(h.state_dir)
+    plan = _plan(h)
+    (entry,) = [e for e in plan.entries if e.lifecycle_id == _A13_ID]
+    assert entry.outcome is rc.PlanEntryOutcome.PENDING
+    assert plan.blocked
+    assert _tree(h.state_dir) == before
+    assert not [x for x in h.log if x[0] in ("write", "rm", "git-remove", "delete")]
+    assert _A19_NAMES["baseline"] in h.docker.live and _a13_registered(h)
+
+
+def _a19_reconcile_and_sigkill(repo_path, state_dir, point):
+    """Module-level (picklable) child: a real admission (real Docker, real
+    Git) whose chained reconciliation self-SIGKILLs right after `point`."""
+    os.environ["CODEAGENT_STATE_DIR"] = state_dir
+    import codeagent.lifecycle_store as ls_child
+    import codeagent.reconciliation as rc_child
+
+    def die():
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    def after(name, predicate):
+        real = getattr(rc_child, name)
+
+        def inner(*a, **k):
+            out = real(*a, **k)
+            if predicate(*a, **k):
+                die()
+            return out
+
+        setattr(rc_child, name, inner)
+
+    if point == "after_reconciling":
+        after("_publish_projection_state", lambda *a, **k: k["state"] is ls_child.LifecycleState.RECONCILING)
+    elif point == "after_container_removing":
+        after("_publish_reconciler_container_transition", lambda *a, **k: k["intent"] is ls_child.ContainerIntent.REMOVING)
+    elif point == "after_rm":
+        after("run_bounded_stdout", lambda argv, **k: argv[:2] == ["docker", "rm"])
+    elif point == "after_container_absent":
+        after("_publish_reconciler_container_transition", lambda *a, **k: k["intent"] is ls_child.ContainerIntent.ABSENT)
+    elif point in ("after_disposing", "after_worktree_absent"):
+        want = _wl.WorktreeIntent.DISPOSING if point == "after_disposing" else _wl.WorktreeIntent.ABSENT
+        after(
+            "_publish_reconciler_worktree_transition",
+            lambda *a, **k: k.get("target", _wl.ABSENT_WORKTREE_TRANSITION).intent is want,
+        )
+    else:  # after_ref_removing
+        after("_publish_reconciler_checkpoint_ref_transition", lambda *a, **k: k["target"].intent is cs.CheckpointIntent.REMOVING)
+    ls_child.prepare_lifecycle(repo_path, run_id="a19-reconciler-killed")
+    die()  # unreachable
+
+
+def _a19_container_listed(cid) -> bool:
+    out = subprocess.run(["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}"], capture_output=True, text=True, check=True)
+    return cid in out.stdout.split()
+
+
+@pytest.mark.skipif(not (_docker_available() or REQUIRE_DOCKER), reason="real Docker daemon not available")
+@pytest.mark.parametrize(
+    "point, crashed, container_alive, registered",
+    [
+        ("after_reconciling", ("present", "present", "present"), True, True),
+        ("after_container_removing", ("removing", "present", "present"), True, True),
+        ("after_rm", ("removing", "present", "present"), False, True),
+        ("after_container_absent", ("absent", "present", "present"), False, True),
+        ("after_disposing", ("absent", "disposing", "present"), False, True),
+        ("after_worktree_absent", ("absent", "absent", "present"), False, False),
+        ("after_ref_removing", ("absent", "absent", "removing"), False, False),
+    ],
+)
+def test_a19_real_sigkill_inside_the_chained_row_resumes(tmp_path, monkeypatch, point, crashed, container_alive, registered):
+    if REQUIRE_DOCKER and not _docker_available():
+        pytest.fail("CODEAGENT_REQUIRE_DOCKER=1 but a real Docker daemon is not available")
+    repo = _make_repo(tmp_path)
+    state_dir = _set_state_dir(monkeypatch, tmp_path)
+    h = _Harness(repo, state_dir)
+    container_id = None
+    try:
+        A = _a16_commit(repo, "A")
+        container_id = _create_owned_container(
+            name=_A19_NAMES["verification"], state_root_id=h.state_root.state_root_id, lifecycle_id=_A13_ID,
+            role="verification",
+        )
+        run_dir = _a19_seed(h, verification=("present", container_id), ref=_a16_record("present", A), live=A)
+    finally:
+        h.close()
+    try:
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(target=_a19_reconcile_and_sigkill, args=(str(repo), str(state_dir), point))
+        proc.start()
+        proc.join(timeout=120)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=10)
+            pytest.fail("reconciler child did not self-SIGKILL within the timeout")
+        assert proc.exitcode == -signal.SIGKILL
+        payload = _read_projection_dict(run_dir)
+        assert payload["state"] == "RECONCILING"
+        assert payload["reconciliation"]["attempts_total"] == 1
+        assert payload["containers"]["baseline"] == {"intent": "absent", "id": None}
+        assert (payload["containers"]["verification"]["intent"], payload["worktree"]["intent"],
+                payload["checkpoint_ref"]["intent"]) == crashed
+        assert _a19_container_listed(container_id) is container_alive
+        h = _Harness(repo, state_dir)
+        try:
+            assert _a13_registered(h) is registered
+            entry = _a17_entry(h.reconcile())  # real Docker, real Git
+            assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+            _a17_assert_fully_reconciled(h, run_dir)
+            assert not _a19_container_listed(container_id)
+        finally:
+            if _a13_registered(h):
+                _run("git", "-C", str(repo), "worktree", "remove", "--force", str(_a13_leaf(h)), check=False)
+            h.close()
+    finally:
+        subprocess.run(["docker", "rm", "--force", container_id], capture_output=True)
+
+
+@pytest.mark.skipif(not (_docker_available() or REQUIRE_DOCKER), reason="real Docker daemon not available")
+def test_a19_real_docker_t36_shape_and_unlabeled_impostor(tmp_path, monkeypatch):
+    """Real Docker and Git, no fakes: an owned container beside a `present`
+    worktree is removed with the worktree; an unlabeled impostor at the same
+    deterministic name is refused with nothing touched."""
+    if REQUIRE_DOCKER and not _docker_available():
+        pytest.fail("CODEAGENT_REQUIRE_DOCKER=1 but a real Docker daemon is not available")
+    repo = _make_repo(tmp_path)
+    state_dir = _set_state_dir(monkeypatch, tmp_path)
+    h = _Harness(repo, state_dir)
+    impostor = owned = None
+    try:
+        impostor = _create_unlabeled_container(name=_A19_NAMES["baseline"])
+        run_dir = _a19_seed(h, baseline=("present", impostor))
+        before = (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes()
+        entry = _a17_entry(h.reconcile())
+        assert entry.outcome is rc.ReconciliationEntryOutcome.REFUSED
+        assert entry.detail == "baseline container: the owned candidate's labels do not prove ownership"
+        assert (run_dir / ls.LIFECYCLE_JSON_FILENAME).read_bytes() == before
+        assert _a19_container_listed(impostor) and _a13_registered(h)
+        _force_remove_container(impostor)
+        impostor = None
+        owned = _create_owned_container(
+            name=_A19_NAMES["baseline"], state_root_id=h.state_root.state_root_id, lifecycle_id=_A13_ID, role="baseline"
+        )
+        _run("git", "-C", str(repo), "worktree", "remove", "--force", str(_a13_leaf(h)))
+        _shutil.rmtree(run_dir)
+        run_dir = _a19_seed(h, baseline=("present", owned))
+        entry = _a17_entry(h.reconcile())
+        assert entry.outcome is rc.ReconciliationEntryOutcome.RECONCILED, entry.detail
+        _a17_assert_fully_reconciled(h, run_dir)
+        assert not _a19_container_listed(owned)
+    finally:
+        for cid in (impostor, owned):
+            if cid:
+                subprocess.run(["docker", "rm", "--force", cid], capture_output=True)
+        if _a13_registered(h):
+            _run("git", "-C", str(repo), "worktree", "remove", "--force", str(_a13_leaf(h)), check=False)
+        h.close()
