@@ -62,11 +62,14 @@ from __future__ import annotations
 import math
 import os
 import selectors
+import signal
 import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum, unique
+
+from .cancellation import attach_cleanup_failures
 
 _BOUNDED_READ_CHUNK = 65_536
 _KILL_CONFIRM_GRACE_SECONDS = 2.0
@@ -277,42 +280,105 @@ def _confirm_exit(process: subprocess.Popen, *, deadline: float) -> None:
         raise _BoundedFailure(BoundedProcessFailure.MONITORING_FAILED) from exc
 
 
-def _terminate_and_confirm(process: subprocess.Popen) -> None:
-    """The single abort path for every post-launch failure: kill the
-    child, close its stdout, and confirm it was reaped -- within a
-    grace window computed fresh from the moment of the kill attempt
-    (`time.monotonic() + _KILL_CONFIRM_GRACE_SECONDS`), never derived
-    from or extended by the original command deadline, so an early
-    failure on a long-timeout command cannot grant a kill-confirmation
-    wait anywhere near that original budget.
+def _first_interrupt(retained) -> BaseException | None:
+    """The earliest retained `BaseException` that is not an `Exception`."""
+    return next((exc for exc in retained if not isinstance(exc, Exception)), None)
 
-    Raises `_BoundedFailure(TERMINATION_UNCONFIRMED)` if the process
-    itself cannot be confirmed reaped -- this takes precedence over a
-    stdout-close failure, since the process's own fate is the more
-    consequential unknown. If the process is confirmed reaped but the
-    stdout close failed, raises `_BoundedFailure(CLEANUP_UNCONFIRMED)`
-    instead. Never returns having silently left the child running or a
-    close failure unreported."""
+
+def _terminate_and_confirm(process: subprocess.Popen) -> tuple:
+    """The single abort path for every post-launch failure: kill the
+    child's process group, kill the child, close its stdout, and confirm it
+    was reaped -- within a grace window computed fresh from the moment of
+    the kill attempt (`time.monotonic() + _KILL_CONFIRM_GRACE_SECONDS`),
+    never derived from or extended by the original command deadline.
+
+    Contract (ADR 0005 Amendment 1 §12), pinned by tests:
+    - one `os.killpg(SIGKILL)` (`ProcessLookupError` = group absent), one
+      direct `kill()`, one stdout close, one bounded reap, and, after a
+      failed group kill and a confirmed reap, one signal-0 probe (never a
+      kill; only `ProcessLookupError` confirms no member is left -- macOS
+      reports `PermissionError` for a group holding only its exited,
+      unreaped leader);
+    - every failure of those steps, `BaseException`s included, is retained
+      in one chronological record as its exact instance and never stops a
+      later step (a reap's `TimeoutExpired` is never retained);
+    - cleanup unconfirmed -> raises the internal `_BoundedFailure`
+      (`TERMINATION_UNCONFIRMED` for an unconfirmed reap, then for an
+      unconfirmed group; else `CLEANUP_UNCONFIRMED` for a close failure),
+      carrying `failures_in_order` and `deferred_interrupt` (the earliest
+      retained non-`Exception`, by identity); the caller's public error
+      copies both. Cleanup dominates an interrupt;
+    - cleanup confirmed -> returns the whole chronological record. Every
+      caller has a body failure, which stays primary (ADR 0005 Amendment 1
+      §12, fifth correction): the record is attached to it with
+      `attach_cleanup_failures`, and a cleanup-time interrupt never replaces
+      it."""
+    retained: list = []
+    group_exc: BaseException | None = None
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # the group is confirmed absent
+    except BaseException as exc:  # noqa: BLE001 - retained; never stops later steps
+        group_exc = exc
+        retained.append(exc)
     try:
         process.kill()
-    except Exception:  # noqa: BLE001 - still attempt to confirm exit below
-        pass
+    except BaseException as exc:  # noqa: BLE001 - retained; the reap below decides
+        retained.append(exc)
 
     close_exc: BaseException | None = None
     try:
         if process.stdout is not None:
             process.stdout.close()
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
         close_exc = exc
+        retained.append(exc)
 
+    reap_exc: BaseException | None = None
     confirm_deadline = time.monotonic() + _KILL_CONFIRM_GRACE_SECONDS
     try:
         process.wait(timeout=max(0.0, confirm_deadline - time.monotonic()))
-    except Exception as exc:  # noqa: BLE001 - any inability to confirm reap is unconfirmed
-        raise _BoundedFailure(BoundedProcessFailure.TERMINATION_UNCONFIRMED) from exc
+    except subprocess.TimeoutExpired as exc:
+        reap_exc = exc  # chained internally only; never retained
+    except BaseException as exc:  # noqa: BLE001 - any inability to confirm reap is unconfirmed
+        reap_exc = exc
+        retained.append(exc)
 
-    if close_exc is not None:
-        raise _BoundedFailure(BoundedProcessFailure.CLEANUP_UNCONFIRMED) from close_exc
+    group_unconfirmed = False
+    if group_exc is not None and reap_exc is None:
+        try:
+            os.killpg(process.pid, 0)
+            group_unconfirmed = True
+        except ProcessLookupError:
+            pass  # no member left
+        except BaseException as exc:  # noqa: BLE001 - retained; unconfirmed
+            retained.append(exc)
+            group_unconfirmed = True
+
+    if reap_exc is not None:
+        failure, cause = BoundedProcessFailure.TERMINATION_UNCONFIRMED, reap_exc
+    elif group_unconfirmed:
+        failure, cause = BoundedProcessFailure.TERMINATION_UNCONFIRMED, group_exc
+    elif close_exc is not None:
+        failure, cause = BoundedProcessFailure.CLEANUP_UNCONFIRMED, close_exc
+    else:
+        return tuple(retained)
+    error = _BoundedFailure(failure)
+    error.failures_in_order = tuple(retained)
+    error.deferred_interrupt = _first_interrupt(retained)
+    raise error from cause
+
+
+def _public_cleanup_error(cleanup_failure: "_BoundedFailure", body: BaseException) -> BoundedProcessError:
+    """The public, categorical error for an unconfirmed cleanup, carrying the
+    retained failures, any deferred interrupt and the body failure, all by
+    identity (never text)."""
+    error = _to_error(cleanup_failure.reason)
+    error.failures_in_order = getattr(cleanup_failure, "failures_in_order", ())
+    error.deferred_interrupt = getattr(cleanup_failure, "deferred_interrupt", None)
+    error.body_failure = body
+    return error
 
 
 def run_bounded_stdout(
@@ -368,11 +434,26 @@ def run_bounded_stdout(
     deadline = time.monotonic() + timeout_seconds
     try:
         process = subprocess.Popen(
-            materialized, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            materialized,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            # Own session (ADR 0005 Amendment 1 section 6): a terminal
+            # signal to CodeAgent's process group never reaches the child.
+            start_new_session=True,
         )
     except OSError as exc:
         raise _to_error(BoundedProcessFailure.LAUNCH_FAILED) from exc
 
+    # Precedence (ADR 0005 Amendment 1 §12, fifth correction): the body
+    # failure is decided inside the handlers, but cleanup and every raise
+    # happen outside them, so re-raising a pre-existing instance never
+    # rewrites its `__context__`. Cleanup unconfirmed dominates (the body
+    # failure is the explicit cause and `body_failure`); cleanup confirmed
+    # keeps the body failure primary, with the cleanup record attached.
+    body: BaseException | None = None
+    body_cause: BaseException | None = None
+    fresh = False
     try:
         buf = _drain(process, deadline=deadline, limit=stdout_limit)
         _confirm_exit(process, deadline=deadline)
@@ -389,30 +470,21 @@ def run_bounded_stdout(
             if isinstance(failure.__cause__, _BoundedFailure)
             else None
         )
-        # Attach the deeper cause to `original` itself, before it is
-        # ever used as a `from` target below -- otherwise, if
-        # `_terminate_and_confirm` also fails, the further raise
-        # (`from original`) would carry an `original` with no
-        # `__cause__` of its own, silently losing this inner failure
-        # from the complete public chain.
         original.__cause__ = inner_cause
-        try:
-            _terminate_and_confirm(process)
-        except _BoundedFailure as cleanup_failure:
-            raise _to_error(cleanup_failure.reason) from original
-        raise original from inner_cause
+        body, body_cause, fresh = original, inner_cause, True
     except Exception as exc:  # noqa: BLE001 - any other ordinary failure is still categorical
-        original = _to_error(BoundedProcessFailure.MONITORING_FAILED)
-        try:
-            _terminate_and_confirm(process)
-        except _BoundedFailure as cleanup_failure:
-            raise _to_error(cleanup_failure.reason) from original
-        raise original from exc
+        body, body_cause, fresh = _to_error(BoundedProcessFailure.MONITORING_FAILED), exc, True
     except BaseException as exc:  # noqa: BLE001 - cancellation-style: never wrapped
+        body = exc
+
+    if body is not None:
         try:
-            _terminate_and_confirm(process)
+            record = _terminate_and_confirm(process)
         except _BoundedFailure as cleanup_failure:
-            raise _to_error(cleanup_failure.reason) from exc
-        raise
+            raise _public_cleanup_error(cleanup_failure, body) from body
+        attach_cleanup_failures(body, record)
+        if fresh:
+            raise body from body_cause
+        raise body  # the exact instance; its own cause/context are untouched
 
     return BoundedProcessResult(returncode=process.returncode, stdout=bytes(buf))

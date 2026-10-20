@@ -1611,12 +1611,15 @@ def test_event_type_values_are_pinned() -> None:
 
 
 def test_verification_outcome_values_are_pinned() -> None:
+    # "cancelled" added by ADR 0005 Amendment 1 (ledger D3), a disclosed
+    # update of this pin.
     assert {o.value for o in events.VerificationOutcome} == {
         "passed",
         "test_failure",
         "timeout",
         "environment_failure",
         "command_start_failure",
+        "cancelled",
     }
 
 

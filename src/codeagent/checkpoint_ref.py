@@ -119,11 +119,14 @@ import os
 import re
 import secrets
 import selectors
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
 from enum import Enum, unique
 from pathlib import Path
+
+from .cancellation import attach_cleanup_failures
 
 REF_NAMESPACE = "refs/codeagent/runs"
 LIFECYCLE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -339,6 +342,9 @@ def _run_git(repo_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
             text=True,
             timeout=GIT_TIMEOUT_SECONDS,
             env=git_environment(),
+            # Own session (ADR 0005 Amendment 1 section 6). On timeout,
+            # subprocess.run kills only this direct child (a stated residual).
+            start_new_session=True,
         )
     except subprocess.TimeoutExpired as exc:
         raise CheckpointRefError(
@@ -749,6 +755,7 @@ class _RefTransaction:
                 text=True,
                 bufsize=1,
                 env=git_environment(),
+                start_new_session=True,
             )
         except OSError as exc:
             raise CheckpointRefError(
@@ -781,43 +788,141 @@ class _RefTransaction:
         if process is None:
             return
 
+        # One chronological record of every cleanup failure in this method
+        # (`failures_in_order`; the abort failure is kept separately, as it
+        # has its own precedence), each as its exact instance,
+        # `BaseException`s included; no failure stops a later step and none
+        # is raised raw. `TimeoutExpired` is never retained (its text names
+        # argv). `everything` additionally places the abort failure in
+        # occurrence order, to find the earliest non-`Exception`.
+        chronology: list[BaseException] = []
+        everything: list[BaseException] = []
+
+        def retain(caught: BaseException) -> None:
+            chronology.append(caught)
+            everything.append(caught)
+
+        def reaped() -> bool:
+            try:
+                return process.poll() is not None
+            except BaseException as caught:  # noqa: BLE001 — retained; unconfirmed
+                retain(caught)
+                return False
+
         abort_failure: BaseException | None = None
-        if not self._finished and process.poll() is None:
+        if not self._finished and not reaped():
             try:
                 self.abort()
             except BaseException as caught:  # noqa: BLE001 — cleanup must not depend on abort
                 abort_failure = caught
+                everything.append(caught)
 
         if self._selector is not None:
             try:
                 self._selector.close()
             except Exception:  # noqa: BLE001
                 pass
+            except BaseException as caught:  # noqa: BLE001 — retained; never stops later steps
+                retain(caught)
         for stream in (process.stdin, process.stdout):
             try:
                 if stream is not None:
                     stream.close()
             except Exception:  # noqa: BLE001
                 pass
+            except BaseException as caught:  # noqa: BLE001 — retained; never stops later steps
+                retain(caught)
 
-        if process.poll() is None:
-            process.kill()
+        group_failure: BaseException | None = None
+        if not reaped():
+            # The child leads its own session (ADR 0005 Amendment 1): kill
+            # its whole process group before reaping. `ProcessLookupError`
+            # means the group is confirmed absent; any other failure leaves
+            # descendants (possibly holding Git resources) unconfirmed.
+            # Contract, pinned by tests: one group kill; one direct `kill()`
+            # and a bounded reap; if that reap is not confirmed (timeout or
+            # failure), exactly one retry `kill()` and one more bounded reap.
             try:
-                process.wait(timeout=GIT_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                process.kill()
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except BaseException as caught:  # noqa: BLE001 — retained; reported below
+                group_failure = caught
+                retain(caught)
+            for _attempt in range(2):
+                try:
+                    process.kill()
+                except BaseException as caught:  # noqa: BLE001 — retained; the reap still runs
+                    retain(caught)
                 try:
                     process.wait(timeout=GIT_TIMEOUT_SECONDS)
+                    break
                 except subprocess.TimeoutExpired:
                     pass
+                except BaseException as caught:  # noqa: BLE001 — retained
+                    retain(caught)
 
-        if process.poll() is None:
-            raise CheckpointRefError(
-                CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED,
-                "the git ref transaction process could not be confirmed terminated "
-                "after bounded cleanup attempts; whether its checkpoint-ref lock was "
-                "released is unknown",
-            ) from abort_failure
+        terminated = reaped()
+        group_unconfirmed = False
+        if group_failure is not None:
+            if not terminated:
+                group_unconfirmed = True
+            else:
+                # Signal 0, never a kill: only `ProcessLookupError` confirms
+                # no member is left (macOS reports `PermissionError` for a
+                # group holding only its exited, unreaped leader).
+                try:
+                    os.killpg(process.pid, 0)
+                    group_unconfirmed = True
+                except ProcessLookupError:
+                    pass
+                except BaseException as caught:  # noqa: BLE001 — retained; unconfirmed
+                    retain(caught)
+                    group_unconfirmed = True
+
+        index = next((i for i, f in enumerate(everything) if not isinstance(f, Exception)), None)
+        interrupt = everything[index] if index is not None else None
+        if terminated and not group_unconfirmed:
+            # Cleanup confirmed (ADR 0005 Amendment 1 §12, fifth correction).
+            # An exception already propagating from the `with` body stays
+            # primary: it is never replaced, and every cleanup failure (the
+            # abort failure included) is attached to it in order. With no
+            # body exception, the earliest non-`Exception` is re-raised as the
+            # exact instance, carrying every other occurrence in order.
+            if exc is not None:
+                attach_cleanup_failures(exc, everything)
+                return
+            if interrupt is not None:
+                attach_cleanup_failures(interrupt, everything[:index] + everything[index + 1:])
+                raise interrupt
+            return
+
+        # Cleanup unconfirmed dominates any interrupt. Cause precedence: the
+        # abort failure when there is one (the existing contract); otherwise
+        # the earliest entry of the chronological record, skipping a
+        # group-kill failure the probe has cleared; `None` when termination
+        # was simply never observed. Retained: `failures_in_order` (the
+        # whole record, by identity), `group_kill_failure`,
+        # `cleanup_failures` (the record without the group-kill failure),
+        # and `deferred_interrupt` (the earliest non-`Exception`). The
+        # message is fixed text.
+        error = CheckpointRefError(
+            CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED,
+            "the git ref transaction process could not be confirmed terminated "
+            "after bounded cleanup attempts; whether its checkpoint-ref lock was "
+            "released is unknown",
+        )
+        error.group_kill_failure = group_failure
+        error.failures_in_order = tuple(chronology)
+        error.cleanup_failures = tuple(f for f in chronology if f is not group_failure)
+        error.deferred_interrupt = interrupt
+        error.body_failure = exc  # the `with` body's exception, by identity (also `__context__`)
+        candidates = [f for f in chronology if group_unconfirmed or f is not group_failure]
+        if abort_failure is not None:
+            cause = abort_failure
+        else:
+            cause = candidates[0] if candidates else None
+        raise error from cause
 
     def begin(self, update_line: str) -> None:
         """Send the update and prepare it, which locks the ref."""

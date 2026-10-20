@@ -6729,3 +6729,228 @@ T-F1 has only partial, reconciler-level coverage for the two accepted shapes;
 T-E1 and T-F2 are unchanged. This is GitHub-hosted `ubuntu-24.04` x86_64
 automated-test evidence, not a security review. Gate O remains unsatisfied
 until D3 lands. `uv.lock` untouched.
+
+## 2026-10-19 — D3 / ADR 0005 Amendment 1: entrypoint-owned cancellation (local)
+
+**What.** Amendment 1 moved from Proposed to **Accepted (2026-10-06)** and was
+implemented per the accepted D3 plan (revision 5): `cancellation.py`,
+`cli.owned_cancellation()` with the 28-row failure model, controller safe points
+C1–C23, approval and verifier cancellation, `VerificationOutcome.CANCELLED`, own
+sessions at L1–L7 with group kill on the owned-`Popen` abort paths, composition
+plumbing, the inventory pin, `PATH`-shim per-site tests, a test-only driver,
+and real-signal E1–E12. `main()` is unchanged; nothing is operator-reachable.
+
+**Decision (author, before coding).** Amendment 1 §8 contradicted itself:
+counting transitions into EXPLORE changes the budget-exceeded pins
+(`test_controller.py:242/261/278`) it said were unchanged. `iterations_used` is
+now *exploration passes begun*; recorded as a correction under §8.
+
+**Lessons.**
+
+- A sliced wait busy-spins against a fake process whose `wait()` returns
+  instantly; the executor fake now models a running process explicitly.
+- Fakes reaching `os.killpg` must never carry a real-looking PID unpatched; the
+  executor fake has no `pid` unless the test also patches `os.killpg`.
+- A mutated signal handler that raises `KeyboardInterrupt` aborts pytest rather
+  than failing a test; the handler test now converts any `BaseException` into
+  an explicit failure.
+- The E2E fixture first omitted `CODEAGENT_STATE_DIR` for the test process and
+  wrote one entry into the default state root; its own check caught it, the
+  entry was inspected and removed, and the fixture was fixed.
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** Directly affected 1,760 and
+focused (23 + 3 new files) 2,643, each forward and reverse; dedicated Docker
+command 14 passed; full suite 4,247 passed, 0 skipped (from 3,994); 51/51
+mutations caught, sources restored and SHA-256-verified; no leftovers;
+`git diff --check` clean. Exact files, deviations and limits: ADR 0005
+Amendment 1 §12.
+
+Uncommitted; no Linux CI. **Gate O remains unsatisfied** until D3 is committed
+and Linux CI succeeds. `uv.lock` untouched.
+
+## 2026-10-19 — D3: fail-closed process-group cleanup (joint-review correction, local)
+
+**What.** Joint review found that the L1, L4/L5 and L7 abort paths swallowed
+every `os.killpg` failure, reaped only the direct child, and could report
+confirmed cleanup, contradicting Amendment 1 §6. Fixed before any commit:
+`ProcessLookupError` alone confirms group absence; any other failure is
+retained, every later cleanup step still runs exactly once, and the result is
+the helper's sanitized unconfirmed category (`TERMINATION_UNCONFIRMED`,
+`PROCESS_CLEANUP_UNCONFIRMED`, `TRANSACTION_CLEANUP_UNCONFIRMED`). L5's
+overflow abort moved out of the handled region so it can never run twice. The
+executor's attach path (L2) now fails closed to `ENVIRONMENT_FAILURE`, never a
+confirmed `CANCELLED`/`TIMEOUT`, while still removing the container by id.
+
+**Decision (author).** macOS raises `PermissionError` for `killpg` on a group
+whose only member is its exited, unreaped leader (verified by a disposable
+experiment). The strict rule broke seven existing `_git_safety` tests,
+including the preview overflow evidence capture uses. After the reap, a failed
+group kill is now followed by one signal-0 probe; only `ProcessLookupError`
+there confirms absence.
+
+**Lesson.** A platform's errno for "group exists only as a zombie" is not
+portable; confirm absence by observation after the reap rather than inferring
+it from the kill's error.
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** Restoring swallow-and-
+continue per helper failed every failure-direction test (L1 4/5, the fifth
+pinning reap dominance; L4/L5 6/6; L7 2/2; L2 4/4). Directly affected 1,788 and
+focused 2,662, forward and reverse; dedicated Docker command 14 passed; full
+suite 4,275 passed, 0 skipped; 56/56 mutation checks caught, sources restored
+and SHA-256-verified; no leftovers; `git diff --check` clean. Supersedes the
+earlier entry's totals. Uncommitted; no Linux CI; Gate O remains unsatisfied.
+`uv.lock` untouched.
+
+## 2026-10-19 — D3: guarded attach and transaction abort (second joint-review correction, local)
+
+**What.** Review found two fallback paths that could still raise raw. L2:
+unguarded `proc.kill()`/`proc.wait()` in the attach abort escaped
+`_start_and_inspect` (callers catch only `_DockerLaunchError`), so removal by
+immutable id could be skipped. L7: direct `kill()`, non-timeout `wait()` and
+`poll()` failures escaped `_RefTransaction.__exit__`. Now L2's
+`_abort_attach_client` never raises, retains every failure (including the
+group-kill failure, which the first correction had discarded, and a failed
+attach wait) in an internal `_AttachAbort` record, fails closed to
+`ENVIRONMENT_FAILURE` and still removes the container by id. L7 retains every
+failure (`cleanup_failures`), keeps the abort failure as the cause when present
+(else the earliest in occurrence order), and ends
+`TRANSACTION_CLEANUP_UNCONFIRMED`.
+
+**Decision.** The real kill contract, now pinned: L1 and L4/L5 kill and reap
+once; L2 and L7 kill once (L2 only if the group kill raised), reap within a
+bound, and after an unconfirmed reap retry the kill and reap exactly once.
+L2's second reap was unbounded and is now bounded. "Nothing is killed twice"
+was an overclaim for L2/L7 and is withdrawn.
+
+**Lesson.** A "fallback" step is part of the cleanup path too; every call in
+it needs the same retain-and-continue discipline as the primary step.
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** Restoring the unguarded
+blocks verbatim failed all 6 path-level L2 tests and 9 of 14 L7 tests (the 5
+that pass are earlier real-Git group-kill tests the old block handled).
+Directly affected 1,809 and focused 2,683, forward and reverse; dedicated
+Docker command 14 passed; full suite 4,296 passed, 0 skipped; 57/57 mutation
+checks caught, sources restored and SHA-256-verified; no leftovers;
+`git diff --check` clean. Supersedes the earlier D3 entries' totals.
+Uncommitted; no Linux CI; Gate O remains unsatisfied. `uv.lock` untouched.
+
+## 2026-10-19 — D3: BaseException-safe attach abort and chronological L7 cause (third joint-review correction, local)
+
+**What.** Two claims of the second correction were not yet true. (1) L2's
+attach abort and sliced wait caught only `Exception`, so a `KeyboardInterrupt`,
+`SystemExit` or other non-`Exception` could escape before the container id was
+returned, bypassing removal by id. They now retain any `BaseException` in one
+chronological record (`_AttachAbort.failures_in_order`; `ProcessLookupError`
+and a reap's `TimeoutExpired` keep their special meaning) and every remaining
+step runs. (2) L7 put the group-kill failure first when choosing the cause, so
+an earlier `poll()` failure lost; `__exit__` now keeps one chronological record
+(`failures_in_order`) and the cause is the abort failure, else its earliest
+entry (skipping a probe-cleared group-kill failure).
+
+**Decision (flagged for joint review).** A retained non-`Exception` is not
+swallowed: `DockerVerifier._execute` re-raises the exact first one only after
+the attempt's container cleanup by id (and `REMOVING`/confirmed `ABSENT`) has
+run. Swallowing it would discard a requested exit.
+
+**Lesson.** "Never raises" needs `BaseException` scope to be true; deciding
+what happens to an interrupt after cleanup is a separate, explicit choice.
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** Restoring the previous code
+failed all 10 new L2 cases (R-L2BASE) and the new L7 case without an abort
+failure (R-L7ORDER). Directly affected 1,821 and focused 2,695, forward and
+reverse; dedicated Docker command 14 passed; full suite 4,308 passed, 0
+skipped; 59/59 mutation checks caught, sources restored and SHA-256-verified;
+no leftovers; `git diff --check` clean. Supersedes the earlier D3 entries'
+totals. Uncommitted; no Linux CI; Gate O remains unsatisfied. `uv.lock`
+untouched.
+
+## 2026-10-19 — D3: cleanup dominance for retained interrupts, and the BaseException model in L1/L4/L5/L7 (fourth joint-review correction, local)
+
+**What.** The retain-then-re-raise decision was accepted with a qualification:
+L2 re-raised a retained `KeyboardInterrupt`/`SystemExit` unconditionally, so an
+unconfirmed attach, group, removal, absence or `ABSENT`-publication obligation
+was hidden by the raw interrupt. Now it re-raises only after fully confirmed
+cleanup; otherwise the sanitized failure result is returned with the interrupt
+in `VerificationResult.deferred_interrupt` (also `RunController.` and
+`LifecycleRunResult.deferred_interrupt`). L1, L4/L5 and L7 now retain every
+abort-step `BaseException` chronologically, run every remaining step, re-raise
+the earliest non-`Exception` only after confirmed cleanup, and otherwise raise
+their sanitized category carrying `failures_in_order`/`deferred_interrupt`.
+
+**Finding.** Verifying L1 rather than assuming it: its outer body-interrupt
+path was sound (now pinned), but its own abort steps caught only `Exception`,
+so it did not qualify to stay unchanged.
+
+**Lesson.** A revert check that "fails" because a `KeyboardInterrupt` aborts
+the pytest session proves nothing; tests that expect no escape now convert any
+escaping `BaseException` into an explicit failure (this caught three such
+reverts on the first run).
+
+**Residuals.** An L4/L5 body interrupt is still converted to
+`PROCESS_SETUP_FAILED` (pre-D3 behaviour); after a body interrupt with confirmed
+cleanup, a later cleanup interrupt is not re-raised; L3/L6 direct-child timeout.
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** Directly affected 1,857 and
+focused 2,723, forward and reverse; dedicated Docker command 14 passed; full
+suite 4,344 passed, 0 skipped; 63/63 mutation checks caught, sources restored
+and SHA-256-verified; no leftovers; `git diff --check` clean. Supersedes the
+earlier D3 entries' totals. Uncommitted; no Linux CI; Gate O remains
+unsatisfied. `uv.lock` untouched.
+
+## 2026-10-19 — D3: one precedence model for body and cleanup failures (fifth joint-review correction, local)
+
+**What.** The fourth correction's cleanup dominance was accepted, but its two
+residuals were not: L4/L5 wrapped a body `KeyboardInterrupt` as
+`PROCESS_SETUP_FAILED`, and a later cleanup interrupt could replace or drop a
+failure already in flight. One model now covers L1, L4/L5, L7 and (an
+extension flagged for review) L2: unconfirmed cleanup dominates (categorical
+error; the body failure kept as cause per module convention and as
+`body_failure`); confirmed cleanup keeps a body failure primary (ordinary ->
+existing categorical error, non-`Exception` -> exact instance; L7 uses
+`__exit__`'s exception); with no body failure the earliest cleanup interrupt
+is re-raised. Other failures attach in order via `codeagent_cleanup_failures`.
+
+**Decision.** Body failures are decided inside handlers but every cleanup and
+raise runs outside them, so re-raising a pre-existing instance never rewrites
+its `__context__`; secondaries ride on an attribute rather than the cause
+chain.
+
+**Lesson.** "Primary" has to be decided once, from occurrence order, before
+cleanup runs; letting cleanup decide it lets a late interrupt rewrite history.
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** R-L45WRAP, R-L1DROP,
+R-L7REPLACE and R-L2BODY failed the new tests. Directly affected 1,872 and
+focused 2,732, forward and reverse; dedicated Docker command 14 passed; full
+suite 4,359 passed, 0 skipped; 67/67 mutation checks caught, sources restored
+and SHA-256-verified; no leftovers; `git diff --check` clean. Supersedes the
+earlier D3 entries' totals. L3/L6 remain the accepted process-tree residual.
+Uncommitted; no Linux CI; Gate O remains unsatisfied. `uv.lock` untouched.
+
+## 2026-10-19 — D3: never-raising evidence attachment and deferred-interrupt carriage (sixth joint-review correction, local)
+
+**What.** The L2 extension was accepted. Three defects fixed: (1) attachment
+helpers tolerated only `AttributeError`/`TypeError`, so a custom exception
+refusing `getattr`/`setattr` with anything else (even `KeyboardInterrupt`)
+could replace the primary; now one shared helper,
+`cancellation.attach_cleanup_failures`, guards read and write against every
+`BaseException` and never touches the chain; (2)
+`LifecycleRunResult.deferred_interrupt` was a public field (text in `repr`,
+identity in equality); now `repr=False, compare=False`, validated; (3) the
+controller's deferred interrupt was dropped whenever a release failure raised
+`LifecycleRunCleanupError`, and on the raise path; now every composition
+outcome carries it (result field, error field, or the best-effort
+`codeagent_deferred_interrupt` attribute on a raw primary), with Amendment 14's
+precedence unchanged.
+
+**Lesson.** Evidence attachment is itself code on the failure path; it must be
+at least as fail-safe as the cleanup it describes. And a parametrized test can
+hide an abort: one revert first looked caught after 2 of 18 cases because a
+`KeyboardInterrupt` ended the session; the test now reports every case (12/18
+fail under the old catches; the 6 `AttributeError` cases correctly pass).
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** Directly affected 1,906 and
+focused 2,771, forward and reverse; dedicated Docker command 14 passed; full
+suite 4,401 passed, 0 skipped; 70/70 mutation checks caught, sources restored
+and SHA-256-verified; no leftovers; `git diff --check` clean. Supersedes the
+earlier D3 entries' totals. Uncommitted; no Linux CI; Gate O remains
+unsatisfied. `uv.lock` untouched.

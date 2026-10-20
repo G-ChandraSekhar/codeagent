@@ -19,6 +19,15 @@ call it until a checkpoint-ref reconciliation row, a worktree-plus-
 container row, abandonment (ADR 0004 section 11), and ADR 0005
 cancellation exist.
 
+**Cancellation (ADR 0005 Amendment 1).** `cancellation` is a read-only
+token passed to the `DockerVerifier` and the `RunController`. This module
+installs no signal handler: `cli.owned_cancellation()` is the only
+production owner, entered around a run dispatch starting with D6 (`solve`);
+in D3 only a test-only driver enters it around this function. A
+cancellation requested during `prepare_lifecycle()` or composition setup
+only sets the flag and is first observed at the controller's first check,
+so the worktree may be materialized and then disposed by ordinary teardown.
+
 **Cleanup contract (Amendment 14 R1-R8, D).** Once `RunController.run()`
 returns, its `_terminate()` was the only disposal attempt: the worktree is
 never exited again, so nothing is mutated after `RunFinished`. Only the
@@ -31,16 +40,25 @@ exception (when every stage is confirmed) or one sanitized
 and the outcome are decided from pre-dedup attribution (R8); the
 cycle-safe identity dedup (D) only chooses which exception instances are
 reported.
+
+**Deferred interrupt (ADR 0005 Amendment 1 §12).** When the controller
+recorded a deferred interrupt, every outcome preserves that exact instance
+without changing the precedence above: `LifecycleRunResult.deferred_interrupt`
+and `LifecycleRunCleanupError.deferred_interrupt` (never in a `repr`, equality
+or message), or, on an exception that surfaces raw, the best-effort
+`codeagent_deferred_interrupt` attribute (an exception type that refuses
+attributes cannot carry it).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, unique
 from pathlib import Path
 
 from . import domain, events
 from ._lifecycle_fs import LifecycleFsError
+from .cancellation import DEFERRED_INTERRUPT_ATTRIBUTE, NEVER_CANCELLED, CancellationToken, set_evidence_attribute
 from .checkpoint_ref import CheckpointRef
 from .checkpoint_session import CheckpointSession
 from .controller import ApprovalProvider, Clock, EventLog, ModelClient, RunConfig, RunController
@@ -96,10 +114,32 @@ class LifecycleRunResult:
     unconfirmed_stages: tuple[CleanupStage, ...]
     reservation_release_error: LifecycleFsError | None
     lease_release_error: LifecycleStoreError | None
+    # ADR 0005 Amendment 1 §12: an exit-style interrupt the controller
+    # recorded as deferred evidence (`RunController.deferred_interrupt`). The
+    # exact instance; never in `repr` or equality (its text is never
+    # exposed); a non-`Exception` only.
+    deferred_interrupt: BaseException | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        _require_deferred_interrupt(self.deferred_interrupt)
 
     @property
     def release_confirmed(self) -> bool:
         return not self.unconfirmed_stages
+
+
+def _require_deferred_interrupt(value) -> None:
+    if value is not None and (not isinstance(value, BaseException) or isinstance(value, Exception)):
+        raise ValueError("deferred_interrupt must be a BaseException that is not an Exception")
+
+
+def _carry_deferred(exc: BaseException, deferred: BaseException | None) -> None:
+    """Preserve the controller's deferred interrupt on an exception that
+    surfaces raw (Amendment 14 keeps it primary): best effort, through the
+    stable `codeagent_deferred_interrupt` attribute, never through text or
+    the cause chain. Skipped when `exc` is that interrupt itself."""
+    if deferred is not None and exc is not deferred:
+        set_evidence_attribute(exc, DEFERRED_INTERRUPT_ATTRIBUTE, deferred)
 
 
 class LifecycleRunCleanupError(Exception):
@@ -118,7 +158,9 @@ class LifecycleRunCleanupError(Exception):
         original: BaseException | None,
         failures: tuple[CleanupFailure, ...],
         failed_stages: tuple[CleanupStage, ...],
+        deferred_interrupt: BaseException | None = None,
     ) -> None:
+        _require_deferred_interrupt(deferred_interrupt)
         message = _MESSAGE_PREFIX + ", ".join(stage.value for stage in failed_stages)
         super().__init__(message)
         self.message = message
@@ -126,6 +168,9 @@ class LifecycleRunCleanupError(Exception):
         self.original = original
         self.failures = failures
         self.failed_stages = failed_stages
+        # The controller's deferred interrupt (ADR 0005 Amendment 1 §12), by
+        # identity; never part of the message.
+        self.deferred_interrupt = deferred_interrupt
 
 
 @dataclass(frozen=True)
@@ -214,7 +259,7 @@ def _field_candidate(
     candidates.append(_Candidate(stage, value, True, not owned))
 
 
-def _raise_path(original, worktree, worktree_entered, reservation, lease):
+def _raise_path(original, worktree, worktree_entered, reservation, lease, deferred_interrupt=None):
     """R5: run every raise-path stage exactly once (none inside a handler),
     then attribute (R8), dedup (D), and re-raise or dominate."""
     original_reach: set[int] = set()
@@ -258,16 +303,18 @@ def _raise_path(original, worktree, worktree_entered, reservation, lease):
 
     failed_stages = _unique_stages(candidates)
     if not failed_stages:
+        _carry_deferred(original, deferred_interrupt)
         raise original
     raise LifecycleRunCleanupError(
         finished=None,
         original=original,
         failures=_dedup(candidates, original),
         failed_stages=failed_stages,
+        deferred_interrupt=deferred_interrupt,
     ) from original
 
 
-def _returned_path(finished, reservation, lease) -> LifecycleRunResult:
+def _returned_path(finished, reservation, lease, deferred_interrupt=None) -> LifecycleRunResult:
     """R4: release the reservation's descriptors, then the lease, each
     exactly once. The worktree is never exited (R1)."""
     candidates: list[_Candidate] = []
@@ -290,12 +337,17 @@ def _returned_path(finished, reservation, lease) -> LifecycleRunResult:
             unconfirmed_stages=stages,
             reservation_release_error=by_stage.get(CleanupStage.RESERVATION),
             lease_release_error=by_stage.get(CleanupStage.LEASE),
+            deferred_interrupt=deferred_interrupt,
         )
     primary = unexpected[0].exception
     if len(candidates) == 1 and not isinstance(primary, Exception):
+        # Amendment 14: a lone release-time interrupt stays primary; the
+        # earlier deferred interrupt is carried on it, never erased.
+        _carry_deferred(primary, deferred_interrupt)
         raise primary
     raise LifecycleRunCleanupError(
-        finished=finished, original=None, failures=failures, failed_stages=stages
+        finished=finished, original=None, failures=failures, failed_stages=stages,
+        deferred_interrupt=deferred_interrupt,
     ) from primary
 
 
@@ -316,12 +368,14 @@ def run_lifecycle_aware(
     max_plan_revisions: int = 2,
     clock: Clock | None = None,
     event_log: EventLog | None = None,
+    cancellation: CancellationToken = NEVER_CANCELLED,
 ) -> LifecycleRunResult:
     """Run one lifecycle-aware run end to end. See the module docstring and
     ADR 0004 Amendment 14 for the boundary and the full cleanup contract."""
     lease = prepare_lifecycle(source_repo_path, run_id=run_id)  # self-cleans on failure
 
     original: BaseException | None = None
+    controller = None
     reservation = None
     worktree = None
     worktree_entered = False
@@ -360,6 +414,7 @@ def run_lifecycle_aware(
                 timeout_seconds=verify_timeout_seconds,
                 clock=clock,
                 lifecycle_context=DockerVerifierLifecycleContext(publisher=publishers.container_publisher),
+                cancellation=cancellation,
             ),
             GitPatchApplier(path, patch_operations),
             WorktreeFileReader(path),
@@ -372,11 +427,13 @@ def run_lifecycle_aware(
             clock=clock,
             event_log=event_log,
             lifecycle_owner=publishers.owner_publisher,
+            cancellation=cancellation,
         )
         finished = controller.run()
     except BaseException as exc:
         original = exc
 
+    deferred = controller.deferred_interrupt if controller is not None else None
     if original is not None:
-        _raise_path(original, worktree, worktree_entered, reservation, lease)
-    return _returned_path(finished, reservation, lease)
+        _raise_path(original, worktree, worktree_entered, reservation, lease, deferred)
+    return _returned_path(finished, reservation, lease, deferred)

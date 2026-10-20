@@ -2933,3 +2933,377 @@ def test_read_bounded_injected_git_safety_error_after_popen_cleans_up_and_propag
         assert spawned["proc"].poll() is not None  # confirmed reaped, not leaked
     finally:
         subprocess.run(["pkill", "-f", "sleep 300"], capture_output=True)
+
+
+# ADR 0005 Amendment 1 (ledger D3): L3-L5 real-process session tests. L3's
+# direct-child-only timeout residual stays documented and untested.
+from tests.support import process_shims as _shims  # noqa: E402
+
+
+@pytest.mark.parametrize("site", ["L3", "L4", "L5"])
+def test_git_launch_leads_its_own_session(site, tmp_path, monkeypatch):
+    _shims.check_session(site, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("site", ["L3", "L4", "L5"])
+def test_git_group_sigint_never_reaches_the_child(site, tmp_path):
+    _shims.check_group_sigint_spared(site, tmp_path)
+
+
+@pytest.mark.parametrize("site", ["L4", "L5"])
+def test_git_abort_kills_the_whole_process_group(site, tmp_path, monkeypatch):
+    _shims.check_abort_group_kill(site, tmp_path, monkeypatch)
+
+
+# ADR 0005 Amendment 1 (D3 joint-review correction): the L4/L5 abort path's
+# group kill is fail-closed (PROCESS_CLEANUP_UNCONFIRMED).
+
+_GS_GROUP_TEXT = "SENTINEL-group-kill-/secret/path"
+
+
+class _GsAbortProc:
+    def __init__(self, *, wait_timeout=False):
+        self.pid = 4_000_654
+        self.kills = 0
+        self.waits = 0
+        self.stdout = None
+        self._wait_timeout = wait_timeout
+
+    def kill(self):
+        self.kills += 1
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if self._wait_timeout:
+            raise subprocess.TimeoutExpired(["git", "-C", "/secret/repo"], timeout)
+        return -9
+
+
+def _gs_killpg(monkeypatch, exc, probe_exc=None):
+    calls = []
+
+    def killpg(pid, sig):
+        calls.append(sig)
+        raise exc if sig == _git_safety.signal.SIGKILL else (probe_exc if probe_exc is not None else exc)
+
+    monkeypatch.setattr(_git_safety.os, "killpg", killpg)
+    return calls
+
+
+def test_l4_l5_group_absent_is_not_uncertain(monkeypatch):
+    calls = _gs_killpg(monkeypatch, ProcessLookupError())
+    proc = _GsAbortProc()
+    _git_safety._terminate_and_confirm(proc, writer_thread=None, deadline=time.monotonic())
+    assert len(calls) == 1 and (proc.kills, proc.waits) == (1, 1)
+
+
+@pytest.mark.parametrize("group_exc", [PermissionError(_GS_GROUP_TEXT), RuntimeError(_GS_GROUP_TEXT)])
+def test_l4_l5_group_kill_failure_is_cleanup_unconfirmed(monkeypatch, group_exc):
+    calls = _gs_killpg(monkeypatch, group_exc)
+    proc = _GsAbortProc()
+    with pytest.raises(GitSafetyError) as info:
+        _git_safety._terminate_and_confirm(proc, writer_thread=None, deadline=time.monotonic())
+    err = info.value
+    assert err.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+    assert err.__cause__ is group_exc and _GS_GROUP_TEXT not in str(err)
+    assert calls == [_git_safety.signal.SIGKILL, 0] and (proc.kills, proc.waits) == (1, 1)
+
+
+def test_l4_l5_post_reap_probe_confirms_an_absent_group(monkeypatch):
+    calls = _gs_killpg(monkeypatch, PermissionError(_GS_GROUP_TEXT), probe_exc=ProcessLookupError())
+    proc = _GsAbortProc()
+    _git_safety._terminate_and_confirm(proc, writer_thread=None, deadline=time.monotonic())
+    assert calls == [_git_safety.signal.SIGKILL, 0] and (proc.kills, proc.waits) == (1, 1)
+
+
+def test_l4_l5_reap_timeout_with_group_failure_never_chains_the_timeout(monkeypatch):
+    group_exc = PermissionError(_GS_GROUP_TEXT)
+    _gs_killpg(monkeypatch, group_exc)
+    proc = _GsAbortProc(wait_timeout=True)
+    with pytest.raises(GitSafetyError) as info:
+        _git_safety._terminate_and_confirm(proc, writer_thread=None, deadline=time.monotonic())
+    err = info.value
+    assert err.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+    assert err.__cause__ is group_exc  # never the TimeoutExpired (its text names argv)
+    assert "/secret/repo" not in str(err)
+
+
+def test_l4_l5_unconfirmed_writer_with_group_failure(monkeypatch):
+    group_exc = PermissionError(_GS_GROUP_TEXT)
+    _gs_killpg(monkeypatch, group_exc)
+    release = threading.Event()
+    writer = threading.Thread(target=release.wait, daemon=True)
+    writer.start()
+    try:
+        with pytest.raises(GitSafetyError) as info:
+            _git_safety._terminate_and_confirm(
+                _GsAbortProc(), writer_thread=writer, deadline=time.monotonic() - 10
+            )
+        assert info.value.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+        assert info.value.__cause__ is group_exc
+    finally:
+        release.set()
+        writer.join(5)
+
+
+def _count_popen_kills(monkeypatch):
+    kills = []
+    real_kill = subprocess.Popen.kill
+    monkeypatch.setattr(subprocess.Popen, "kill", lambda self: (kills.append(self.pid), real_kill(self))[1])
+    return kills
+
+
+def test_l4_end_to_end_group_kill_failure_dominates_and_kills_once(monkeypatch):
+    calls = _gs_killpg(monkeypatch, PermissionError(_GS_GROUP_TEXT))
+    kills = _count_popen_kills(monkeypatch)
+    with pytest.raises(GitSafetyError) as info:
+        _git_safety._read_bounded(["help", "-a"], env=_git_safety.git_environment(), timeout=30.0, limit=8)
+    assert info.value.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+    assert calls.count(_git_safety.signal.SIGKILL) == 1 and len(kills) == 1
+
+
+def test_l5_overflow_group_kill_failure_is_terminated_exactly_once(monkeypatch):
+    """The preview overflow abort runs outside the handled region, so its
+    own unconfirmed result is never followed by a second terminate."""
+    calls = _gs_killpg(monkeypatch, PermissionError(_GS_GROUP_TEXT))
+    kills = _count_popen_kills(monkeypatch)
+    with pytest.raises(GitSafetyError) as info:
+        _git_safety._read_bounded_preview(["help", "-a"], env=_git_safety.git_environment(), timeout=30.0, limit=8)
+    assert info.value.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+    assert calls.count(_git_safety.signal.SIGKILL) == 1 and len(kills) == 1
+
+
+def test_l5_overflow_with_absent_group_still_returns_the_preview(monkeypatch):
+    calls = _gs_killpg(monkeypatch, ProcessLookupError())
+    result = _git_safety._read_bounded_preview(["help", "-a"], env=_git_safety.git_environment(), timeout=30.0, limit=8)
+    assert result.complete is False and len(result.stdout) == 8 and len(calls) == 1
+
+
+# ADR 0005 Amendment 1 §12 (fourth correction): L4/L5 BaseException model.
+
+
+class _GsScripted:
+    """kills/waits/closes scripts: None = succeed, "timeout", or an
+    exception instance to raise."""
+
+    def __init__(self, *, kill=None, wait=None, close=None):
+        self.pid = 4_000_655
+        self.kill_calls = self.wait_calls = self.close_calls = 0
+        self._kill, self._wait, self._close = kill, wait, close
+        outer = self
+
+        class _Out:
+            def close(self):
+                outer.close_calls += 1
+                if outer._close is not None:
+                    raise outer._close
+
+        self.stdout = _Out()
+
+    def kill(self):
+        self.kill_calls += 1
+        if self._kill is not None:
+            raise self._kill
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        if self._wait == "timeout":
+            raise subprocess.TimeoutExpired(["git", "-C", "/secret/repo"], timeout)
+        if self._wait is not None:
+            raise self._wait
+        return -9
+
+
+def _gs_steps(monkeypatch, *, group=None, probe=ProcessLookupError()):
+    calls = []
+
+    def killpg(pid, sig):
+        calls.append(sig)
+        action = group if sig == _git_safety.signal.SIGKILL else probe
+        if action is not None:
+            raise action
+
+    monkeypatch.setattr(_git_safety.os, "killpg", killpg)
+    return calls
+
+
+class _GsBase(BaseException):
+    pass
+
+
+def _without_escape(fn):
+    """Call `fn`; any escaping `BaseException` (including KeyboardInterrupt,
+    which would otherwise abort the pytest session) becomes a test failure."""
+    try:
+        return fn()
+    except BaseException as exc:  # noqa: BLE001
+        pytest.fail(f"{type(exc).__name__} escaped instead of being retained")
+
+
+@pytest.mark.parametrize("site", ["group_kill", "direct_kill", "close"])
+def test_l4_l5_confirmed_cleanup_returns_the_interrupt_for_reraise(monkeypatch, site):
+    inst = KeyboardInterrupt(f"SENTINEL-{site}")
+    calls = _gs_steps(monkeypatch, group=inst if site == "group_kill" else None)
+    proc = _GsScripted(kill=inst if site == "direct_kill" else None, close=inst if site == "close" else None)
+    # Fifth correction: a confirmed cleanup returns its whole record.
+    assert _without_escape(
+        lambda: _git_safety._terminate_and_confirm(proc, writer_thread=None, deadline=time.monotonic())
+    ) == (inst,)
+    # Every later step still ran exactly once.
+    assert (proc.kill_calls, proc.close_calls, proc.wait_calls) == (1, 1, 1)
+    assert calls == ([_git_safety.signal.SIGKILL, 0] if site == "group_kill" else [_git_safety.signal.SIGKILL])
+
+
+@pytest.mark.parametrize("site", ["reap", "probe", "group_kill_then_reap_timeout"])
+def test_l4_l5_unconfirmed_cleanup_dominates_an_interrupt(monkeypatch, site):
+    inst = _GsBase(f"SENTINEL-{site}")
+    if site == "reap":
+        group, probe, proc = None, ProcessLookupError(), _GsScripted(wait=inst)
+    elif site == "probe":
+        group, probe, proc = PermissionError("SENTINEL-g"), inst, _GsScripted()
+    else:
+        group, probe, proc = inst, ProcessLookupError(), _GsScripted(wait="timeout")
+    _gs_steps(monkeypatch, group=group, probe=probe)
+    with pytest.raises(GitSafetyError) as info:
+        _git_safety._terminate_and_confirm(proc, writer_thread=None, deadline=time.monotonic())
+    err = info.value
+    assert err.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+    assert err.deferred_interrupt is inst and inst in err.failures_in_order
+    assert err.__cause__ is err.failures_in_order[0]  # the earliest retained failure
+    if site == "probe":
+        assert err.failures_in_order == (group, inst)
+    assert "SENTINEL" not in str(err) and "/secret/repo" not in str(err)
+    assert (proc.kill_calls, proc.close_calls, proc.wait_calls) == (1, 1, 1)
+
+
+def test_l4_path_level_confirmed_cleanup_reraises_the_exact_interrupt(monkeypatch):
+    inst = KeyboardInterrupt("SENTINEL-ki")
+    _gs_steps(monkeypatch, group=inst)  # the probe then confirms absence
+    kills = _count_popen_kills(monkeypatch)
+    # Fifth correction: the body failure (the overflow) stays primary; the
+    # cleanup interrupt is attached, never raised in its place.
+    err = _without_escape(lambda: _expect_git_error(
+        lambda: _git_safety._read_bounded(["help", "-a"], env=_git_safety.git_environment(), timeout=30.0, limit=8)
+    ))
+    assert err.reason is not GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+    assert err.codeagent_cleanup_failures == (inst,) and len(kills) == 1
+
+
+def test_l5_path_level_unconfirmed_cleanup_dominates(monkeypatch):
+    inst = _GsBase("SENTINEL-base")
+    _gs_steps(monkeypatch, group=inst, probe=PermissionError("SENTINEL-p"))
+    kills = _count_popen_kills(monkeypatch)
+    with pytest.raises(GitSafetyError) as info:
+        _git_safety._read_bounded_preview(["help", "-a"], env=_git_safety.git_environment(), timeout=30.0, limit=8)
+    assert info.value.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+    assert info.value.deferred_interrupt is inst and len(kills) == 1
+
+
+
+def _expect_git_error(fn):
+    try:
+        fn()
+    except GitSafetyError as err:
+        return err
+    raise AssertionError("expected a GitSafetyError")
+
+
+# ADR 0005 Amendment 1 §12 (fifth correction): one precedence model for L4/L5.
+
+
+def _gs_body(monkeypatch, body):
+    def drain(process, *, deadline, limit):
+        raise body
+
+    monkeypatch.setattr(_git_safety, "_drain_stdout", drain)
+
+
+def _gs_chain(exc):
+    cause, context = RuntimeError("preset-cause"), RuntimeError("preset-context")
+    exc.__cause__, exc.__context__ = cause, context
+    return exc, cause, context
+
+
+def _gs_read():
+    return _git_safety._read_bounded(["--version"], env=_git_safety.git_environment(), timeout=30.0, limit=4096)
+
+
+def test_l4_ordinary_body_failure_then_cleanup_interrupt(monkeypatch):
+    body, ki = RuntimeError("SENTINEL-body"), KeyboardInterrupt("SENTINEL-ki")
+    _gs_body(monkeypatch, body)
+    _gs_steps(monkeypatch, group=ki)
+    kills = _count_popen_kills(monkeypatch)
+    err = _without_escape(lambda: _expect_git_error(_gs_read))
+    assert err.reason is GitSafetyFailure.PROCESS_SETUP_FAILED and err.__cause__ is body
+    assert err.codeagent_cleanup_failures == (ki,) and len(kills) == 1
+    assert "SENTINEL" not in str(err)
+
+
+@pytest.mark.parametrize("make", [lambda: KeyboardInterrupt("SENTINEL-1"), lambda: SystemExit("SENTINEL-1"), lambda: _GsBase("SENTINEL-1")])
+def test_l4_body_interrupt_is_reraised_exactly_never_wrapped(monkeypatch, make):
+    ki1, cause, context = _gs_chain(make())
+    ki2 = _GsBase("SENTINEL-2")
+    _gs_body(monkeypatch, ki1)
+    _gs_steps(monkeypatch, group=ki2)  # a second, cleanup-time interrupt
+    kills = _count_popen_kills(monkeypatch)
+    with pytest.raises(type(ki1)) as info:
+        _gs_read()
+    assert info.value is ki1  # not PROCESS_SETUP_FAILED, not ki2
+    assert ki1.codeagent_cleanup_failures == (ki2,)
+    assert ki1.__cause__ is cause and ki1.__context__ is context and len(kills) == 1
+
+
+def test_l5_no_body_two_cleanup_interrupts_reraises_the_earliest(monkeypatch):
+    ki1, cause, context = _gs_chain(KeyboardInterrupt("SENTINEL-1"))
+    ki2 = _GsBase("SENTINEL-2")
+    _gs_steps(monkeypatch, group=ki1)
+    kills = []
+    real_kill = subprocess.Popen.kill
+
+    def kill(self):
+        kills.append(self.pid)
+        real_kill(self)
+        raise ki2
+
+    monkeypatch.setattr(subprocess.Popen, "kill", kill)
+    with pytest.raises(KeyboardInterrupt) as info:
+        _git_safety._read_bounded_preview(["help", "-a"], env=_git_safety.git_environment(), timeout=30.0, limit=8)
+    assert info.value is ki1 and ki1.codeagent_cleanup_failures == (ki2,)
+    assert ki1.__cause__ is cause and ki1.__context__ is context and len(kills) == 1
+
+
+def test_l4_unconfirmed_cleanup_dominates_a_body_interrupt(monkeypatch):
+    ki1, cause, context = _gs_chain(KeyboardInterrupt("SENTINEL-1"))
+    group, ki2, probe = PermissionError("SENTINEL-g"), _GsBase("SENTINEL-2"), PermissionError("SENTINEL-p")
+    _gs_body(monkeypatch, ki1)
+    _gs_steps(monkeypatch, group=group, probe=probe)
+    kills = []
+    real_kill = subprocess.Popen.kill
+
+    def kill(self):
+        kills.append(self.pid)
+        real_kill(self)
+        raise ki2
+
+    monkeypatch.setattr(subprocess.Popen, "kill", kill)
+    err = _without_escape(lambda: _expect_git_error(_gs_read))
+    assert err.reason is GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED
+    assert err.body_failure is ki1 and err.deferred_interrupt is ki2
+    assert err.failures_in_order == (group, ki2, probe) and err.__cause__ is group  # accepted L4/L5 convention
+    assert ki1.__cause__ is cause and ki1.__context__ is context and len(kills) == 1
+    assert "SENTINEL" not in str(err)
+
+
+# Sixth correction: an attribute-refusing body still surfaces, unchanged.
+from tests.support.refusing import REFUSALS, refusing  # noqa: E402
+
+
+@pytest.mark.parametrize("make_refusal", REFUSALS)
+def test_l4_refusing_body_still_surfaces_exactly(monkeypatch, make_refusal):
+    body = refusing(SystemExit, make_refusal())
+    _gs_body(monkeypatch, body)
+    _gs_steps(monkeypatch, group=_GsBase("SENTINEL-2"))
+    kills = _count_popen_kills(monkeypatch)
+    with pytest.raises(SystemExit) as info:
+        _gs_read()
+    assert info.value is body and len(kills) == 1

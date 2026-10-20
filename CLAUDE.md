@@ -2984,6 +2984,160 @@ Stage 2 (of the four-stage planning process in
     orphaned Docker child can still force a refusal; abandonment is unchanged.
     T-F1 gains partial, reconciler-level coverage for these two accepted shapes only. **Gate
     O remains unsatisfied until D3.**
+- **Ledger D3: entrypoint-owned cancellation (ADR 0005 Amendment 1,
+  Accepted 2026-10-06)** is **implemented and verified locally on macOS
+  (2026-10-19); uncommitted, unpushed, Linux CI pending.** Gate O is **not**
+  satisfied: Amendment 1 §9 requires commit and a successful Linux CI run
+  first, and even then operator cancellation is unreachable before D6.
+  - **What it adds:** `src/codeagent/cancellation.py` (main-thread-only,
+    append-based `CancellationSource`, read-only `CancellationToken`,
+    `NEVER_CANCELLED`, `OperationCancelled`, `CancellationThreadError`, the
+    sliced `wait_cancellable`); `cli.owned_cancellation()` (the sole
+    production `signal.signal` caller; the 28-row install/restore failure
+    model with exact ordered `failures`, `unrestored`, cleanup dominance and
+    same-object repeated close) — `main()`, `_dispatch()`, `build_parser()`
+    and `ExitCode` are unchanged and `reconcile` is not wrapped;
+    `RunController` safe points C1–C23 (none inside the patch critical
+    section), `OperationCancelled` mapped only at `decide()`;
+    `VerificationOutcome.CANCELLED` (`exit_code`/`error` None,
+    `NOT_APPLICABLE` or `CONFIRMED_ABSENT`); verifier entry check, sliced
+    attach wait, attach-client group kill, cancel → `REMOVING`/rm/`ABSENT`;
+    `start_new_session=True` at all seven launch sites (L1–L7) with group
+    kill on the five owned-`Popen` abort paths; the `cancellation` keyword
+    through `_lifecycle_run`; `.github/workflows/ci.yml`'s dedicated Docker
+    step now also runs `tests/integration/test_cancellation_e2e.py -v`.
+  - **Disclosed deviation:** Amendment 1 §8's "completed transitions into
+    EXPLORE" contradicted its own "unchanged for every run that reached
+    EXPLORE" on budget-exceeded runs. By author decision before coding,
+    `iterations_used` is the number of exploration passes begun (0 before
+    the first pass); every existing pin holds. Recorded in the ADR.
+  - **Tests:** `test_cancellation.py`, `test_subprocess_inventory.py` (the
+    exact seven-call-node inventory), `tests/support/process_shims.py`
+    (`PATH`-shim per-site session, group-SIGINT and grandchild-kill tests
+    for L1–L7), `tests/support/cancellation_driver.py` (test-only), E1–E12
+    in `test_cancellation_e2e.py` (real SIGINT to the driver's group and
+    SIGTERM to its PID, real Docker and Git); extended `test_cli.py`,
+    `test_controller.py` (exhaustive sweep), `test_executor.py`,
+    `test_events.py` (member pin, disclosed), `test_verification_result_parity.py`.
+  - **Joint-review correction (2026-10-19, before any commit):** the L1,
+    L4/L5 and L7 abort paths swallowed every `os.killpg` failure and could
+    report confirmed cleanup after reaping only the direct child. Now
+    `ProcessLookupError` alone means the group is gone; any other failure is
+    retained, every later cleanup step still runs (L1/L4/L5: one direct kill
+    and one bounded reap; L2/L7: plus exactly one retry kill and bounded reap
+    after an unconfirmed reap), and unless a
+    post-reap signal-0 probe raises `ProcessLookupError` (needed because
+    macOS returns EPERM for a group holding only its exited leader; author
+    decision) the result is the helper's sanitized unconfirmed category
+    (`TERMINATION_UNCONFIRMED`, `PROCESS_CLEANUP_UNCONFIRMED`,
+    `TRANSACTION_CLEANUP_UNCONFIRMED`). The executor's attach path fails
+    closed to `ENVIRONMENT_FAILURE`, never `CANCELLED`/`TIMEOUT`. Fault-
+    injection tests added; restoring the old behaviour per helper made them
+    fail. Details: ADR 0005 Amendment 1 §12.
+  - **Second joint-review correction (2026-10-19):** L2's attach abort and
+    L7's transaction exit could still raise raw from `kill()`/`wait()`
+    (L2 then skipped removal by id). Now `_abort_attach_client` never raises
+    and retains every failure (including the group-kill failure and a failed
+    attach wait) in an internal `_AttachAbort` record; the attempt fails
+    closed to `ENVIRONMENT_FAILURE` and still removes the container by id.
+    L7 retains every failure in `cleanup_failures`, keeps the abort failure
+    as the cause when present (else the earliest), and ends
+    `TRANSACTION_CLEANUP_UNCONFIRMED`. Call counts pinned; restoring the old
+    blocks failed the new path-level tests. Details: ADR 0005 Amendment 1 §12.
+  - **Third joint-review correction (2026-10-19):** L2's attach abort and
+    sliced wait caught only `Exception`, so a `KeyboardInterrupt`/
+    `SystemExit` could still bypass removal by id. They now retain any
+    `BaseException` in one chronological record; every step still runs, and
+    a retained non-`Exception` is re-raised (exact instance) only after
+    fully confirmed cleanup (client reaped, group gone, container confirmed
+    absent, durable `ABSENT` where applicable; accepted with that
+    qualification). L7 now picks its cause from one chronological record
+    (an early `poll()` failure precedes a later group-kill failure).
+  - **Fourth joint-review correction (2026-10-19):** L2 applies cleanup
+    dominance: with any unconfirmed attach, group, removal, absence or
+    `ABSENT`-publication obligation, the sanitized failure result is
+    returned carrying the interrupt as `VerificationResult.deferred_interrupt`
+    (also exposed as `RunController.deferred_interrupt` and
+    `LifecycleRunResult.deferred_interrupt`). L1, L4/L5 and L7 now retain
+    every abort-step `BaseException` chronologically, run every remaining
+    step, re-raise the earliest non-`Exception` only after fully confirmed
+    cleanup, and otherwise raise their sanitized category carrying
+    `failures_in_order`/`deferred_interrupt`. L1's body-interrupt path was
+    verified and pinned; its abort steps did not qualify to stay unchanged.
+    Residuals at the time (resolved by the fifth correction): an L4/L5 body
+    interrupt was still converted to `PROCESS_SETUP_FAILED`; L3/L6
+    direct-child timeout. Details: ADR 0005 Amendment 1 §12.
+  - **Fifth joint-review correction (2026-10-19):** one precedence model for
+    L1, L4/L5, L7 (and, flagged as an extension, L2): unconfirmed cleanup
+    dominates (categorical error, body failure kept as cause per module
+    convention and as `body_failure`); confirmed cleanup keeps a body failure
+    primary (ordinary -> existing categorical error; non-`Exception` ->
+    exact instance, so L4/L5 no longer wrap a body `KeyboardInterrupt` as
+    `PROCESS_SETUP_FAILED`; L7 keeps the `with` body's exception); with no
+    body failure the earliest cleanup interrupt is re-raised. Other cleanup
+    failures are attached in order as `codeagent_cleanup_failures`, never
+    touching `__cause__`/`__context__`. L3/L6 remain the accepted residual.
+    Supersedes the fourth correction's re-raise rule and residuals 1-2.
+  - **Sixth joint-review correction (2026-10-19):** the L2 extension is
+    accepted. Attachment is now one shared never-raising helper
+    (`cancellation.attach_cleanup_failures`) guarding read and write against
+    any `BaseException`, so it can never replace the primary (a refusing
+    exception just cannot expose the record).
+    `LifecycleRunResult.deferred_interrupt` is `repr=False, compare=False`
+    and validated. The controller's deferred interrupt now survives every
+    composition outcome (returned result, `LifecycleRunCleanupError`, or the
+    `codeagent_deferred_interrupt` attribute on a raw primary), with
+    Amendment 14's precedence unchanged, including the raise path.
+  - **Verified locally after the sixth correction:** directly affected
+    1,906 and focused 2,771, each forward and reverse; dedicated CI Docker
+    command 14 passed; full suite 4,401 passed, 0 skipped; 70/70 mutation
+    checks (the 51 plan mutations plus nineteen correction reverts) caught,
+    sources restored and SHA-256-verified; no leftovers; `git diff --check`
+    clean.
+  - **Verified locally after the fifth correction (superseded above):** directly affected
+    1,872 and focused 2,732, each forward and reverse; dedicated CI Docker
+    command 14 passed; full suite 4,359 passed, 0 skipped; 67/67
+    mutation checks (the 51 plan mutations plus sixteen correction reverts)
+    caught, sources restored and SHA-256-verified; no leftovers;
+    `git diff --check` clean.
+  - **Verified locally after the fourth correction (superseded above):** directly affected
+    1,857 and focused 2,723, each forward and reverse; dedicated CI Docker
+    command 14 passed; full suite 4,344 passed, 0 skipped; 63/63 mutation
+    checks (the 51 plan mutations plus twelve correction reverts) caught,
+    sources restored and SHA-256-verified; no leftovers; `git diff --check`
+    clean.
+  - **Verified locally after the third correction (superseded above):** directly affected
+    1,821 and focused 2,695, each forward and reverse; dedicated CI Docker
+    command 14 passed; full suite 4,308 passed, 0 skipped; 59/59 mutation
+    checks (the 51 plan mutations plus eight correction reverts) caught,
+    sources restored and SHA-256-verified; no leftovers; `git diff --check`
+    clean.
+  - **Verified locally after the second correction (superseded above):** directly affected 1,809
+    and focused 2,683, each forward and reverse; dedicated CI Docker
+    command 14 passed; full suite 4,296 passed, 0 skipped; 57/57 mutation
+    checks (the 51 plan mutations plus six correction reverts) caught,
+    sources restored and SHA-256-verified; no leftovers; `git diff --check`
+    clean.
+  - **Verified locally after the first correction (superseded above):**
+    directly affected 1,788 and
+    focused 2,662, each forward and reverse; dedicated CI Docker command 14
+    passed; full suite 4,275 passed, 0 skipped; 56/56 mutation checks (the 51
+    plan mutations plus five correction reverts) caught, sources restored and
+    SHA-256-verified; no leftovers; `git diff --check` clean.
+  - **First local pass (superseded by the totals above):**
+    directly affected 11 files 1,760 and the
+    focused set (the 23-file set plus the three new test files) 2,643, each
+    forward and reverse; the dedicated CI Docker command 14 passed; full
+    suite 4,247 passed, 0 skipped (from 3,994); 51/51 mutations caught with
+    sources restored and SHA-256-verified; no leftovers; `git diff --check`
+    clean. Details: ADR 0005 Amendment 1 §12 and `ENGINEERING_LOG.md`.
+  - **Boundaries:** no operator path; L3/L6 `subprocess.run` timeouts kill
+    only the direct child (untested residual); cancellation is not observed
+    inside model calls, bounded Docker/Git control-plane commands, or
+    `prepare_lifecycle()`/setup (the worktree may be materialized then
+    disposed); SIGKILL/SIGHUP/SIGQUIT rely on reconciliation; T-E1 and T-F2
+    unchanged; T-F1 gains cooperative-cleanup evidence only. Automated-test
+    evidence, not a security review.
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

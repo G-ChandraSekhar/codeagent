@@ -462,3 +462,45 @@ class FakeEvidenceSink:
             bytes_written=0,
             error=None,
         )
+
+
+class CountingToken:
+    """ADR 0005 Amendment 1 sweep double: counts `is_cancelled()` calls and
+    reports cancellation from the `cancel_from`th call onward (never, when
+    None). The controller records the check site itself."""
+
+    def __init__(self, cancel_from: int | None = None) -> None:
+        self._cancel_from = cancel_from
+        self.calls = 0
+
+    def is_cancelled(self) -> bool:
+        self.calls += 1
+        return self._cancel_from is not None and self.calls >= self._cancel_from
+
+
+class BlockingCancellableApprovalProvider:
+    """A blocking approval provider that stops waiting only when its token is
+    cancelled, then raises `OperationCancelled` (ADR 0005 Amendment 1
+    section 4). `on_wait` runs once when the wait begins (the test-only
+    driver writes its `ready-approval` gate there). A deadline that passes
+    fails loudly; it never returns a decision."""
+
+    def __init__(self, token, *, on_wait=None, poll_seconds: float = 0.01, deadline_seconds: float = 120.0) -> None:
+        self._token = token
+        self._on_wait = on_wait
+        self._poll = poll_seconds
+        self._deadline = deadline_seconds
+
+    def decide(self, visit_index: int) -> domain.ApprovalDecision:
+        import time
+
+        from codeagent.cancellation import OperationCancelled
+
+        if self._on_wait is not None:
+            self._on_wait()
+        deadline = time.monotonic() + self._deadline
+        while not self._token.is_cancelled():
+            if time.monotonic() > deadline:
+                raise AssertionError("approval wait was never cancelled before its deadline")
+            time.sleep(self._poll)
+        raise OperationCancelled()

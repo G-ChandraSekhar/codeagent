@@ -835,3 +835,352 @@ def test_repeated_termination_unconfirmed_also_preserves_complete_chain(monkeypa
     for node in (final, middle, deepest):
         assert isinstance(node, bs.BoundedProcessError)
         assert not isinstance(node, bs._BoundedFailure)
+
+
+# ADR 0005 Amendment 1 (ledger D3): L1 real-process session tests.
+from tests.support import process_shims as _shims  # noqa: E402
+
+
+def test_l1_launch_leads_its_own_session(tmp_path, monkeypatch):
+    _shims.check_session("L1", tmp_path, monkeypatch)
+
+
+def test_l1_group_sigint_never_reaches_the_child(tmp_path):
+    _shims.check_group_sigint_spared("L1", tmp_path)
+
+
+def test_l1_abort_kills_the_whole_process_group(tmp_path, monkeypatch):
+    _shims.check_abort_group_kill("L1", tmp_path, monkeypatch)
+
+
+# ADR 0005 Amendment 1 (D3 joint-review correction): L1's group kill is
+# fail-closed. ProcessLookupError means the group is confirmed absent; any
+# other group-kill failure is retained, every later cleanup step still runs
+# exactly once, and the result is TERMINATION_UNCONFIRMED.
+
+import sys  # noqa: E402
+
+_GROUP_SENTINEL_TEXT = "SENTINEL-group-kill-/secret/path"
+
+
+class _AbortProc:
+    """A fake child for the abort path. Never a real pid: every test using
+    it patches `os.killpg`."""
+
+    def __init__(self, *, wait_error=None, close_error=None):
+        self.pid = 4_000_321
+        self.kills = 0
+        self.waits = 0
+        self.closes = 0
+        self._wait_error = wait_error
+        self._close_error = close_error
+        outer = self
+
+        class _Stdout:
+            def close(self):
+                outer.closes += 1
+                if outer._close_error is not None:
+                    raise outer._close_error
+
+        self.stdout = _Stdout()
+
+    def kill(self):
+        self.kills += 1
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if self._wait_error is not None:
+            raise self._wait_error
+        return -9
+
+
+def _killpg_raising(monkeypatch, exc, probe_exc=None):
+    """`exc` for the SIGKILL group kill; `probe_exc` (default: `exc`) for
+    the post-reap signal-0 probe."""
+    calls = []
+
+    def killpg(pid, sig):
+        calls.append((pid, sig))
+        raise exc if sig == bs.signal.SIGKILL else (probe_exc if probe_exc is not None else exc)
+
+    monkeypatch.setattr(bs.os, "killpg", killpg)
+    return calls
+
+
+def test_l1_group_absent_is_not_uncertain(monkeypatch):
+    calls = _killpg_raising(monkeypatch, ProcessLookupError())
+    proc = _AbortProc()
+    bs._terminate_and_confirm(proc)  # confirmed: no raise
+    assert calls == [(proc.pid, bs.signal.SIGKILL)]
+    assert (proc.kills, proc.closes, proc.waits) == (1, 1, 1)
+
+
+@pytest.mark.parametrize("group_exc", [PermissionError(_GROUP_SENTINEL_TEXT), RuntimeError(_GROUP_SENTINEL_TEXT)])
+def test_l1_group_kill_failure_dominates_a_confirmed_reap(monkeypatch, group_exc):
+    calls = _killpg_raising(monkeypatch, group_exc)
+    proc = _AbortProc()
+    with pytest.raises(bs._BoundedFailure) as info:
+        bs._terminate_and_confirm(proc)
+    assert info.value.reason is bs.BoundedProcessFailure.TERMINATION_UNCONFIRMED
+    assert info.value.__cause__ is group_exc
+    # Every later step still ran, exactly once; no second group/direct kill
+    # (the only further group call is the signal-0 probe after the reap).
+    assert [sig for _, sig in calls] == [bs.signal.SIGKILL, 0]
+    assert (proc.kills, proc.closes, proc.waits) == (1, 1, 1)
+
+
+def test_l1_post_reap_probe_confirms_an_absent_group(monkeypatch):
+    """macOS reports PermissionError for a group holding only its exited
+    leader; a ProcessLookupError from the post-reap signal-0 probe confirms
+    no member remains."""
+    calls = _killpg_raising(monkeypatch, PermissionError(_GROUP_SENTINEL_TEXT), probe_exc=ProcessLookupError())
+    proc = _AbortProc()
+    bs._terminate_and_confirm(proc)  # confirmed: no raise
+    assert [sig for _, sig in calls] == [bs.signal.SIGKILL, 0]
+    assert (proc.kills, proc.closes, proc.waits) == (1, 1, 1)
+
+
+def test_l1_group_kill_failure_dominates_a_close_failure(monkeypatch):
+    group_exc = PermissionError(_GROUP_SENTINEL_TEXT)
+    _killpg_raising(monkeypatch, group_exc)
+    proc = _AbortProc(close_error=OSError("close"))
+    with pytest.raises(bs._BoundedFailure) as info:
+        bs._terminate_and_confirm(proc)
+    assert info.value.reason is bs.BoundedProcessFailure.TERMINATION_UNCONFIRMED
+    assert info.value.__cause__ is group_exc
+
+
+def test_l1_unconfirmed_reap_dominates_a_group_kill_failure(monkeypatch):
+    _killpg_raising(monkeypatch, PermissionError(_GROUP_SENTINEL_TEXT))
+    reap_exc = subprocess.TimeoutExpired("x", 1)
+    proc = _AbortProc(wait_error=reap_exc)
+    with pytest.raises(bs._BoundedFailure) as info:
+        bs._terminate_and_confirm(proc)
+    assert info.value.reason is bs.BoundedProcessFailure.TERMINATION_UNCONFIRMED
+    assert info.value.__cause__ is reap_exc
+    assert (proc.kills, proc.waits) == (1, 1)
+
+
+def test_l1_end_to_end_group_kill_failure_is_sanitized_and_kills_once(monkeypatch):
+    """A real timed-out child: the direct kill and reap still happen exactly
+    once, but the public result is TERMINATION_UNCONFIRMED with fixed text."""
+    group_exc = PermissionError(_GROUP_SENTINEL_TEXT)
+    calls = _killpg_raising(monkeypatch, group_exc)
+    kills = []
+    real_kill = subprocess.Popen.kill
+    monkeypatch.setattr(subprocess.Popen, "kill", lambda self: (kills.append(self.pid), real_kill(self))[1])
+    with pytest.raises(bs.BoundedProcessError) as info:
+        bs.run_bounded_stdout(
+            [sys.executable, "-c", "import time; time.sleep(30)"], timeout_seconds=0.3, stdout_limit=64
+        )
+    err = info.value
+    assert err.reason is bs.BoundedProcessFailure.TERMINATION_UNCONFIRMED
+    assert isinstance(err.__cause__, bs.BoundedProcessError)
+    assert err.__cause__.reason is bs.BoundedProcessFailure.TIMED_OUT
+    assert [sig for _, sig in calls] == [bs.signal.SIGKILL, 0] and len(kills) == 1
+    chain, node = [], err
+    while node is not None:
+        chain.append(node)
+        node = node.__cause__
+    assert all(isinstance(n, bs.BoundedProcessError) for n in chain)
+    assert all(_GROUP_SENTINEL_TEXT not in str(n) for n in chain)
+
+
+# ADR 0005 Amendment 1 §12 (fourth correction): L1 BaseException model, and
+# a pin of the outer body-interrupt path (cleanup completes, then the exact
+# body interrupt is re-raised).
+
+
+class _L1Base(BaseException):
+    pass
+
+
+def _without_escape(fn):
+    """Call `fn`; any escaping `BaseException` (including KeyboardInterrupt,
+    which would otherwise abort the pytest session) becomes a test failure."""
+    try:
+        return fn()
+    except BaseException as exc:  # noqa: BLE001
+        pytest.fail(f"{type(exc).__name__} escaped instead of being retained")
+
+
+def _l1_steps(monkeypatch, *, group=None, probe=ProcessLookupError()):
+    calls = []
+
+    def killpg(pid, sig):
+        calls.append(sig)
+        action = group if sig == bs.signal.SIGKILL else probe
+        if action is not None:
+            raise action
+
+    monkeypatch.setattr(bs.os, "killpg", killpg)
+    return calls
+
+
+@pytest.mark.parametrize("site", ["group_kill", "direct_kill"])
+def test_l1_confirmed_cleanup_returns_the_interrupt(monkeypatch, site):
+    inst = KeyboardInterrupt(f"SENTINEL-{site}")
+    calls = _l1_steps(monkeypatch, group=inst if site == "group_kill" else None)
+    proc = _AbortProc()
+    if site == "direct_kill":
+        proc.kill = lambda: (_ for _ in ()).throw(inst)
+    # Fifth correction: a confirmed cleanup returns its whole chronological
+    # record (the caller's body failure stays primary).
+    assert _without_escape(lambda: bs._terminate_and_confirm(proc)) == (inst,)
+    assert (proc.closes, proc.waits) == (1, 1)
+    assert calls == ([bs.signal.SIGKILL, 0] if site == "group_kill" else [bs.signal.SIGKILL])
+
+
+@pytest.mark.parametrize("site", ["reap", "probe", "close"])
+def test_l1_unconfirmed_cleanup_dominates_an_interrupt(monkeypatch, site):
+    inst = _L1Base(f"SENTINEL-{site}")
+    if site == "reap":
+        _l1_steps(monkeypatch)
+        proc, reason = _AbortProc(wait_error=inst), bs.BoundedProcessFailure.TERMINATION_UNCONFIRMED
+    elif site == "probe":
+        _l1_steps(monkeypatch, group=PermissionError("SENTINEL-g"), probe=inst)
+        proc, reason = _AbortProc(), bs.BoundedProcessFailure.TERMINATION_UNCONFIRMED
+    else:
+        _l1_steps(monkeypatch)
+        proc, reason = _AbortProc(close_error=inst), bs.BoundedProcessFailure.CLEANUP_UNCONFIRMED
+    with pytest.raises(bs._BoundedFailure) as info:
+        bs._terminate_and_confirm(proc)
+    assert info.value.reason is reason
+    assert info.value.deferred_interrupt is inst and inst in info.value.failures_in_order
+    assert (proc.kills, proc.closes, proc.waits) == (1, 1, 1)
+
+
+def test_l1_path_level_confirmed_cleanup_reraises_and_dominance_is_public(monkeypatch):
+    inst = KeyboardInterrupt("SENTINEL-ki")
+    _l1_steps(monkeypatch, group=inst)  # probe confirms absence
+    kills = []
+    real_kill = subprocess.Popen.kill
+    monkeypatch.setattr(subprocess.Popen, "kill", lambda self: (kills.append(self.pid), real_kill(self))[1])
+    # Fifth correction: the body failure (the timeout) stays primary; the
+    # cleanup interrupt is attached, never raised in its place.
+    err = _without_escape(lambda: _expect_bounded_error(
+        lambda: bs.run_bounded_stdout([sys.executable, "-c", "import time; time.sleep(30)"], timeout_seconds=0.3, stdout_limit=64)
+    ))
+    assert err.reason is bs.BoundedProcessFailure.TIMED_OUT
+    assert err.codeagent_cleanup_failures == (inst,) and len(kills) == 1
+
+    inst2 = _L1Base("SENTINEL-base")
+    _l1_steps(monkeypatch, group=inst2, probe=PermissionError("SENTINEL-p"))
+    with pytest.raises(bs.BoundedProcessError) as info2:
+        bs.run_bounded_stdout([sys.executable, "-c", "import time; time.sleep(30)"], timeout_seconds=0.3, stdout_limit=64)
+    err = info2.value
+    assert err.reason is bs.BoundedProcessFailure.TERMINATION_UNCONFIRMED
+    assert err.deferred_interrupt is inst2 and "SENTINEL" not in str(err)
+
+
+def test_l1_body_interrupt_completes_cleanup_before_reraise(monkeypatch):
+    """Pins the outer path: a body interrupt (in the drain) still runs the
+    complete abort (group kill, kill, close, reap) and then re-raises the
+    exact instance."""
+    inst = KeyboardInterrupt("SENTINEL-body")
+    calls = _l1_steps(monkeypatch, group=None)
+    waits = []
+    real_wait = subprocess.Popen.wait
+    monkeypatch.setattr(subprocess.Popen, "wait", lambda self, timeout=None: (waits.append(timeout), real_wait(self, timeout))[1])
+
+    def drain(process, *, deadline, limit):
+        raise inst
+
+    monkeypatch.setattr(bs, "_drain", drain)
+    with pytest.raises(KeyboardInterrupt) as info:
+        bs.run_bounded_stdout([sys.executable, "-c", "import time; time.sleep(30)"], timeout_seconds=30, stdout_limit=64)
+    assert info.value is inst
+    assert calls == [bs.signal.SIGKILL] and len(waits) == 1
+
+
+
+def _expect_bounded_error(fn):
+    try:
+        fn()
+    except bs.BoundedProcessError as err:
+        return err
+    raise AssertionError("expected a BoundedProcessError")
+
+
+# ADR 0005 Amendment 1 §12 (fifth correction): one precedence model. The body
+# failure stays primary after a confirmed cleanup; later cleanup failures are
+# attached in order by identity; unconfirmed cleanup dominates.
+
+
+def _l1_body(monkeypatch, body):
+    def drain(process, *, deadline, limit):
+        raise body
+
+    monkeypatch.setattr(bs, "_drain", drain)
+
+
+def _sleeper():
+    return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+
+def _count_kills(monkeypatch):
+    kills = []
+    real_kill = subprocess.Popen.kill
+    monkeypatch.setattr(subprocess.Popen, "kill", lambda self: (kills.append(self.pid), real_kill(self))[1])
+    return kills
+
+
+def _with_preset_chain(exc):
+    cause, context = RuntimeError("preset-cause"), RuntimeError("preset-context")
+    exc.__cause__, exc.__context__ = cause, context
+    return exc, cause, context
+
+
+def test_l1_ordinary_body_failure_then_cleanup_interrupt(monkeypatch):
+    kills = _count_kills(monkeypatch)
+    body = RuntimeError("SENTINEL-body")
+    _l1_body(monkeypatch, body)
+    ki = KeyboardInterrupt("SENTINEL-ki")
+    _l1_steps(monkeypatch, group=ki)  # probe confirms absence
+    err = _without_escape(lambda: _expect_bounded_error(lambda: bs.run_bounded_stdout(_sleeper(), timeout_seconds=30, stdout_limit=64)))
+    assert err.reason is bs.BoundedProcessFailure.MONITORING_FAILED and err.__cause__ is body
+    assert err.codeagent_cleanup_failures == (ki,)
+    assert "SENTINEL" not in str(err) and len(kills) == 1
+
+
+def test_l1_body_interrupt_then_second_cleanup_interrupt(monkeypatch):
+    kills = _count_kills(monkeypatch)
+    ki1, cause, context = _with_preset_chain(KeyboardInterrupt("SENTINEL-1"))
+    ki2 = _L1Base("SENTINEL-2")
+    _l1_body(monkeypatch, ki1)
+    _l1_steps(monkeypatch, group=ki2)
+    with pytest.raises(KeyboardInterrupt) as info:
+        bs.run_bounded_stdout(_sleeper(), timeout_seconds=30, stdout_limit=64)
+    assert info.value is ki1
+    assert ki1.codeagent_cleanup_failures == (ki2,)
+    assert ki1.__cause__ is cause and ki1.__context__ is context
+    assert len(kills) == 1  # every later cleanup step still ran
+
+
+def test_l1_unconfirmed_cleanup_dominates_a_body_interrupt(monkeypatch):
+    kills = _count_kills(monkeypatch)
+    ki1, cause, context = _with_preset_chain(KeyboardInterrupt("SENTINEL-1"))
+    ki2, probe = _L1Base("SENTINEL-2"), PermissionError("SENTINEL-p")
+    _l1_body(monkeypatch, ki1)
+    _l1_steps(monkeypatch, group=ki2, probe=probe)
+    err = _without_escape(lambda: _expect_bounded_error(lambda: bs.run_bounded_stdout(_sleeper(), timeout_seconds=30, stdout_limit=64)))
+    assert err.reason is bs.BoundedProcessFailure.TERMINATION_UNCONFIRMED
+    assert err.__cause__ is ki1 and err.body_failure is ki1
+    assert err.failures_in_order == (ki2, probe) and err.deferred_interrupt is ki2
+    assert ki1.__cause__ is cause and ki1.__context__ is context
+    assert "SENTINEL" not in str(err) and len(kills) == 1
+
+
+# Sixth correction: an attribute-refusing body still surfaces, unchanged.
+from tests.support.refusing import REFUSALS, refusing  # noqa: E402
+
+
+@pytest.mark.parametrize("make_refusal", REFUSALS)
+def test_l1_refusing_body_still_surfaces_exactly(monkeypatch, make_refusal):
+    body = refusing(KeyboardInterrupt, make_refusal())
+    _l1_body(monkeypatch, body)
+    _l1_steps(monkeypatch, group=_L1Base("SENTINEL-2"))  # a cleanup failure to attach
+    kills = _count_kills(monkeypatch)
+    with pytest.raises(KeyboardInterrupt) as info:
+        bs.run_bounded_stdout(_sleeper(), timeout_seconds=30, stdout_limit=64)
+    assert info.value is body and len(kills) == 1

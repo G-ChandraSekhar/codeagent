@@ -1603,3 +1603,126 @@ def test_t41_scope_and_marker_pins():
     assert docker_tests == {
         n for n in dir(this) if n.startswith(tuple(f"test_t{i}_" for i in (*range(30, 39), *range(46, 53))))
     }
+
+
+# ---------------------------------------------------------------------------
+# ADR 0005 Amendment 1 §12 (sixth correction): the controller's deferred
+# interrupt survives every composition outcome, by identity, never by text;
+# Amendment 14's release precedence is unchanged. Docker-free (activation
+# fails, so no baseline runs).
+# ---------------------------------------------------------------------------
+
+
+def _deferring(monkeypatch, inst, *, raise_after=None):
+    real = lr.RunController
+
+    class Deferring(real):
+        def run(self):
+            self._deferred_interrupt = inst
+            if raise_after is not None:
+                raise raise_after
+            return super().run()
+
+    monkeypatch.setattr(lr, "RunController", Deferring)
+
+
+def _inst():
+    return KeyboardInterrupt(f"SENTINEL-deferred-{os.sep}secret{os.sep}path")
+
+
+def test_d3_returned_result_keeps_the_deferred_interrupt_private(env, monkeypatch):
+    _fail_activate(monkeypatch)
+    inst = _inst()
+    _deferring(monkeypatch, inst)
+    result = _invoke(env)
+    assert result.deferred_interrupt is inst and env.lease_closes == 1
+    assert "SENTINEL" not in repr(result) and "secret" not in repr(result)
+    import dataclasses
+
+    assert dataclasses.replace(result, deferred_interrupt=KeyboardInterrupt("other")) == result
+    assert dataclasses.replace(result, deferred_interrupt=None) == result
+    with pytest.raises(ValueError):
+        dataclasses.replace(result, deferred_interrupt=RuntimeError("an Exception is refused"))
+
+
+def test_d3_declared_release_failure_keeps_the_deferred_interrupt(env, monkeypatch):
+    _fail_activate(monkeypatch)
+    inst = _inst()
+    _deferring(monkeypatch, inst)
+    env.lease_fail = injected = _L()
+    result = _invoke(env)
+    assert result.lease_release_error is injected and result.deferred_interrupt is inst
+    assert env.lease_closes == 1
+
+
+def test_d3_unexpected_release_failure_carries_the_deferred_interrupt(env, monkeypatch):
+    _fail_activate(monkeypatch)
+    inst = _inst()
+    _deferring(monkeypatch, inst)
+    env.lease_fail = boom = RuntimeError("SECRET-lease")
+    with pytest.raises(lr.LifecycleRunCleanupError) as excinfo:
+        _invoke(env)
+    err = excinfo.value
+    assert err.__cause__ is boom and err.finished is not None  # precedence unchanged
+    assert err.deferred_interrupt is inst
+    _assert_sanitized(err, (LEASE,), env)
+    assert "SENTINEL" not in str(err) and env.lease_closes == 1
+
+
+def test_d3_release_time_interrupt_stays_primary_and_carries_the_deferred_one(env, monkeypatch):
+    _fail_activate(monkeypatch)
+    inst = _inst()
+    _deferring(monkeypatch, inst)
+    env.lease_fail = ki2 = SystemExit("SENTINEL-release")
+    with pytest.raises(SystemExit) as excinfo:
+        _invoke(env)
+    assert excinfo.value is ki2  # Amendment 14: a lone release-time interrupt stays primary
+    assert ki2.codeagent_deferred_interrupt is inst and env.lease_closes == 1
+
+
+def test_d3_simultaneous_reservation_and_lease_failures(env, monkeypatch):
+    _fail_activate(monkeypatch)
+    inst = _inst()
+    _deferring(monkeypatch, inst)
+    _scenario_reservation(env, monkeypatch)
+    env.lease_fail = boom = RuntimeError("SECRET-lease")
+    with pytest.raises(lr.LifecycleRunCleanupError) as excinfo:
+        _invoke(env)
+    err = excinfo.value
+    assert err.deferred_interrupt is inst
+    assert err.__cause__ is boom  # the first unexpected failure (Amendment 14 R4)
+    _assert_sanitized(err, (RES, LEASE), env)
+    assert env.lease_closes == 1
+
+
+def test_d3_raise_path_confirmed_cleanup_carries_the_deferred_interrupt(env, monkeypatch):
+    inst, boom = _inst(), RuntimeError("SECRET-run")
+    _deferring(monkeypatch, inst, raise_after=boom)
+    with pytest.raises(RuntimeError) as excinfo:
+        _invoke(env)
+    assert excinfo.value is boom and boom.codeagent_deferred_interrupt is inst
+    assert env.lease_closes == 1
+
+
+def test_d3_raise_path_with_release_failure_carries_the_deferred_interrupt(env, monkeypatch):
+    inst, boom = _inst(), RuntimeError("SECRET-run")
+    _deferring(monkeypatch, inst, raise_after=boom)
+    env.lease_fail = lease_boom = RuntimeError("SECRET-lease")
+    with pytest.raises(lr.LifecycleRunCleanupError) as excinfo:
+        _invoke(env)
+    err = excinfo.value
+    assert err.original is boom and err.deferred_interrupt is inst
+    assert lease_boom in [f.exception for f in err.failures]
+    assert "SENTINEL" not in str(err) and env.lease_closes == 1
+
+
+def test_d3_refusing_raw_primary_cannot_lose_its_identity(env, monkeypatch):
+    from tests.support.refusing import refusing
+
+    _fail_activate(monkeypatch)
+    inst = _inst()
+    _deferring(monkeypatch, inst)
+    env.lease_fail = ki2 = refusing(SystemExit, KeyboardInterrupt("refuse"))
+    with pytest.raises(SystemExit) as excinfo:
+        _invoke(env)
+    assert excinfo.value is ki2  # attachment refused; the primary is unchanged

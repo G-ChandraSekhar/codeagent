@@ -2291,3 +2291,448 @@ def test_the_symbolic_probe_runs_only_on_an_empty_listing(
     _git(repo, "update-ref", ref.ref_name, _head(repo))
     assert ref.observe().present
     assert "symbolic-ref" not in calls
+
+
+# ADR 0005 Amendment 1 (ledger D3): L6/L7 real-process session tests. L6's
+# direct-child-only timeout residual stays documented and untested.
+from tests.support import process_shims as _shims  # noqa: E402
+
+
+@pytest.mark.parametrize("site", ["L6", "L7"])
+def test_ref_launch_leads_its_own_session(site, tmp_path, monkeypatch):
+    _shims.check_session(site, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("site", ["L6", "L7"])
+def test_ref_group_sigint_never_reaches_the_child(site, tmp_path):
+    _shims.check_group_sigint_spared(site, tmp_path)
+
+
+def test_l7_abort_kills_the_whole_process_group(tmp_path, monkeypatch):
+    _shims.check_abort_group_kill("L7", tmp_path, monkeypatch)
+
+
+# ADR 0005 Amendment 1 (D3 joint-review correction): L7's group kill is
+# fail-closed (TRANSACTION_CLEANUP_UNCONFIRMED), against a real
+# `git update-ref --stdin` child kept alive past its abort step.
+
+import subprocess as _sp  # noqa: E402
+
+from codeagent import checkpoint_ref as _cr  # noqa: E402
+
+_L7_GROUP_TEXT = "SENTINEL-group-kill-/secret/path"
+
+
+def _l7_repo(tmp_path):
+    repo = tmp_path / "repo"
+    _sp.run(["git", "init", "-q", str(repo)], check=True)
+    return repo
+
+
+def _l7_setup(monkeypatch, *, killpg_exc, abort_exc, probe_exc=None):
+    killpg_calls, kills = [], []
+    real_killpg = _cr.os.killpg
+
+    def killpg(pid, sig):
+        killpg_calls.append(sig)
+        if sig != _cr.signal.SIGKILL:
+            raise probe_exc if probe_exc is not None else killpg_exc
+        if isinstance(killpg_exc, ProcessLookupError):
+            real_killpg(pid, sig)  # really kill it, then report the group as gone
+        raise killpg_exc
+
+    def abort(self):
+        if abort_exc is not None:
+            raise abort_exc
+        # a no-op abort: the child stays alive into the kill step
+
+    real_kill = _sp.Popen.kill
+    monkeypatch.setattr(_cr.os, "killpg", killpg)
+    monkeypatch.setattr(_cr._RefTransaction, "abort", abort)
+    monkeypatch.setattr(_sp.Popen, "kill", lambda self: (kills.append(self.pid), real_kill(self))[1])
+    return killpg_calls, kills
+
+
+def test_l7_group_absent_is_not_uncertain(tmp_path, monkeypatch):
+    killpg_calls, kills = _l7_setup(monkeypatch, killpg_exc=ProcessLookupError(), abort_exc=None)
+    transaction = _cr._RefTransaction(_l7_repo(tmp_path))
+    transaction.__enter__()
+    transaction.__exit__(None, None, None)  # confirmed: no raise
+    assert killpg_calls == [_cr.signal.SIGKILL] and len(kills) == 1
+    assert transaction._process.poll() is not None
+
+
+@pytest.mark.parametrize("abort_failure", [None, RuntimeError("abort failed")])
+def test_l7_group_kill_failure_is_transaction_cleanup_unconfirmed(tmp_path, monkeypatch, abort_failure):
+    group_exc = PermissionError(_L7_GROUP_TEXT)
+    killpg_calls, kills = _l7_setup(monkeypatch, killpg_exc=group_exc, abort_exc=abort_failure)
+    transaction = _cr._RefTransaction(_l7_repo(tmp_path))
+    transaction.__enter__()
+    with pytest.raises(_cr.CheckpointRefError) as info:
+        transaction.__exit__(None, None, None)
+    err = info.value
+    assert err.reason is _cr.CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED
+    assert err.outcome is _cr.MutationOutcome.UNKNOWN
+    # The abort failure stays the explicit cause when there is one; the
+    # group-kill failure is always retained.
+    assert err.__cause__ is (abort_failure if abort_failure is not None else group_exc)
+    assert err.group_kill_failure is group_exc
+    assert _L7_GROUP_TEXT not in str(err)
+    # The direct child was still killed and reaped, exactly once.
+    assert killpg_calls == [_cr.signal.SIGKILL, 0] and len(kills) == 1
+    assert transaction._process.poll() is not None
+
+
+def test_l7_post_reap_probe_confirms_an_absent_group(tmp_path, monkeypatch):
+    killpg_calls, kills = _l7_setup(
+        monkeypatch, killpg_exc=PermissionError(_L7_GROUP_TEXT), abort_exc=None, probe_exc=ProcessLookupError()
+    )
+    transaction = _cr._RefTransaction(_l7_repo(tmp_path))
+    transaction.__enter__()
+    transaction.__exit__(None, None, None)  # confirmed: no raise
+    assert killpg_calls == [_cr.signal.SIGKILL, 0] and len(kills) == 1
+
+
+# ADR 0005 Amendment 1 §12 (second joint-review correction): L7 retains every
+# direct-kill, reap and observation failure; nothing escapes raw. Contract:
+# one group kill; one direct kill and a bounded reap; if that reap is not
+# confirmed, exactly one retry kill and one more bounded reap. Cause: the
+# abort failure if any, else the earliest unconfirmed cleanup failure.
+
+
+class _L7Proc:
+    def __init__(self, *, kills=(), waits=(), poll_error=None):
+        self.pid = 4_000_987
+        self.stdin = self.stdout = None
+        self._kills, self._waits = list(kills), list(waits)
+        self._poll_error = poll_error
+        self.kill_calls = self.wait_calls = 0
+        self.returncode = None
+
+    def poll(self):
+        if self._poll_error is not None and self.wait_calls:
+            raise self._poll_error
+        return self.returncode
+
+    def kill(self):
+        self.kill_calls += 1
+        action = self._kills.pop(0) if self._kills else None
+        if isinstance(action, BaseException):
+            raise action
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        action = self._waits.pop(0) if self._waits else None
+        if action == "timeout":
+            raise _sp.TimeoutExpired(["git", "-C", "/secret/repo"], timeout)
+        if isinstance(action, BaseException):
+            raise action
+        self.returncode = -9
+        return -9
+
+
+def _l7_run(monkeypatch, tmp_path, proc, *, group_exc=None, probe_exc=None, abort_exc=None):
+    calls = []
+
+    def killpg(pid, sig):
+        calls.append(sig)
+        if sig == _cr.signal.SIGKILL:
+            if group_exc is not None:
+                raise group_exc
+            return
+        raise probe_exc if probe_exc is not None else PermissionError("probe")
+
+    def abort(self):
+        if abort_exc is not None:
+            raise abort_exc
+
+    monkeypatch.setattr(_cr.os, "killpg", killpg)
+    monkeypatch.setattr(_cr._RefTransaction, "abort", abort)
+    transaction = _cr._RefTransaction(tmp_path)
+    transaction._process = proc
+    try:
+        transaction.__exit__(None, None, None)
+    except _cr.CheckpointRefError as err:
+        assert err.reason is _cr.CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED
+        assert "SENTINEL" not in str(err) and "/secret/repo" not in str(err)
+        return err, calls
+    return None, calls
+
+
+def _s(name):
+    return RuntimeError(f"SENTINEL-{name}-/secret/path")
+
+
+@pytest.mark.parametrize("abort_failure", [None, _s("abort")])
+def test_l7_group_fails_and_direct_kill_raises(tmp_path, monkeypatch, abort_failure):
+    a, b = PermissionError("SENTINEL-a"), _s("b")
+    proc = _L7Proc(kills=[b], waits=[None])
+    err, calls = _l7_run(monkeypatch, tmp_path, proc, group_exc=a, abort_exc=abort_failure)
+    assert err is not None and calls == [_cr.signal.SIGKILL, 0]
+    assert err.__cause__ is (abort_failure if abort_failure is not None else a)
+    # The signal-0 probe's own failure is retained too (third correction).
+    assert err.group_kill_failure is a and err.cleanup_failures[0] is b
+    assert len(err.cleanup_failures) == 2 and isinstance(err.cleanup_failures[1], PermissionError)
+    assert (proc.kill_calls, proc.wait_calls) == (1, 1)
+
+
+def test_l7_group_fails_kill_raises_but_probe_confirms_absence(tmp_path, monkeypatch):
+    proc = _L7Proc(kills=[_s("b")], waits=[None])
+    err, calls = _l7_run(monkeypatch, tmp_path, proc, group_exc=PermissionError("a"), probe_exc=ProcessLookupError())
+    assert err is None and calls == [_cr.signal.SIGKILL, 0]
+    assert (proc.kill_calls, proc.wait_calls) == (1, 1)
+
+
+@pytest.mark.parametrize("second_wait", [None, "timeout"])
+def test_l7_reap_timeout_then_retry_kill_raises(tmp_path, monkeypatch, second_wait):
+    c = _s("c")
+    proc = _L7Proc(kills=[None, c], waits=["timeout", second_wait])
+    err, calls = _l7_run(monkeypatch, tmp_path, proc)
+    assert calls == [_cr.signal.SIGKILL] and (proc.kill_calls, proc.wait_calls) == (2, 2)
+    if second_wait is None:
+        assert err is None  # terminated and the group kill succeeded
+    else:
+        assert err.__cause__ is c and err.cleanup_failures == (c,) and err.group_kill_failure is None
+
+
+@pytest.mark.parametrize("twice", [False, True])
+def test_l7_wait_raises_a_non_timeout_sentinel(tmp_path, monkeypatch, twice):
+    d, d2 = _s("d"), _s("d2")
+    proc = _L7Proc(waits=[d, d2 if twice else None])
+    err, _ = _l7_run(monkeypatch, tmp_path, proc)
+    assert (proc.kill_calls, proc.wait_calls) == (2, 2)
+    if twice:
+        assert err.__cause__ is d and err.cleanup_failures == (d, d2)
+    else:
+        assert err is None
+
+
+def test_l7_multiple_failures_keep_cause_precedence_and_every_failure(tmp_path, monkeypatch):
+    a, b, d, e, ab = PermissionError("SENTINEL-a"), _s("b"), _s("d"), _s("e"), _s("abort")
+    proc = _L7Proc(kills=[b, e], waits=[d, "timeout"])
+    err, _ = _l7_run(monkeypatch, tmp_path, proc, group_exc=a)
+    assert err.__cause__ is a  # no abort failure: the earliest, the group kill
+    assert err.group_kill_failure is a and err.cleanup_failures == (b, d, e)
+    proc = _L7Proc(kills=[b, e], waits=[d, "timeout"])
+    err, _ = _l7_run(monkeypatch, tmp_path, proc, group_exc=a, abort_exc=ab)
+    assert err.__cause__ is ab and err.group_kill_failure is a and err.cleanup_failures == (b, d, e)
+    assert (proc.kill_calls, proc.wait_calls) == (2, 2)
+
+
+def test_l7_final_observation_failure_is_retained(tmp_path, monkeypatch):
+    p = _s("poll")
+    proc = _L7Proc(waits=[None], poll_error=p)
+    err, _ = _l7_run(monkeypatch, tmp_path, proc)
+    assert err.__cause__ is p and err.cleanup_failures == (p,)
+    assert (proc.kill_calls, proc.wait_calls) == (1, 1)
+
+
+class _L7PollScriptProc(_L7Proc):
+    """`polls`: one entry per `poll()` call (an exception to raise, or None
+    for "still running"); after the script, it reports its real state."""
+
+    def __init__(self, *, polls, **kwargs):
+        super().__init__(**kwargs)
+        self._polls = list(polls)
+        self.poll_calls = 0
+
+    def poll(self):
+        self.poll_calls += 1
+        if self._polls:
+            action = self._polls.pop(0)
+            if isinstance(action, BaseException):
+                raise action
+            return None
+        return self.returncode
+
+
+@pytest.mark.parametrize("abort_failure", [None, _s("abort")])
+def test_l7_early_poll_failure_precedes_a_later_group_kill_failure(tmp_path, monkeypatch, abort_failure):
+    """One chronological record: P (the pre-abort observation) happens before
+    G (the group kill), so P is the cause unless an abort failure exists."""
+    p, g = _s("poll-P"), PermissionError("SENTINEL-G")
+    # poll #1 (pre-abort) raises P; poll #2 (pre-kill) "running"; poll #3
+    # (final) "running": termination is never confirmed.
+    proc = _L7PollScriptProc(polls=[p, None, None], waits=["timeout", "timeout"])
+    err, calls = _l7_run(monkeypatch, tmp_path, proc, group_exc=g, abort_exc=abort_failure)
+    assert err is not None
+    assert err.failures_in_order == (p, g)
+    assert err.group_kill_failure is g and err.cleanup_failures == (p,)
+    assert err.__cause__ is (abort_failure if abort_failure is not None else p)
+    # Every bounded step still ran: one group kill, two direct kills, two
+    # reaps, three observations; no probe (termination was never confirmed).
+    assert calls == [_cr.signal.SIGKILL]
+    assert (proc.kill_calls, proc.wait_calls, proc.poll_calls) == (2, 2, 3)
+
+
+# ADR 0005 Amendment 1 §12 (fourth correction): a non-Exception at any L7
+# abort step is retained; every bounded step still runs; it is re-raised
+# (exact instance) only after fully confirmed cleanup, otherwise cleanup
+# dominance: TRANSACTION_CLEANUP_UNCONFIRMED carries it by identity.
+
+
+@pytest.mark.parametrize(
+    "site, make_proc, group_exc, probe_exc, counts",
+    [
+        ("early_poll", lambda i: _L7PollScriptProc(polls=[i], waits=[None]), None, None, (1, 1)),
+        ("group_kill", lambda i: _L7Proc(waits=[None]), "INST", ProcessLookupError(), (1, 1)),
+        ("kill1", lambda i: _L7Proc(kills=[i], waits=[None]), None, None, (1, 1)),
+        ("reap1", lambda i: _L7Proc(waits=[i, None]), None, None, (2, 2)),
+        ("kill2", lambda i: _L7Proc(kills=[None, i], waits=["timeout", None]), None, None, (2, 2)),
+    ],
+)
+def test_l7_interrupt_reraised_only_after_confirmed_cleanup(tmp_path, monkeypatch, site, make_proc, group_exc, probe_exc, counts):
+    inst = KeyboardInterrupt(f"SENTINEL-{site}")
+    proc = make_proc(inst)
+    with pytest.raises(KeyboardInterrupt) as info:
+        _l7_run(monkeypatch, tmp_path, proc, group_exc=inst if group_exc == "INST" else group_exc, probe_exc=probe_exc)
+    assert info.value is inst
+    assert (proc.kill_calls, proc.wait_calls) == counts
+    assert proc.returncode is not None  # reaped before the re-raise
+
+
+class _L7Base(BaseException):
+    pass
+
+
+@pytest.mark.parametrize("site", ["reap2", "probe", "kill1_then_unreaped"])
+def test_l7_unconfirmed_cleanup_dominates_an_interrupt(tmp_path, monkeypatch, site):
+    inst = _L7Base(f"SENTINEL-{site}")
+    if site == "reap2":
+        proc, group, probe = _L7Proc(waits=["timeout", inst]), None, None
+    elif site == "probe":
+        proc, group, probe = _L7Proc(waits=[None]), PermissionError("SENTINEL-g"), inst
+    else:
+        proc, group, probe = _L7Proc(kills=[inst], waits=["timeout", "timeout"]), None, None
+    err, calls = _l7_run(monkeypatch, tmp_path, proc, group_exc=group, probe_exc=probe)
+    assert err is not None and err.deferred_interrupt is inst
+    assert inst in err.failures_in_order
+    if site == "probe":
+        assert err.failures_in_order == (group, inst) and err.__cause__ is group
+    else:
+        assert err.__cause__ is inst  # the earliest (and only) entry
+    expected = {"reap2": (2, 2), "probe": (1, 1), "kill1_then_unreaped": (2, 2)}[site]
+    assert (proc.kill_calls, proc.wait_calls) == expected
+
+
+def test_l7_abort_interrupt_is_reraised_after_confirmed_cleanup(tmp_path, monkeypatch):
+    """The abort failure is in the occurrence order too: a non-Exception
+    from `abort()` is no longer swallowed when cleanup is confirmed."""
+    inst = KeyboardInterrupt("SENTINEL-abort")
+    proc = _L7Proc(waits=[None])
+    with pytest.raises(KeyboardInterrupt) as info:
+        _l7_run(monkeypatch, tmp_path, proc, abort_exc=inst)
+    assert info.value is inst and (proc.kill_calls, proc.wait_calls) == (1, 1)
+
+
+def test_l7_abort_failure_stays_the_cause_under_dominance(tmp_path, monkeypatch):
+    abort_failure, inst = _s("abort"), _L7Base("SENTINEL-reap")
+    proc = _L7Proc(waits=["timeout", inst])
+    err, _ = _l7_run(monkeypatch, tmp_path, proc, abort_exc=abort_failure)
+    assert err.__cause__ is abort_failure and err.deferred_interrupt is inst
+
+
+# ADR 0005 Amendment 1 §12 (fifth correction): L7 uses the `with` body's
+# exception. Confirmed cleanup keeps it primary (never replaced; cleanup
+# failures attached in order); no body -> the earliest interrupt is
+# re-raised; unconfirmed cleanup dominates with the accepted precedence.
+
+
+def _l7_exit(monkeypatch, tmp_path, proc, body, *, group_exc=None, probe_exc=ProcessLookupError()):
+    calls = []
+
+    def killpg(pid, sig):
+        calls.append(sig)
+        action = group_exc if sig == _cr.signal.SIGKILL else probe_exc
+        if action is not None:
+            raise action
+
+    monkeypatch.setattr(_cr.os, "killpg", killpg)
+    monkeypatch.setattr(_cr._RefTransaction, "abort", lambda self: None)
+    transaction = _cr._RefTransaction(tmp_path)
+    transaction._process = proc
+    if body is None:
+        return transaction.__exit__(None, None, None), calls
+    return transaction.__exit__(type(body), body, body.__traceback__), calls
+
+
+def _l7_chain(exc):
+    cause, context = RuntimeError("preset-cause"), RuntimeError("preset-context")
+    exc.__cause__, exc.__context__ = cause, context
+    return exc, cause, context
+
+
+def test_l7_ordinary_body_failure_then_cleanup_interrupt(tmp_path, monkeypatch):
+    body, cause, context = _l7_chain(RuntimeError("SENTINEL-body"))
+    ki = KeyboardInterrupt("SENTINEL-ki")
+    proc = _L7Proc(kills=[ki], waits=[None])
+    try:
+        result, calls = _l7_exit(monkeypatch, tmp_path, proc, body)
+    except BaseException as escaped:  # noqa: BLE001
+        pytest.fail(f"{type(escaped).__name__} replaced the body exception")
+    assert result is None  # the body exception keeps propagating
+    assert body.codeagent_cleanup_failures == (ki,)
+    assert body.__cause__ is cause and body.__context__ is context
+    assert (proc.kill_calls, proc.wait_calls, calls) == (1, 1, [_cr.signal.SIGKILL])
+
+
+def test_l7_body_interrupt_then_second_cleanup_interrupt(tmp_path, monkeypatch):
+    ki1, cause, context = _l7_chain(KeyboardInterrupt("SENTINEL-1"))
+    ki2 = _L7Base("SENTINEL-2")
+    proc = _L7Proc(waits=[None])
+    try:
+        result, calls = _l7_exit(monkeypatch, tmp_path, proc, ki1, group_exc=ki2)
+    except BaseException as escaped:  # noqa: BLE001
+        pytest.fail(f"{type(escaped).__name__} replaced the body exception")
+    assert result is None and ki1.codeagent_cleanup_failures == (ki2,)
+    assert ki1.__cause__ is cause and ki1.__context__ is context
+    assert (proc.kill_calls, proc.wait_calls, calls) == (1, 1, [_cr.signal.SIGKILL, 0])
+
+
+def test_l7_no_body_two_cleanup_interrupts_reraises_the_earliest(tmp_path, monkeypatch):
+    ki1, cause, context = _l7_chain(KeyboardInterrupt("SENTINEL-1"))
+    ki2 = _L7Base("SENTINEL-2")
+    proc = _L7PollScriptProc(polls=[ki1], kills=[ki2], waits=[None])
+    with pytest.raises(KeyboardInterrupt) as info:
+        _l7_exit(monkeypatch, tmp_path, proc, None)
+    assert info.value is ki1 and ki1.codeagent_cleanup_failures == (ki2,)
+    assert ki1.__cause__ is cause and ki1.__context__ is context
+    assert (proc.kill_calls, proc.wait_calls) == (1, 1)
+
+
+def test_l7_unconfirmed_cleanup_dominates_a_body_exception(tmp_path, monkeypatch):
+    body, cause, context = _l7_chain(KeyboardInterrupt("SENTINEL-body"))
+    ki = _L7Base("SENTINEL-reap2")
+    proc = _L7Proc(waits=["timeout", ki])
+    with pytest.raises(_cr.CheckpointRefError) as info:
+        _l7_exit(monkeypatch, tmp_path, proc, body)
+    err = info.value
+    assert err.reason is _cr.CheckpointRefFailure.TRANSACTION_CLEANUP_UNCONFIRMED
+    assert err.body_failure is body and err.deferred_interrupt is ki and err.__cause__ is ki
+    assert body.__cause__ is cause and body.__context__ is context
+    assert (proc.kill_calls, proc.wait_calls) == (2, 2)
+    assert "SENTINEL" not in str(err)
+
+
+# Sixth correction: an attribute-refusing body/interrupt still surfaces.
+from tests.support.refusing import REFUSALS, refusing  # noqa: E402
+
+
+@pytest.mark.parametrize("make_refusal", REFUSALS)
+def test_l7_refusing_body_keeps_propagating(tmp_path, monkeypatch, make_refusal):
+    body = refusing(RuntimeError, make_refusal())
+    proc = _L7Proc(kills=[KeyboardInterrupt("SENTINEL-ki")], waits=[None])
+    try:
+        result, _calls = _l7_exit(monkeypatch, tmp_path, proc, body)
+    except BaseException as escaped:  # noqa: BLE001
+        pytest.fail(f"{type(escaped).__name__} escaped attachment")
+    assert result is None
+
+
+@pytest.mark.parametrize("make_refusal", REFUSALS)
+def test_l7_refusing_interrupt_is_still_reraised_exactly(tmp_path, monkeypatch, make_refusal):
+    ki1 = refusing(KeyboardInterrupt, make_refusal())
+    proc = _L7PollScriptProc(polls=[ki1], kills=[_L7Base("SENTINEL-2")], waits=[None])
+    with pytest.raises(KeyboardInterrupt) as info:
+        _l7_exit(monkeypatch, tmp_path, proc, None)
+    assert info.value is ki1

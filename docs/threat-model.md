@@ -791,8 +791,20 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   CLI or controller path calls `prepare_lifecycle()` or constructs a
   lifecycle-aware `DockerVerifier`, and the default `DockerVerifier` path
   still creates unlabeled, UUID-suffixed `codeagent-verify-*` containers
-  that reconciliation never targets. ADR 0005 (cooperative cancellation,
-  entrypoint-owned SIGINT/SIGTERM) is not implemented. Spike evidence:
+  that reconciliation never targets. ADR 0005 Amendment 1 (Accepted
+  2026-10-06; ledger D3) is implemented and verified locally (macOS,
+  2026-10-19), not yet committed or Linux-CI-confirmed: with
+  `cli.owned_cancellation()` around the internal composition, a real SIGINT
+  (process group) or SIGTERM (exact PID) during a running baseline or
+  verification container is observed by the sliced attach wait, the attach
+  client's process group is killed, and the container is removed by
+  immutable id and confirmed absent before the run ends `CANCELLED`
+  (`tests/integration/test_cancellation_e2e.py`, E1-E4, E7). This is
+  cooperative-cleanup evidence only: it is exercised through a test-only
+  driver, `main()` installs no handler before D6, and SIGKILL, SIGHUP and
+  SIGQUIT still rely on reconciliation alone (E8 proves a real
+  cleanup-unconfirmed leftover is reconciled at the next admission by
+  Amendment 19). Spike evidence:
   S1's spike already demonstrates clean removal in the
   *normal* (non-crash) path — 3/3 trials showed no leftover containers.
   The dedicated Stage-2 interruption spike (S5) has since run on
@@ -832,8 +844,9 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   (which cannot be caught) — the only honest mitigation is a startup-time
   reconciliation sweep, not prevention. T-F1 remains open: the ADR 0004
   container mechanisms are implemented but unwired, containers from the
-  default `DockerVerifier` path are not attributable, ADR 0005 is not
-  implemented, and reconciliation runs only when a later mutating run
+  default `DockerVerifier` path are not attributable, ADR 0005's mechanism
+  is implemented locally only (D3; Linux CI pending; no operator path before
+  D6), and reconciliation runs only when a later mutating run
   starts in the same repository (ADR 0004 §15 gives no bound for a
   repository that is never run again). End-to-end mitigation still
   requires production wiring plus production acceptance tests on both
@@ -847,7 +860,7 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   T-F1
 - Owning milestone/spike: ADR 0004/0005 (accepted) — Milestone 3
   lifecycle work; ADR 0004's container mechanisms implemented but unwired;
-  ADR 0005 not started
+  ADR 0005 implemented locally by D3 (Amendment 1), Linux CI pending
 
 **T-F2 — Orphaned disposable worktree after crash.**
 - Asset/objective: O7, O1
@@ -1364,7 +1377,25 @@ by repository-supplied configuration.
 - Planned control: the executor must forcefully kill (not just request
   termination of) a process exceeding its timeout (guide §9.2: 120s process
   timeout as a starting default)
-- Evidence/future test: Stage-2 isolation spike's "timeout" case
+- Evidence/future test: Stage-2 isolation spike's "timeout" case. ADR 0005
+  Amendment 1 (ledger D3; implemented and verified locally 2026-10-19, Linux
+  CI pending): the verification attach wait is sliced (at most 0.1 s per
+  wait) and cancellable; on timeout or cancellation the attach client's
+  whole process group is killed before it is reaped, and the container
+  itself is then removed by id. All seven production launch sites run in
+  their own session; the owned-`Popen` abort paths (L1, L2, L4, L5, L7) kill
+  the process group, with real grandchild-absence tests, and fail closed: a
+  group kill that fails with anything but `ProcessLookupError` makes the
+  cleanup unconfirmed (L2: `ENVIRONMENT_FAILURE`, never `CANCELLED` or
+  `TIMEOUT`) even when the direct child is reaped, unless a signal-0 probe
+  after that reap confirms the group has no member left. A
+  `KeyboardInterrupt`/`SystemExit` at any abort step is retained and never
+  stops a later cleanup step. Unconfirmed cleanup always dominates; after a
+  confirmed cleanup an earlier body failure stays primary, and otherwise the
+  earliest interrupt is re-raised, with the other cleanup failures attached
+  by identity. The two
+  `subprocess.run` Git paths (L3, L6) still kill only their direct child on
+  timeout, an untested, stated residual
 - Residual risk: substantially mitigated once the executor forcefully kills
   rather than relying on cooperative shutdown; today, no executor exists.
   Residual exposure from an implementation that kills the wrong process

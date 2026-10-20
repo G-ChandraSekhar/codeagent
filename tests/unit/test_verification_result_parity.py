@@ -148,3 +148,55 @@ def test_public_validator_is_not_shadowed_by_a_private_copy() -> None:
             )
     finally:
         events_module.validate_verification_outcome_shape = original
+
+
+# ADR 0005 Amendment 1 (ledger D3): VerificationOutcome.CANCELLED's shape,
+# identical across BaselineRecorded, VerificationCompleted and
+# controller.VerificationResult.
+
+
+def _build_verification_completed_event(outcome, exit_code, error, cleanup_status) -> None:
+    events.VerificationCompleted(
+        run_id="r",
+        sequence=0,
+        timestamp=datetime.now(timezone.utc),
+        state=domain.RunState.VERIFY,
+        iteration=0,
+        outcome=outcome,
+        command=("pytest",),
+        exit_code=exit_code,
+        duration_seconds=1.0,
+        fail_to_pass=(),
+        pass_to_pass_broken=(),
+        cleanup_status=cleanup_status,
+        error=error,
+    )
+
+
+_ALL_BUILDERS = (_build_baseline_event, _build_verification_completed_event, _build_verification_result)
+_C = events.VerificationOutcome.CANCELLED
+_S = events.ContainerCleanupStatus
+
+
+@pytest.mark.parametrize("builder", _ALL_BUILDERS)
+@pytest.mark.parametrize("cleanup_status", [_S.NOT_APPLICABLE, _S.CONFIRMED_ABSENT])
+def test_cancelled_valid_shapes(builder, cleanup_status) -> None:
+    builder(_C, None, None, cleanup_status)
+
+
+@pytest.mark.parametrize("builder", _ALL_BUILDERS)
+@pytest.mark.parametrize(
+    "exit_code, error, cleanup_status",
+    [
+        (None, None, _S.UNCONFIRMED),  # M12: an unconfirmed cleanup is never CANCELLED
+        (0, None, _S.CONFIRMED_ABSENT),
+        (1, None, _S.CONFIRMED_ABSENT),
+        (137, None, _S.NOT_APPLICABLE),
+        (None, _SOME_ERROR, _S.CONFIRMED_ABSENT),
+        (None, _OTHER_ERROR, _S.NOT_APPLICABLE),
+        (None, _OOM_ERROR, _S.CONFIRMED_ABSENT),
+    ],
+)
+def test_cancelled_invalid_shapes(builder, exit_code, error, cleanup_status) -> None:
+    with pytest.raises(ValueError):
+        builder(_C, exit_code, error, cleanup_status)

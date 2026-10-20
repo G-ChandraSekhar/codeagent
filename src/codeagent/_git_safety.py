@@ -120,6 +120,7 @@ from __future__ import annotations
 import os
 import re
 import selectors
+import signal
 import subprocess
 import threading
 import time
@@ -127,6 +128,8 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from enum import Enum, unique
 from pathlib import Path
+
+from .cancellation import attach_cleanup_failures
 
 # Bounded so a hung Git invocation cannot stall a caller indefinitely.
 # Matches codeagent.checkpoint_ref.GIT_TIMEOUT_SECONDS.
@@ -478,6 +481,9 @@ def _run(
             timeout=timeout,
             env=git_environment(),
             input=input_text,
+            # Own session (ADR 0005 Amendment 1 section 6). On timeout,
+            # subprocess.run kills only this direct child (a stated residual).
+            start_new_session=True,
         )
     except subprocess.TimeoutExpired:
         # `TimeoutExpired.__str__` embeds the full argv, which can
@@ -640,7 +646,8 @@ def _terminate_and_confirm(
     *,
     writer_thread: threading.Thread | None,
     deadline: float,
-) -> None:
+    body_failure: BaseException | None = None,
+) -> tuple:
     """The single abort path, used for every failure after `Popen`
     succeeds: kill the child (which is what actually unblocks a writer
     thread stuck on a full stdin pipe — the child's end of the pipe
@@ -662,33 +669,125 @@ def _terminate_and_confirm(
     writer thread is confirmed stopped below, closing stdin is its own
     responsibility (see `_read_bounded`'s `_write_stdin`, which always
     closes it in its own `finally`), not this function's.
+
+    The child leads its own session (ADR 0005 Amendment 1), so its whole
+    process group is killed first, before reaping; `kill()` is the fallback.
+    `ProcessLookupError` from the group kill means the group is confirmed
+    absent.
+
+    `BaseException` model (ADR 0005 Amendment 1 §12, third correction):
+    every failure of the group kill, direct kill, stdout close, reap, writer
+    join and signal-0 probe -- `BaseException`s included -- is retained in
+    one chronological record as its exact instance and never stops a later
+    step (a reap's `TimeoutExpired` is never retained). Cleanup unconfirmed
+    -> `PROCESS_CLEANUP_UNCONFIRMED`, whose `__cause__` is the earliest
+    retained failure (the group-kill failure when there is one, since it is
+    the first step) and which carries `failures_in_order` and
+    `deferred_interrupt` (the earliest retained non-`Exception`) and
+    `body_failure` (the caller's body failure, by identity). Cleanup
+    confirmed -> returns the whole chronological record; the caller applies
+    the fifth correction's precedence (`_surface_after_cleanup`). Any other group-kill failure leaves descendants unconfirmed
+    unless, after the reap, a signal-0 probe of the group raises
+    `ProcessLookupError`: the direct kill, stdout close, bounded reap and
+    writer confirmation
+    still each run once, and the result is then
+    `PROCESS_CLEANUP_UNCONFIRMED` even when the direct child's reap is
+    confirmed. A `PROCESS_CLEANUP_UNCONFIRMED` raised here has the earliest
+    retained failure as its `__cause__` -- the group-kill failure whenever
+    one occurred -- and never a `TimeoutExpired` (whose text names argv);
+    the message stays the fixed category text.
     """
+    retained: list = []
+    group_exc: BaseException | None = None
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # the group is confirmed absent
+    except BaseException as exc:  # noqa: BLE001 — retained; never stops later steps
+        group_exc = exc
+        retained.append(exc)
     try:
         process.kill()
-    except Exception:  # noqa: BLE001 — still attempt to confirm exit below
-        pass
+    except BaseException as exc:  # noqa: BLE001 — retained; the reap below decides
+        retained.append(exc)
     try:
         if process.stdout is not None:
             process.stdout.close()
-    except Exception:  # noqa: BLE001
-        pass
+    except BaseException as exc:  # noqa: BLE001 — retained (a close failure alone was never fatal)
+        retained.append(exc)
 
+    unconfirmed = False
+    reaped = False
     confirm_deadline = max(deadline, time.monotonic()) + _KILL_CONFIRM_GRACE_SECONDS
     try:
         process.wait(timeout=max(0.0, confirm_deadline - time.monotonic()))
+        reaped = True
     except subprocess.TimeoutExpired:
-        raise GitSafetyError(
-            GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED,
-            _BOUNDED_FAILURE_MESSAGES[GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED],
-        ) from None
+        unconfirmed = True  # never retained: its text names argv
+    except BaseException as exc:  # noqa: BLE001 — retained; unconfirmed
+        retained.append(exc)
+        unconfirmed = True
 
     if writer_thread is not None:
-        writer_thread.join(timeout=max(0.0, confirm_deadline - time.monotonic()))
-        if writer_thread.is_alive():
-            raise GitSafetyError(
-                GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED,
-                _BOUNDED_FAILURE_MESSAGES[GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED],
-            )
+        try:
+            writer_thread.join(timeout=max(0.0, confirm_deadline - time.monotonic()))
+            if writer_thread.is_alive():
+                unconfirmed = True
+        except BaseException as exc:  # noqa: BLE001 — retained; unconfirmed
+            retained.append(exc)
+            unconfirmed = True
+
+    if group_exc is not None and reaped:
+        try:
+            os.killpg(process.pid, 0)
+            unconfirmed = True  # a member is still present
+        except ProcessLookupError:
+            pass  # no member left
+        except BaseException as exc:  # noqa: BLE001 — retained; unconfirmed
+            retained.append(exc)
+            unconfirmed = True
+    elif group_exc is not None:
+        unconfirmed = True
+
+    if not unconfirmed:
+        return tuple(retained)
+    error = GitSafetyError(
+        GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED,
+        _BOUNDED_FAILURE_MESSAGES[GitSafetyFailure.PROCESS_CLEANUP_UNCONFIRMED],
+    )
+    error.failures_in_order = tuple(retained)
+    error.deferred_interrupt = next((exc for exc in retained if not isinstance(exc, Exception)), None)
+    error.body_failure = body_failure
+    raise error from (retained[0] if retained else None)
+
+
+def _surface_after_cleanup(process, writer_thread, deadline, body, body_cause, fresh) -> None:
+    """ADR 0005 Amendment 1 §12 (fifth correction), called outside any
+    `except` block so re-raising a pre-existing instance never rewrites its
+    `__context__`. Unconfirmed cleanup dominates (`_terminate_and_confirm`
+    raises). Confirmed cleanup: the body failure stays primary, with the
+    cleanup record attached; a non-`Exception` body is re-raised as the exact
+    instance (never wrapped); a cleanup-time interrupt never replaces it."""
+    record = _terminate_and_confirm(process, writer_thread=writer_thread, deadline=deadline, body_failure=body)
+    attach_cleanup_failures(body, record)
+    if fresh:
+        raise body from body_cause
+    raise body
+
+
+def _no_body_cleanup(process, deadline) -> None:
+    """A cleanup with no body failure (the preview's overflow stop): the
+    earliest retained non-`Exception` is re-raised, as the exact instance,
+    with every other retained failure attached in order; otherwise nothing
+    is raised."""
+    record = _terminate_and_confirm(process, writer_thread=None, deadline=deadline)
+    index = next((i for i, exc in enumerate(record) if not isinstance(exc, Exception)), None)
+    if index is not None:
+        interrupt = record[index]
+        # Every other occurrence, in order (a repeat of the same object from
+        # a distinct call is kept); only the primary's own position is left out.
+        attach_cleanup_failures(interrupt, record[:index] + record[index + 1:])
+        raise interrupt
 
 
 def _read_bounded(
@@ -739,6 +838,7 @@ def _read_bounded(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=env,
+            start_new_session=True,
         )
     except OSError as exc:
         raise GitSafetyError(
@@ -780,21 +880,22 @@ def _read_bounded(
         _confirm_exit(process, deadline=deadline)
         _confirm_writer(writer_thread, deadline=deadline)
     except _BoundedFailure as failure:
-        _terminate_and_confirm(process, writer_thread=writer_thread, deadline=deadline)
-        raise GitSafetyError(failure.reason, _BOUNDED_FAILURE_MESSAGES[failure.reason]) from None
-    except GitSafetyError:
+        body = GitSafetyError(failure.reason, _BOUNDED_FAILURE_MESSAGES[failure.reason])
+        body_cause, fresh = None, True
+    except GitSafetyError as exc:
         # Cleanup first, then preserve the original error's identity —
         # unless cleanup itself fails, in which case that failure (a
-        # confirmed-unconfirmed process/thread) dominates and propagates
-        # instead, via the bare `raise` never being reached below.
-        _terminate_and_confirm(process, writer_thread=writer_thread, deadline=deadline)
-        raise
-    except BaseException as exc:  # noqa: BLE001 — one unified cleanup path for anything else
-        _terminate_and_confirm(process, writer_thread=writer_thread, deadline=deadline)
-        raise GitSafetyError(
-            GitSafetyFailure.PROCESS_SETUP_FAILED,
-            "a git subprocess failed unexpectedly",
-        ) from exc
+        # confirmed-unconfirmed process/thread) dominates.
+        body, body_cause, fresh = exc, None, False
+    except Exception as exc:  # noqa: BLE001 — an ordinary unexpected failure is categorical
+        body = GitSafetyError(GitSafetyFailure.PROCESS_SETUP_FAILED, "a git subprocess failed unexpectedly")
+        body_cause, fresh = exc, True
+    except BaseException as exc:  # noqa: BLE001 — a non-`Exception` is never wrapped
+        body, body_cause, fresh = exc, None, False
+    else:
+        body = None
+    if body is not None:
+        _surface_after_cleanup(process, writer_thread, deadline, body, body_cause, fresh)
 
     return BoundedProcessResult(stdout=bytes(buf), returncode=process.returncode)
 
@@ -925,6 +1026,7 @@ def _read_bounded_preview(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=env,
+            start_new_session=True,
         )
     except OSError as exc:
         raise GitSafetyError(
@@ -934,23 +1036,28 @@ def _read_bounded_preview(
 
     try:
         buf, complete = _drain_stdout_preview(process, deadline=deadline, limit=limit)
-        if not complete:
-            _terminate_and_confirm(process, writer_thread=None, deadline=deadline)
-            return BoundedPreviewResult(stdout=buf, returncode=None, complete=False)
-        _confirm_exit(process, deadline=deadline)
+        if complete:
+            _confirm_exit(process, deadline=deadline)
     except _BoundedFailure as failure:
-        _terminate_and_confirm(process, writer_thread=None, deadline=deadline)
-        raise GitSafetyError(failure.reason, _BOUNDED_FAILURE_MESSAGES[failure.reason]) from None
-    except GitSafetyError:
-        _terminate_and_confirm(process, writer_thread=None, deadline=deadline)
-        raise
-    except BaseException as exc:  # noqa: BLE001 — one unified cleanup path for anything else
-        _terminate_and_confirm(process, writer_thread=None, deadline=deadline)
-        raise GitSafetyError(
-            GitSafetyFailure.PROCESS_SETUP_FAILED,
-            "a git subprocess failed unexpectedly",
-        ) from exc
+        body = GitSafetyError(failure.reason, _BOUNDED_FAILURE_MESSAGES[failure.reason])
+        body_cause, fresh = None, True
+    except GitSafetyError as exc:
+        body, body_cause, fresh = exc, None, False
+    except Exception as exc:  # noqa: BLE001 — an ordinary unexpected failure is categorical
+        body = GitSafetyError(GitSafetyFailure.PROCESS_SETUP_FAILED, "a git subprocess failed unexpectedly")
+        body_cause, fresh = exc, True
+    except BaseException as exc:  # noqa: BLE001 — a non-`Exception` is never wrapped
+        body, body_cause, fresh = exc, None, False
+    else:
+        body = None
+    if body is not None:
+        _surface_after_cleanup(process, None, deadline, body, body_cause, fresh)
 
+    if not complete:
+        # Outside the try: if this abort itself raises (an unconfirmed
+        # cleanup), no handler above runs it a second time.
+        _no_body_cleanup(process, deadline)
+        return BoundedPreviewResult(stdout=buf, returncode=None, complete=False)
     return BoundedPreviewResult(stdout=buf, returncode=process.returncode, complete=True)
 
 

@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 import subprocess
+import time
 import uuid
 
 import pytest
@@ -95,7 +97,14 @@ def _name_only_listing(names: list[str], returncode: int = 0) -> BoundedProcessR
 
 
 class _FakeProc:
-    """Stands in for subprocess.Popen(["docker", "start", "--attach", ...])."""
+    """Stands in for subprocess.Popen(["docker", "start", "--attach", ...]).
+
+    `raise_timeout_first` models a client that keeps running until it is
+    killed: `poll()` is None and every `wait(timeout)` times out until
+    `kill()` (D3: the attach wait is sliced, so a single early timeout no
+    longer means the budget expired). Deliberately has no `pid`: a test that
+    reaches the group-kill path must patch `os.killpg`, so a fake can never
+    signal a real process group."""
 
     def __init__(
         self,
@@ -103,24 +112,51 @@ class _FakeProc:
         stdout: bytes = b"",
         stderr: bytes = b"",
         raise_timeout_first: bool = False,
+        pid: int | None = None,
     ) -> None:
+        if pid is not None:
+            self.pid = pid
         self.stdout = io.BytesIO(stdout)
         self.stderr = io.BytesIO(stderr)
         self._raise_timeout_first = raise_timeout_first
         self._wait_calls = 0
         self.killed = False
 
+    def poll(self):
+        if self.killed:
+            return -9
+        return None if self._raise_timeout_first else 0
+
     def wait(self, timeout=None):
         self._wait_calls += 1
-        if self._raise_timeout_first and self._wait_calls == 1:
+        if self._raise_timeout_first and not self.killed:
+            time.sleep(min(timeout, 0.01) if timeout is not None else 0)
             raise subprocess.TimeoutExpired(cmd="docker", timeout=timeout)
-        return 0
+        return self.poll()
 
     def kill(self) -> None:
         self.killed = True
 
 
-def _make_verifier(monkeypatch, tmp_path, *, docker_calls, popen_factory=None) -> DockerVerifier:
+# Never a real process: every test using it patches `os.killpg`.
+_FAKE_PID = 4_000_123
+
+
+def _record_killpg(monkeypatch, *, raises: BaseException | None = None) -> list:
+    calls: list = []
+
+    def killpg(pid, sig):
+        calls.append((pid, sig))
+        if raises is not None:
+            raise raises
+
+    monkeypatch.setattr("codeagent.executor.os.killpg", killpg)
+    return calls
+
+
+def _make_verifier(
+    monkeypatch, tmp_path, *, docker_calls, popen_factory=None, timeout_seconds=None, cancellation=None
+) -> DockerVerifier:
     """docker_calls: list of BoundedProcessResult / exceptions to return,
     in the exact order `_run_docker` is invoked: create, [inspect], rm,
     ps -a. `fake_run_docker` accepts and ignores the real `limit`/
@@ -143,7 +179,12 @@ def _make_verifier(monkeypatch, tmp_path, *, docker_calls, popen_factory=None) -
             "codeagent.executor.subprocess.Popen", lambda *a, **k: popen_factory()
         )
 
-    return DockerVerifier(tmp_path, clock=SteppingClock())
+    kwargs = {}
+    if timeout_seconds is not None:
+        kwargs["timeout_seconds"] = timeout_seconds
+    if cancellation is not None:
+        kwargs["cancellation"] = cancellation
+    return DockerVerifier(tmp_path, clock=SteppingClock(), **kwargs)
 
 
 # --------------------------------------------------------------------
@@ -878,14 +919,19 @@ def test_timeout_while_running_is_timeout_outcome(monkeypatch, tmp_path) -> None
             _result(0),  # rm (cleanup)
             _listing([(_OTHER_CONTAINER_ID, "unrelated")]),  # confirmed gone (name-wise)
         ],
-        popen_factory=lambda: _FakeProc(raise_timeout_first=True),
+        popen_factory=lambda: _FakeProc(raise_timeout_first=True, pid=_FAKE_PID),
+        timeout_seconds=0.2,
     )
+    killpg_calls = _record_killpg(monkeypatch, raises=ProcessLookupError())
 
     result = verifier.run_baseline()
 
     assert result.outcome == events.VerificationOutcome.TIMEOUT
     assert result.error.code == ErrorCode.EXECUTOR_TIMEOUT
     assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+    # D3: the timeout path kills the client's process group first; the
+    # direct kill is the fallback when the group kill raises.
+    assert killpg_calls == [(_FAKE_PID, signal.SIGKILL)]
 
 
 # --------------------------------------------------------------------
@@ -2015,3 +2061,745 @@ def test_effective_uid_0_and_gid_0_are_refused(monkeypatch, tmp_path, uid, gid, 
     with pytest.raises(ValueError) as excinfo:
         DockerVerifier(tmp_path, clock=SteppingClock())
     assert str(excinfo.value) == message
+
+
+# --------------------------------------------------------------------
+# ADR 0005 Amendment 1 (ledger D3): verifier cancellation
+# --------------------------------------------------------------------
+
+from codeagent.cancellation import CancellationSource  # noqa: E402
+
+
+class _TokenAfter:
+    """Reports cancellation from its (n+1)th `is_cancelled()` call on."""
+
+    def __init__(self, n: int) -> None:
+        self._n = n
+        self.calls = 0
+
+    def is_cancelled(self) -> bool:
+        self.calls += 1
+        return self.calls > self._n
+
+
+def _cancelled_token():
+    source = CancellationSource()
+    source.request("test")
+    return source.token
+
+
+def _killable_procs(monkeypatch):
+    """A running fake attach client whose group-kill marks it killed."""
+    procs: list[_FakeProc] = []
+
+    def factory():
+        proc = _FakeProc(raise_timeout_first=True, pid=_FAKE_PID)
+        procs.append(proc)
+        return proc
+
+    calls: list = []
+
+    def killpg(pid, sig):
+        calls.append((pid, sig))
+        for proc in procs:
+            if proc.pid == pid:
+                proc.killed = True
+
+    monkeypatch.setattr("codeagent.executor.os.killpg", killpg)
+    return factory, procs, calls
+
+
+@pytest.mark.parametrize("lifecycle", [False, True])
+def test_entry_cancelled_returns_cancelled_not_applicable_with_zero_docker_calls(
+    monkeypatch, tmp_path, lifecycle
+) -> None:
+    def no_docker(*a, **k):
+        raise AssertionError("no Docker call may happen after an entry cancellation")
+
+    monkeypatch.setattr("codeagent.executor._run_docker", no_docker)
+    monkeypatch.setattr("codeagent.executor.subprocess.Popen", no_docker)
+    monkeypatch.setattr(docker_ownership_module, "docker_ps_all_id_name_pairs", no_docker)
+    publisher = _FakeContainerPublisher()
+    verifier = DockerVerifier(
+        tmp_path,
+        clock=SteppingClock(),
+        lifecycle_context=_lifecycle_ctx(publisher) if lifecycle else None,
+        cancellation=_cancelled_token(),
+    )
+    for result in (verifier.run_baseline(), verifier.run(0)):
+        assert result.outcome is events.VerificationOutcome.CANCELLED
+        assert result.cleanup_status is events.ContainerCleanupStatus.NOT_APPLICABLE
+        assert result.exit_code is None and result.error is None
+    assert publisher.calls == []  # before CREATING is published
+
+
+def test_attach_running_cancel_group_kills_then_removes_by_id(monkeypatch, tmp_path) -> None:
+    factory, procs, killpg_calls = _killable_procs(monkeypatch)
+    publisher = _FakeContainerPublisher()
+    verifier = _make_lifecycle_verifier(
+        monkeypatch,
+        tmp_path,
+        publisher=publisher,
+        docker_calls=[_create_success(), _result(0)],  # create, rm (no inspect)
+        ps_results=[({}, {}), ({}, {})],
+        popen_factory=factory,
+    )
+    verifier._cancellation = _TokenAfter(1)  # entry check passes; observed in the wait
+
+    result = verifier.run_baseline()
+
+    assert killpg_calls == [(_FAKE_PID, signal.SIGKILL)]
+    assert procs[0].killed
+    intents = [intent for _, intent, _ in publisher.calls]
+    assert intents == [cl.ContainerIntent.CREATING, cl.ContainerIntent.PRESENT,
+                       cl.ContainerIntent.REMOVING, cl.ContainerIntent.ABSENT]
+    assert result.outcome is events.VerificationOutcome.CANCELLED
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+    assert result.exit_code is None and result.error is None
+
+
+def test_legacy_attach_running_cancel_is_cancelled_and_confirmed_absent(monkeypatch, tmp_path) -> None:
+    factory, _, killpg_calls = _killable_procs(monkeypatch)
+    verifier = _make_verifier(
+        monkeypatch,
+        tmp_path,
+        docker_calls=[_create_success(), _result(0), _listing([(_OTHER_CONTAINER_ID, "unrelated")])],
+        popen_factory=factory,
+        cancellation=_TokenAfter(1),
+    )
+    result = verifier.run_baseline()
+    assert killpg_calls == [(_FAKE_PID, signal.SIGKILL)]
+    assert result.outcome is events.VerificationOutcome.CANCELLED
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+
+
+@pytest.mark.parametrize("lifecycle", [False, True])
+def test_cleanup_unconfirmed_after_cancel_is_environment_failure(monkeypatch, tmp_path, lifecycle) -> None:
+    """M13: never CANCELLED with an unconfirmed cleanup."""
+    factory, _, _ = _killable_procs(monkeypatch)
+    if lifecycle:
+        verifier = _make_lifecycle_verifier(
+            monkeypatch,
+            tmp_path,
+            publisher=_FakeContainerPublisher(),
+            docker_calls=[_create_success(), _result(0)],
+            ps_results=[({}, {}), ({_baseline_name(): _FIXED_CONTAINER_ID}, {_FIXED_CONTAINER_ID: _baseline_name()})],
+            popen_factory=factory,
+        )
+        verifier._cancellation = _TokenAfter(1)
+    else:
+        verifier = _make_verifier(
+            monkeypatch,
+            tmp_path,
+            docker_calls=[_create_success(), _result(0), _listing([(_FIXED_CONTAINER_ID, "still-here")])],
+            popen_factory=factory,
+            cancellation=_TokenAfter(1),
+        )
+    result = verifier.run_baseline()
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED
+
+
+def test_client_exited_first_keeps_the_genuine_outcome(monkeypatch, tmp_path) -> None:
+    """M30: a token set after the client exited never overrides its result."""
+    killpg_calls = _record_killpg(monkeypatch)
+    verifier = _make_verifier(
+        monkeypatch,
+        tmp_path,
+        docker_calls=[
+            _create_success(),
+            _result(0, _state_json(status="exited", exit_code=1)),
+            _result(0),
+            _listing([(_OTHER_CONTAINER_ID, "unrelated")]),
+        ],
+        popen_factory=lambda: _FakeProc(),  # already exited
+        cancellation=_TokenAfter(1),
+    )
+    result = verifier.run_baseline()
+    assert result.outcome is events.VerificationOutcome.TEST_FAILURE
+    assert killpg_calls == []
+
+
+def test_attach_wait_is_sliced(monkeypatch, tmp_path) -> None:
+    """M5: every wait on the attach client is at most one 0.1 s slice."""
+    factory, procs, _ = _killable_procs(monkeypatch)
+    waits: list = []
+    real_wait = _FakeProc.wait
+
+    def recording_wait(self, timeout=None):
+        waits.append(timeout)
+        return real_wait(self, timeout)
+
+    monkeypatch.setattr(_FakeProc, "wait", recording_wait)
+    verifier = _make_verifier(
+        monkeypatch,
+        tmp_path,
+        docker_calls=[_create_success(), _result(0), _listing([(_OTHER_CONTAINER_ID, "unrelated")])],
+        popen_factory=factory,
+        cancellation=_TokenAfter(4),
+    )
+    verifier.run_baseline()
+    slices = waits[:-1]  # the last wait is the post-kill reap
+    assert len(slices) == 3 and all(t is not None and t <= 0.1 for t in slices)
+
+
+# ADR 0005 Amendment 1 (ledger D3): L2 real-process session tests (a
+# `docker` PATH shim; no Docker daemon needed).
+from tests.support import process_shims as _shims  # noqa: E402
+
+
+def test_l2_attach_client_leads_its_own_session(tmp_path, monkeypatch):
+    _shims.check_session("L2", tmp_path, monkeypatch)
+
+
+def test_l2_group_sigint_never_reaches_the_attach_client(tmp_path):
+    _shims.check_group_sigint_spared("L2", tmp_path)
+
+
+def test_l2_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
+    _shims.check_abort_group_kill("L2", tmp_path, monkeypatch)
+
+
+# ADR 0005 Amendment 1 (D3 joint-review correction): the attach client's
+# group kill is fail-closed. ProcessLookupError = group confirmed absent;
+# any other failure still kills and reaps the client exactly once and
+# removes the container by id, but the result is never CANCELLED/TIMEOUT.
+
+_EXE_GROUP_TEXT = "SENTINEL-group-kill-/secret/path"
+
+
+def _group_procs(monkeypatch, killpg_exc):
+    procs: list[_FakeProc] = []
+    kills: list[int] = []
+
+    class _Counting(_FakeProc):
+        def kill(self):
+            kills.append(1)
+            super().kill()
+
+    def factory():
+        proc = _Counting(raise_timeout_first=True, pid=_FAKE_PID)
+        procs.append(proc)
+        return proc
+
+    calls = _record_killpg(monkeypatch, raises=killpg_exc)
+    return factory, calls, kills
+
+
+@pytest.mark.parametrize("lifecycle", [False, True])
+@pytest.mark.parametrize("how", ["cancel", "timeout"])
+def test_attach_group_kill_failure_fails_closed(monkeypatch, tmp_path, lifecycle, how):
+    factory, calls, kills = _group_procs(monkeypatch, PermissionError(_EXE_GROUP_TEXT))
+    token = _TokenAfter(1) if how == "cancel" else None
+    timeout = 30.0 if how == "cancel" else 0.2
+    if lifecycle:
+        publisher = _FakeContainerPublisher()
+        verifier = _make_lifecycle_verifier(
+            monkeypatch, tmp_path, publisher=publisher,
+            docker_calls=[_create_success(), _result(0)], ps_results=[({}, {}), ({}, {})], popen_factory=factory,
+        )
+        verifier._timeout_seconds = timeout
+        if token is not None:
+            verifier._cancellation = token
+    else:
+        verifier = _make_verifier(
+            monkeypatch, tmp_path,
+            docker_calls=[_create_success(), _result(0), _listing([(_OTHER_CONTAINER_ID, "unrelated")])],
+            popen_factory=factory, timeout_seconds=timeout, cancellation=token,
+        )
+    result = verifier.run_baseline()
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.error.code is ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE
+    assert result.error.message == "the verification attach client could not be confirmed terminated"
+    # The container itself was still removed by id and confirmed absent.
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+    assert [sig for _, sig in calls] == [signal.SIGKILL, 0] and len(kills) == 1
+    if lifecycle:
+        assert [i for _, i, _ in publisher.calls][-2:] == [cl.ContainerIntent.REMOVING, cl.ContainerIntent.ABSENT]
+
+
+@pytest.mark.parametrize("how", ["cancel", "timeout"])
+def test_attach_group_absent_keeps_the_genuine_cancel_or_timeout(monkeypatch, tmp_path, how):
+    factory, calls, kills = _group_procs(monkeypatch, ProcessLookupError())
+    verifier = _make_verifier(
+        monkeypatch, tmp_path,
+        docker_calls=[_create_success(), _result(0), _listing([(_OTHER_CONTAINER_ID, "unrelated")])],
+        popen_factory=factory,
+        timeout_seconds=30.0 if how == "cancel" else 0.2,
+        cancellation=_TokenAfter(1) if how == "cancel" else None,
+    )
+    result = verifier.run_baseline()
+    expected = events.VerificationOutcome.CANCELLED if how == "cancel" else events.VerificationOutcome.TIMEOUT
+    assert result.outcome is expected
+    assert [sig for _, sig in calls] == [signal.SIGKILL] and len(kills) == 1
+
+
+@pytest.mark.parametrize("how", ["cancel", "timeout"])
+def test_attach_post_reap_probe_confirms_an_absent_group(monkeypatch, tmp_path, how):
+    """macOS EPERM for a group holding only its exited leader: the
+    post-reap signal-0 probe's ProcessLookupError keeps the genuine result."""
+    procs: list[_FakeProc] = []
+
+    def factory():
+        proc = _FakeProc(raise_timeout_first=True, pid=_FAKE_PID)
+        procs.append(proc)
+        return proc
+
+    calls = []
+
+    def killpg(pid, sig):
+        calls.append(sig)
+        raise PermissionError(_EXE_GROUP_TEXT) if sig == signal.SIGKILL else ProcessLookupError()
+
+    monkeypatch.setattr("codeagent.executor.os.killpg", killpg)
+    verifier = _make_verifier(
+        monkeypatch, tmp_path,
+        docker_calls=[_create_success(), _result(0), _listing([(_OTHER_CONTAINER_ID, "unrelated")])],
+        popen_factory=factory,
+        timeout_seconds=30.0 if how == "cancel" else 0.2,
+        cancellation=_TokenAfter(1) if how == "cancel" else None,
+    )
+    result = verifier.run_baseline()
+    expected = events.VerificationOutcome.CANCELLED if how == "cancel" else events.VerificationOutcome.TIMEOUT
+    assert result.outcome is expected and calls == [signal.SIGKILL, 0]
+
+
+# ADR 0005 Amendment 1 §12 (second joint-review correction): every attach-
+# abort failure is retained, never raised raw, and the known container id is
+# still removed. Contract: one group kill; a direct kill only if it raised;
+# a bounded reap; if unconfirmed, exactly one retry kill and one more reap.
+
+from codeagent import executor as _exe  # noqa: E402
+
+
+class _ScriptedProc:
+    """`kills`/`waits` scripts: each entry is None (succeed), "timeout", or an
+    exception instance to raise. Never a real pid (killpg is patched)."""
+
+    def __init__(self, *, kills=(), waits=()):
+        self.pid = _FAKE_PID
+        self._kills, self._waits = list(kills), list(waits)
+        self.kill_calls = 0
+        self.wait_calls = 0
+        self.returncode = None
+        self.stdout = io.BytesIO(b"")
+        self.stderr = io.BytesIO(b"")
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.kill_calls += 1
+        action = self._kills.pop(0) if self._kills else None
+        if isinstance(action, BaseException):
+            raise action
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        action = self._waits.pop(0) if self._waits else None
+        if action == "timeout":
+            raise subprocess.TimeoutExpired(["docker", "start", "/secret/path"], timeout)
+        if isinstance(action, BaseException):
+            raise action
+        self.returncode = -9
+        return -9
+
+
+def _patch_group(monkeypatch, group_exc=None, probe_exc=ProcessLookupError()):
+    calls = []
+
+    def killpg(pid, sig):
+        calls.append(sig)
+        if sig == signal.SIGKILL:
+            if group_exc is not None:
+                raise group_exc
+            return
+        raise probe_exc
+
+    monkeypatch.setattr("codeagent.executor.os.killpg", killpg)
+    return calls
+
+
+def _sentinel(name):
+    return RuntimeError(f"SENTINEL-{name}-/secret/path")
+
+
+@pytest.mark.parametrize("probe_absent", [True, False])
+def test_l2_abort_group_fails_and_direct_kill_raises(monkeypatch, probe_absent):
+    a, b = PermissionError("SENTINEL-a"), _sentinel("b")
+    calls = _patch_group(monkeypatch, a, ProcessLookupError() if probe_absent else PermissionError("p"))
+    proc = _ScriptedProc(kills=[b], waits=[None])
+    record = _exe._abort_attach_client(proc, _exe._AttachAbort())
+    assert record.group_failure is a and record.kill_failures == [b] and record.reap_failures == []
+    assert (proc.kill_calls, proc.wait_calls, record.kills, record.reaps) == (1, 1, 1, 1)
+    assert calls == [signal.SIGKILL, 0]
+    assert record.confirmed is probe_absent
+
+
+@pytest.mark.parametrize("second_wait, confirmed", [(None, True), ("timeout", False)])
+def test_l2_abort_reap_timeout_then_retry_kill_raises(monkeypatch, second_wait, confirmed):
+    c = _sentinel("c")
+    calls = _patch_group(monkeypatch)  # the group kill succeeds
+    proc = _ScriptedProc(kills=[c], waits=["timeout", second_wait])
+    record = _exe._abort_attach_client(proc, _exe._AttachAbort())
+    # No direct kill first (the group kill succeeded); exactly one retry.
+    assert (proc.kill_calls, proc.wait_calls) == (1, 2)
+    assert record.kill_failures == [c] and record.reap_failures == []
+    assert calls == [signal.SIGKILL] and record.confirmed is confirmed
+
+
+@pytest.mark.parametrize("waits, confirmed", [(["D", None], True), (["D", "D2"], False)])
+def test_l2_abort_wait_raises_a_non_timeout_sentinel(monkeypatch, waits, confirmed):
+    d, d2 = _sentinel("d"), _sentinel("d2")
+    _patch_group(monkeypatch, PermissionError("SENTINEL-a"))
+    script = [d if w == "D" else d2 if w == "D2" else w for w in waits]
+    proc = _ScriptedProc(waits=script)
+    record = _exe._abort_attach_client(proc, _exe._AttachAbort())
+    assert record.reap_failures == [x for x in script if isinstance(x, BaseException)]
+    assert (proc.kill_calls, proc.wait_calls) == (2, 2)
+    assert record.reaped is confirmed
+
+
+def _cancel_lifecycle_verifier(monkeypatch, tmp_path, proc):
+    publisher = _FakeContainerPublisher()
+    verifier = _make_lifecycle_verifier(
+        monkeypatch, tmp_path, publisher=publisher,
+        docker_calls=[_create_success(), _result(0)],  # create, rm --force <id>
+        ps_results=[({}, {}), ({}, {})],  # pre-create; fresh post-rm absence
+        popen_factory=lambda: proc,
+    )
+    verifier._cancellation = _TokenAfter(1)
+    return verifier, publisher
+
+
+def _assert_removed_by_id_and_failed_closed(result, publisher):
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.error.code is ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE
+    assert result.error.message == "the verification attach client could not be confirmed terminated"
+    assert "SENTINEL" not in repr(result) and "/secret/path" not in repr(result)
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+    assert [(i, x) for _, i, x in publisher.calls][-2:] == [
+        (cl.ContainerIntent.REMOVING, _FIXED_CONTAINER_ID), (cl.ContainerIntent.ABSENT, None)
+    ]
+
+
+def test_l2_multiple_abort_failures_still_remove_the_container_by_id(monkeypatch, tmp_path):
+    a, b, d, e = PermissionError("SENTINEL-a"), _sentinel("b"), _sentinel("d"), _sentinel("e")
+    _patch_group(monkeypatch, a, PermissionError("p"))
+    proc = _ScriptedProc(kills=[b, e], waits=[d, "timeout"])
+    verifier, publisher = _cancel_lifecycle_verifier(monkeypatch, tmp_path, proc)
+    result = verifier.run_baseline()
+    _assert_removed_by_id_and_failed_closed(result, publisher)
+    record = verifier._last_attach_abort
+    assert record.group_failure is a and record.kill_failures == [b, e] and record.reap_failures == [d]
+    assert (proc.kill_calls, proc.wait_calls, record.reaped) == (2, 2, False)
+
+
+def test_l2_failed_attach_wait_still_removes_the_container_by_id(monkeypatch, tmp_path):
+    w = _sentinel("w")
+    _patch_group(monkeypatch)
+
+    def failing_wait(process, **kwargs):
+        raise w
+
+    monkeypatch.setattr(_exe, "wait_cancellable", failing_wait)
+    proc = _ScriptedProc(waits=[None])
+    verifier, publisher = _cancel_lifecycle_verifier(monkeypatch, tmp_path, proc)
+    result = verifier.run_baseline()
+    _assert_removed_by_id_and_failed_closed(result, publisher)
+    assert verifier._last_attach_abort.wait_failure is w
+    assert (proc.kill_calls, proc.wait_calls) == (0, 1)  # the group kill succeeded
+
+
+def test_l2_legacy_path_abort_failures_still_remove_by_id(monkeypatch, tmp_path):
+    _patch_group(monkeypatch, PermissionError("SENTINEL-a"), PermissionError("p"))
+    proc = _ScriptedProc(kills=[_sentinel("b")], waits=[None])
+    removed = []
+    verifier = _make_verifier(
+        monkeypatch, tmp_path,
+        docker_calls=[_create_success(), _result(0), _listing([(_OTHER_CONTAINER_ID, "unrelated")])],
+        popen_factory=lambda: proc, cancellation=_TokenAfter(1),
+    )
+    real_cleanup = DockerVerifier._cleanup
+    monkeypatch.setattr(DockerVerifier, "_cleanup", lambda self, name, cid: (removed.append(cid), real_cleanup(self, name, cid))[1])
+    result = verifier.run_baseline()
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+    assert removed == [_FIXED_CONTAINER_ID]
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["group_fails_direct_kill_raises", "reap_timeout_retry_kill_raises", "wait_raises_sentinel"],
+)
+def test_l2_each_abort_failure_still_removes_the_container_by_id(monkeypatch, tmp_path, scenario):
+    """Path-level: through `run_baseline`, each named abort failure is
+    retained (never raised raw), the attempt fails closed, and the container
+    is still removed by immutable id. Exact kill/reap counts are pinned."""
+    if scenario == "group_fails_direct_kill_raises":
+        group_exc, kills, waits, counts = PermissionError("SENTINEL-a"), [_sentinel("b")], [None], (1, 1)
+        probe = PermissionError("p")
+    elif scenario == "reap_timeout_retry_kill_raises":
+        group_exc, kills, waits, counts = None, [_sentinel("c")], ["timeout", None], (1, 2)
+        probe = ProcessLookupError()
+    else:
+        group_exc, kills, waits, counts = None, [], [_sentinel("d"), "timeout"], (1, 2)
+        probe = ProcessLookupError()
+    _patch_group(monkeypatch, group_exc, probe)
+    proc = _ScriptedProc(kills=kills, waits=waits)
+    verifier, publisher = _cancel_lifecycle_verifier(monkeypatch, tmp_path, proc)
+    result = verifier.run_baseline()
+    record = verifier._last_attach_abort
+    assert (proc.kill_calls, proc.wait_calls) == counts == (record.kills, record.reaps)
+    assert record.kill_failures == [k for k in kills if isinstance(k, BaseException)]
+    assert record.reap_failures == [w for w in waits if isinstance(w, BaseException)]
+    if scenario == "reap_timeout_retry_kill_raises":
+        # Reaped on the retry, group killed: a confirmed cancel despite the
+        # retained kill failure (confirmation is by observation).
+        assert result.outcome is events.VerificationOutcome.CANCELLED
+        assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+    else:
+        _assert_removed_by_id_and_failed_closed(result, publisher)
+
+
+# ADR 0005 Amendment 1 §12 (third joint-review correction): a BaseException
+# (not an Exception) at any attach-abort step is retained, every remaining
+# step runs, the container is removed by immutable id and its absence
+# confirmed (ABSENT published), and only then is the exact instance raised.
+
+
+class _InjectedBase(BaseException):
+    pass
+
+
+def _patch_group_steps(monkeypatch, *, group=None, probe=ProcessLookupError()):
+    calls = []
+
+    def killpg(pid, sig):
+        calls.append(sig)
+        action = group if sig == signal.SIGKILL else probe
+        if action is not None:
+            raise action
+
+    monkeypatch.setattr("codeagent.executor.os.killpg", killpg)
+    return calls
+
+
+@pytest.mark.parametrize("make", [lambda: _InjectedBase("SENTINEL-base"), lambda: KeyboardInterrupt("SENTINEL-ki")])
+@pytest.mark.parametrize("site", ["wait", "group_kill", "direct_kill", "reap", "probe"])
+def test_l2_base_exception_cannot_bypass_removal_by_id(monkeypatch, tmp_path, site, make):
+    inst = make()
+    group, probe, kills, waits = None, ProcessLookupError(), [], [None]
+    if site == "wait":
+        def failing_wait(process, **kwargs):
+            raise inst
+
+        monkeypatch.setattr(_exe, "wait_cancellable", failing_wait)
+    elif site == "group_kill":
+        group = inst  # a direct kill follows; the probe confirms absence
+    elif site == "direct_kill":
+        group, kills = PermissionError("SENTINEL-g"), [inst]
+    elif site == "reap":
+        waits = [inst, None]  # retry kill and a second, confirmed reap
+    else:
+        group, probe = PermissionError("SENTINEL-g"), inst
+    calls = _patch_group_steps(monkeypatch, group=group, probe=probe)
+    proc = _ScriptedProc(kills=kills, waits=waits)
+    verifier, publisher = _cancel_lifecycle_verifier(monkeypatch, tmp_path, proc)
+    removed = []
+    real_cleanup = DockerVerifier._cleanup_by_id
+    monkeypatch.setattr(
+        DockerVerifier, "_cleanup_by_id", lambda self, cid, name: (removed.append(cid), real_cleanup(self, cid, name))[1]
+    )
+
+    if site == "probe":
+        # The probe's own failure leaves the group unconfirmed: cleanup
+        # dominance (fourth correction) -- no raise; the sanitized failure
+        # carries the exact interrupt.
+        result = _without_escape(verifier.run_baseline)
+        assert result.deferred_interrupt is inst
+        assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+        assert "SENTINEL" not in repr(result)
+    else:
+        with pytest.raises(type(inst)) as info:
+            verifier.run_baseline()
+        assert info.value is inst
+    # Removal by immutable id ran and absence was confirmed in every case.
+    assert removed == [_FIXED_CONTAINER_ID]
+    assert [(i, x) for _, i, x in publisher.calls][-2:] == [
+        (cl.ContainerIntent.REMOVING, _FIXED_CONTAINER_ID), (cl.ContainerIntent.ABSENT, None)
+    ]
+    record = verifier._last_attach_abort
+    step = {"direct_kill": "kill"}.get(site, site)
+    assert (step, inst) in record.failures_in_order and record.deferred_interrupt is inst
+    expected = {  # (direct kills, reaps, killpg signals)
+        "wait": (0, 1, [signal.SIGKILL]),
+        "group_kill": (1, 1, [signal.SIGKILL, 0]),
+        "direct_kill": (1, 1, [signal.SIGKILL, 0]),
+        "reap": (1, 2, [signal.SIGKILL]),
+        "probe": (1, 1, [signal.SIGKILL, 0]),
+    }[site]
+    assert (proc.kill_calls, proc.wait_calls, calls) == expected
+
+
+# ADR 0005 Amendment 1 §12 (fourth correction): the retained interrupt is
+# re-raised only after FULLY confirmed cleanup. Any unconfirmed attach,
+# group, removal, absence-confirmation or ABSENT-publication obligation ->
+# the sanitized failure is returned, carrying the exact interrupt.
+
+from codeagent import _docker_ownership as _own  # noqa: E402
+
+
+def _wait_interrupt(monkeypatch, inst):
+    def failing_wait(process, **kwargs):
+        raise inst
+
+    monkeypatch.setattr(_exe, "wait_cancellable", failing_wait)
+
+
+_STILL_THERE = ({_baseline_name(): _FIXED_CONTAINER_ID}, {_FIXED_CONTAINER_ID: _baseline_name()})
+
+
+def _without_escape(fn):
+    """Call `fn`; any escaping `BaseException` (including KeyboardInterrupt,
+    which would otherwise abort the pytest session) becomes a test failure."""
+    try:
+        return fn()
+    except BaseException as exc:  # noqa: BLE001
+        pytest.fail(f"{type(exc).__name__} escaped instead of being retained")
+
+
+@pytest.mark.parametrize("failure", ["removal_unconfirmed", "absence_unobservable", "absent_publication", "attach_group"])
+def test_l2_lifecycle_cleanup_dominates_a_retained_interrupt(monkeypatch, tmp_path, failure):
+    inst = KeyboardInterrupt("SENTINEL-ki")
+    _wait_interrupt(monkeypatch, inst)
+    group, probe = (PermissionError("SENTINEL-g"), PermissionError("SENTINEL-p")) if failure == "attach_group" else (None, ProcessLookupError())
+    _patch_group_steps(monkeypatch, group=group, probe=probe)
+    post_rm = {
+        "removal_unconfirmed": _STILL_THERE,
+        "absence_unobservable": _own.DockerListingError("SENTINEL-listing"),
+    }.get(failure, ({}, {}))
+    publisher = _FakeContainerPublisher()
+    if failure == "absent_publication":
+        publisher.fail_once(cl.ContainerRole.BASELINE, cl.ContainerIntent.ABSENT, _pub_error())
+    verifier = _make_lifecycle_verifier(
+        monkeypatch, tmp_path, publisher=publisher,
+        docker_calls=[_create_success(), _result(0)], ps_results=[({}, {}), post_rm],
+        popen_factory=lambda: _ScriptedProc(kills=[None], waits=[None]),
+    )
+    result = _without_escape(verifier.run_baseline)  # never raises: cleanup dominance
+    assert result.deferred_interrupt is inst
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert "SENTINEL" not in repr(result) and "SENTINEL" not in result.error.message
+    expected_status = {
+        "removal_unconfirmed": events.ContainerCleanupStatus.UNCONFIRMED,
+        "absence_unobservable": events.ContainerCleanupStatus.UNCONFIRMED,
+    }.get(failure, events.ContainerCleanupStatus.CONFIRMED_ABSENT)
+    assert result.cleanup_status is expected_status
+    # Removal by immutable id was still attempted in every case.
+    assert (cl.ContainerIntent.REMOVING, _FIXED_CONTAINER_ID) in [(i, x) for _, i, x in publisher.calls]
+
+
+@pytest.mark.parametrize("failure", ["removal_unconfirmed", "absence_unobservable", "attach_group"])
+def test_l2_legacy_cleanup_dominates_a_retained_interrupt(monkeypatch, tmp_path, failure):
+    inst = _InjectedBase("SENTINEL-base")
+    _wait_interrupt(monkeypatch, inst)
+    group, probe = (PermissionError("SENTINEL-g"), PermissionError("SENTINEL-p")) if failure == "attach_group" else (None, ProcessLookupError())
+    _patch_group_steps(monkeypatch, group=group, probe=probe)
+    listing = {
+        "removal_unconfirmed": _listing([(_FIXED_CONTAINER_ID, "still-here")]),
+        "absence_unobservable": _result(1),
+    }.get(failure, _listing([(_OTHER_CONTAINER_ID, "unrelated")]))
+    verifier = _make_verifier(
+        monkeypatch, tmp_path, docker_calls=[_create_success(), _result(0), listing],
+        popen_factory=lambda: _ScriptedProc(kills=[None], waits=[None]),
+    )
+    result = _without_escape(verifier.run_baseline)
+    assert result.deferred_interrupt is inst
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert "SENTINEL" not in repr(result)
+    if failure == "attach_group":
+        assert result.cleanup_status is events.ContainerCleanupStatus.CONFIRMED_ABSENT
+    else:
+        assert result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED
+
+
+@pytest.mark.parametrize("lifecycle", [False, True])
+def test_l2_fully_confirmed_cleanup_reraises_the_exact_interrupt(monkeypatch, tmp_path, lifecycle):
+    inst = SystemExit("SENTINEL-exit")
+    _wait_interrupt(monkeypatch, inst)
+    _patch_group_steps(monkeypatch)
+    if lifecycle:
+        publisher = _FakeContainerPublisher()
+        verifier = _make_lifecycle_verifier(
+            monkeypatch, tmp_path, publisher=publisher, docker_calls=[_create_success(), _result(0)],
+            ps_results=[({}, {}), ({}, {})], popen_factory=lambda: _ScriptedProc(waits=[None]),
+        )
+    else:
+        verifier = _make_verifier(
+            monkeypatch, tmp_path,
+            docker_calls=[_create_success(), _result(0), _listing([(_OTHER_CONTAINER_ID, "unrelated")])],
+            popen_factory=lambda: _ScriptedProc(waits=[None]),
+        )
+    with pytest.raises(SystemExit) as info:
+        verifier.run_baseline()
+    assert info.value is inst
+    if lifecycle:
+        assert [i for _, i, _ in publisher.calls][-1] is cl.ContainerIntent.ABSENT
+
+
+def test_verification_result_deferred_interrupt_must_be_a_non_exception():
+    from codeagent.controller import VerificationResult
+
+    with pytest.raises(ValueError):
+        VerificationResult(
+            outcome=events.VerificationOutcome.PASSED, exit_code=0, duration_seconds=0.0, stdout="", stderr="",
+            cleanup_status=events.ContainerCleanupStatus.CONFIRMED_ABSENT, deferred_interrupt=RuntimeError("x"),
+        )
+
+
+# ADR 0005 Amendment 1 §12 (fifth correction), applied to L2 for one model.
+
+
+def test_l2_ordinary_wait_failure_stays_primary_over_a_cleanup_interrupt(monkeypatch, tmp_path):
+    body, ki = RuntimeError("SENTINEL-body"), KeyboardInterrupt("SENTINEL-ki")
+    _wait_interrupt(monkeypatch, body)
+    _patch_group_steps(monkeypatch, group=ki)  # probe confirms absence
+    proc = _ScriptedProc(kills=[None], waits=[None])
+    verifier, publisher = _cancel_lifecycle_verifier(monkeypatch, tmp_path, proc)
+    result = _without_escape(verifier.run_baseline)
+    assert result.outcome is events.VerificationOutcome.ENVIRONMENT_FAILURE
+    assert result.deferred_interrupt is ki and "SENTINEL" not in repr(result)
+    assert [i for _, i, _ in publisher.calls][-1] is cl.ContainerIntent.ABSENT
+
+
+def test_l2_reraised_interrupt_carries_every_other_failure_in_order(monkeypatch, tmp_path):
+    ki1, ki2 = KeyboardInterrupt("SENTINEL-1"), _InjectedBase("SENTINEL-2")
+    cause, context = RuntimeError("c"), RuntimeError("x")
+    ki1.__cause__, ki1.__context__ = cause, context
+    _wait_interrupt(monkeypatch, ki1)
+    _patch_group_steps(monkeypatch, group=ki2)  # probe confirms absence
+    proc = _ScriptedProc(kills=[None], waits=[None])
+    verifier, _publisher = _cancel_lifecycle_verifier(monkeypatch, tmp_path, proc)
+    with pytest.raises(KeyboardInterrupt) as info:
+        verifier.run_baseline()
+    assert info.value is ki1 and ki1.codeagent_cleanup_failures == (ki2,)
+    assert ki1.__cause__ is cause and ki1.__context__ is context
+    assert (proc.kill_calls, proc.wait_calls) == (1, 1)
+
+
+# Sixth correction: an attribute-refusing interrupt is still re-raised.
+from tests.support.refusing import REFUSALS, refusing  # noqa: E402
+
+
+@pytest.mark.parametrize("make_refusal", REFUSALS)
+def test_l2_refusing_interrupt_is_still_reraised_exactly(monkeypatch, tmp_path, make_refusal):
+    ki1 = refusing(KeyboardInterrupt, make_refusal())
+    _wait_interrupt(monkeypatch, ki1)
+    _patch_group_steps(monkeypatch, group=_InjectedBase("SENTINEL-2"))  # probe confirms absence
+    proc = _ScriptedProc(kills=[None], waits=[None])
+    verifier, publisher = _cancel_lifecycle_verifier(monkeypatch, tmp_path, proc)
+    with pytest.raises(KeyboardInterrupt) as info:
+        verifier.run_baseline()
+    assert info.value is ki1
+    assert [i for _, i, _ in publisher.calls][-1] is cl.ContainerIntent.ABSENT

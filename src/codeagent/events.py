@@ -87,6 +87,10 @@ class VerificationOutcome(str, Enum):
     TIMEOUT = "timeout"
     ENVIRONMENT_FAILURE = "environment_failure"
     COMMAND_START_FAILURE = "command_start_failure"
+    # ADR 0005 Amendment 1 section 5: cancellation was observed before the
+    # command produced a result (at verifier entry, or while the attach
+    # client was still running). Never a test result, never an error.
+    CANCELLED = "cancelled"
 
 
 @unique
@@ -102,7 +106,8 @@ class ContainerCleanupStatus(str, Enum):
       failure that occurs *before* the create invocation begins; once
       that invocation is attempted (including a bare launch failure),
       cleanup must be confirmed one way or the other, never reported as
-      not-applicable.
+      not-applicable. Also legal for `CANCELLED` observed at verifier
+      entry, before any lifecycle publication or Docker call.
     - `CONFIRMED_ABSENT`: cleanup ran and a genuine listing afterward
       confirmed the container's exact name is gone.
     - `UNCONFIRMED`: cleanup was attempted but could not be confirmed —
@@ -163,6 +168,7 @@ def _validate_exit_code_for_outcome(outcome: VerificationOutcome, exit_code: int
     - TEST_FAILURE requires a present, nonzero exit_code.
     - COMMAND_START_FAILURE requires exit_code is None (the command
       never ran, so there is nothing to report an exit code for).
+    - CANCELLED requires exit_code is None (ADR 0005 Amendment 1).
     - TIMEOUT and ENVIRONMENT_FAILURE permit either None or any integer
       exit code — e.g. a killed process's negative POSIX signal-based
       return code (Linux/macOS) if one is available, or None if it
@@ -183,6 +189,12 @@ def _validate_exit_code_for_outcome(outcome: VerificationOutcome, exit_code: int
             raise ValueError(
                 "exit_code must be None when outcome is COMMAND_START_FAILURE "
                 f"(the command never ran), got {exit_code!r}"
+            )
+    elif outcome is VerificationOutcome.CANCELLED:
+        if exit_code is not None:
+            raise ValueError(
+                "exit_code must be None when outcome is CANCELLED "
+                f"(no result was produced), got {exit_code!r}"
             )
     # TIMEOUT and ENVIRONMENT_FAILURE: any int or None is permitted.
 
@@ -210,7 +222,7 @@ def _validate_error_for_verification_outcome(
 ) -> None:
     expected_codes = _EXECUTOR_ERROR_CODES_BY_OUTCOME.get(outcome)
     if expected_codes is None:
-        # PASSED or TEST_FAILURE: both are expected domain outcomes, not
+        # PASSED, TEST_FAILURE or CANCELLED: expected domain outcomes, not
         # errors (error-taxonomy requirement 2) — no error permitted.
         if error is not None:
             raise ValueError(f"error must be None when outcome is {outcome!r}, got {error!r}")
@@ -232,10 +244,13 @@ def _validate_cleanup_status_for_outcome(
       ENVIRONMENT_FAILURE whenever cleanup cannot be confirmed, so
       PASSED/TEST_FAILURE/TIMEOUT/COMMAND_START_FAILURE can never pair
       with UNCONFIRMED.
-    - `NOT_APPLICABLE` implies `outcome` is `COMMAND_START_FAILURE` or
-      `ENVIRONMENT_FAILURE` — only a failure before any container ever
-      ran can have nothing to clean up; PASSED/TEST_FAILURE/TIMEOUT all
-      require a container to have actually run.
+    - `NOT_APPLICABLE` implies `outcome` is `COMMAND_START_FAILURE`,
+      `ENVIRONMENT_FAILURE` or `CANCELLED` — only a failure or a
+      cancellation before any container was created can have nothing to
+      clean up; PASSED/TEST_FAILURE/TIMEOUT all require a container to
+      have actually run. `CANCELLED` with `UNCONFIRMED` is never valid:
+      the verifier rewrites an unconfirmed cleanup to
+      `ENVIRONMENT_FAILURE` (ADR 0005 Amendment 1 section 5).
     - `CONFIRMED_ABSENT` is legal for every outcome.
     """
     if cleanup_status is ContainerCleanupStatus.UNCONFIRMED:
@@ -248,10 +263,11 @@ def _validate_cleanup_status_for_outcome(
         if outcome not in (
             VerificationOutcome.COMMAND_START_FAILURE,
             VerificationOutcome.ENVIRONMENT_FAILURE,
+            VerificationOutcome.CANCELLED,
         ):
             raise ValueError(
-                "cleanup_status NOT_APPLICABLE requires outcome COMMAND_START_FAILURE or "
-                f"ENVIRONMENT_FAILURE, got {outcome!r}"
+                "cleanup_status NOT_APPLICABLE requires outcome COMMAND_START_FAILURE, "
+                f"ENVIRONMENT_FAILURE or CANCELLED, got {outcome!r}"
             )
 
 

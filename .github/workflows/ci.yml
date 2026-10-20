@@ -66,10 +66,12 @@ jobs:
             exit 1
           fi
 
+      # ADR 0005 Amendment 1 (ledger D3, J8): the real-signal cancellation
+      # tests E1-E12 run here too, with -v, so each is named in the log.
       - name: Run real Docker verification tests (must execute, not skip)
         env:
           CODEAGENT_REQUIRE_DOCKER: "1"
-        run: python -m pytest tests/integration/test_slice_c.py -v
+        run: python -m pytest tests/integration/test_slice_c.py tests/integration/test_cancellation_e2e.py -v
 
       - name: Run complete test suite
         env:

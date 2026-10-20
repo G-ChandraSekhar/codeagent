@@ -35,12 +35,13 @@ from __future__ import annotations
 import json
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
 from codeagent import domain, events
+from codeagent.cancellation import NEVER_CANCELLED, CancellationToken, OperationCancelled
 from codeagent.checkpoint_ref import (
     LIFECYCLE_ID_RE,
     CheckpointRefError,
@@ -183,8 +184,22 @@ class VerificationResult:
     stderr: str
     cleanup_status: events.ContainerCleanupStatus
     error: OperationalError | None = None
+    # ADR 0005 Amendment 1 §12 (fourth and fifth corrections): a
+    # non-`Exception` `BaseException` (for example `KeyboardInterrupt`)
+    # retained during an attempt when it is not re-raised -- because cleanup
+    # could not be fully confirmed (cleanup dominance), or because an
+    # ordinary attach-wait failure stays primary. The sanitized failure
+    # above is the result; this exact instance is carried alongside it,
+    # never raised and never in `repr`, equality or any event. Otherwise the
+    # verifier re-raises it instead of returning.
+    deferred_interrupt: BaseException | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.deferred_interrupt is not None and (
+            not isinstance(self.deferred_interrupt, BaseException)
+            or isinstance(self.deferred_interrupt, Exception)
+        ):
+            raise ValueError("deferred_interrupt must be a BaseException that is not an Exception")
         events.validate_verification_outcome_shape(
             self.outcome, self.exit_code, self.error, self.cleanup_status
         )
@@ -257,6 +272,11 @@ class RepositoryReader(Protocol):
 
 
 class ApprovalProvider(Protocol):
+    """A cancellable provider that stops waiting because the run's token
+    was cancelled raises `codeagent.cancellation.OperationCancelled`; the
+    controller maps that to `CANCELLED` only around this call (ADR 0005
+    Amendment 1 section 4)."""
+
     def decide(self, visit_index: int) -> domain.ApprovalDecision: ...
 
 
@@ -402,6 +422,31 @@ class RunConfig:
         _require_nonnegative_int("max_plan_revisions", self.max_plan_revisions)
 
 
+class _CancellationObserved(Exception):
+    """Raised only by `RunController._cancellation_check` and caught only
+    by `run()`, before its ordinary-exception boundary."""
+
+
+# ADR 0005 Amendment 1 section 3: the check sites that live inside
+# `_transition()` and `_dispatch_tool()`, named as in the D3 plan's table.
+# Every other non-abort transition or dispatch is a missing entry and fails
+# closed (KeyError) rather than skipping its check.
+_TRANSITION_CHECK_SITES: dict[domain.Trigger, str] = {
+    domain.Trigger.BASELINE_RECORDED: "C4",
+    domain.Trigger.PLAN_PROPOSED: "C12",
+    domain.Trigger.PLAN_RECORDED: "C13",
+    domain.Trigger.PLAN_REVISION_REQUESTED: "C16",
+    domain.Trigger.PLAN_APPROVED: "C17",
+    domain.Trigger.PATCH_APPLIED: "C20",
+    domain.Trigger.VERIFICATION_FAILED: "C23",
+}
+_DISPATCH_CHECK_SITES: dict[domain.ToolName, str] = {
+    domain.ToolName.READ_FILE: "C7",
+    domain.ToolName.PROPOSE_PLAN: "C11",
+    domain.ToolName.APPLY_PATCH: "C18",
+}
+
+
 class EventLog:
     """In-memory stand-in for the real EventSink (unbuilt). Its entire
     job is assigning and enforcing monotonic sequence numbers — real
@@ -444,8 +489,20 @@ class RunController:
       compared against RunConfig's budgets — a plan revision no longer
       consumes repair budget, and vice versa.
 
-    `RunFinished.iterations_used` is a count (`pass_index + 1`), not the
-    last zero-based `pass_index` value — see the docstring on `_finish`.
+    `RunFinished.iterations_used` is the number of exploration passes
+    begun — 0 for a run that ends before its first EXPLORE pass — see the
+    docstring on `_finish`.
+
+    Cancellation (ADR 0005 Amendment 1 section 3): after `RunStarted`, the
+    token is checked at the entry of every non-abort transition except
+    `RUN_STARTED`, every tool dispatch, every model request and every
+    verifier call, and immediately after every blocking collaborator
+    returns successfully and its completion event is emitted. Once a check
+    observes cancellation nothing new begins; the run ends through
+    `_terminate(CANCELLED)`. `activate()` and `RUN_STARTED` are exempt, and
+    the patch critical section (from the `APPLY_PATCH` dispatch check to
+    `PatchApplied` or its failure `ToolCompleted`) contains no check. A
+    returned operational failure keeps its existing path.
     """
 
     def __init__(
@@ -462,6 +519,7 @@ class RunController:
         clock: Clock | None = None,
         event_log: EventLog | None = None,
         lifecycle_owner: LifecycleOwnerPublisher | None = None,
+        cancellation: CancellationToken = NEVER_CANCELLED,
     ) -> None:
         self._c = config
         self._model = model
@@ -501,6 +559,27 @@ class RunController:
         # see _run_after_start() and _terminate() below.
         self._termination_started = False
         self._pass_index = 0
+        # ADR 0005 Amendment 1. `_cancellation_sites` records each check as
+        # (site, next event sequence) for the exhaustive sweep test only.
+        self._cancellation = cancellation
+        self._cancellation_sites: list[tuple[str, int]] = []
+        # The first `VerificationResult.deferred_interrupt` seen (cleanup
+        # unconfirmed dominated it); exposed, never raised, never persisted.
+        self._deferred_interrupt: BaseException | None = None
+        # Exploration passes begun (ADR 0005 Amendment 1 section 8).
+        self._passes_begun = 0
+
+    @property
+    def deferred_interrupt(self) -> BaseException | None:
+        """An exit-style interrupt the verifier retained while its cleanup
+        stayed unconfirmed (ADR 0005 Amendment 1 §12). The run still ends
+        through the ordinary cleanup-unconfirmed path; this keeps the second
+        fact observable to the caller."""
+        return self._deferred_interrupt
+
+    def _note_deferred_interrupt(self, result: VerificationResult) -> None:
+        if result.deferred_interrupt is not None and self._deferred_interrupt is None:
+            self._deferred_interrupt = result.deferred_interrupt
 
     def _now(self) -> datetime:
         return self._clock.now()
@@ -517,7 +596,18 @@ class RunController:
     def _emit(self, event: events.Event) -> None:
         self.log.append(event)
 
+    def _cancellation_check(self, site: str) -> None:
+        self._cancellation_sites.append((site, self.log.next_sequence()))
+        if self._cancellation.is_cancelled():
+            raise _CancellationObserved(site)
+
     def _transition(self, iteration: int, trigger: domain.Trigger) -> domain.TransitionResult:
+        if not (
+            trigger in domain.ABORT_TRIGGERS
+            or trigger is domain.Trigger.RUN_STARTED
+            or self._termination_started
+        ):
+            self._cancellation_check(_TRANSITION_CHECK_SITES[trigger])
         from_state = self.state
         result = domain.transition(from_state, trigger)
         self._emit(
@@ -542,7 +632,8 @@ class RunController:
         """Emit ToolRequested then PolicyDecisionRecorded for a legal
         tool call. Raises domain.IllegalToolCallError (fail closed) if
         the tool isn't legal in the current state — checked before
-        anything is emitted."""
+        anything is emitted. The cancellation check runs first."""
+        self._cancellation_check(_DISPATCH_CHECK_SITES[tool])
         domain.check_tool_call(self.state, tool)
         self._emit(
             events.ToolRequested(
@@ -582,8 +673,7 @@ class RunController:
         Deliberately narrow. Not covered: any `BaseException` that is not
         an `Exception` (`KeyboardInterrupt`/`SystemExit`/`GeneratorExit`
         propagate untouched by construction — they don't inherit from
-        `Exception`); signal-driven cancellation, which remains ADR
-        0005's domain (accepted, unimplemented); a failure during the
+        `Exception`); a failure during the
         `RunStarted` emission or `RUN_STARTED` transition above (outside
         this boundary — the event contract doesn't yet say whether
         terminalization is even valid before `RunStarted` exists in the
@@ -592,6 +682,11 @@ class RunController:
         `_termination_started` guard (see `_terminate()`) ensures is
         never converted into a second terminalization attempt — it
         propagates unchanged instead.
+
+        Cancellation (ADR 0005 Amendment 1): a check that observes the
+        token raises the private `_CancellationObserved`, caught here
+        before the ordinary-exception boundary and routed once through
+        `_terminate(CANCELLED)`.
         """
         c = self._c
 
@@ -610,14 +705,23 @@ class RunController:
         )
         self._transition(0, domain.Trigger.RUN_STARTED)
 
+        cancelled = False
         try:
             return self._run_after_start()
+        except _CancellationObserved:
+            if self._termination_started:
+                raise
+            cancelled = True
         except Exception:
             if self._termination_started:
                 raise
             # Fall through to the fallback _terminate() call below,
             # outside this handler. The exception is never bound to a
             # name anywhere in this block, so nothing here retains it.
+
+        if cancelled:
+            # Outside the handler, for the same clean-context reason as below.
+            return self._terminate(self._pass_index, domain.Trigger.CANCELLED)
 
         # Reached only when an ordinary Exception escaped
         # _run_after_start() and _terminate() had not yet started.
@@ -667,8 +771,11 @@ class RunController:
                         message="the run's lifecycle projection could not be confirmed active",
                     ),
                 )
+        self._cancellation_check("C1")
 
+        self._cancellation_check("C2")
         baseline_result = self._verifier.run_baseline()
+        self._note_deferred_interrupt(baseline_result)
         self._total_duration += baseline_result.duration_seconds
         self._emit(
             events.BaselineRecorded(
@@ -687,6 +794,8 @@ class RunController:
         )
         if baseline_result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED:
             self._any_verifier_cleanup_unconfirmed = True
+        if baseline_result.outcome is events.VerificationOutcome.CANCELLED:
+            return self._terminate(0, domain.Trigger.CANCELLED)
         if baseline_result.outcome not in (
             events.VerificationOutcome.PASSED,
             events.VerificationOutcome.TEST_FAILURE,
@@ -696,6 +805,7 @@ class RunController:
             # like) aborts the run outright — there's nothing to repair
             # towards yet.
             return self._terminate(0, domain.Trigger.UNRECOVERABLE_ERROR, error=baseline_result.error)
+        self._cancellation_check("C3")
         self._transition(0, domain.Trigger.BASELINE_RECORDED)
 
         pass_index = 0
@@ -706,6 +816,7 @@ class RunController:
 
         while True:
             self._pass_index = pass_index
+            self._passes_begun += 1
             plan, read_error = self._explore_and_propose_plan(pass_index)
             if plan is None:
                 # The read the model requested before proposing a plan
@@ -720,7 +831,17 @@ class RunController:
             self._transition(pass_index, domain.Trigger.PLAN_PROPOSED)
             self._transition(pass_index, domain.Trigger.PLAN_RECORDED)
 
-            decision = self._approval.decide(approval_visit)
+            self._cancellation_check("C14")
+            approval_cancelled = False
+            try:
+                decision = self._approval.decide(approval_visit)
+            except OperationCancelled:
+                # Only here: raised anywhere else it is an ordinary
+                # unexpected exception (UNCLASSIFIED_FAILURE). No
+                # ApprovalRecorded is emitted.
+                approval_cancelled = True
+            if approval_cancelled:
+                return self._terminate(pass_index, domain.Trigger.CANCELLED)
             self._emit(
                 events.ApprovalRecorded(
                     run_id=c.run_id,
@@ -733,6 +854,7 @@ class RunController:
                 )
             )
             approval_visit += 1
+            self._cancellation_check("C15")
 
             if decision is domain.ApprovalDecision.REJECTED:
                 return self._terminate(pass_index, domain.Trigger.PLAN_REJECTED)
@@ -764,10 +886,13 @@ class RunController:
                 return self._terminate(
                     pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error
                 )
+            self._cancellation_check("C19")
 
             self._transition(pass_index, domain.Trigger.PATCH_APPLIED)
 
+            self._cancellation_check("C21")
             verification_result = self._verifier.run(verification_attempt)
+            self._note_deferred_interrupt(verification_result)
             verification_attempt += 1
             self._total_duration += verification_result.duration_seconds
             if verification_result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED:
@@ -789,6 +914,15 @@ class RunController:
                     error=verification_result.error,
                 )
             )
+
+            if verification_result.outcome is events.VerificationOutcome.CANCELLED:
+                # Never the TEST_FAILURE repair branch.
+                return self._terminate(pass_index, domain.Trigger.CANCELLED)
+            if verification_result.outcome in (
+                events.VerificationOutcome.PASSED,
+                events.VerificationOutcome.TEST_FAILURE,
+            ):
+                self._cancellation_check("C22")
 
             if verification_result.outcome is events.VerificationOutcome.PASSED:
                 return self._terminate(pass_index, domain.Trigger.VERIFICATION_PASSED)
@@ -838,13 +972,17 @@ class RunController:
         patch or verification operational failure is)."""
         c = self._c
 
+        self._cancellation_check("C5")
         read_path = self._model.request_read_path()
+        self._cancellation_check("C6")
         read_result, read_error, read_tool_call_id = self._dispatch_read_file(
             iteration, read_path
         )
         if read_result is None:
             return None, read_error
+        self._cancellation_check("C8")
 
+        self._cancellation_check("C9")
         request_id = f"{c.run_id}-req-{iteration}"
         self._emit(
             events.ModelRequestStarted(
@@ -873,6 +1011,7 @@ class RunController:
                 tool_call_count=1,
             )
         )
+        self._cancellation_check("C10")
 
         tool_call_id = f"{c.run_id}-tc-plan-{iteration}"
         self._dispatch_tool(
@@ -1403,10 +1542,13 @@ class RunController:
         terminal_reason: domain.TerminalReason,
         error: OperationalError | None = None,
     ) -> events.RunFinished:
-        """`iterations_used` is a count of exploration passes actually
-        performed (`pass_index + 1`) — not `pass_index` itself, which is
-        a zero-based index. A run that reaches DONE on its very first
-        EXPLORE pass (`pass_index == 0`) reports `iterations_used == 1`.
+        """`iterations_used` is the number of exploration passes begun
+        (ADR 0005 Amendment 1 section 8, as corrected at implementation):
+        for every run that reached its first pass this equals
+        `pass_index + 1`, not the zero-based `pass_index` itself, so a run
+        that reaches DONE on its very first pass reports 1. A run that ends
+        before its first pass (activation failure, a baseline operational
+        failure or cleanup-unconfirmed, or cancellation at C1-C4) reports 0.
         """
         finished = events.RunFinished(
             run_id=self._c.run_id,
@@ -1418,7 +1560,7 @@ class RunController:
             total_cost_microusd=0,
             total_tokens=0,
             total_duration_seconds=self._total_duration,
-            iterations_used=pass_index + 1,
+            iterations_used=self._passes_begun,
             error=error,
         )
         self._emit(finished)

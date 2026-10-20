@@ -1860,3 +1860,338 @@ def test_fallback_terminate_teardown_failure_has_no_chained_collaborator_context
         text = repr(event)
         assert "boom-collaborator-should-never-be-chained" not in text
         assert "RuntimeError" not in text
+
+
+# --------------------------------------------------------------------
+# ADR 0005 Amendment 1 (ledger D3): safe points, approval cancellation,
+# terminal precedence, and iteration accounting.
+# --------------------------------------------------------------------
+
+from codeagent.cancellation import CancellationSource, OperationCancelled  # noqa: E402
+from codeagent.evidence import EvidenceReceipt  # noqa: E402
+from tests.support.fakes import CountingToken  # noqa: E402
+
+_LONGEST_PATH = dict(
+    approval_decisions=(
+        domain.ApprovalDecision.REVISION_REQUESTED,
+        domain.ApprovalDecision.APPROVED,
+        domain.ApprovalDecision.APPROVED,
+    ),
+    verification_outcomes=(events.VerificationOutcome.TEST_FAILURE, events.VerificationOutcome.PASSED),
+)
+_PASS = ["C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "C14", "C15"]
+# The complete ordered check-site list for the longest path: revision, then
+# a failed verification and repair, then a pass (plan section 3.2).
+_EXPECTED_SITES = (
+    ["C1", "C2", "C3", "C4"]
+    + _PASS + ["C16"]
+    + _PASS + ["C17", "C18", "C19", "C20", "C21", "C22", "C23"]
+    + _PASS + ["C17", "C18", "C19", "C20", "C21", "C22"]
+)
+_STARTS = (events.ToolRequested, events.ModelRequestStarted, events.PatchApplied, events.CheckpointCreated,
+           events.ApprovalRecorded, events.BaselineRecorded, events.VerificationCompleted, events.PlanProposed)
+
+
+def _sweep_controller(token, **overrides):
+    owner = FakeLifecycleOwnerPublisher()
+    kwargs = dict(_LONGEST_PATH, lifecycle_owner=owner)
+    kwargs.update(overrides)
+    controller = _build("r-sweep", **kwargs)
+    controller._cancellation = token
+    return controller, owner
+
+
+def _reference_sites():
+    controller, _ = _sweep_controller(CountingToken(None))
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED
+    return controller
+
+
+def test_reference_run_visits_every_check_site_in_order():
+    """M7/M9/M10: removing any check changes this exact list."""
+    controller = _reference_sites()
+    assert [site for site, _ in controller._cancellation_sites] == _EXPECTED_SITES
+
+
+def test_no_check_site_inside_the_patch_critical_section():
+    """M6: nothing between the APPLY_PATCH ToolRequested and PatchApplied."""
+    controller = _reference_sites()
+    log = controller.log.events
+    requests = [e.sequence for e in log
+                if isinstance(e, events.ToolRequested) and e.tool is domain.ToolName.APPLY_PATCH]
+    applied = [e.sequence for e in log if isinstance(e, events.PatchApplied)]
+    assert len(requests) == len(applied) == 2
+    for start, end in zip(requests, applied):
+        inside = [s for s, seq in controller._cancellation_sites if start < seq <= end]
+        assert inside == []
+        # C18 is the last check before the section, C19 the first after.
+        assert ("C18", start) in controller._cancellation_sites
+        assert ("C19", end + 1) in controller._cancellation_sites
+
+
+@pytest.mark.parametrize("n", range(1, len(_EXPECTED_SITES) + 1))
+def test_sweep_cancel_at_each_check(n):
+    controller, owner = _sweep_controller(CountingToken(n))
+    finished = controller.run()
+    log = controller.log.events
+
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED and finished.error is None
+    site, seq = controller._cancellation_sites[-1]
+    assert len(controller._cancellation_sites) == n and site == _EXPECTED_SITES[n - 1]
+    # Nothing new starts after the observing check: only teardown follows.
+    tail = log[seq:]
+    assert [type(e) for e in tail] == [events.EvidenceCaptured, events.StateTransitioned, events.RunFinished]
+    assert tail[1].trigger is domain.Trigger.CANCELLED
+    # Every started event is paired.
+    tool_ids = [e.tool_call_id for e in log if isinstance(e, events.ToolRequested)]
+    done_ids = [e.tool_call_id for e in log if isinstance(e, events.ToolCompleted)]
+    assert tool_ids == done_ids
+    assert [e.request_id for e in log if isinstance(e, events.ModelRequestStarted)] == [
+        e.request_id for e in log if isinstance(e, events.ModelResponseReceived)
+    ]
+    # Teardown reached COMPLETE (C1 is after activate(); M17).
+    assert owner.calls == ["activate", "begin_cleanup", "complete"]
+    assert controller._workspace.disposed
+    # Iteration accounting: 0 before the first pass (C1-C4), else passes begun.
+    # The pass counter increments before C5, so a pass whose C5 observed
+    # cancellation still counts as begun.
+    passes_begun = _EXPECTED_SITES[:n].count("C5")
+    assert finished.iterations_used == passes_begun
+
+
+def test_approval_operation_cancelled_terminates_cancelled_without_approval_recorded():
+    """M14."""
+
+    class Cancels:
+        def decide(self, visit_index):
+            raise OperationCancelled()
+
+    controller = _build("r-approval-cancel", approval=Cancels())
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED and finished.error is None
+    assert not any(isinstance(e, events.ApprovalRecorded) for e in controller.log.events)
+    assert not any(
+        isinstance(e, events.ToolRequested) and e.tool is domain.ToolName.APPLY_PATCH for e in controller.log.events
+    )
+
+
+def test_blocking_cancellable_approval_provider_with_a_real_source():
+    from tests.support.fakes import BlockingCancellableApprovalProvider
+
+    source = CancellationSource()
+    provider = BlockingCancellableApprovalProvider(source.token, on_wait=lambda: source.request("test"))
+    controller = _build("r-approval-blocking", approval=provider)
+    controller._cancellation = source.token
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED
+    assert not any(isinstance(e, events.ApprovalRecorded) for e in controller.log.events)
+
+
+def test_operation_cancelled_elsewhere_is_unclassified():
+    """M15: only `decide()` maps OperationCancelled to CANCELLED."""
+
+    class Model(FakeModel):
+        def propose_plan(self, read_result):
+            raise OperationCancelled()
+
+    controller = _build("r-oc-elsewhere", model=Model(PLAN))
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error.code is ErrorCode.UNCLASSIFIED_FAILURE
+
+
+class _ScriptedVerifier:
+    """Returns given results; `before` runs before each call (a test can set
+    the token there, modelling a signal during the call)."""
+
+    def __init__(self, baseline, runs, before=None):
+        self._baseline, self._runs, self._before = baseline, list(runs), before
+
+    @property
+    def command(self):
+        return ("true",)
+
+    def run_baseline(self):
+        if self._before:
+            self._before()
+        return self._baseline
+
+    def run(self, attempt_index):
+        if self._before:
+            self._before()
+        return self._runs[min(attempt_index, len(self._runs) - 1)]
+
+
+def _vr(outcome, *, exit_code=None, cleanup=events.ContainerCleanupStatus.CONFIRMED_ABSENT, code=None):
+    error = None if code is None else OperationalError(code=code, error_id=f"e-{outcome.value}", message="m")
+    return VerificationResult(outcome=outcome, exit_code=exit_code, duration_seconds=0.0, stdout="", stderr="",
+                              cleanup_status=cleanup, error=error)
+
+
+_TF = _vr(events.VerificationOutcome.TEST_FAILURE, exit_code=1)
+_CANCELLED = _vr(events.VerificationOutcome.CANCELLED)
+
+
+def test_baseline_cancelled_outcome_terminates_cancelled_with_zero_iterations():
+    controller = _build("r-bl-cancel", verifier=_ScriptedVerifier(_CANCELLED, [_TF]))
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED and finished.error is None
+    assert finished.iterations_used == 0
+    assert not any(isinstance(e, events.StateTransitioned) and e.trigger is domain.Trigger.BASELINE_RECORDED
+                   for e in controller.log.events)
+
+
+def test_verification_cancelled_outcome_never_feeds_the_repair_branch():
+    controller = _build("r-v-cancel", verifier=_ScriptedVerifier(_TF, [_CANCELLED]))
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED and finished.iterations_used == 1
+    assert not any(isinstance(e, events.StateTransitioned) and e.trigger is domain.Trigger.VERIFICATION_FAILED
+                   for e in controller.log.events)
+
+
+def _source():
+    return CancellationSource()
+
+
+def test_precedence_cleanup_unconfirmed_outranks_cancellation():
+    """M16, rank 1 over rank 5."""
+    source = _source()
+    unconfirmed = _vr(events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                      cleanup=events.ContainerCleanupStatus.UNCONFIRMED, code=ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE)
+    controller = _build("r-p1", verifier=_ScriptedVerifier(_TF, [unconfirmed], before=lambda: source.request("t")))
+    controller._cancellation = source.token
+    finished = controller.run()
+    # The baseline call sets the token; the baseline itself is fine, so C3 observes it.
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED
+
+    source2 = _source()
+    calls = {"n": 0}
+
+    def on_call():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            source2.request("t")
+
+    controller = _build("r-p1b", verifier=_ScriptedVerifier(_TF, [unconfirmed], before=on_call))
+    controller._cancellation = source2.token
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+
+
+def test_precedence_evidence_failure_outranks_cancellation():
+    receipt = EvidenceReceipt(success=False, complete=False, artifact_id=None, sha256_payload=None,
+                              bytes_written=None,
+                              error=OperationalError(code=ErrorCode.EVIDENCE_CAPTURE_FAILED, error_id="ev",
+                                                     message="m"))
+    controller = _build("r-p2", evidence_sink=FakeEvidenceSink(receipt))
+    controller._cancellation = CountingToken(1)
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+
+
+@pytest.mark.parametrize("which", ["read", "patch", "verification"])
+def test_precedence_returned_failure_outranks_a_pending_cancellation(which):
+    """Rank 4 over rank 5: the failed call's own code is reported."""
+    source = _source()
+    kwargs = {}
+    expected = None
+    if which == "read":
+        class Reader(FakeRepositoryReader):
+            def read_file(self, relative_path):
+                source.request("t")
+                return super().read_file(relative_path)
+
+        kwargs["reader"] = Reader(should_fail=True)
+        expected = ErrorCode.TOOL_INPUT_INVALID
+    elif which == "patch":
+        class Applier(FakePatchApplier):
+            def apply(self, run_id, iteration, approved_paths):
+                source.request("t")
+                return super().apply(run_id, iteration, approved_paths)
+
+        kwargs["patch_applier"] = Applier(should_fail=True)
+        expected = ErrorCode.PATCH_VALIDATION_FAILED
+    else:
+        env = _vr(events.VerificationOutcome.ENVIRONMENT_FAILURE, code=ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE)
+        calls = {"n": 0}
+
+        def on_call():
+            calls["n"] += 1
+            if calls["n"] == 2:
+                source.request("t")
+
+        kwargs["verifier"] = _ScriptedVerifier(_TF, [env], before=on_call)
+        expected = ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE
+    controller = _build(f"r-p4-{which}", **kwargs)
+    controller._cancellation = source.token
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert finished.error.code is expected
+
+
+def test_pending_cancellation_during_the_patch_is_observed_at_c19():
+    """M6/M8: the critical section completes; C19 is the first observer."""
+    source = _source()
+
+    class Applier(FakePatchApplier):
+        def apply(self, run_id, iteration, approved_paths):
+            source.request("t")
+            return super().apply(run_id, iteration, approved_paths)
+
+    controller = _build("r-patch-pending", patch_applier=Applier())
+    controller._cancellation = source.token
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED
+    assert controller._cancellation_sites[-1][0] == "C19"
+    assert any(isinstance(e, events.PatchApplied) for e in controller.log.events)
+    assert any(isinstance(e, events.CheckpointCreated) for e in controller.log.events)
+
+
+def test_cancellation_never_starts_a_patch():
+    """M8: a token observed at C18 means no APPLY_PATCH ToolRequested."""
+    controller = _build("r-c18")
+    controller._cancellation = CountingToken(None)
+    controller.run()
+    c18 = [i for i, (s, _) in enumerate(controller._cancellation_sites) if s == "C18"][0] + 1
+    controller = _build("r-c18b")
+    controller._cancellation = CountingToken(c18)
+    controller.run()
+    assert not any(isinstance(e, events.ToolRequested) and e.tool is domain.ToolName.APPLY_PATCH
+                   for e in controller.log.events)
+
+
+def test_iterations_used_is_zero_before_the_first_pass():
+    """Amendment 1 section 8 (as corrected at implementation): passes begun."""
+    owner = FakeLifecycleOwnerPublisher()
+    owner.activate_error = OwnerStatePublicationError(OwnerStatePublicationFailure.NOT_INSTALLED, "x")
+    assert _build("r-it-act", lifecycle_owner=owner).run().iterations_used == 0
+
+    env = _vr(events.VerificationOutcome.ENVIRONMENT_FAILURE, code=ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE)
+    assert _build("r-it-env", verifier=_ScriptedVerifier(env, [_TF])).run().iterations_used == 0
+
+    unconfirmed = _vr(events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                      cleanup=events.ContainerCleanupStatus.UNCONFIRMED, code=ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE)
+    finished = _build("r-it-unc", verifier=_ScriptedVerifier(unconfirmed, [_TF])).run()
+    assert finished.iterations_used == 0
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+
+
+def test_deferred_interrupt_is_exposed_while_cleanup_unconfirmed_ends_the_run():
+    """ADR 0005 Amendment 1 §12 (fourth correction): neither fact replaces
+    the other -- the run ends LIFECYCLE_CLEANUP_UNCONFIRMED and the exact
+    interrupt is observable on the controller."""
+    inst = KeyboardInterrupt("SENTINEL-ki")
+    unconfirmed = VerificationResult(
+        outcome=events.VerificationOutcome.ENVIRONMENT_FAILURE, exit_code=None, duration_seconds=0.0,
+        stdout="", stderr="", cleanup_status=events.ContainerCleanupStatus.UNCONFIRMED,
+        error=OperationalError(code=ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE, error_id="e", message="m"),
+        deferred_interrupt=inst,
+    )
+    controller = _build("r-deferred", verifier=_ScriptedVerifier(unconfirmed, [_TF]))
+    finished = controller.run()
+    assert finished.error.code is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+    assert controller.deferred_interrupt is inst
+    assert all("SENTINEL" not in repr(e) for e in controller.log.events)

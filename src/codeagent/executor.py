@@ -62,13 +62,15 @@ lifecycle projection is written anywhere in this module.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
 import re
+import signal
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, unique
 from pathlib import Path
 from uuid import uuid4
@@ -76,6 +78,13 @@ from uuid import uuid4
 from codeagent import container_lifecycle, events
 from codeagent import _docker_ownership as docker_ownership
 from codeagent._bounded_subprocess import BoundedProcessError, BoundedProcessFailure, run_bounded_stdout
+from codeagent.cancellation import (
+    NEVER_CANCELLED,
+    CancellationToken,
+    WaitResult,
+    attach_cleanup_failures,
+    wait_cancellable,
+)
 from codeagent.controller import Clock, SystemClock, VerificationResult
 from codeagent.errors import ErrorCode, OperationalError
 
@@ -90,6 +99,12 @@ DEFAULT_COMMAND: tuple[str, ...] = ("python3", "-B", "-m", "unittest", "tests.te
 _DIGEST_PINNED_IMAGE_RE = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
 
 _MAX_STREAM_BYTES = 64 * 1024
+
+# After the attach client's process group is killed (timeout or
+# cancellation), how long to wait for it to be reaped before a direct
+# `kill()` fallback and an unbounded reap.
+_ATTACH_KILL_GRACE_SECONDS = 5.0
+_ATTACH_GROUP_UNCONFIRMED = "the verification attach client could not be confirmed terminated"
 
 # Slice 3B-4: fixed, documented, per-command bounds and timeouts for
 # every non-streaming Docker control-plane command — never one
@@ -469,6 +484,102 @@ def _effective_container_user() -> str:
     return f"{uid}:{gid}"
 
 
+@dataclass
+class _AttachAbort:
+    """Internal record of one attach-client abort (never raised or
+    persisted). `failures_in_order` holds every failure as `(step, exact
+    instance)` in the order it occurred, `BaseException`s included; the
+    per-step lists and counts let fault-injection tests assert identity."""
+
+    wait_failure: BaseException | None = None
+    group_failure: BaseException | None = None
+    group_probe_absent: bool | None = None
+    probe_failure: BaseException | None = None
+    kill_failures: list = field(default_factory=list)
+    reap_failures: list = field(default_factory=list)
+    failures_in_order: list = field(default_factory=list)
+    kills: int = 0
+    reaps: int = 0
+    reaped: bool = False
+
+    def retain(self, step: str, exc: BaseException) -> None:
+        self.failures_in_order.append((step, exc))
+
+    @property
+    def confirmed(self) -> bool:
+        return self.reaped and (self.group_failure is None or bool(self.group_probe_absent))
+
+    @property
+    def deferred_interrupt(self) -> BaseException | None:
+        """The first retained `BaseException` that is not an `Exception`
+        (`KeyboardInterrupt`, `SystemExit`, ...), re-raised by
+        `DockerVerifier._execute` only after removal by id has run."""
+        for _step, exc in self.failures_in_order:
+            if not isinstance(exc, Exception):
+                return exc
+        return None
+
+
+def _abort_attach_client(proc, record: _AttachAbort) -> _AttachAbort:
+    """Abort the `docker start --attach` client (ADR 0005 Amendment 1 §12).
+    Never raises: every failure, `BaseException`s included, is retained in
+    `record` so that the caller still returns the container id for removal
+    by id. A retained non-`Exception` (for example `KeyboardInterrupt`) is
+    re-raised later, by `DockerVerifier._execute`, after that removal.
+
+    Contract, pinned by tests:
+    1. One `os.killpg(SIGKILL)`. `ProcessLookupError` = group absent; any
+       other failure is retained.
+    2. A direct `kill()` only if the group kill raised, then one bounded
+       reap (`_ATTACH_KILL_GRACE_SECONDS`).
+    3. If that reap is not confirmed (timeout or failure): exactly one retry
+       `kill()` and one more bounded reap. So at most two direct kills and
+       two reaps; never an unbounded wait.
+    4. After a confirmed reap, a failed group kill is re-checked once with a
+       signal-0 probe (never a kill); only `ProcessLookupError` confirms the
+       group has no member left (macOS reports `PermissionError` for a group
+       whose only member is its exited, unreaped leader)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+        group_killed = True
+    except ProcessLookupError:
+        group_killed = False
+    except BaseException as caught:  # noqa: BLE001 - retained; never escapes
+        record.group_failure = caught
+        record.retain("group_kill", caught)
+        group_killed = False
+    for attempt in range(2):
+        if attempt == 1 or not group_killed:
+            record.kills += 1
+            try:
+                proc.kill()
+            except BaseException as caught:  # noqa: BLE001 - retained; the reap still runs
+                record.kill_failures.append(caught)
+                record.retain("kill", caught)
+        record.reaps += 1
+        try:
+            proc.wait(timeout=_ATTACH_KILL_GRACE_SECONDS)
+            record.reaped = True
+            break
+        except subprocess.TimeoutExpired:
+            pass  # never retained: its text names argv
+        except BaseException as caught:  # noqa: BLE001 - retained
+            record.reap_failures.append(caught)
+            record.retain("reap", caught)
+    if record.group_failure is not None and record.reaped:
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            record.group_probe_absent = True
+        except BaseException as caught:  # noqa: BLE001 - retained; unconfirmed
+            record.group_probe_absent = False
+            record.probe_failure = caught
+            record.retain("probe", caught)
+        else:
+            record.group_probe_absent = False
+    return record
+
+
 class DockerVerifier:
     def __init__(
         self,
@@ -479,6 +590,7 @@ class DockerVerifier:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         clock: Clock | None = None,
         lifecycle_context: DockerVerifierLifecycleContext | None = None,
+        cancellation: CancellationToken = NEVER_CANCELLED,
     ) -> None:
         resolved = Path(worktree_path).resolve()
         if not resolved.is_dir():
@@ -518,6 +630,13 @@ class DockerVerifier:
         # `_attempt`/`_execute`/`_cleanup` methods, untouched by this
         # slice, remain the sole code path.
         self._lifecycle_context = lifecycle_context
+        # The last attach-client abort's internal record (`_AttachAbort`), for
+        # identity-based fault-injection tests only; never persisted.
+        self._last_attach_abort: _AttachAbort | None = None
+        self._last_container_cleanup_confirmed = True
+        # ADR 0005 Amendment 1 section 5: observed at entry and during the
+        # sliced attach wait only.
+        self._cancellation = cancellation
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -670,7 +789,7 @@ class DockerVerifier:
             )
 
         try:
-            exit_code, status, oom_killed, stdout_text, stderr_text, timed_out = (
+            exit_code, status, oom_killed, stdout_text, stderr_text, timed_out, cancelled, attach_unconfirmed = (
                 self._start_and_inspect(container_id)
             )
         except _DockerLaunchError:
@@ -694,6 +813,28 @@ class DockerVerifier:
                 container_id,
             )
 
+        if attach_unconfirmed:
+            return (
+                create_attempted,
+                True,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE,
+                None,
+                stdout_text,
+                stderr_text,
+                self._error(ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE, label, _ATTACH_GROUP_UNCONFIRMED),
+                container_id,
+            )
+        if cancelled:
+            return (
+                create_attempted,
+                True,
+                events.VerificationOutcome.CANCELLED,
+                None,
+                stdout_text,
+                stderr_text,
+                None,
+                container_id,
+            )
         if timed_out:
             return (
                 create_attempted,
@@ -788,7 +929,57 @@ class DockerVerifier:
     def _execute(
         self, label: str, *, role: container_lifecycle.ContainerRole | None = None
     ) -> VerificationResult:
+        """Runs one attempt. A non-`Exception` `BaseException` (for example
+        `KeyboardInterrupt`) retained by the attach-client abort can never
+        bypass the attempt's container cleanup by id. It is re-raised here,
+        as the exact instance, only after fully confirmed cleanup (client
+        reaped, group gone, container confirmed absent, and on the
+        lifecycle-aware path `ABSENT` durably published). If any of that is
+        unconfirmed, the sanitized failure result is returned instead,
+        carrying the interrupt as `VerificationResult.deferred_interrupt`."""
+        self._last_attach_abort = None
+        self._last_container_cleanup_confirmed = True
+        result = self._execute_attempt(label, role=role)
+        abort = self._last_attach_abort
+        interrupt = abort.deferred_interrupt if abort is not None else None
+        if interrupt is None:
+            return result
+        body_primary = abort.wait_failure is not None and isinstance(abort.wait_failure, Exception)
+        if abort.confirmed and self._last_container_cleanup_confirmed and not body_primary:
+            # Every obligation confirmed: client reaped, group gone, container
+            # removed and confirmed absent (and `ABSENT` durably published on
+            # the lifecycle-aware path). Only now, the exact instance, with
+            # every other retained failure attached in order (fifth
+            # correction: one precedence model).
+            others = [exc for _step, exc in abort.failures_in_order]
+            # By identity, never `==` (a custom `__eq__` could raise); only the
+            # primary's own position is left out.
+            position = next(i for i, exc in enumerate(others) if exc is interrupt)
+            attach_cleanup_failures(interrupt, others[:position] + others[position + 1:])
+            raise interrupt
+        # An ordinary wait failure (L2's body failure) stays primary even
+        # after confirmed cleanup; a later interrupt never replaces it.
+        # Cleanup dominance: the sanitized failure result stands, carrying
+        # the interrupt by identity; neither fact replaces the other.
+        return dataclasses.replace(result, deferred_interrupt=interrupt)
+
+    def _execute_attempt(
+        self, label: str, *, role: container_lifecycle.ContainerRole | None = None
+    ) -> VerificationResult:
         start = self._clock.monotonic()
+
+        if self._cancellation.is_cancelled():
+            # Entry check (ADR 0005 Amendment 1 section 5): before any
+            # lifecycle publication or Docker call, so nothing exists to
+            # clean up.
+            return VerificationResult(
+                outcome=events.VerificationOutcome.CANCELLED,
+                exit_code=None,
+                duration_seconds=self._clock.monotonic() - start,
+                stdout="",
+                stderr="",
+                cleanup_status=events.ContainerCleanupStatus.NOT_APPLICABLE,
+            )
 
         if self._lifecycle_context is None:
             # Legacy path: completely unchanged from before Slice 3B-6.
@@ -808,6 +999,9 @@ class DockerVerifier:
             confirmed_absent = self._cleanup(name, container_id) if create_attempted else True
             cleanup_status = self._cleanup_status_for(
                 create_attempted=create_attempted, confirmed_absent=confirmed_absent
+            )
+            self._last_container_cleanup_confirmed = (
+                cleanup_status is not events.ContainerCleanupStatus.UNCONFIRMED
             )
 
             duration = self._clock.monotonic() - start
@@ -895,6 +1089,10 @@ class DockerVerifier:
                         "verification container could not be confirmed removed",
                     )
 
+        self._last_container_cleanup_confirmed = (
+            disposition in (_CleanupDisposition.CONFIRMED_ABSENT, _CleanupDisposition.NOT_APPLICABLE)
+            and not absent_publish_failed
+        )
         cleanup_status = {
             _CleanupDisposition.NOT_APPLICABLE: events.ContainerCleanupStatus.NOT_APPLICABLE,
             _CleanupDisposition.UNCONFIRMED_DEFERRED: events.ContainerCleanupStatus.UNCONFIRMED,
@@ -1050,8 +1248,8 @@ class DockerVerifier:
             )
 
         try:
-            exit_code, status, oom_killed, stdout_text, stderr_text, timed_out = self._start_and_inspect(
-                container_id
+            exit_code, status, oom_killed, stdout_text, stderr_text, timed_out, cancelled, attach_unconfirmed = (
+                self._start_and_inspect(container_id)
             )
         except _DockerLaunchError:
             return _AttemptResult(
@@ -1062,6 +1260,20 @@ class DockerVerifier:
                 ),
             )
 
+        if attach_unconfirmed:
+            return _AttemptResult(
+                create_attempted, container_id, _CleanupDisposition.REQUIRES_ID_CLEANUP,
+                events.VerificationOutcome.ENVIRONMENT_FAILURE, None, stdout_text, stderr_text,
+                self._error(ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE, label, _ATTACH_GROUP_UNCONFIRMED),
+            )
+        if cancelled:
+            # Observed while the attach client was still running; it was
+            # group-killed and reaped. Cleanup by immutable id follows, and
+            # an unconfirmed cleanup is rewritten to ENVIRONMENT_FAILURE.
+            return _AttemptResult(
+                create_attempted, container_id, _CleanupDisposition.REQUIRES_ID_CLEANUP,
+                events.VerificationOutcome.CANCELLED, None, stdout_text, stderr_text, None,
+            )
         if timed_out:
             return _AttemptResult(
                 create_attempted, container_id, _CleanupDisposition.REQUIRES_ID_CLEANUP,
@@ -1354,7 +1566,7 @@ class DockerVerifier:
 
     def _start_and_inspect(
         self, container_id: str
-    ) -> tuple[int | None, str | None, bool | None, str, str, bool]:
+    ) -> tuple[int | None, str | None, bool | None, str, str, bool, bool, bool]:
         """`docker start --attach` and the final-state `docker inspect`
         both target `container_id` (Slice 3B-4) — the immutable
         identity Docker itself confirmed at create time, never the
@@ -1363,7 +1575,23 @@ class DockerVerifier:
         method; a `_DockerLaunchError` or `_DockerControlPlaneFailure`
         from the inspect step is folded into a malformed-inspection
         return (`None, None, None, ...`) instead, the same treatment a
-        malformed or unparseable inspect payload already gets."""
+        malformed or unparseable inspect payload already gets.
+
+        ADR 0005 Amendment 1: the attach client runs in its own session, and
+        the wait is sliced so the cancellation token is observed. If the
+        token is observed while the client is still running, or the time
+        budget expires, the client's process group is killed before it is
+        reaped, and inspection is skipped (`cancelled`/`timed_out`). If the
+        client exited first, its genuine outcome stands.
+
+        The last element, `attach_unconfirmed`, is True when the attach
+        client's abort (`_abort_attach_client`) could not confirm that the
+        client and its process group are gone, or when the sliced wait
+        itself failed. Every failure is retained in `self._last_attach_abort`
+        and never raised. Callers then fail closed: `ENVIRONMENT_FAILURE`
+        with fixed text, never `CANCELLED` or `TIMEOUT`, while the known
+        container id is still returned so the container is removed by id
+        and its absence confirmed as usual."""
         stdout_collector = _BoundedCollector(_MAX_STREAM_BYTES)
         stderr_collector = _BoundedCollector(_MAX_STREAM_BYTES)
         try:
@@ -1371,6 +1599,7 @@ class DockerVerifier:
                 ["docker", "start", "--attach", container_id],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=True,
             )
         except OSError as exc:
             raise _DockerLaunchError(str(exc)) from exc
@@ -1384,38 +1613,45 @@ class DockerVerifier:
         stdout_thread.start()
         stderr_thread.start()
 
-        timed_out = False
+        abort = _AttachAbort()
         try:
-            proc.wait(timeout=self._timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            proc.kill()
-            proc.wait()
+            waited = wait_cancellable(proc, timeout=self._timeout_seconds, token=self._cancellation)
+        except BaseException as caught:  # noqa: BLE001 - an unobservable wait: abort, fail closed
+            abort.wait_failure = caught
+            abort.retain("wait", caught)
+            waited = None
+        timed_out = waited is WaitResult.TIMED_OUT
+        cancelled = waited is WaitResult.CANCELLED
+        attach_unconfirmed = False
+        if waited is not WaitResult.EXITED:
+            _abort_attach_client(proc, abort)
+            attach_unconfirmed = abort.wait_failure is not None or not abort.confirmed
+        self._last_attach_abort = abort
         stdout_thread.join(timeout=5)
         stderr_thread.join(timeout=5)
 
         stdout_text = stdout_collector.text()
         stderr_text = stderr_collector.text()
 
-        if timed_out:
-            return None, None, None, stdout_text, stderr_text, True
+        if waited is not WaitResult.EXITED:
+            return None, None, None, stdout_text, stderr_text, timed_out, cancelled, attach_unconfirmed
 
         try:
             inspect_result = _run_docker(
                 "inspect", "--format", "{{json .State}}", container_id, limit=_INSPECT_STATE_MAX_BYTES
             )
         except (_DockerLaunchError, _DockerControlPlaneFailure):
-            return None, None, None, stdout_text, stderr_text, False
+            return None, None, None, stdout_text, stderr_text, False, False, False
         if inspect_result.returncode != 0:
-            return None, None, None, stdout_text, stderr_text, False
+            return None, None, None, stdout_text, stderr_text, False, False, False
 
         try:
             inspect_text = inspect_result.stdout.decode("utf-8")
         except UnicodeDecodeError:
-            return None, None, None, stdout_text, stderr_text, False
+            return None, None, None, stdout_text, stderr_text, False, False, False
 
         exit_code, status, oom_killed = self._parse_state(inspect_text)
-        return exit_code, status, oom_killed, stdout_text, stderr_text, False
+        return exit_code, status, oom_killed, stdout_text, stderr_text, False, False, False
 
     @staticmethod
     def _parse_state(raw_state: str) -> tuple[int | None, str | None, bool | None]:
