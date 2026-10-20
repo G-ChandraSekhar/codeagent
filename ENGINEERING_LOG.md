@@ -7117,3 +7117,35 @@ and reverse. Full suite 4,636 passed, 2 skipped; the skips are the macOS
 non-UTF-8-name tests. No leftovers; `git diff --check` clean; nothing
 staged; `uv.lock` untouched. Supersedes earlier D4a totals. Not committed;
 no Linux CI.
+
+## 2026-10-20 — D4a: Linux CI evidence reconciliation
+
+**What.** A documentation-only pass recording that commit `efdac7f` (an
+ordinary fast-forward, `8345fac..efdac7f`) passed GitHub Actions run
+[39476859443](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39476859443).
+The run was push-triggered and completed with `success`; its head SHA
+matches the commit exactly. This was re-verified independently through the
+Actions API and a freshly fetched raw job log. Every step of the single job
+succeeded, and the log has no error annotation. Docker was required and
+available. The pinned verification image reported `linux/amd64`. The
+dedicated Docker step's tests are all named as passing. The complete suite
+had no failures, and its collected total matched the local total. The
+leftover-container check was empty. No code, test, workflow, configuration,
+dependency or design change was made.
+
+**Limits.** The complete-suite step uses `pytest -q`, which does not
+identify its skipped tests; they are not named or attributed here. There is
+no named CI evidence for the two non-UTF-8-filename tests. The earlier
+disposable local Linux container run (MR42) remains their only named
+evidence. This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test
+evidence, not a security review.
+
+**Unchanged.**
+- The accepted residual interrupt window between `os.open` returning and
+  entry into the ownership guard.
+- D4a does not complete ledger D4; D4b has not started, and no model drives
+  a run.
+- The ledger, threat-model and ADR 0007 updates remain deferred to D4b.
+- No threat is newly mitigated.
+- The earlier D4a entries' "uncommitted, no Linux CI" wording is historical.
+- `uv.lock` was not touched.

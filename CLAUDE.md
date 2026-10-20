@@ -3149,9 +3149,24 @@ Stage 2 (of the four-stage planning process in
     unchanged; T-F1 gains cooperative-cleanup evidence only. Automated-test
     evidence, not a security review.
 - **Ledger D4a: descriptor-relative repository toolkit** (D4 plan
-  revisions 5 and 6, accepted 2026-10-20) is **implemented and locally
-  verified on macOS (2026-10-20), uncommitted, with no Linux CI**. It is a
-  prerequisite and does not complete ledger D4 (only D4b does).
+  revisions 5 and 6, accepted 2026-10-20) is **implemented, locally
+  verified on macOS (2026-10-20), committed (`efdac7f`) as an ordinary
+  fast-forward over `8345fac`, and confirmed on GitHub-hosted Linux CI**
+  (run
+  [39476859443](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39476859443),
+  push-triggered, `success`; the result is summarized in `ENGINEERING_LOG.md`'s
+  D4a Linux-CI entry). It is a prerequisite and does not complete ledger D4
+  (only D4b does). D4b has not started, and D4a alone does not make a model
+  drive a run. (Historical: the bullets below record the pre-commit local
+  work; their earlier "uncommitted, no Linux CI" wording was true then.)
+  - **Linux CI evidence limits:**
+    - The complete-suite step uses `pytest -q`, which does not identify its
+      skipped tests. Their identities are not recorded or inferred here.
+    - There is no named CI evidence for the two non-UTF-8-filename tests.
+      The only named evidence for them is the earlier disposable local
+      Linux container run (MR42).
+    - This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence,
+      not a security review.
   - **What it adds:**
     - `tool_schema.py`, the neutral tool contract;
     - `repo_tools.py`: `list_directory`, ranged `read_file` and in-process
@@ -3168,14 +3183,19 @@ Stage 2 (of the four-stage planning process in
     ownership, root registration inside the ownership guard, and the
     bytes-read scan cap):**
     - full suite: 4,636 passed, 2 skipped (both non-UTF-8-filename tests,
-      which macOS APFS refuses; they pass under Linux in the pinned image);
+      which macOS APFS refuses; they passed in a disposable local Linux
+      container using the pinned image, not in CI);
     - 56 mutations on macOS, 55 caught by assertion and 1 by a time guard,
-      plus MR42 caught under Linux;
+      plus MR42 caught in that local Linux container;
     - no leftover resources.
   - **Deviations:** see `ENGINEERING_LOG.md`'s 2026-10-20 D4a entry.
+  - **Accepted residual:** an interrupt in the instant between `os.open`
+    returning and entry into the ownership guard can still leak the root
+    descriptor.
   - **Deferred:** ledger, threat-model and ADR 0007 updates wait for D4b.
-- **Next:** D4 (model-driven exploration and repair loop) is the
-  recommended next primary slice, since no model drives a run. D4 and D5 are
+- **Next:** D4b (the model-driven exploration and repair loop, which
+  completes ledger D4) is the recommended next primary slice, since no
+  model drives a run. D4 and D5 are
   prerequisites for D6; D5's substrate waits for the C-1 ADR 0004 amendment,
   and D5's integration depends on D4. Remaining planning range D4–D10:
   228–460 h (cumulative D1–D10 314–600 h; D1–D3 86–140 h) — component
