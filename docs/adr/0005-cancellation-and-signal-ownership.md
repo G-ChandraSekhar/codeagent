@@ -2,11 +2,11 @@
 
 Status: Accepted (2026-09-15)
 
-Implementation status: **Amendment 1's mechanism is implemented and
-verified locally (macOS, 2026-10-19), uncommitted; Linux CI pending** (see
-Amendment 1 §12). It is exercised only through a test-only driver around the
-internal composition; `main()` installs no handler before D6. The original
-2026-09-15 text below is unchanged.
+Implementation status: **Amendment 1's mechanism is implemented, committed
+as `e84e0e0`, and Linux-CI-confirmed** (run 39354731489; local evidence in
+Amendment 1 §12, CI evidence in §13). It is exercised only through a test-only
+driver around the internal composition; `main()` installs no handler before
+D6. The original 2026-09-15 text below is unchanged.
 
 ## Context
 
@@ -160,7 +160,8 @@ Production findings from reading `src/codeagent/executor.py`,
 ## Amendment 1 (Accepted 2026-10-06): entrypoint-owned cancellation mechanism, precise safe points, and process isolation (ledger D3)
 
 **Status: Accepted 2026-10-06** after joint review. Implemented and verified
-locally 2026-10-19, uncommitted; Linux CI pending (§12). Ledger
+locally 2026-10-19 (§12); committed as `e84e0e0` and Linux-CI-confirmed
+2026-10-20 (§13). Ledger
 deliverable D3. This amendment refines the accepted decision above; where it
 says otherwise, it supersedes the specific sentence it names. Every other part
 of the decision, the consequences, and the rejected alternatives stands
@@ -520,6 +521,10 @@ The estimate is 38–60 focused hours (the ledger says 20–40). The ledger is
 not modified until implementation changes D3's status.
 
 ### 12. Local implementation evidence (2026-10-19; uncommitted, Linux CI pending)
+
+*Historical local evidence, recorded before the commit. Its "uncommitted",
+"Linux CI pending" and "Gate O is not satisfied" statements are superseded by
+§13.*
 
 **Status.** Implemented and verified locally on macOS (Docker 29.8.0, already
 running), on top of `e4426a1`. Not committed, not pushed, no Linux CI run.
@@ -912,3 +917,52 @@ only until Linux CI; on macOS `ps` exposes no session id, so E12's session check
 there rests on the inventory pin, the shim tests and `pgid == pid`; gated tests
 fail on a deadline (up to 300 s) rather than hang; automated-test evidence, not
 a security review.
+
+### 13. Linux CI evidence (2026-10-20)
+
+**Commit and run.** Commit `e84e0e0b6dd821401bbc934facb4d6b984d23cd8`, pushed
+to `main` as an ordinary fast-forward (`e4426a1..e84e0e0`). GitHub Actions run
+[39354731489](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39354731489):
+push-triggered, head `e84e0e0b6dd821401bbc934facb4d6b984d23cd8`, status
+`completed`, conclusion `success` (started 01:40:23Z, updated 01:43:56Z).
+Verified independently through the Actions API and a freshly fetched raw job
+log.
+
+- **Job:** "Test (ubuntu-24.04, Python 3.12)"; all 13 API-reported steps
+  `success`; the raw log contains no `##[error]` line.
+- **Environment:** runner image `ubuntu-24.04` (version 20261012.334.1),
+  Ubuntu 24.04.5; CPython 3.12.15; Docker client and server 28.0.4. The
+  mandatory Docker preflight passed, and the pinned verification image
+  (`python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`)
+  reported `linux/amd64`.
+- **Dedicated Docker step:** `python -m pytest
+  tests/integration/test_slice_c.py tests/integration/test_cancellation_e2e.py
+  -v` with `CODEAGENT_REQUIRE_DOCKER: 1` in that step's environment:
+  **14 passed in 14.10s**, each named `PASSED` in the log — the four Slice C
+  tests and the ten cancellation tests E1–E10 (E1/E2 baseline, E3/E4
+  verification, E5/E6 approval wait, E7 serialized repeated signals during
+  gated cleanup, E8 cleanup-unconfirmed reconciliation, E9 signal during the
+  patch, E10 signal during admission). E11 (handler restoration) and E12
+  (attach-client identity) are assertions exercised inside those tests, not
+  separately named pytest cases.
+- **Complete suite:** `python -m pytest -q` with `CODEAGENT_REQUIRE_DOCKER: 1`
+  in that step's environment: **4,398 passed, 3 skipped, 0 failed in
+  179.34s**; 4,398 + 3 = 4,401, matching the local collected total. `pytest
+  -q` does not name the three skips, so they are not identified here. Docker
+  was required and available in that step, so they are not attributable to
+  missing Docker.
+- **Leftover check:** the anchored
+  `^codeagent-(verify-|baseline-|verification-)` filter over a full `docker ps
+  -a` name listing, covering all three container families, printed no match,
+  and the step succeeded.
+
+**Gate O.** With this run, D1, D2 and D3 are all implemented, committed and
+Linux-CI-confirmed, so Gate O is satisfied (§9). That only permits D6 to wire
+the first operator run. It does not make cancellation operator-reachable,
+create `codeagent solve`, or meet Gate α or public v1; D6 must run `solve`
+inside `cli.owned_cancellation()` and repeat the real-signal proof through the
+actual operator command, and owns operator exit codes.
+
+**Limits.** GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence only,
+not a security review and not a general Linux or ARM64 claim. The non-claims in
+§10 and the L3/L6 direct-child timeout residual stand.

@@ -2911,7 +2911,7 @@ Stage 2 (of the four-stage planning process in
     tests, so D1's tests running is inferred from the matching total, not
     named in the log; GitHub-hosted `ubuntu-24.04` x86_64 automated-test
     evidence only, not a security review.
-  - **Not done:** D2 and D3 (Gate O stays unsatisfied); the run-time
+  - **Not done at D1 landing:** D2 and D3 (Gate O then stayed unsatisfied); the run-time
     admission warning (a mandatory D6 test). The A4 same-user race stays
     open; T-E1, T-F1 and T-F2 are not newly mitigated; abandonment still
     refuses while an observer's own cleanup cannot be confirmed.
@@ -2982,13 +2982,23 @@ Stage 2 (of the four-stage planning process in
     automated-test evidence, not a security review.
   - **Boundaries:** no cross-resource atomicity; A4 races remain open; a late
     orphaned Docker child can still force a refusal; abandonment is unchanged.
-    T-F1 gains partial, reconciler-level coverage for these two accepted shapes only. **Gate
-    O remains unsatisfied until D3.**
+    T-F1 gains partial, reconciler-level coverage for these two accepted shapes only. **At D2
+    landing, Gate O remained unsatisfied pending D3.**
 - **Ledger D3: entrypoint-owned cancellation (ADR 0005 Amendment 1,
-  Accepted 2026-10-06)** is **implemented and verified locally on macOS
-  (2026-10-19); uncommitted, unpushed, Linux CI pending.** Gate O is **not**
-  satisfied: Amendment 1 §9 requires commit and a successful Linux CI run
-  first, and even then operator cancellation is unreachable before D6.
+  Accepted 2026-10-06)** is **implemented, locally verified on macOS
+  (2026-10-19), committed (`e84e0e0b6dd821401bbc934facb4d6b984d23cd8`) as an
+  ordinary fast-forward over `e4426a1`, and confirmed on GitHub-hosted Linux
+  CI** (run
+  [39354731489](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39354731489),
+  push-triggered, `success`; full evidence in ADR 0005 Amendment 1 §13).
+  **Gate O is satisfied (2026-10-20)**: D1–D3 are implemented, committed and
+  Linux-CI-confirmed. That only permits D6 to wire the first operator run:
+  operator cancellation is unreachable before D6, which must run `solve`
+  inside `cli.owned_cancellation()` and repeat the real-signal proof through
+  the actual command. Not operator-ready; Gate α and public v1 unmet.
+  (Historical: the bullets below describe the pre-commit local work and its
+  six corrections; their "uncommitted"/"Linux CI pending" wording was true
+  at the time.)
   - **What it adds:** `src/codeagent/cancellation.py` (main-thread-only,
     append-based `CancellationSource`, read-only `CancellationToken`,
     `NEVER_CANCELLED`, `OperationCancelled`, `CancellationThreadError`, the
@@ -3138,6 +3148,13 @@ Stage 2 (of the four-stage planning process in
     disposed); SIGKILL/SIGHUP/SIGQUIT rely on reconciliation; T-E1 and T-F2
     unchanged; T-F1 gains cooperative-cleanup evidence only. Automated-test
     evidence, not a security review.
+- **Next:** D4 (model-driven exploration and repair loop) is the
+  recommended next primary slice, since no model drives a run. D4 and D5 are
+  prerequisites for D6; D5's substrate waits for the C-1 ADR 0004 amendment,
+  and D5's integration depends on D4. Remaining planning range D4–D10:
+  228–460 h (cumulative D1–D10 314–600 h; D1–D3 86–140 h) — component
+  planning estimates, not hours spent or commitments
+  (`docs/V1_COMPLETION_LEDGER.md`).
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

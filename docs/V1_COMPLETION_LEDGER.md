@@ -35,8 +35,8 @@ Labels used throughout:
 | Total product completion | **~25–35%** [inference]. **None** of the 11 frozen v1 criteria (§1.2) has objective evidence through the operator path; several are partially supported by internal mechanisms. |
 | Strongest completed capability | **Mechanism-verified** resource lifecycle safety: a real worktree, an owned checkpoint ref, and a lifecycle-labelled Docker verifier with durable write-ahead state. Automatic reconciliation covers the documented single-resource and worktree→ref crash shapes, and D2's two container→worktree→ref shapes (ADR 0004 Amendment 19), proven with real Git, Docker and SIGKILL tests in Linux CI. It is reachable only through test-called internal code. |
 | Largest missing product capability | **No model drives a run.** There is no model adapter [absent], no multi-tool loop, and no list/search tools. The patch applied is **supplied by the caller at construction** (`_lifecycle_run.run_lifecycle_aware(patch_operations=...)`), not proposed by a model. |
-| Next release-blocking dependency | **D3 — CLI ownership boundary plus ADR 0005 cancellation: implemented and verified locally (macOS, 2026-10-19), uncommitted; Linux CI pending** (ADR 0005 Amendment 1, Accepted 2026-10-06). Gate O remains unsatisfied until D3 is committed and its Linux CI run succeeds. (D2 is complete: ADR 0004 Amendment 19, Accepted 2026-10-05, committed as `639fdc5`, Linux-CI-confirmed in run 37527217946. D1 is complete, accepted as ADR 0004 Amendment 18 on 2026-10-05, and Linux-CI-confirmed: commit `e0474af`, run 37333036614.) |
-| Remaining effort, frozen scope | **~228–460 focused planning hours for D4–D10** (the deliverables after D3, summed from §7's component estimates). For context: the D1–D10 cumulative planning range is 314–600 h, of which D1–D3 (D1 and D2 completed, D3 implemented) account for 86–140 h (§7; D1 re-estimated to 24–40 h on 2026-10-04, D2 to 24–40 h on 2026-10-05, D3 to 38–60 h on 2026-10-19 per the accepted D3 plan, revision 5). All are component planning estimates, not measured hours spent and not delivery commitments. |
+| Next release-blocking dependency | **D4 — model-driven exploration and repair loop** (recommended next primary slice: no model currently drives a run). D4 and D5 are both prerequisites for D6; D5's substrate may proceed only after the required C-1 ADR 0004 amendment, and D5's integration depends on D4. **Gate O is satisfied** (2026-10-20): D3 is complete, ADR 0005 Amendment 1 (Accepted 2026-10-06), commit `e84e0e0`, Linux CI run [39354731489](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39354731489); evidence in ADR 0005 Amendment 1 §13. (D2 is complete: ADR 0004 Amendment 19, Accepted 2026-10-05, committed as `639fdc5`, Linux-CI-confirmed in run 37527217946. D1 is complete, accepted as ADR 0004 Amendment 18 on 2026-10-05, and Linux-CI-confirmed: commit `e0474af`, run 37333036614.) |
+| Remaining effort, frozen scope | **~228–460 focused planning hours for D4–D10** (the deliverables after D3, summed from §7's component estimates). For context: the D1–D10 cumulative planning range is 314–600 h, of which the completed D1–D3 account for 86–140 h (§7; D1 re-estimated to 24–40 h on 2026-10-04, D2 to 24–40 h on 2026-10-05, D3 to 38–60 h on 2026-10-19 per the accepted D3 plan, revision 5). All are component planning estimates, not measured hours spent and not delivery commitments. |
 | Readiness | **Not operator-ready.** The only CLI is the maintenance-only `codeagent reconcile` (D1, Linux-CI-confirmed; it never runs a task); there is no `solve` [absent]. The only end-to-end path, `_lifecycle_run.run_lifecycle_aware`, is imported by no production module (verified call graph, §2.1). |
 
 **Gates, which must not be conflated:**
@@ -49,16 +49,19 @@ Labels used throughout:
     Accepted 2026-10-05; Linux-CI-confirmed, run 37527217946);
   - abandonment (**done by D1**, ADR 0004 Amendment 18 Accepted
     2026-10-05; Linux-CI-confirmed, run 37333036614);
-  - ADR 0005 cancellation (**implemented and verified locally by D3** on
-    2026-10-19, ADR 0005 Amendment 1 Accepted 2026-10-06; **not yet
-    committed and not yet Linux-CI-confirmed**).
+  - ADR 0005 cancellation (**done by D3**, ADR 0005 Amendment 1 Accepted
+    2026-10-06; commit `e84e0e0`, Linux CI run [39354731489](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39354731489); evidence in ADR 0005 Amendment 1 §13).
 
   The `codeagent reconcile` maintenance command (D1) is the recovery
-  prerequisite itself and never runs the composition. **Gate O remains
-  unsatisfied**: Amendment 1 §9 permits marking it satisfied only once D3
-  is implemented, locally verified, committed, and confirmed by a
-  successful Linux CI run. Even then, operator cancellation is not
-  reachable or proven before D6.
+  prerequisite itself and never runs the composition. **Gate O is satisfied
+  (2026-10-20)**: D1, D2 and D3 are implemented, committed and
+  Linux-CI-confirmed, as Amendment 1 §9 requires. Satisfying Gate O **only
+  permits D6 to wire the first operator run**. It does not make CodeAgent
+  operator-ready, does not make cancellation operator-reachable, and does
+  not create `codeagent solve`; D6 must run `solve` inside
+  `cli.owned_cancellation()` and repeat the real-signal proof through the
+  actual operator command. Gate α, public v1 and every `COMPLETE_FOR_V1`
+  row remain unmet.
 - **Gate α — internal alpha**: brief criteria 1–7 met with objective evidence.
   This is **not** a release and is never published as "v1".
 - **Gate v1 — public v1**: **all** brief criteria 1–11 (§1.2) met, each with
@@ -255,7 +258,7 @@ The **required ADR 0004 amendment** (before D5's recreation code) defines:
 | 10 | Patch and checkpoint | `GitPatchApplier` (one preconfigured replacement); `CheckpointSession` | Checkpoint mechanism-verified; patch not model-driven |
 | 11 | Docker verification | `DockerVerifier.run` | Mechanism-verified; internal |
 | 12 | Repair loop | `RunController._run_after_start` (repair/revision budgets) | No failure feedback; four of six budgets [absent]; no recreate after a post-write failure (it terminates) |
-| 13 | Cleanup, cancel, recovery | `_terminate`; `_lifecycle_run`; next-run reconciliation | Cancellation: D3 mechanism implemented locally, exercised only through a test-only driver around the internal composition (Linux CI pending; no operator path before D6); abandonment via `codeagent reconcile --abandon` (D1; Linux-CI-confirmed) |
+| 13 | Cleanup, cancel, recovery | `_terminate`; `_lifecycle_run`; next-run reconciliation | Cancellation: D3 mechanism Linux-CI-confirmed (run 39354731489), exercised only through a test-only driver around the internal composition (no operator path before D6); abandonment via `codeagent reconcile --abandon` (D1; Linux-CI-confirmed) |
 | 14 | Report and trace | `report.build_report` (unused in production); `EventLog` in-memory | JSONL sink and redaction [absent] |
 
 ---
@@ -293,30 +296,30 @@ path.
 | Capability | Mech. | v1 | Mechanism evidence | Missing for v1 | Blockers | Done when | Deliverable |
 |---|---|---|---|---|---|---|---|
 | Installation/packaging | PARTIAL | IMPLEMENTED_UNWIRED (D1 console-script skeleton, Linux-CI-confirmed via the editable install; fresh-venv packaging is D10 and not done) | `[project.scripts] codeagent`; `tests/integration/test_reconcile_cli.py` console-script test (editable install) | Runtime deps, fresh-venv install, README | — | Fresh-venv install + `codeagent --help` in CI and README | D10 |
-| CLI entry point | PARTIAL | OPERATOR_REACHABLE (`reconcile` only, maintenance; Linux-CI-confirmed) | `codeagent.cli`; exit codes 0–4 pinned (`tests/unit/test_cli.py`); real subprocess tests; `cli.owned_cancellation()` (D3, local; `main()` does not enter it, `main()` has no run path, and nothing is operator-reachable) | `solve` | Gate O for `solve` | CLI e2e in CI; exit codes pinned | D3, D6 |
+| CLI entry point | PARTIAL | OPERATOR_REACHABLE (`reconcile` only, maintenance; Linux-CI-confirmed) | `codeagent.cli`; exit codes 0–4 pinned (`tests/unit/test_cli.py`); real subprocess tests; `cli.owned_cancellation()` (D3, Linux-CI-confirmed; `main()` does not enter it, `main()` has no run path, and nothing is operator-reachable) | `solve` | D4–D6 for `solve` (Gate O satisfied) | CLI e2e in CI; exit codes pinned | D3, D6 |
 | Task/config parsing | NONE | NOT_STARTED | `RunConfig` validation | argv → config, C-4, T-I4 | D6 | Invalid input refused before any lifecycle mutation | D6 |
 | OpenAI Responses adapter | NONE | NOT_STARTED | S2 spike unstarted | Adapter, strict schemas, S2 | T-G1 (D6) | Recorded-response replay in CI + opt-in live smoke | D7 |
 | Tool schemas / response parsing | DESIGNED | NOT_STARTED | `domain.ToolName`; `events.ToolRequested` [test `test_events.py`] | Schemas, malformed-argument handling | D4 | Illegal/malformed calls fail closed with events | D4, D7 |
 | Budgets, usage, retries, API failures | PARTIAL | IMPLEMENTED_UNWIRED | Repair and plan-revision budgets (`controller.py`) [test `test_controller.py`] | Tool-call, wall-clock, token, cost; retries | D4, D7 | Each `BudgetKind` ends a run correctly, tested | D4, D7 |
-| Repository identity / Git safety | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | `repo_identity.py`, `_git_safety.py` (ADR 0006), real SHA-256 tests [CI] | Operator path | Gate O | Reached and proven via `solve` | D6 |
+| Repository identity / Git safety | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | `repo_identity.py`, `_git_safety.py` (ADR 0006), real SHA-256 tests [CI] | Operator path | D6 (Gate O satisfied) | Reached and proven via `solve` | D6 |
 | File reading/search | PARTIAL | WIRED_INTERNAL_ONLY | `WorktreeFileReader` (one file, 64 KiB, escape refusal) [test `test_reader.py`] | `list_directory`, ranged read, `search_text`, pagination | — | Bounded, path-safe, escape-tested | D4 |
 | Patch application (4 ops, transactional protocol) | PARTIAL | WIRED_INTERNAL_ONLY | `GitPatchApplier`: one exact replacement, ADR 0006 hardening [test `test_patch.py`] | add/update/delete/rename; whole-proposal pre-write validation; syntax guard; test-file rules; model-supplied integration | Integration: D4 | Pre-write refusal leaves the worktree unchanged; each op tested; rules enforced; model-supplied ops through D4 | D5 |
 | ADR 0003 discard-and-recreate | DESIGNED | NOT_STARTED | ADR 0003; controller terminates on patch failure (compliant only for a terminating run) | Fresh-reservation incarnation on the continue path; mid-recreate crash reconciliation | C-1 ADR 0004 amendment | Post-write failure → confirmed disposal + leaf absence → fresh reservation → new incarnation at the last checkpoint → repair continues (real Git) | D5 |
-| Checkpoint create/advance/delete | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | `checkpoint_ref.py`, `checkpoint_session.py`; T30, T34 [CI] | Operator path | Gate O | Proven via `solve` | D6 |
+| Checkpoint create/advance/delete | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | `checkpoint_ref.py`, `checkpoint_session.py`; T30, T34 [CI] | Operator path | D6 (Gate O satisfied) | Proven via `solve` | D6 |
 | Approval gate (3 modes) | PARTIAL | WIRED_INTERNAL_ONLY | FSM legality [test `test_domain.py`]; fake provider | `interactive`, `none` (T-I4), `plan-file` (T-I2) | D6 | Live CLI run proves no pre-approval mutation; rejection leaves source byte-identical | D6 |
 | Orchestration and repair loop | PARTIAL | WIRED_INTERNAL_ONLY | `RunController` FSM; exception boundary (Amendment 9) [CI] | Multi-tool loop, failure feedback, reapproval on material change | D4 | Fake CI: fail → feedback → revised patch → pass | D4 |
 | Evidence and reporting | PARTIAL | IMPLEMENTED_UNWIRED (`report.py` unused) | `FilesystemEvidenceSink` [CI]; `report.py` [test] | JSONL sink, redaction, persisted reports | — | Redacted trace + JSON/Markdown report every run; redaction-scan test | D6 |
-| Docker verification | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | `DockerVerifier`; `test_slice_c.py` (4) [CI]; D3 entry check, sliced cancellable attach wait, group kill and `CANCELLED` [local; Linux CI pending] | Operator path (D6), including operator-reachable cancellation | D3 Linux CI, Gate O | Proven via `solve` | D6 |
+| Docker verification | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | `DockerVerifier`; `test_slice_c.py` (4) [CI]; D3 entry check, sliced cancellable attach wait, group kill and `CANCELLED` [CI, run 39354731489] | Operator path (D6), including operator-reachable cancellation | D4–D6 (Gate O satisfied) | Proven via `solve` | D6 |
 | Command execution policy | MECHANISM_VERIFIED (ADR 0001 narrowing) | WIRED_INTERNAL_ONLY | No model process tool; structured argv | C-2 tracing; C-4 parsing | D6 | Every controller command traced with a policy decision | D6 |
 | Network/resource/timeout enforcement | MECHANISM_VERIFIED (spike-level) | WIRED_INTERNAL_ONLY | `executor._SECURITY_FLAGS`; `spikes/s4/S4_RESULT.md` (memory INCONCLUSIVE; predates Amendment 15's uid change) | Production-suite adversarial tests on both platforms | — | Attempted violations fail in the CI suite and on macOS | D10 |
-| Lifecycle state root and locks | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | `state_root.py`, `state_locks.py`; T40 [CI] | Operator path | Gate O | Proven via `solve` | D6 |
-| Owner/container/worktree/ref publication | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | Shared cursor + 4 publishers (Amendments 6–11) [CI] | Operator path | Gate O | Proven via `solve` | D6 |
-| Lifecycle-aware composition | PARTIAL | WIRED_INTERNAL_ONLY | `run_lifecycle_aware`, T30–T47 [CI]; **caller-supplied patch** | Model-driven tools; operator path | D4–D6, Gate O | `solve` drives it with model-supplied patches | D6 |
-| Reconciliation, documented shapes | PARTIAL | WIRED_INTERNAL_ONLY | Rows: all-absent, containers, A12, A13, A16, A17, A19 and the C1 correction [CI]; T33–T37, T47–T52 | Mid-recreate crash shape (C-1); operator path | D5, Gate O | See §4 | D5, D6 |
-| Live-container → worktree → ref | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | ADR 0004 Amendment 19 (Accepted 2026-10-05); T36 → RECONCILED, T48–T52 (running container, non-crash `CLEANING`, impostor), non-producible-shape refusals, real reconciler SIGKILL, write-fault matrix; commit `639fdc5`, Linux CI run 37527217946 [CI; test execution inferred from the suite total, not named]. Before D2, T36 asserted BLOCKED (historical). | Operator path | Gate O | T36 → RECONCILED, full cleanup (done) | D2 |
+| Lifecycle state root and locks | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | `state_root.py`, `state_locks.py`; T40 [CI] | Operator path | D6 (Gate O satisfied) | Proven via `solve` | D6 |
+| Owner/container/worktree/ref publication | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | Shared cursor + 4 publishers (Amendments 6–11) [CI] | Operator path | D6 (Gate O satisfied) | Proven via `solve` | D6 |
+| Lifecycle-aware composition | PARTIAL | WIRED_INTERNAL_ONLY | `run_lifecycle_aware`, T30–T47 [CI]; **caller-supplied patch** | Model-driven tools; operator path | D4–D6 (Gate O satisfied) | `solve` drives it with model-supplied patches | D6 |
+| Reconciliation, documented shapes | PARTIAL | WIRED_INTERNAL_ONLY | Rows: all-absent, containers, A12, A13, A16, A17, A19 and the C1 correction [CI]; T33–T37, T47–T52 | Mid-recreate crash shape (C-1); operator path | D5, D6 (Gate O satisfied) | See §4 | D5, D6 |
+| Live-container → worktree → ref | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY | ADR 0004 Amendment 19 (Accepted 2026-10-05); T36 → RECONCILED, T48–T52 (running container, non-crash `CLEANING`, impostor), non-producible-shape refusals, real reconciler SIGKILL, write-fault matrix; commit `639fdc5`, Linux CI run 37527217946 [CI; test execution inferred from the suite total, not named]. Before D2, T36 asserted BLOCKED (historical). | Operator path | D6 (Gate O satisfied) | T36 → RECONCILED, full cleanup (done) | D2 |
 | Abandonment / explicit reconcile | MECHANISM_VERIFIED | VERIFIED_LINUX_CI (maintenance path only; not COMPLETE_FOR_V1) | ADR 0004 Amendment 18 (Accepted 2026-10-05); `abandonment.py`, `maintenance.py`, `cli.py`; `tests/unit/test_{abandonment,maintenance,cli}.py`, `tests/integration/test_reconcile_cli.py` (real T36, partial-removal, T37, SIGKILL, lock contention; historical: after Amendment 19 the T36 abandonment test checks the dry run instead of a real reconcile); Linux CI run 37333036614 | — | — | Every blocked entry in a trusted, valid repository namespace has an operator exit (preconditions: a valid state root and `state-root.json`, the repository lock file, a valid identity-matched `repo.json`, and a well-formed `runs/`; corrupt or missing trusted metadata, a hostile `lifecycle.lock`, or a corrupt final marker intentionally block maintenance too and need manual archival): `ABANDONED` only after confirmed absence; `ABANDONED_UNRESOLVED` only by explicit acknowledgement, never `CLEAN`; no resource deleted; exit codes pinned | D1 |
-| ADR 0005 cancellation | PARTIAL (implemented and verified locally, 2026-10-19; becomes `MECHANISM_VERIFIED` only after Linux CI) | WIRED_INTERNAL_ONLY (never `OPERATOR_REACHABLE` before D6) | ADR 0005 Amendment 1 (Accepted 2026-10-06); `cancellation.py`, `cli.owned_cancellation()`, controller safe points C1–C23, `VerificationOutcome.CANCELLED`, L1–L7 own sessions; real SIGINT/SIGTERM E1–E12 through a test-only driver around the internal composition [local macOS only] | Linux CI; operator path (`solve`) | D3 commit and Linux CI, then Gate O to D6 | Proven via `codeagent solve` | D3 (mechanism), D6 (operator path) |
-| Operator lifecycle wiring | NONE | NOT_STARTED | `_lifecycle_run` AST-pinned as unimported (T41) | `solve` | Gate O | `solve` is the only run caller | D6 |
+| ADR 0005 cancellation | MECHANISM_VERIFIED | WIRED_INTERNAL_ONLY (never `OPERATOR_REACHABLE` before D6) | ADR 0005 Amendment 1 (Accepted 2026-10-06); `cancellation.py`, `cli.owned_cancellation()`, controller safe points C1–C23, `VerificationOutcome.CANCELLED`, L1–L7 own sessions; real SIGINT/SIGTERM E1–E10 (with E11/E12 asserted inside them) through a test-only driver around the internal composition [CI; commit `e84e0e0`, Linux CI run [39354731489](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39354731489); evidence in ADR 0005 Amendment 1 §13] | Operator path (`solve`) | D4–D6 (Gate O satisfied) | Proven via `codeagent solve` | D3 (mechanism, done), D6 (operator path) |
+| Operator lifecycle wiring | NONE | NOT_STARTED | `_lifecycle_run` AST-pinned as unimported (T41) | `solve` | D4–D6 (Gate O satisfied) | `solve` is the only run caller | D6 |
 | Deterministic fake-model e2e CI | PARTIAL | WIRED_INTERNAL_ONLY | T30 with a fake model and **preconfigured patch** [CI] | Through the CLI, model-driven | D4–D6 | CI drives `codeagent solve` with a scripted fake model emitting the patch | D6 |
 | Real-model smoke / flagship trials | NONE | NOT_STARTED | — | Adapter, trials, J-9 fixture validation | D7 | Criteria 1, 3, 5 | D7 |
 | macOS acceptance | — | VERIFIED_LOCAL (mechanisms only) | Per-slice local runs | Full workflow | D7 | Recorded macOS real-model flagship run | D7 |
@@ -338,12 +341,12 @@ evidence at most.
 
 | Threat / failure | v1 obligation | Current evidence | Missing | Blocks |
 |---|---|---|---|---|
-| T-E1 concurrent runs | **Fail closed** | Repository lock for the whole internal run; T40 | Operator path | Gate O / criterion 1 |
-| T-F1 orphaned containers | **Automatic recovery** for the accepted attributable container-only row (3B-5) and for Amendment 19's two owner-producible chained families: a baseline with the ref absent, and a verification with the ref non-absent (Gate O row). For any other refused shape, abandonment is the operator exit; it only records a disposition and never removes resources | 3B-5 row; `test_slice_3b6.py` SIGKILL [CI]; A19 container → worktree → ref row, T36/T48–T52 [CI] | Operator path | Gate O |
-| T-F2 orphaned worktree | **Fail closed**; abandonment is the operator exit for refused shapes (a recorded disposition, never resource removal) | A12/A13/A17 rows; T35/T37 [CI] | Abandonment; mid-recreate crash shape (C-1) | Gate O; D5 |
+| T-E1 concurrent runs | **Fail closed** | Repository lock for the whole internal run; T40 | Operator path | criterion 1 (Gate O satisfied) |
+| T-F1 orphaned containers | **Automatic recovery** for the accepted attributable container-only row (3B-5) and for Amendment 19's two owner-producible chained families: a baseline with the ref absent, and a verification with the ref non-absent (Gate O row). For any other refused shape, abandonment is the operator exit; it only records a disposition and never removes resources | 3B-5 row; `test_slice_3b6.py` SIGKILL [CI]; A19 container → worktree → ref row, T36/T48–T52 [CI] | Operator path | D6 (Gate O satisfied) |
+| T-F2 orphaned worktree | **Fail closed**; abandonment is the operator exit for refused shapes (a recorded disposition, never resource removal) | A12/A13/A17 rows; T35/T37 [CI]; abandonment (D1) [CI] | Mid-recreate crash shape (C-1); operator path | D5, D6 (Gate O satisfied) |
 | T-M1 shared `.git` metadata | **Fully mitigate original-checkout integrity**; document ref visibility | Exact `worktree remove`, no prune (AST-pinned); CAS ref delete | Per-file hash snapshot (criterion 7); benchmark integrity check (J-7) | 7 |
-| Cancellation | **Implement** (ADR 0005) | D3 implemented locally (ADR 0005 Amendment 1): real SIGINT/SIGTERM E1–E12 end `CANCELLED` with resources confirmed absent and a clean next admission [local macOS only; Linux CI pending]. T34's `KeyboardInterrupt` path still reconciles on the next run | Linux CI; operator path (D6) | Gate O |
-| Abandonment | **Implement** (ADR 0004 §11) | Implemented by D1 (Amendment 18 Accepted 2026-10-05; Linux-CI-confirmed): records a disposition, never removes a resource | — (Gate O still needs D3's commit and Linux CI) | Gate O |
+| Cancellation | **Implement** (ADR 0005) | D3 (ADR 0005 Amendment 1): real SIGINT/SIGTERM E1–E10 end `CANCELLED` with resources confirmed absent and a clean next admission, through a test-only driver [CI, run 39354731489]. T34's `KeyboardInterrupt` path still reconciles on the next run | Operator path (D6) | D6 |
+| Abandonment | **Implement** (ADR 0004 §11) | Implemented by D1 (Amendment 18 Accepted 2026-10-05; Linux-CI-confirmed): records a disposition, never removes a resource | — (Gate O satisfied 2026-10-20) | — (Gate O satisfied) |
 | Container-escape identity (T-K1, A5) | **Accepted limitation, documented** | Amendment 15: the container runs as the effective host uid:gid; root refused | README statement that an escape maps to the invoking user | 11 |
 | Same-user A4 races | **Accepted limitation, documented** | Narrowed by fresh gates and CAS (A16/A17); not closed | Operator-visible statement | 11 |
 | T-G1 redaction | **Gate: before real-model integration or real-content persistence** | None | Redactor + scan test | D7 |
@@ -362,7 +365,7 @@ evidence at most.
 | M0 Contracts and threats | `domain.py`, `events.py`, `errors.py`, ADRs 0001–0006, threat model | Stale status text (C-7) | — | **Complete** |
 | M1 Thin vertical slice | Fake read → plan → approve → patch → verify → report in a real worktree and Docker (`test_slice_c.py::test_real_docker_e2e_failing_baseline_then_passing_verification`) | — | Preconfigured patch: fine for M1, not evidence for M2/M4 | **Complete** |
 | M2 Robust repository tools | Bounded single read; checkpoints; ADR 0006 | List/search/pagination; 4-op transactional patch protocol; syntax guard; recreate (C-1) | `patch.py` is hardened but supports one replacement | **Partial** |
-| M3 Hardened execution | Docker lifecycle; S4 limits; bounded control plane; lifecycle store; reconciliation rows; internal composition | Cancellation (D3 implemented locally; Linux CI pending), redaction, container chaining, production adversarial tests, operator path | `_lifecycle_run` resembles an entry point but is uncalled | **Substrate nearly complete; product partial** |
+| M3 Hardened execution | Docker lifecycle; S4 limits; bounded control plane; lifecycle store; reconciliation rows; internal composition | Operator-reachable cancellation (D3 mechanism Linux-CI-confirmed), redaction, mid-recreate crash-shape (C-1) reconciliation (D5), production adversarial tests, operator path | `_lifecycle_run` resembles an entry point but is uncalled | **Substrate nearly complete; product partial** |
 | M4 Real model loop | — | All | `ModelClient` is the fake-shaped two-step protocol | **Not started** |
 | M5 Repair loop and verification contract | Repair/revision budgets; baseline; terminal reasons | Failure feedback, reapproval, recreate-and-continue | `VerificationCompleted.fail_to_pass` always `()` | **Partial** |
 | M6 Benchmark harness | — | All | — | **Not started** |
@@ -379,7 +382,8 @@ evidence at most.
 3. **D3 — CLI ownership boundary plus ADR 0005 cancellation.** The
    entrypoint module holds the sole handler owner, `cli.owned_cancellation()`;
    `main()` enters it around `solve` starting with D6. **Gate O is satisfied
-   only after D1–D3, with D3 committed and Linux-CI-confirmed.**
+   (2026-10-20)**: D1–D3 are done; D3 is commit `e84e0e0`, Linux CI run
+   39354731489.
 4. **D4 — Model-driven exploration and repair loop**, with the fake model:
    tool protocol, list/read/search, budgets, failure feedback, reapproval.
 5. **D5 — Transactional patch protocol.**
@@ -518,15 +522,21 @@ planning estimate), the remaining planning range is D4–D10: **228–460 h**.
 
 ## 9. Immediate recommendation
 
-**Next: joint review of D3, then its commit and Linux CI.** Gate O remains
-unsatisfied until both succeed.
+**Next: D4 (model-driven exploration and repair loop).** No model currently
+drives a run, so D4 is the recommended next primary implementation slice. D4
+and D5 are both prerequisites for D6. D5's substrate may proceed only after the
+required C-1 ADR 0004 amendment; D5's integration depends on D4. Gate O is now
+satisfied, which only permits D6 to wire the first operator run.
 
-**Implemented locally (2026-10-19), uncommitted: D3** — ADR 0005 Amendment 1
-(Accepted 2026-10-06): `cancellation.py`, `cli.owned_cancellation()` with the
-28-row signal-ownership matrix, controller safe points, approval and verifier
-cancellation, own sessions for all seven launch sites, iteration accounting,
-composition plumbing, and real-signal tests E1–E12 through a test-only driver
-(macOS; Linux CI pending). It adds no operator path: `main()` is unchanged.
+**Done (2026-10-20): D3** — ADR 0005 Amendment 1 (Accepted 2026-10-06):
+`cancellation.py`, `cli.owned_cancellation()` with the 28-row signal-ownership
+matrix, controller safe points, approval and verifier cancellation, own
+sessions for all seven launch sites, iteration accounting, composition
+plumbing, and real-signal tests through a test-only driver, after six
+pre-commit joint-review corrections. Committed as `e84e0e0` and
+Linux-CI-confirmed (run 39354731489; evidence in ADR 0005 Amendment 1 §13). It
+adds no operator path: `main()` is unchanged, and operator cancellation stays
+D6's to wire and prove through `codeagent solve`.
 
 **Done (2026-10-06): D2** — live-container → worktree → ref reconciliation
 (ADR 0004 Amendment 19, Accepted 2026-10-05, with an implementation-time

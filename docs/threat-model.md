@@ -792,8 +792,8 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   lifecycle-aware `DockerVerifier`, and the default `DockerVerifier` path
   still creates unlabeled, UUID-suffixed `codeagent-verify-*` containers
   that reconciliation never targets. ADR 0005 Amendment 1 (Accepted
-  2026-10-06; ledger D3) is implemented and verified locally (macOS,
-  2026-10-19), not yet committed or Linux-CI-confirmed: with
+  2026-10-06; ledger D3) is implemented, committed as `e84e0e0` and
+  Linux-CI-confirmed (run 39354731489; ADR 0005 Amendment 1 §13): with
   `cli.owned_cancellation()` around the internal composition, a real SIGINT
   (process group) or SIGTERM (exact PID) during a running baseline or
   verification container is observed by the sliced attach wait, the attach
@@ -845,8 +845,8 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   reconciliation sweep, not prevention. T-F1 remains open: the ADR 0004
   container mechanisms are implemented but unwired, containers from the
   default `DockerVerifier` path are not attributable, ADR 0005's mechanism
-  is implemented locally only (D3; Linux CI pending; no operator path before
-  D6), and reconciliation runs only when a later mutating run
+  is Linux-CI-confirmed but reachable only through a test-only driver (D3;
+  no operator path before D6), and reconciliation runs only when a later mutating run
   starts in the same repository (ADR 0004 §15 gives no bound for a
   repository that is never run again). End-to-end mitigation still
   requires production wiring plus production acceptance tests on both
@@ -860,7 +860,8 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   T-F1
 - Owning milestone/spike: ADR 0004/0005 (accepted) — Milestone 3
   lifecycle work; ADR 0004's container mechanisms implemented but unwired;
-  ADR 0005 implemented locally by D3 (Amendment 1), Linux CI pending
+  ADR 0005 Amendment 1 implemented by D3 (commit `e84e0e0`, Linux CI run
+  39354731489); its operator path is D6's
 
 **T-F2 — Orphaned disposable worktree after crash.**
 - Asset/objective: O7, O1
@@ -1378,8 +1379,8 @@ by repository-supplied configuration.
   termination of) a process exceeding its timeout (guide §9.2: 120s process
   timeout as a starting default)
 - Evidence/future test: Stage-2 isolation spike's "timeout" case. ADR 0005
-  Amendment 1 (ledger D3; implemented and verified locally 2026-10-19, Linux
-  CI pending): the verification attach wait is sliced (at most 0.1 s per
+  Amendment 1 (ledger D3; commit `e84e0e0`, Linux-CI-confirmed in run
+  39354731489): the verification attach wait is sliced (at most 0.1 s per
   wait) and cancellable; on timeout or cancellation the attach client's
   whole process group is killed before it is reaped, and the container
   itself is then removed by id. All seven production launch sites run in

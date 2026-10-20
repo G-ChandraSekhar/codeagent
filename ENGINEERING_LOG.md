@@ -6954,3 +6954,32 @@ suite 4,401 passed, 0 skipped; 70/70 mutation checks caught, sources restored
 and SHA-256-verified; no leftovers; `git diff --check` clean. Supersedes the
 earlier D3 entries' totals. Uncommitted; no Linux CI; Gate O remains
 unsatisfied. `uv.lock` untouched.
+
+## 2026-10-20 — D3 / ADR 0005 Amendment 1: Linux CI evidence reconciliation; Gate O satisfied
+
+**What.** A documentation-only pass recording that commit `e84e0e0` (an
+ordinary fast-forward, `e4426a1..e84e0e0`) passed GitHub Actions run
+[39354731489](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39354731489),
+re-verified independently from the Actions API and a freshly fetched raw job
+log. Counts, environment, timings and limits are recorded once, in ADR 0005
+Amendment 1 §13. No code, test, workflow, configuration, dependency or design
+change.
+
+**Gate O.** D1, D2 and D3 are now implemented, committed and
+Linux-CI-confirmed, so Gate O is satisfied. It only permits D6 to wire the
+first operator run: CodeAgent is not operator-ready, cancellation is not
+operator-reachable, `codeagent solve` does not exist, and Gate α and public v1
+are unmet. D6 must run `solve` inside `cli.owned_cancellation()` and repeat the
+real-signal proof through the actual command.
+
+**Limits.** E11 and E12 are assertions inside the named E1–E10 tests, not
+separate pytest cases. The quiet complete-suite log does not name its skips;
+Docker was required and available there. GitHub-hosted `ubuntu-24.04` x86_64
+automated-test evidence only, not a security review.
+
+**Updated (current status only).** ADR 0005 (status lines, a historical marker
+on §12, new §13); `CLAUDE.md` (D3 entry status, the next step);
+`docs/V1_COMPLETION_LEDGER.md` (next dependency D4, Gate O satisfied, D3 rows
+CI-confirmed, the effort row's completed/remaining wording);
+`docs/threat-model.md` (T-F1 and T-J7 D3 status). Earlier entries and local
+evidence are unchanged. `uv.lock` untouched.
