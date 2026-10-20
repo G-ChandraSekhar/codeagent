@@ -3148,6 +3148,32 @@ Stage 2 (of the four-stage planning process in
     disposed); SIGKILL/SIGHUP/SIGQUIT rely on reconciliation; T-E1 and T-F2
     unchanged; T-F1 gains cooperative-cleanup evidence only. Automated-test
     evidence, not a security review.
+- **Ledger D4a: descriptor-relative repository toolkit** (D4 plan
+  revisions 5 and 6, accepted 2026-10-20) is **implemented and locally
+  verified on macOS (2026-10-20), uncommitted, with no Linux CI**. It is a
+  prerequisite and does not complete ledger D4 (only D4b does).
+  - **What it adds:**
+    - `tool_schema.py`, the neutral tool contract;
+    - `repo_tools.py`: `list_directory`, ranged `read_file` and in-process
+      `search_text`, with `O_NOFOLLOW` at every path component, `.git`
+      denied by name and by inode, per-call descriptor ownership with
+      cleanup dominance, and authenticated single-use search chains;
+    - `_read_adapter.py`, transitional and deleted in D4b.
+  - **What it removes:** `reader.py`, which closes its documented TOCTOU race.
+  - **Controller change:** limited to revision 5 §7.5. An unconfirmed
+    descriptor cleanup ends the run through the existing run-loop terminal
+    owner.
+  - **Not changed:** no model loop, event-schema, domain or budget change.
+  - **Verified (after three joint-review fixes: root-descriptor
+    ownership, root registration inside the ownership guard, and the
+    bytes-read scan cap):**
+    - full suite: 4,636 passed, 2 skipped (both non-UTF-8-filename tests,
+      which macOS APFS refuses; they pass under Linux in the pinned image);
+    - 56 mutations on macOS, 55 caught by assertion and 1 by a time guard,
+      plus MR42 caught under Linux;
+    - no leftover resources.
+  - **Deviations:** see `ENGINEERING_LOG.md`'s 2026-10-20 D4a entry.
+  - **Deferred:** ledger, threat-model and ADR 0007 updates wait for D4b.
 - **Next:** D4 (model-driven exploration and repair loop) is the
   recommended next primary slice, since no model drives a run. D4 and D5 are
   prerequisites for D6; D5's substrate waits for the C-1 ADR 0004 amendment,

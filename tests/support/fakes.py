@@ -249,8 +249,9 @@ class FakePatchApplier:
 
 
 class FakeRepositoryReader:
-    """No real filesystem involved — see codeagent.reader.WorktreeFileReader
-    for the real implementation this fakes. Returns the same configured
+    """No real filesystem involved — see
+    codeagent._read_adapter.RepoToolsReaderAdapter for the real
+    implementation this fakes. Returns the same configured
     content for any relative_path unless `should_fail`; doesn't validate
     the path itself (path validation is the real reader's job, exercised
     against real content in test_reader.py and the real Docker E2E)."""

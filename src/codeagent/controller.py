@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Protocol
 
 from codeagent import domain, events
-from codeagent.cancellation import NEVER_CANCELLED, CancellationToken, OperationCancelled
+from codeagent.cancellation import NEVER_CANCELLED, CancellationToken, OperationCancelled, attach_cleanup_failures
 from codeagent.checkpoint_ref import (
     LIFECYCLE_ID_RE,
     CheckpointRefError,
@@ -52,6 +52,7 @@ from codeagent.checkpoint_session import CheckpointIntent, CheckpointPublication
 from codeagent.errors import ErrorCode, OperationalError
 from codeagent.evidence import EvidenceReceipt, EvidenceSink
 from codeagent.lifecycle_owner import OwnerStatePublicationError
+from codeagent.tool_schema import ToolCleanupUnconfirmedError
 
 
 def _canonical_json(payload: dict[str, object]) -> str:
@@ -79,8 +80,8 @@ class ReadResult:
     Deliberately narrow: this is Milestone 1's single-file,
     read-before-plan vertical slice, not Milestone 2's general
     repository-read result shape. No directory listing, no pagination,
-    no binary content — see codeagent.reader.WorktreeFileReader's
-    module docstring.
+    no binary content. Transitional: deleted in D4b with the legacy read
+    path (`codeagent._read_adapter`).
     """
 
     success: bool
@@ -264,8 +265,12 @@ class RepositoryReader(Protocol):
     Deliberately narrow, matching ModelClient's scope above: Milestone
     1's read-before-plan slice only. No directory listing, no
     pagination, no binary content, no search — see
-    codeagent.reader.WorktreeFileReader (the real implementation) and
+    codeagent._read_adapter.RepoToolsReaderAdapter (the real
+    implementation, over codeagent.repo_tools) and
     tests/support/fakes.FakeRepositoryReader (the deterministic fake).
+    An implementation may raise
+    `tool_schema.ToolCleanupUnconfirmedError`; `_dispatch_read_file`
+    routes it (D4 plan revision 5 §7.4).
     """
 
     def read_file(self, relative_path: str) -> ReadResult: ...
@@ -568,13 +573,22 @@ class RunController:
         self._deferred_interrupt: BaseException | None = None
         # Exploration passes begun (ADR 0005 Amendment 1 section 8).
         self._passes_begun = 0
+        # Every repository-tool descriptor-cleanup failure, by identity
+        # (ledger D4a; D4 plan revision 5 §7.4). Never persisted.
+        self._tool_cleanup_failures: list[ToolCleanupUnconfirmedError] = []
+
+    @property
+    def tool_cleanup_failures(self) -> tuple[ToolCleanupUnconfirmedError, ...]:
+        """Retained `ToolCleanupUnconfirmedError` instances, in order."""
+        return tuple(self._tool_cleanup_failures)
 
     @property
     def deferred_interrupt(self) -> BaseException | None:
-        """An exit-style interrupt the verifier retained while its cleanup
-        stayed unconfirmed (ADR 0005 Amendment 1 §12). The run still ends
-        through the ordinary cleanup-unconfirmed path; this keeps the second
-        fact observable to the caller."""
+        """An exit-style interrupt retained while cleanup stayed
+        unconfirmed: by the verifier (ADR 0005 Amendment 1 §12) or a
+        repository tool's descriptor cleanup (D4 plan revision 5 §7.4).
+        The first one seen wins. The run still ends through the ordinary
+        failure path; this keeps the second fact observable to the caller."""
         return self._deferred_interrupt
 
     def _note_deferred_interrupt(self, result: VerificationResult) -> None:
@@ -1077,9 +1091,17 @@ class RunController:
         )
 
         start = self._clock.monotonic()
-        result = self._reader.read_file(relative_path)
-        duration = self._clock.monotonic() - start
-        self._total_duration += duration
+        try:
+            try:
+                result = self._reader.read_file(relative_path)
+            finally:
+                duration = self._clock.monotonic() - start
+                self._total_duration += duration
+        except ToolCleanupUnconfirmedError as cleanup:
+            # Returned to the existing caller, whose run-loop branch is the
+            # sole terminal owner (no safe point on that path).
+            error = self._record_tool_cleanup(iteration, domain.ToolName.READ_FILE, tool_call_id, cleanup, duration)
+            return None, error, tool_call_id
 
         if not result.success:
             self._emit(
@@ -1118,6 +1140,53 @@ class RunController:
             )
         )
         return result, None, tool_call_id
+
+    def _record_tool_cleanup(
+        self,
+        iteration: int,
+        tool: domain.ToolName,
+        tool_call_id: str,
+        cleanup: ToolCleanupUnconfirmedError,
+        duration: float,
+    ) -> OperationalError:
+        """The only place a repository-tool descriptor-cleanup failure
+        becomes events and state (D4 plan revision 5 §7.4). Retains the
+        error by identity, emits exactly one failed `ToolCompleted` with a
+        fixed message, defers a body interrupt under D3's first-wins rule,
+        and returns the fixed error. It never calls `_terminate`; the
+        caller's existing terminal owner does, and the returned failure
+        outranks a pending cancellation (ADR 0005 Amendment 1 §3)."""
+        self._tool_cleanup_failures.append(cleanup)
+        error = OperationalError(
+            code=ErrorCode.TOOL_EXECUTION_FAILED,
+            error_id=f"{self._c.run_id}-tool-cleanup-{len(self._tool_cleanup_failures)}",
+            message=ToolCleanupUnconfirmedError.MESSAGE,
+        )
+        body = cleanup.body_failure
+        interrupt = body if body is not None and not isinstance(body, Exception) else None
+        try:
+            self._emit(
+                events.ToolCompleted(
+                    run_id=self._c.run_id,
+                    sequence=self.log.next_sequence(),
+                    timestamp=self._now(),
+                    state=self.state,
+                    iteration=iteration,
+                    tool=tool,
+                    tool_call_id=tool_call_id,
+                    success=False,
+                    duration_seconds=duration,
+                    result_summary="",
+                    error=error,
+                )
+            )
+        except BaseException as emit_exc:
+            if interrupt is not None:
+                attach_cleanup_failures(emit_exc, (interrupt,))
+            raise
+        if interrupt is not None and self._deferred_interrupt is None:
+            self._deferred_interrupt = interrupt
+        return error
 
     def _map_checkpoint_error(self, exc: Exception, iteration: int) -> OperationalError:
         """ADR 0003 Amendment 2's exact reason+MutationOutcome mapping.

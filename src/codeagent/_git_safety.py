@@ -166,8 +166,9 @@ ATTR_CHECK_CHUNK_SIZE = 512
 # single check-attr stdin payload.
 MAX_ATTR_CHECK_STDIN_BYTES = 4 * 1024 * 1024
 
-# patch.py-hardening bounds (ADR 0006's patch.py slice). Parity with
-# reader.py's existing MAX_READ_BYTES for patch-controlled file content;
+# patch.py-hardening bounds (ADR 0006's patch.py slice). Parity with the
+# 64 KiB read limit (originally reader.py's MAX_READ_BYTES; now
+# tool_schema.MAX_CHANGE_TEXT_BYTES, pinned equal by a test);
 # a commit header is at most a few hundred bytes even for a merge, so
 # this is generous headroom without inviting a large-message DoS — the
 # message body is never parsed or retained.

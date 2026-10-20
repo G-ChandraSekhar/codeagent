@@ -6983,3 +6983,137 @@ on §12, new §13); `CLAUDE.md` (D3 entry status, the next step);
 CI-confirmed, the effort row's completed/remaining wording);
 `docs/threat-model.md` (T-F1 and T-J7 D3 status). Earlier entries and local
 evidence are unchanged. `uv.lock` untouched.
+
+## 2026-10-20 — Ledger D4a: descriptor-relative repository toolkit (local, uncommitted)
+
+**What.** Per D4 plan revisions 5 and 6 (accepted, with precision pins P1/P2):
+`tool_schema.py` (neutral contract: frozen argument dataclasses, strict
+bytes→UTF-8→JSON parsing, static path rules including the `.git`/`git~1`
+casefold and HFS-ignorable name rule, list cursors, static search-cursor
+shape, per-tool redaction, the only plan/change digests, `ToolOutcome`,
+note helpers, `ToolCleanupUnconfirmedError`); `repo_tools.py`
+(`list_directory`, ranged `read_file`, in-process `search_text`, all
+descriptor-relative with `O_NOFOLLOW` at every component, per-call root
+identity check, the `.git` inode rule, bounded enumeration, an exact 80 KiB
+payload projection, per-call descriptor ownership with cleanup dominance,
+and server-held single-use search chains with collision-safe nonces);
+`_read_adapter.py` (transitional legacy reader, deleted in D4b). `reader.py`
+is deleted, closing its documented TOCTOU race. The `controller.py` delta is
+exactly revision 5 §7.5: one import, `_tool_cleanup_failures` plus a
+property, `_record_tool_cleanup`, and the `_dispatch_read_file` catch; the
+run loop stays the sole terminal owner.
+
+**Deviations, disclosed for review.**
+- The adapter calls a transitional `RepoTools.read_whole_file` (same walker,
+  one open, ≤64 KiB, any line count, no payload cap) instead of
+  `read_file(ReadFileArgs(path, 1, None))`, which would have regressed
+  legacy files over 2,000 lines or with escape-heavy content.
+- Search adds `unsearched.unaddressable_names` (names a model path cannot
+  express: control characters, backslash, >512 bytes) beside
+  `non_utf8_names`; a depth-32 directory with children counts once as
+  `too_deep`.
+- Payload envelopes reserve every scalar at its maximum (cursor 2 KiB,
+  counters, booleans); projection is exact against that reserve. The static
+  worst-case search result is ≤2.6 KiB, not the plan's "about 2.2 KiB".
+- `_record_tool_cleanup` retains the error before emitting `ToolCompleted`
+  (plan order was emit first); observable only if emission fails.
+- `test_reader.py`'s read-size test spies on `repo_tools._read` instead of
+  `Path.open`; the asserted request sizes are unchanged. This is outside
+  U7's literal "message texts" scope. Test-support edits only:
+  `test_lifecycle_run.py`'s injection helper patches `RepoToolsReaderAdapter`,
+  and `test_slice_c.py` constructs the adapter.
+- Mutations: 50 run, 49 caught by assertion, MR115 by the planned time
+  guard. MR96 is an equivalent mutant (canonical cursors make page and byte
+  comparison identical); MR43/MR16 are obsolete under server-held chains;
+  MR42/MR10 were not run. Five tests were strengthened after first-pass
+  survivors (content-cap boundary, `fits()` separator, two
+  `KeyboardInterrupt` escapes, the between-files stop).
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** Direct 13-file set 1,328
+passed, 2 skipped, forward and reverse (before the final test additions);
+full suite 4,595 passed, 2 skipped (from 4,401/0). The skips are the two
+non-UTF-8-filename tests: APFS refuses such names, Linux CI should run
+them. The 23-file focused set was not reconstructed. No leftover
+containers, worktrees, refs, default state root or processes; `git diff
+--check` clean; nothing staged; `uv.lock` untouched. Not committed; no Linux
+CI. Ledger, threat model and ADR 0007 are deferred to D4b's docs pass. D4b
+not started.
+
+## 2026-10-20 — D4a joint-review fixes (local, uncommitted)
+
+**Fixes.**
+1. **Root-descriptor ownership.** `_CallDescriptors.__enter__` previously
+   closed the root only for a mapped inspection failure or an identity
+   mismatch. Any other exception (an unexpected error, `KeyboardInterrupt`,
+   `SystemExit`) leaked it, and a failed close reported `body_failure=None`
+   even though a failure was already present. Now every exit after
+   `os.open` returns closes the root exactly once. A confirmed close
+   re-raises the original failure unchanged; an unconfirmed one raises
+   `ToolCleanupUnconfirmedError`, with that failure kept as `body_failure`
+   and as the cause.
+2. **Search scan cap.** The 16 MiB per-page cap was checked against the
+   enumerated `st_size`, which goes stale if a file grows. Reads are now
+   bounded by the remaining budget, and every byte read counts, including
+   reads that end in `unreadable`. If the budget runs out inside a file,
+   nothing from that file is emitted and it is not marked done; the next
+   page retries it. Exactly reaching the budget without seeing EOF also
+   defers the file. A page that cannot fit even one file fails closed. That
+   is unreachable with the production constants, and a test pins it.
+
+**Accepted at review.** The five deviations in the D4a entry above. In
+addition, `read_whole_file` is pinned to its two users so that D4b deletes
+it along with `_read_adapter`.
+
+**Mutation accounting.** 55 run on macOS: 54 caught by assertion and MR115
+by its planned time guard. The new ones are FD1/FD2 (root leak, dropped
+body failure) and SC1–SC3 (stale-size limit, uncounted bytes, partial file
+emitted). The fix re-anchored MR71. Settled at review:
+- MR96 is retired as equivalent. The decoder accepts only canonical cursor
+  bytes, and encoding is deterministic, so for any cursor that decodes,
+  comparing page numbers and comparing bytes always agree.
+- MR43 is superseded, because search positions are held server-side.
+- MR10 and MR16 belong to D4b.
+- MR42 ran under Linux semantics: the pinned verification image, the
+  repository mounted read-only, tests in the container's `/tmp`. The two
+  non-UTF-8-name tests, which macOS skips, pass there; the mutant is caught
+  by assertion. The source was restored and SHA-256-verified.
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** Direct 13-file set
+1,347 passed, 2 skipped, in both forward and reverse order. Full suite 4,611
+passed, 2 skipped; the skips are the macOS non-UTF-8-name tests. No
+leftovers, `git diff --check` clean, nothing staged, `uv.lock` untouched.
+Supersedes the totals in the D4a entry above. Not committed; no Linux CI.
+
+## 2026-10-20 — D4a review fix 3: root registration inside the ownership guard (local, uncommitted)
+
+**Fix.** `_CallDescriptors.__enter__` still left `_open.append(fd)`,
+`self.root = fd` and the return outside its guard. A failure there
+(reproduced with an `append` that raises) leaked the root descriptor. One
+guard now covers inspection, registration, root assignment and the return.
+On any failure it drops a partial registration, marks the scope as exited so
+no later `__exit__` closes the descriptor again, and closes the root exactly
+once. A confirmed close re-raises the exact original failure: the fixed
+`_ToolFailure` or the exact exception instance. An unconfirmed close raises
+`ToolCleanupUnconfirmedError` with that failure as `body_failure` and as the
+cause. One window remains unguarded: the instant between `os.open`
+returning and Python entering the guard.
+
+**Tests.** 25 new tests:
+- `append` raising an ordinary exception, `MemoryError`,
+  `KeyboardInterrupt` or `SystemExit`, each with registration before or
+  without it, and with a confirmed or failed close;
+- a failure after `append` succeeded, with each close outcome;
+- one failure through a real tool call.
+
+They assert exact identity, `body_failure` and the cause, exactly one close
+and no leaked descriptor.
+
+**Mutations.** 56 run: 55 caught by assertion and MR115 by its time guard.
+New: FD3 (registration moved back outside the guard). FD1 was re-anchored.
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`).** `test_repo_tools.py`
+122 passed, 2 skipped. Direct 13-file set 1,372 passed, 2 skipped, forward
+and reverse. Full suite 4,636 passed, 2 skipped; the skips are the macOS
+non-UTF-8-name tests. No leftovers; `git diff --check` clean; nothing
+staged; `uv.lock` untouched. Supersedes earlier D4a totals. Not committed;
+no Linux CI.

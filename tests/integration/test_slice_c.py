@@ -52,7 +52,8 @@ from codeagent.controller import PlanProposal, RunConfig, RunController, SystemC
 from codeagent.evidence import FilesystemEvidenceSink, parse_artifact
 from codeagent.executor import CONTAINER_NAME_PREFIX, DockerVerifier
 from codeagent.patch import GitPatchApplier, PatchOperation
-from codeagent.reader import WorktreeFileReader
+from codeagent._read_adapter import RepoToolsReaderAdapter
+from codeagent.repo_tools import RepoTools
 from codeagent.report import build_report, render_json, render_text
 from codeagent.workspace import GitWorktree
 from tests.support.fakes import FIXTURE_VERIFY_COMMAND, FakeApprovalProvider, MarkerGatedFakeModel
@@ -163,7 +164,7 @@ def test_real_docker_e2e_failing_baseline_then_passing_verification() -> None:
                 worktree_path,
                 (PatchOperation("jobs/worker.py", BUGGY, FIXED),),
             )
-            reader = WorktreeFileReader(worktree_path)
+            reader = RepoToolsReaderAdapter(RepoTools(worktree_path))
             model = MarkerGatedFakeModel(
                 read_path="jobs/worker.py", marker=BUG_MARKER, plan=PLAN
             )

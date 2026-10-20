@@ -235,12 +235,12 @@ def _raise_in_body(monkeypatch, exc, before=None):
     """Raise `exc` while collaborators are built, i.e. after the worktree
     was entered (no `RunFinished` will exist)."""
 
-    def reader(path):
+    def reader(tools):
         if before is not None:
             before()
         raise exc
 
-    monkeypatch.setattr(lr, "WorktreeFileReader", reader)
+    monkeypatch.setattr(lr, "RepoToolsReaderAdapter", reader)
 
 
 def _noop_worktree_remove(monkeypatch, e):

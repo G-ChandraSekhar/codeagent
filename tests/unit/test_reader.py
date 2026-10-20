@@ -1,10 +1,10 @@
-"""Milestone 1: WorktreeFileReader tests — the read half of the
-read-plan-approve-patch-verify-report vertical slice.
+"""The legacy single-file read path: originally `reader.WorktreeFileReader`
+(Milestone 1), now `_read_adapter.RepoToolsReaderAdapter` over the
+descriptor-relative `repo_tools.RepoTools` (ledger D4a). Every original
+assertion is kept; only the constructor and, in one test, the read-size
+spy target changed (D4a implementation report).
 
-Real filesystem, real fixture repo. Not the Milestone 2 repository-read
-toolkit; see reader.py's module docstring for the intentional scope
-limits (one UTF-8 text file, bounded size, no listing/pagination/
-search).
+Real filesystem, real fixture repo.
 """
 
 from __future__ import annotations
@@ -15,8 +15,15 @@ from pathlib import Path
 import pytest
 
 from codeagent.errors import ErrorCode
-from codeagent.reader import MAX_READ_BYTES, WorktreeFileReader
+from codeagent import repo_tools
+from codeagent._read_adapter import RepoToolsReaderAdapter
+from codeagent.repo_tools import READ_CONTENT_CAP_BYTES as MAX_READ_BYTES
+from codeagent.repo_tools import RepoTools
 from tests.support.fixture_repo import real_fixture_repo
+
+
+def WorktreeFileReader(path):  # noqa: N802 - keeps the original call sites unchanged
+    return RepoToolsReaderAdapter(RepoTools(path))
 
 
 def test_reads_a_real_file_from_the_worktree() -> None:
@@ -141,20 +148,16 @@ def test_read_never_requests_more_than_the_limit_plus_one_byte(monkeypatch) -> N
         huge.write_bytes(b"y" * (MAX_READ_BYTES * 5))
 
         requested_sizes: list[int] = []
-        real_open = Path.open
+        real_read = repo_tools._read
 
-        def spy_open(self, *args, **kwargs):
-            fh = real_open(self, *args, **kwargs)
-            real_read = fh.read
+        def spy_read(fd, n):
+            requested_sizes.append(n)
+            return real_read(fd, n)
 
-            def spy_read(n=-1):
-                requested_sizes.append(n)
-                return real_read(n)
-
-            fh.read = spy_read
-            return fh
-
-        monkeypatch.setattr(Path, "open", spy_open)
+        # D4a: the descriptor-relative reader reads through
+        # `repo_tools._read` (os.read on the opened descriptor), not
+        # Path.open; the asserted request sizes are unchanged.
+        monkeypatch.setattr(repo_tools, "_read", spy_read)
 
         result = WorktreeFileReader(repo).read_file("jobs/huge.py")
 

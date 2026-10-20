@@ -72,7 +72,8 @@ from .executor import (
 )
 from .lifecycle_store import LifecycleStoreError, create_shared_lifecycle_publishers, prepare_lifecycle
 from .patch import GitPatchApplier, PatchOperation
-from .reader import WorktreeFileReader
+from ._read_adapter import RepoToolsReaderAdapter
+from .repo_tools import RepoTools
 from .workspace import GitWorktree
 
 _MESSAGE_PREFIX = "lifecycle run cleanup could not be confirmed: "
@@ -417,7 +418,7 @@ def run_lifecycle_aware(
                 cancellation=cancellation,
             ),
             GitPatchApplier(path, patch_operations),
-            WorktreeFileReader(path),
+            RepoToolsReaderAdapter(RepoTools(path)),
             worktree,
             CheckpointSession(
                 CheckpointRef(source, lease.lifecycle_id),
