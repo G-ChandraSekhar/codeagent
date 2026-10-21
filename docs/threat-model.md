@@ -234,7 +234,7 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   content) — mitigated by patch validation (planned), not eliminated
 - Owning milestone/spike: Milestone 2 (patch validation), Milestone 3 (process
   policy)
-- **Ledger D4b status (2026-10-20; accepted at joint review; local macOS evidence only, Linux CI pending; ADR 0007, Accepted):** a scripted test-only fake model now drives the read-only tools, so
+- **Ledger D4b status (ADR 0007, Accepted 2026-10-20; commit `981f93b`, Linux-CI-confirmed in run 39519675089):** a scripted test-only fake model now drives the read-only tools, so
   repository content does reach a model context. It reaches only the
   in-memory `ModelContext` of the fake; events keep their redaction (no file
   content, snippets, verification output, `expected_text` or `new_text`). The
@@ -262,7 +262,7 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   controller actually calls `check_tool_call` before dispatch (a controller
   bug, not a domain-layer gap)
 - Owning milestone/spike: Milestone 1 (controller wiring)
-- **Ledger D4b status (2026-10-20; accepted at joint review; local macOS evidence only, Linux CI pending; ADR 0007, Accepted):** the turn loop checks
+- **Ledger D4b status (ADR 0007, Accepted 2026-10-20; commit `981f93b`, Linux-CI-confirmed in run 39519675089):** the turn loop checks
   `domain.legal_tools(state)` at the policy stage for every model-requested
   call: `apply_patch` requested by the model in `EXPLORE` is denied
   (`tool_not_legal_in_state`) with a full `ToolRequested`/`PolicyDecisionRecorded`/
@@ -284,7 +284,7 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
 - Residual risk: "off-plan" detection logic doesn't exist yet; a patch that
   matches the declared file list but is still excessive isn't caught
 - Owning milestone/spike: Milestone 2
-- **Ledger D4b status (2026-10-20; accepted at joint review; local macOS evidence only, Linux CI pending; ADR 0007, Accepted):** a plan carries exactly
+- **Ledger D4b status (ADR 0007, Accepted 2026-10-20; commit `981f93b`, Linux-CI-confirmed in run 39519675089):** a plan carries exactly
   one `ProposedChange` (`path`, `expected_text`, `new_text`, within D4a's byte
   limits) and the approved path set is that single path, so an off-plan file is
   refused. Size and excessive-change policy remain D5; not newly mitigated.
@@ -306,7 +306,7 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
 - Residual risk: "weakened assertion" detection is heuristic by nature and
   cannot be complete
 - Owning milestone/spike: Milestone 5 (repair loop / success contract), Milestone 6 (benchmark harness)
-- **Ledger D4b status (2026-10-20; accepted at joint review; local macOS evidence only, Linux CI pending; ADR 0007, Accepted):** unchanged and **unmitigated**:
+- **Ledger D4b status (ADR 0007, Accepted 2026-10-20; commit `981f93b`, Linux-CI-confirmed in run 39519675089):** unchanged and **unmitigated**:
   the model may now propose a change to a test file, applied after approval.
   Test-file rules are D5; until D5 lands, D6/D7 must not expose model-driven
   editing.

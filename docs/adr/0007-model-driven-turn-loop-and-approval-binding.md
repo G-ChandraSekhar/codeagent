@@ -5,10 +5,16 @@ accepted in the D4 plan (revisions 5 and 6) and the D4b readiness addendum
 (J1–J4), as implemented by ledger D4b.
 
 Implementation status: **implemented, locally verified on macOS
-(2026-10-20) and accepted at joint review; Linux CI pending.** Not operator-reachable: no
-CLI path runs a task, the only model is a test-only scripted fake, and
-`_lifecycle_run` stays unimported by any bundled module (T41). See
-`ENGINEERING_LOG.md`'s 2026-10-20 D4b entry for the exact verification.
+(2026-10-20), accepted at joint review, committed as `981f93b` (an ordinary
+fast-forward over `0b4b320`), and confirmed on GitHub-hosted Linux CI (run
+[39519675089](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39519675089)).**
+The authoritative CI evidence is in "Linux CI evidence" at the end of this
+ADR. Not operator-reachable: no CLI path runs a task, the only model is a
+test-only scripted fake, and `_lifecycle_run` stays unimported by any bundled
+module (T41). See `ENGINEERING_LOG.md`'s 2026-10-20 D4b entries for the local
+verification. (Historical: before the commit, this line read "implemented,
+locally verified on macOS (2026-10-20) and accepted at joint review; Linux CI
+pending", which was true then.)
 
 ## Context
 
@@ -197,4 +203,48 @@ pass:
   second `ToolCompleted`. No `CheckpointCreated`, `PatchApplied` or verification
   follows, and no C27 is recorded on this controller-dispatched path.
 
-Evidence remains local macOS only; Linux CI pending.
+Evidence remained local macOS only at the time of this correction pass
+(historical: "Linux CI pending" was true then); the Linux CI evidence follows.
+
+## Linux CI evidence (2026-10-21)
+
+Commit `981f93b774a103dd83b057ea57201c69f669ba97` ("feat: add model-driven
+repair loop"), pushed to `main` as an ordinary fast-forward over `0b4b320`.
+Run [39519675089](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39519675089)
+was verified through the Actions API and an independently fetched raw job log.
+
+- **Run:** push-triggered; head SHA exactly `981f93b…ba97`; `completed` /
+  `success`.
+- **Job:** one job, "Test (ubuntu-24.04, Python 3.12)". All 13 API-reported
+  steps succeeded. There are zero `##[error]` lines in the raw log and zero API
+  annotations.
+- **Environment:** runner image `ubuntu-24.04` (Ubuntu 24.04.5 LTS), CPython
+  3.12.15, and Docker client and server 28.0.4.
+- **Docker:** the mandatory preflight succeeded. The pinned
+  `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`
+  reported `linux/amd64`.
+- **Dedicated verbose step:** `python -m pytest
+  tests/integration/test_slice_c.py tests/integration/test_cancellation_e2e.py
+  -v`, with `CODEAGENT_REQUIRE_DOCKER: 1`, gave `14 passed in 14.53s`. All 14
+  are named `PASSED`: the four `test_slice_c.py` tests, and E1–E10 as ten test
+  cases.
+- **Complete suite:** `python -m pytest -q`, with `CODEAGENT_REQUIRE_DOCKER: 1`
+  in that step's own environment, gave `4807 passed, 4 skipped in 193.24s`,
+  with zero failed. 4,807 + 4 = 4,811, which matches the local collected total
+  (4,809 passed + 2 skipped).
+- **Leftover-container check:** the anchored
+  `^codeagent-(verify-|baseline-|verification-)` filter over a full
+  `docker ps -a` name listing produced empty output, and the step succeeded.
+
+**Evidence limits:**
+- `test_d4b_e2e.py` was not part of the verbose step.
+- A20–A22 are not named in the log. Their execution is an inference from the
+  complete-suite command, the matching collection total, the successful run,
+  and Docker being required and available.
+- The four quiet-mode skips are unidentified; `pytest -q` does not name them,
+  and they are not guessed here.
+- This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence, not a
+  security review.
+
+**Unchanged non-claims:** no operator path, no live model or provider
+adapter, no D5 transactional patching, and neither Gate α nor v1 completion.

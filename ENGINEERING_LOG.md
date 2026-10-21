@@ -7302,3 +7302,35 @@ the totals above (including the interim 79/79). No Linux CI.
 The acceptance pass changed only status wording (ADR 0007's status line and
 the current D4b references in `CLAUDE.md`, the ledger and the threat model).
 Linux CI evidence will be recorded in a separate documentation-only pass.
+
+## 2026-10-21 — D4b: Linux CI evidence reconciliation
+
+**What.** A documentation-only pass recording that D4b commit `981f93b` (an
+ordinary fast-forward, `0b4b320..981f93b`) passed GitHub Actions run
+[39519675089](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39519675089).
+The run was push-triggered for that exact commit and completed with
+`success`. This was verified independently through the Actions API and a
+freshly fetched raw job log: every step succeeded, no error annotations, the
+mandatory Docker preflight and pinned-image platform check passed, the
+dedicated verbose step's tests are all named as passing, the complete suite had
+no failures and its collected total matched the local total, and the
+leftover-container check was empty. The exact counts and environment are in ADR
+0007's "Linux CI evidence" section, the single authoritative record. No code,
+test, workflow, configuration, dependency or design change was made.
+
+**Limits.** `test_d4b_e2e.py` is not in the verbose step, so A20–A22 are not
+named in the log; their execution is inferred from the complete-suite command,
+the matching collection total, the successful run and Docker being required and
+available. The quiet-mode skips are unidentified. This is GitHub-hosted
+`ubuntu-24.04` x86_64 automated-test evidence, not a security review.
+
+**Status.** Ledger D4 is complete at the internal scripted-model level only. D5
+is the next release-blocking dependency (its substrate requires the C-1 ADR 0004
+amendment to be accepted before any recreation implementation); D6 follows; Gate O stays satisfied. The remaining
+planning range is D5–D10, 198–405 h (planning estimates).
+
+**Unchanged.** No live model or provider adapter, no operator path, no D5
+transactional patching, and neither Gate α nor v1 completion. T-A4 remains
+unmitigated, D7 redaction and disclosure work is still required before any live
+model, and D5 validation is still absent. The earlier D4b entries' "Linux CI
+pending" wording is historical. `uv.lock` was not touched.

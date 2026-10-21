@@ -3196,10 +3196,22 @@ Stage 2 (of the four-stage planning process in
     (done in D4b).
 - **Ledger D4b: model-driven exploration and repair loop** (D4 plan
   revisions 5 and 6, the D4b readiness addendum J1–J4; ADR 0007, **Accepted
-  2026-10-20**) is **implemented, locally verified on macOS (2026-10-20) and
-  accepted at joint review; Linux CI pending.** Not operator-reachable:
-  the only model is the test-only `ScriptedModel`/`FakeModel`, and no bundled
-  module imports `_lifecycle_run` (T41).
+  2026-10-20**) is **implemented, locally verified on macOS (2026-10-20),
+  accepted at joint review, committed (`981f93b`) as an ordinary
+  fast-forward over `0b4b320`, and confirmed on GitHub-hosted Linux CI** (run
+  [39519675089](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39519675089),
+  push-triggered, `success`; authoritative evidence in ADR 0007's "Linux CI
+  evidence" section). **Ledger D4 is complete at the internal
+  scripted-model level only:** no live model or provider adapter exists, and
+  no operator path runs a task. The only model is the test-only
+  `ScriptedModel`/`FakeModel`, and no bundled module imports `_lifecycle_run`
+  (T41). (Historical: the bullets below record the pre-commit local work;
+  "Linux CI pending" was true then.)
+  - **Linux CI evidence limits:** `test_d4b_e2e.py` is not in the verbose
+    step, so A20–A22 are not named in the log; their execution is inferred
+    from the complete-suite run. The quiet-mode skips are unidentified. This is
+    GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence, not a security
+    review.
   - **What it adds:** `model_protocol.py` (byte-level `ModelTurn`/`ToolCall`,
     `classify_turn`, the in-memory `ModelContext` with a 224 KiB cap);
     `events.ModelResponseRejected` and plan-binding fields;
@@ -3228,11 +3240,13 @@ Stage 2 (of the four-stage planning process in
     feedback can carry repository content into the (fake) model context, so
     D7 must add redaction before a live model; the wall-clock deadline is
     soft; bidi format characters are a D6 residual; T-A4 is unmitigated.
-- **Next:** Linux CI confirmation of D4b; after D4, D5
-  (substrate waits for the C-1 ADR 0004 amendment) and then D6. Remaining
-  planning range D4–D10: 277–537 h (cumulative D1–D10 363–677 h; D1–D3
-  86–140 h; D4 re-estimated to 79–132 h) — component planning estimates, not
-  hours spent or commitments (`docs/V1_COMPLETION_LEDGER.md`).
+- **Next:** D5 (the transactional patch protocol) is the next
+  release-blocking dependency. Its substrate requires the C-1 ADR 0004
+  amendment to be accepted before any recreation implementation; its integration depends
+  on D4, now complete. D6 follows D5; Gate O stays satisfied. Remaining
+  planning range D5–D10: 198–405 h (cumulative D1–D10 363–677 h; D1–D4
+  165–272 h) — component planning estimates, not hours spent or commitments
+  (`docs/V1_COMPLETION_LEDGER.md`).
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
