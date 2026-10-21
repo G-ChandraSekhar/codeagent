@@ -39,15 +39,14 @@ from codeagent import state_root as sr
 from codeagent import workspace as ws
 from codeagent._lifecycle_fs import LifecycleFsError, LifecycleFsFailure
 from codeagent.checkpoint_session import CheckpointIntent
-from codeagent.controller import EventLog, PlanProposal, SystemClock
+from codeagent.controller import EventLog, SystemClock
 from codeagent.errors import ErrorCode
 from codeagent.evidence import EvidenceSinkError
 from codeagent.executor import DEFAULT_IMAGE
 from codeagent.lifecycle_owner import OwnerStatePublicationError, OwnerStatePublicationFailure
-from codeagent.patch import PatchOperation
 from codeagent.state_locks import LockError, LockFailure
 from codeagent.worktree_lifecycle import WorktreeIntent, WorktreePublicationError, WorktreePublicationFailure
-from tests.support.fakes import FIXTURE_VERIFY_COMMAND, FakeApprovalProvider, MarkerGatedFakeModel
+from tests.support.fakes import FIXTURE_VERIFY_COMMAND, FakeApprovalProvider, MarkerGatedFakeModel, make_plan
 from tests.support.fixture_repo import real_fixture_repo
 
 Stage = lr.CleanupStage
@@ -66,11 +65,8 @@ FIXED = (
     "    job.retry_count += 1\n"
     "    already_processed.add(job.idempotency_key)"
 )
-PLAN = PlanProposal(
-    problem_hypothesis="idempotency key dropped on retry",
-    proposed_file_paths=("jobs/worker.py",),
-    verification_intent="python3 -B -m unittest tests.test_worker",
-)
+# Ledger D4b (U6): the patch content comes from the approved proposal.
+PLAN = make_plan(expected_text=BUGGY, new_text=FIXED)
 
 
 def _docker_available() -> bool:
@@ -214,7 +210,6 @@ def _invoke(e, *, model=None, image=DEFAULT_IMAGE, event_log=None, evidence_root
         task_statement="fix retry bug",
         approval_mode=domain.ApprovalMode.INTERACTIVE,
         evidence_root=evidence_root if evidence_root is not None else e.evidence,
-        patch_operations=(PatchOperation("jobs/worker.py", BUGGY, FIXED),),
         model=model or MarkerGatedFakeModel(read_path="jobs/worker.py", marker=BUG_MARKER, plan=PLAN),
         approval=FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
         verify_command=FIXTURE_VERIFY_COMMAND,
@@ -235,12 +230,12 @@ def _raise_in_body(monkeypatch, exc, before=None):
     """Raise `exc` while collaborators are built, i.e. after the worktree
     was entered (no `RunFinished` will exist)."""
 
-    def reader(tools):
+    def tools(path):
         if before is not None:
             before()
         raise exc
 
-    monkeypatch.setattr(lr, "RepoToolsReaderAdapter", reader)
+    monkeypatch.setattr(lr, "RepoTools", tools)
 
 
 def _noop_worktree_remove(monkeypatch, e):
@@ -1082,11 +1077,10 @@ def test_t31_second_run_skips_the_first_as_terminal(env):
 
 
 class _RaisingModel:
-    def request_read_path(self):
-        raise RuntimeError("SECRET-model")
+    model_name = "fake-model-v1"
 
-    def propose_plan(self, read_result):  # pragma: no cover - never reached
-        raise AssertionError
+    def respond(self, context):
+        raise RuntimeError("SECRET-model")
 
 
 @requires_docker
@@ -1208,7 +1202,6 @@ def _child_run_and_sigkill(repo, state_dir, evidence, point):
         task_statement="fix retry bug",
         approval_mode=domain.ApprovalMode.INTERACTIVE,
         evidence_root=evidence,
-        patch_operations=(PatchOperation("jobs/worker.py", BUGGY, FIXED),),
         model=MarkerGatedFakeModel(read_path="jobs/worker.py", marker=BUG_MARKER, plan=PLAN),
         approval=FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
         verify_command=FIXTURE_VERIFY_COMMAND,
@@ -1301,7 +1294,6 @@ def _child_run_with_sleeping_verification(repo, state_dir, evidence):
         task_statement="fix retry bug",
         approval_mode=domain.ApprovalMode.INTERACTIVE,
         evidence_root=evidence,
-        patch_operations=(PatchOperation("jobs/worker.py", BUGGY, FIXED),),
         model=MarkerGatedFakeModel(read_path="jobs/worker.py", marker=BUG_MARKER, plan=PLAN),
         approval=FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
         verify_command=("sh", "-c", " ".join(FIXTURE_VERIFY_COMMAND) + " && exec sleep 600"),
@@ -1483,7 +1475,6 @@ def test_t46_post_patch_verification_reads_the_private_0700_leaf(env, monkeypatc
         task_statement="fix retry bug",
         approval_mode=domain.ApprovalMode.INTERACTIVE,
         evidence_root=env.evidence,
-        patch_operations=(PatchOperation("jobs/worker.py", BUGGY, FIXED),),
         model=MarkerGatedFakeModel(read_path="jobs/worker.py", marker=BUG_MARKER, plan=PLAN),
         approval=FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
         verify_command=(

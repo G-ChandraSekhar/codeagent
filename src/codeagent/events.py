@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, unique
@@ -63,6 +64,7 @@ class EventType(str, Enum):
     MODEL_REQUEST_STARTED = "model_request_started"
     MODEL_REQUEST_FAILED = "model_request_failed"
     MODEL_RESPONSE_RECEIVED = "model_response_received"
+    MODEL_RESPONSE_REJECTED = "model_response_rejected"
     TOOL_REQUESTED = "tool_requested"
     POLICY_DECISION_RECORDED = "policy_decision_recorded"
     TOOL_COMPLETED = "tool_completed"
@@ -131,6 +133,30 @@ class ModelResponseStatus(str, Enum):
     CANCELLED = "cancelled"
     QUEUED = "queued"
     INCOMPLETE = "incomplete"
+
+
+@unique
+class ResponseRejectionReason(str, Enum):
+    """Why a returned model response could not be recorded as a
+    `ModelResponseReceived` (ledger D4b; D4 plan revision 6 §7.1a). The enum
+    is the only evidence: no type name, repr or raw status is recorded."""
+
+    NOT_A_MODEL_TURN = "not_a_model_turn"
+    STATUS_UNRECOGNIZED = "status_unrecognized"
+
+
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+_PROVIDER_CALL_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def _require_digest(name: str, value: str) -> None:
+    if not isinstance(value, str) or not _DIGEST_RE.fullmatch(value):
+        raise ValueError(f"{name} must be 64 lowercase hexadecimal characters")
+
+
+def _require_revision(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
 
 
 def _require_nonempty(name: str, value: str) -> None:
@@ -549,6 +575,29 @@ class ModelResponseReceived(Event):
 
 
 @dataclass(frozen=True, kw_only=True)
+class ModelResponseRejected(Event):
+    """A model client *returned* something, but not a recordable response:
+    not a `ModelTurn`, or a turn whose status is not a `ModelResponseStatus`
+    member (ledger D4b; D4 plan revision 6 §7.1a). Distinct from
+    `ModelRequestFailed` (no response object was obtained) and from
+    `ModelResponseReceived` (a status really came back): no status,
+    response ID or model name is invented."""
+
+    event_type: ClassVar[EventType] = EventType.MODEL_RESPONSE_REJECTED
+    request_id: str
+    rejection_reason: ResponseRejectionReason
+    error: OperationalError
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _require_nonempty("request_id", self.request_id)
+        if not isinstance(self.rejection_reason, ResponseRejectionReason):
+            raise ValueError(f"rejection_reason must be a ResponseRejectionReason, got {self.rejection_reason!r}")
+        if not isinstance(self.error, OperationalError) or self.error.code is not ErrorCode.MODEL_RESPONSE_MALFORMED:
+            raise ValueError(f"error must have code MODEL_RESPONSE_MALFORMED, got {self.error!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
 class ToolRequested(Event):
     event_type: ClassVar[EventType] = EventType.TOOL_REQUESTED
     tool: ToolName
@@ -559,11 +608,19 @@ class ToolRequested(Event):
     # module's canonical form (see _validate_canonical_redacted_arguments_json);
     # no redaction is performed or verified by this validation.
     redacted_arguments_json: str
+    # The model/provider's own call ID, for audit and provider correlation
+    # only (ledger D4b). Present only when it passed validation; never used
+    # as evidence. Controller-dispatched calls have none.
+    provider_call_id: str | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _require_nonempty("tool_call_id", self.tool_call_id)
         _validate_canonical_redacted_arguments_json(self.redacted_arguments_json)
+        if self.provider_call_id is not None and (
+            not isinstance(self.provider_call_id, str) or not _PROVIDER_CALL_ID_RE.fullmatch(self.provider_call_id)
+        ):
+            raise ValueError("provider_call_id must match [A-Za-z0-9_-]{1,128}")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -655,11 +712,23 @@ class PlanProposed(Event):
     proposed_file_paths: tuple[str, ...]
     verification_intent: str
     risk_notes: str
+    # Ledger D4b: the run-wide plan revision (1-based) and the digests that
+    # bind approval to exactly this proposal; `material_change` (audit only)
+    # compares `change_digest` with the last approved revision.
+    plan_revision: int
+    plan_digest: str
+    change_digest: str
+    material_change: bool
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _require_nonempty("problem_hypothesis", self.problem_hypothesis)
         _require_nonempty("verification_intent", self.verification_intent)
+        _require_revision("plan_revision", self.plan_revision)
+        _require_digest("plan_digest", self.plan_digest)
+        _require_digest("change_digest", self.change_digest)
+        if not isinstance(self.material_change, bool):
+            raise ValueError("material_change must be a bool")
         for i, item in enumerate(self.evidence_refs):
             if not item:
                 raise ValueError(f"evidence_refs[{i}] must be a nonempty string")
@@ -673,7 +742,14 @@ class ApprovalRecorded(Event):
     event_type: ClassVar[EventType] = EventType.APPROVAL_RECORDED
     decision: ApprovalDecision
     approval_mode: ApprovalMode
+    plan_revision: int
+    plan_digest: str
     operator_note: str | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _require_revision("plan_revision", self.plan_revision)
+        _require_digest("plan_digest", self.plan_digest)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -683,10 +759,14 @@ class PatchApplied(Event):
     files_changed: tuple[str, ...]
     checkpoint_id: str
     diff_bytes: int
+    plan_revision: int
+    change_digest: str
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _require_nonempty("checkpoint_id", self.checkpoint_id)
+        _require_revision("plan_revision", self.plan_revision)
+        _require_digest("change_digest", self.change_digest)
         if self.operation_count < 1:
             raise ValueError(f"operation_count must be >= 1, got {self.operation_count!r}")
         _require_nonnegative("diff_bytes", self.diff_bytes)
@@ -933,6 +1013,7 @@ AnyEvent = (
     | ModelRequestStarted
     | ModelRequestFailed
     | ModelResponseReceived
+    | ModelResponseRejected
     | ToolRequested
     | PolicyDecisionRecorded
     | ToolCompleted
@@ -953,6 +1034,7 @@ EVENT_CLASSES_BY_TYPE: dict[EventType, type[Event]] = {
     ModelRequestStarted.event_type: ModelRequestStarted,
     ModelRequestFailed.event_type: ModelRequestFailed,
     ModelResponseReceived.event_type: ModelResponseReceived,
+    ModelResponseRejected.event_type: ModelResponseRejected,
     ToolRequested.event_type: ToolRequested,
     PolicyDecisionRecorded.event_type: PolicyDecisionRecorded,
     ToolCompleted.event_type: ToolCompleted,

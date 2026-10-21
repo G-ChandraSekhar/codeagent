@@ -32,9 +32,9 @@ from pathlib import Path
 from codeagent import _lifecycle_run, cli, domain, events, executor
 from codeagent import lifecycle_store as ls
 from codeagent import reconciliation
-from codeagent.controller import EventLog, PlanProposal, RunController, SystemClock
-from codeagent.patch import GitPatchApplier, PatchOperation
-from tests.support.fakes import BlockingCancellableApprovalProvider, FakeApprovalProvider, MarkerGatedFakeModel
+from codeagent.controller import EventLog, RunController, SystemClock
+from codeagent.patch import GitPatchApplier
+from tests.support.fakes import BlockingCancellableApprovalProvider, FakeApprovalProvider, MarkerGatedFakeModel, make_plan
 
 BUGGY = (
     "    job.retry_count += 1\n"
@@ -48,11 +48,8 @@ FIXED = (
     "    job.retry_count += 1\n"
     "    already_processed.add(job.idempotency_key)"
 )
-PLAN = PlanProposal(
-    problem_hypothesis="idempotency key dropped on retry",
-    proposed_file_paths=("jobs/worker.py",),
-    verification_intent="python3 -B -m unittest tests.test_worker",
-)
+# Ledger D4b (U6): the patch content comes from the approved proposal.
+PLAN = make_plan(expected_text=BUGGY, new_text=FIXED)
 _DEADLINE_SECONDS = 300.0
 
 
@@ -187,9 +184,9 @@ def main(config_path: str) -> None:
     elif scenario == "patch_signal":  # E9
         real_apply = GitPatchApplier.apply
 
-        def apply(self, run_id, iteration, approved_paths):
+        def apply(self, run_id, iteration, approved_paths, operations):
             os.kill(os.getpid(), signal.SIGINT)
-            return real_apply(self, run_id, iteration, approved_paths)
+            return real_apply(self, run_id, iteration, approved_paths, operations)
 
         GitPatchApplier.apply = apply
     elif scenario == "admission":  # E10
@@ -221,7 +218,6 @@ def main(config_path: str) -> None:
                 task_statement="fix retry bug",
                 approval_mode=domain.ApprovalMode.INTERACTIVE,
                 evidence_root=config["evidence"],
-                patch_operations=(PatchOperation("jobs/worker.py", BUGGY, FIXED),),
                 model=MarkerGatedFakeModel(read_path="jobs/worker.py", marker="# BUG:", plan=PLAN),
                 approval=approval,
                 verify_command=tuple(config["verify_command"]),

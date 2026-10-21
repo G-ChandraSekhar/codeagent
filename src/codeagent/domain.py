@@ -59,6 +59,11 @@ class Trigger(str, Enum):
     POLICY_VIOLATION = "policy_violation"
     CANCELLED = "cancelled"
     UNRECOVERABLE_ERROR = "unrecoverable_error"
+    # Ledger D4b (ADR 0007): the model provider reported a valid, non-error
+    # INCOMPLETE response (for example an output limit). Not an abort
+    # trigger: model requests happen only in EXPLORE, so it is legal there
+    # alone.
+    MODEL_RESPONSE_INCOMPLETE = "model_response_incomplete"
 
 
 @unique
@@ -69,6 +74,7 @@ class TerminalReason(str, Enum):
     POLICY_VIOLATION = "policy_violation"
     CANCELLED = "cancelled"
     UNRECOVERABLE_ERROR = "unrecoverable_error"
+    MODEL_RESPONSE_INCOMPLETE = "model_response_incomplete"
 
 
 @unique
@@ -197,6 +203,7 @@ _TRANSITIONS: dict[tuple[RunState, Trigger], RunState] = {
     (RunState.EXECUTE, Trigger.PATCH_APPLIED): RunState.VERIFY,
     (RunState.VERIFY, Trigger.VERIFICATION_PASSED): RunState.DONE,
     (RunState.VERIFY, Trigger.VERIFICATION_FAILED): RunState.EXPLORE,
+    (RunState.EXPLORE, Trigger.MODEL_RESPONSE_INCOMPLETE): RunState.DONE,
 }
 
 # Terminal reason recorded for each trigger that ends a run. Every
@@ -211,6 +218,7 @@ _TERMINAL_REASONS: dict[Trigger, TerminalReason] = {
     Trigger.POLICY_VIOLATION: TerminalReason.POLICY_VIOLATION,
     Trigger.CANCELLED: TerminalReason.CANCELLED,
     Trigger.UNRECOVERABLE_ERROR: TerminalReason.UNRECOVERABLE_ERROR,
+    Trigger.MODEL_RESPONSE_INCOMPLETE: TerminalReason.MODEL_RESPONSE_INCOMPLETE,
 }
 
 # Tools a model may call while the run is in a given state. States not

@@ -22,16 +22,17 @@ from pathlib import Path
 from codeagent import domain, events
 from codeagent.checkpoint_ref import CheckpointRef, new_lifecycle_id
 from codeagent.checkpoint_session import CheckpointSession
-from codeagent.controller import RunConfig, RunController, PlanProposal
+from codeagent.controller import RunConfig, RunController
 from codeagent.evidence import FilesystemEvidenceSink, parse_artifact
-from codeagent.patch import GitPatchApplier, PatchOperation
+from codeagent.patch import GitPatchApplier
 from codeagent.workspace import GitWorktree
 from tests.support.fakes import (
     FakeApprovalProvider,
     FakeModel,
-    FakeRepositoryReader,
+    FakeRepositoryTools,
     FakeVerifier,
     SteppingClock,
+    make_plan,
 )
 from tests.support.fixture_repo import real_fixture_repo
 
@@ -44,11 +45,9 @@ FIXED_SNIPPET = (
     "    # (fixture) fix applied by codeagent"
 )
 
-PLAN = PlanProposal(
-    problem_hypothesis="idempotency key dropped on retry",
-    proposed_file_paths=("jobs/worker.py",),
-    verification_intent="python3 -B -m unittest tests.test_worker",
-)
+# Ledger D4b (U6): the patch content comes from the approved proposal.
+PLAN = make_plan(expected_text=ORIGINAL_SNIPPET, new_text=FIXED_SNIPPET)
+FAILING_PLAN = make_plan(expected_text="TEXT_NOT_PRESENT_ANYWHERE", new_text="y")
 
 
 def _status(repo) -> str:
@@ -75,10 +74,7 @@ def test_real_repo_to_worktree_to_patch_to_checkpoint_to_cleanup() -> None:
         session = CheckpointSession(CheckpointRef(repo, lifecycle_id))
 
         with worktree_lifecycle as worktree_path:
-            applier = GitPatchApplier(
-                worktree_path,
-                (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, FIXED_SNIPPET),),
-            )
+            applier = GitPatchApplier(worktree_path)
             config = RunConfig(
                 run_id="r-slice-b",
                 task_statement="fix retry bug",
@@ -92,7 +88,7 @@ def test_real_repo_to_worktree_to_patch_to_checkpoint_to_cleanup() -> None:
                 FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
                 FakeVerifier((events.VerificationOutcome.PASSED,)),
                 applier,
-                FakeRepositoryReader(),
+                FakeRepositoryTools(),
                 worktree_lifecycle,
                 session,
                 FilesystemEvidenceSink(Path(evidence_root)),
@@ -165,10 +161,7 @@ def test_patch_validation_failure_leaves_worktree_and_original_unchanged_via_con
         session = CheckpointSession(CheckpointRef(repo, lifecycle_id))
 
         with worktree_lifecycle as worktree_path:
-            applier = GitPatchApplier(
-                worktree_path,
-                (PatchOperation("jobs/worker.py", "TEXT_NOT_PRESENT_ANYWHERE", "y"),),
-            )
+            applier = GitPatchApplier(worktree_path)
             config = RunConfig(
                 run_id="r-slice-b-fail",
                 task_statement="fix retry bug",
@@ -178,11 +171,11 @@ def test_patch_validation_failure_leaves_worktree_and_original_unchanged_via_con
             )
             controller = RunController(
                 config,
-                FakeModel(PLAN),
+                FakeModel(FAILING_PLAN),
                 FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
                 FakeVerifier((events.VerificationOutcome.PASSED,)),
                 applier,
-                FakeRepositoryReader(),
+                FakeRepositoryTools(),
                 worktree_lifecycle,
                 session,
                 FilesystemEvidenceSink(Path(evidence_root)),

@@ -7149,3 +7149,156 @@ evidence, not a security review.
 - No threat is newly mitigated.
 - The earlier D4a entries' "uncommitted, no Linux CI" wording is historical.
 - `uv.lock` was not touched.
+
+## 2026-10-20 — D4b: model-driven exploration and repair loop (accepted at joint review)
+
+**What.** Ledger D4b per the D4 plan (revisions 5 and 6) and the D4b
+readiness addendum (J1–J4, P1, U16, U17). ADR 0007 (Accepted 2026-10-20 at
+joint review) records the invariants. Starts from `main == origin/main ==
+0b4b320`. Reviewed unstaged; Linux CI pending; `uv.lock` untouched (SHA-256
+`d235cde9…e973`), never staged.
+D5–D7 not started. No operator path, no live model.
+
+**Found and fixed during migration.** The dispatcher read all three tool
+methods off the toolkit *after* `ToolRequested` but outside its guard, so a
+toolkit missing an attribute would leave an unpaired `ToolRequested`. The
+lookup now runs inside the guard.
+
+**Deviations (disclosed).**
+- `PatchOperation` moved to `tool_schema` (`patch` imports
+  `controller.PatchResult`, so the controller could not import `patch`);
+  `patch` re-exports it.
+- No event serialization path exists; the `ModelResponseRejected` round trip
+  is pinned through `dataclasses.asdict`.
+- Verification and baseline tails are bounded in JSON-encoded bytes.
+- The deadline check lives inside `_cancellation_check`, after cancellation,
+  so every safe point checks it.
+- A non-`ApprovalResponse` return raises `TypeError` into Slice 3C-3
+  (`UNCLASSIFIED_FAILURE`).
+- The historical 23-file focused set was not reconstructed; a 15-file direct
+  set (every migrated or new file, plus the subprocess inventory and
+  cancellation E2E) was run forward and reverse instead.
+
+**Migrated assertions (U-rows).**
+- U2: the failed-read test now ends `BUDGET_EXCEEDED(TOOL_CALLS, 25)` with
+  25 failed reads; the rank-4 "read" precedence case became
+  `test_pending_cancellation_during_a_failed_read_is_observed_at_c27`.
+- U3: the R31b duration test includes model latency.
+- U6: the "subset of approved files" test keeps the single-file case (a
+  strict subset of one approved path is no longer representable).
+- U8/J2: the D3 sweep's per-pass sites are `C5 C25 C26 C27 C24 C25 C26 C27
+  C12 C13 C14 C15`.
+- `test_patch.py`: operations moved to `apply()`. A `_Bound` test adapter
+  keeps 32 call sites on the real `GitPatchApplier(worktree).apply(...)`;
+  the two construction-error tests now assert `ValueError` from `apply()`.
+- `test_d4a_read_path.py` became the R31b route tests (terminal owner
+  `_explore_pass`; no later call dispatched).
+- Fixture: the two `CODEAGENT_FIXTURE_MARKER` assertion messages (U10).
+
+**U16 mapping (`test_reader.py` deleted).** Absolute path: `test_tool_schema`
+static paths plus `test_read_file_absolute_path_is_refused_before_any_read`.
+`..`: `test_tool_schema`. Nonexistent nested path and non-directory
+components: `test_read_file_missing_and_non_directory_components`. Symlink
+escape: `test_read_file_symlinks_are_refused_at_every_component`.
+Nonexistent target: the same missing-component test. Non-UTF-8:
+`test_read_file_non_utf8`. No worktree path in messages:
+`test_read_file_messages_never_contain_the_worktree_path` (new). Distinct
+`error_id`s: `test_each_read_failure_gets_a_distinct_error_id` (new).
+Construction: `test_construction_requires_a_real_directory`. The three
+`ReadResult` validators were deleted with `ReadResult`. Whole-file size
+refusal, the read-size spy and the exact-limit file are superseded by
+pagination and the content-cap tests.
+
+**Tests.** New `test_d4b_model_loop.py` (134), `test_d4b_e2e.py` (3, real
+Git and Docker: A20 fail → repair → pass gated on both fixture markers, A21
+stale `expected_text` terminal, A22 cancellation in a pass-2 turn, each with
+full cleanup), `trace_assertions.py` (strict pairing helpers),
+`scripted_model.py`.
+
+**Mutations.** 77 run, 77 caught by assertion (none by an aborted session),
+sources restored and SHA-256-verified: MR2–MR5, MR9–MR16, MR20–MR22,
+MR26–MR29, MR31–MR33, MR35–MR37, MR49/MR80, MR50–MR55, MR60/MR78,
+MR63–MR67, MR73–MR75, MR77, MR79, MR82, MR84, MR86–MR90, MR93, MR94,
+MR99–MR111, MRJ1a/b, MRJ2a–f (MRJ2c with MR64), MRJ3a/b, MRJ4a/b and the two
+patch-seam mutations. Not run, with reasons: MR38's "decoupled copy" variant
+is an equivalent mutant (the R19 tamper precedes `ApprovedPlan`, and a
+defensive copy is not a defect); "stores only the change" reduces to MR37.
+MR76 and MR91 (charging a run-ending turn) are unobservable, because the run
+ends before any later turn could see the charge. MR83, MR85 and MR95 are
+D4a-only.
+
+**Verified (macOS, real Docker, `CODEAGENT_REQUIRE_DOCKER=1`).** Full suite
+4,793 passed, 2 skipped (the macOS non-UTF-8-filename tests). Direct 15-file
+set 1,551 passed, 2 skipped, forward and reverse. Cancellation E1–E12 pass
+through the scripted-model driver. No leftover containers, worktrees,
+`refs/codeagent` refs, processes or state roots; the default macOS state root
+is absent; `git diff --check` clean.
+
+**Risks.** One stale `expected_text` ends the run until D5. Feedback can carry
+repository and test content into the fake model's in-memory context; D7 must
+add redaction before a live model. The wall-clock deadline is soft. Bidi
+format characters are a D6 residual. T-A4 stays unmitigated.
+
+### 2026-10-20 — D4b correction pass (joint review)
+
+**Reproduced first.** (1) A repository tool returning `object()` ended
+`UNCLASSIFIED_FAILURE` with only `ToolRequested` and `PolicyDecisionRecorded`,
+no `ToolCompleted`. (2) A tool that advanced a controlled clock by 7 s and then
+raised showed `ToolCompleted.duration_seconds == 7.0` but
+`RunFinished.total_duration_seconds == 0.01`.
+
+**Fix (`RunController._execute_repository_call` only).** The `ToolOutcome`
+check moved inside the guarded call, so a wrong return type takes the existing
+unexpected-tool path: one failed `ToolCompleted` ("tool failed unexpectedly"),
+then the `TypeError` reaches the Slice 3C-3 fallback, with no C27 decision. That
+path now adds the measured duration to `_total_duration` once. Success and
+cleanup-unconfirmed accounting is unchanged; the interrupt path is unchanged.
+
+**Tests.** `test_a_wrong_return_type_completes_the_triple_and_is_unclassified`
+(pairing, fixed text, sentinel repr and type name absent, no C27), and
+`test_tool_duration_is_counted_exactly_once_on_every_returned_or_raised_path`
+for the raise, cleanup-unconfirmed and success paths (the total moves by
+exactly the tool's 7 s).
+
+**Mutations.** MRfix1 restores the old post-guard placement (both edits);
+MRfix2 drops the failed-path accounting. Both caught. The harness now supports
+multi-site edits. Full set: 79/79 caught by assertion, sources restored and
+SHA-256-verified (supersedes the 77 above).
+
+**Re-review, same class.** The model call already counted and paired its
+raised path. Denials and plan acceptance call no collaborator between their
+events. The controller-dispatched `apply_patch` triple (unchanged from
+`0b4b320`) had the same partial pair; it is fixed below by joint decision,
+not deferred to D5.
+
+**`apply_patch` guard (same day).** Reproduced first: an applier raising, an
+applier returning a non-`PatchResult`, and establish or advance raising outside
+the three mapped checkpoint types each ended `UNCLASSIFIED_FAILURE` with only
+`ToolRequested` and `PolicyDecisionRecorded`. Steps 3–7 moved into
+`_run_patch_transaction`, which emits nothing and returns a mapped failure or
+the validated `PatchResult`. Its call is guarded: an ordinary exception emits
+one failed `ToolCompleted` ("tool failed unexpectedly"), counts its duration
+once and re-raises; an interrupt emits "tool interrupted" and is re-raised
+exactly, with an emission failure attached. All emission stays outside the
+guard, so there is never a second `ToolCompleted`. No C27 on this path. New
+tests cover the four cases and an interrupt (exact ordering, one failure,
+fixed text, exception identity at the 3C-3 boundary, duration once, no success
+or verification events, no sentinel leakage), a failing emission attempted
+once, and the unchanged mapped and success shapes. Mutations MRpatch1–3
+(guard bypassed, duration dropped, interrupt unpaired) were caught; four older
+anchors were made unique.
+
+**Also.** Removed the extra `)` in the ledger's D5 blocker cell, and tidied
+that cell's date wording.
+
+**Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`, after both fixes).**
+`test_d4b_model_loop.py` plus `test_d4b_e2e.py` 153 passed. 15-file direct set
+1,567 passed, 2 skipped, forward and reverse. Full suite 4,809 passed,
+2 skipped (the macOS non-UTF-8-filename tests). Mutations 82/82 caught by
+assertion in one pass, sources restored and SHA-256-verified. These supersede
+the totals above (including the interim 79/79). No Linux CI.
+
+**Accepted (2026-10-20).** D4b and ADR 0007 were accepted at joint review.
+The acceptance pass changed only status wording (ADR 0007's status line and
+the current D4b references in `CLAUDE.md`, the ledger and the threat model).
+Linux CI evidence will be recorded in a separate documentation-only pass.

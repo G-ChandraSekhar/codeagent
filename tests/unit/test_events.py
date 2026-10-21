@@ -33,6 +33,14 @@ def now() -> datetime:
     return datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
+# Ledger D4b: the plan-binding fields now required on PlanProposed,
+# ApprovalRecorded and PatchApplied (disclosed constructor migration; every
+# existing assertion is unchanged).
+PLAN_BINDING = dict(plan_revision=1, plan_digest="a" * 64, change_digest="b" * 64, material_change=True)
+APPROVAL_BINDING = dict(plan_revision=1, plan_digest="a" * 64)
+PATCH_BINDING = dict(plan_revision=1, change_digest="b" * 64)
+
+
 def make_envelope(**overrides: object) -> dict[str, object]:
     base: dict[str, object] = dict(
         run_id="run-1",
@@ -1032,6 +1040,7 @@ def test_plan_proposed_construction() -> None:
         proposed_file_paths=("jobs/worker.py",),
         verification_intent="python3 -B -m unittest tests.test_worker",
         risk_notes="none identified",
+        **PLAN_BINDING,
     )
     assert e.proposed_file_paths == ("jobs/worker.py",)
 
@@ -1052,6 +1061,7 @@ def test_plan_proposed_rejects_invalid_fields(overrides: dict[str, object]) -> N
         proposed_file_paths=(),
         verification_intent="pytest",
         risk_notes="",
+        **PLAN_BINDING,
     )
     kwargs.update(overrides)
     with pytest.raises(ValueError):
@@ -1066,6 +1076,7 @@ def test_plan_proposed_allows_empty_evidence_and_paths() -> None:
         proposed_file_paths=(),
         verification_intent="pytest",
         risk_notes="",
+        **PLAN_BINDING,
     )
     assert e.evidence_refs == ()
 
@@ -1083,6 +1094,7 @@ def test_approval_recorded_accepts_every_approval_decision(
         **make_envelope(state=domain.RunState.APPROVAL),
         decision=decision,
         approval_mode=domain.ApprovalMode.INTERACTIVE,
+        **APPROVAL_BINDING,
     )
     assert e.decision is decision
 
@@ -1093,6 +1105,7 @@ def test_approval_recorded_accepts_every_approval_mode(mode: domain.ApprovalMode
         **make_envelope(state=domain.RunState.APPROVAL),
         decision=domain.ApprovalDecision.APPROVED,
         approval_mode=mode,
+        **APPROVAL_BINDING,
     )
     assert e.approval_mode is mode
 
@@ -1102,6 +1115,7 @@ def test_approval_recorded_operator_note_optional() -> None:
         **make_envelope(state=domain.RunState.APPROVAL),
         decision=domain.ApprovalDecision.REJECTED,
         approval_mode=domain.ApprovalMode.NONE,
+        **APPROVAL_BINDING,
     )
     assert e.operator_note is None
 
@@ -1118,6 +1132,7 @@ def test_patch_applied_construction() -> None:
         files_changed=("a.py", "b.py"),
         checkpoint_id="ckpt-1",
         diff_bytes=128,
+        **PATCH_BINDING,
     )
     assert e.operation_count == 2
 
@@ -1133,7 +1148,7 @@ def test_patch_applied_construction() -> None:
 )
 def test_patch_applied_rejects_invalid_fields(overrides: dict[str, object]) -> None:
     kwargs = dict(
-        operation_count=1, files_changed=("a.py",), checkpoint_id="ckpt-1", diff_bytes=0
+        operation_count=1, files_changed=("a.py",), checkpoint_id="ckpt-1", diff_bytes=0, **PATCH_BINDING
     )
     kwargs.update(overrides)
     with pytest.raises(ValueError):
@@ -1596,6 +1611,8 @@ def test_event_type_values_are_pinned() -> None:
         "model_request_started",
         "model_request_failed",
         "model_response_received",
+        # Ledger D4b (U15): a returned but unrecordable model response.
+        "model_response_rejected",
         "tool_requested",
         "policy_decision_recorded",
         "tool_completed",
@@ -1940,3 +1957,112 @@ def test_evidence_captured_rejects_wrong_error_code() -> None:
 
 def test_evidence_captured_is_registered_in_event_type_registry() -> None:
     assert events.EVENT_CLASSES_BY_TYPE[events.EventType.EVIDENCE_CAPTURED] is events.EvidenceCaptured
+
+
+# --------------------------------------------------------------------
+# Ledger D4b: plan binding, provider call IDs, ModelResponseRejected
+# --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(plan_revision=0),
+        dict(plan_revision=True),
+        dict(plan_digest="A" * 64),
+        dict(plan_digest="a" * 63),
+        dict(change_digest="z" * 64),
+        dict(material_change=1),
+    ],
+)
+def test_plan_proposed_rejects_invalid_binding(overrides: dict[str, object]) -> None:
+    kwargs = dict(
+        problem_hypothesis="h",
+        evidence_refs=("tc-0-1",),
+        proposed_file_paths=("a.py",),
+        verification_intent="v",
+        risk_notes="",
+        **PLAN_BINDING,
+    )
+    kwargs.update(overrides)
+    with pytest.raises(ValueError):
+        events.PlanProposed(**make_envelope(), **kwargs)
+
+
+@pytest.mark.parametrize("overrides", [dict(plan_revision=0), dict(plan_digest="x")])
+def test_approval_recorded_rejects_invalid_binding(overrides: dict[str, object]) -> None:
+    kwargs = dict(decision=domain.ApprovalDecision.APPROVED, approval_mode=domain.ApprovalMode.NONE, **APPROVAL_BINDING)
+    kwargs.update(overrides)
+    with pytest.raises(ValueError):
+        events.ApprovalRecorded(**make_envelope(state=domain.RunState.APPROVAL), **kwargs)
+
+
+@pytest.mark.parametrize("overrides", [dict(plan_revision=-1), dict(change_digest="")])
+def test_patch_applied_rejects_invalid_binding(overrides: dict[str, object]) -> None:
+    kwargs = dict(operation_count=1, files_changed=("a.py",), checkpoint_id="c", diff_bytes=1, **PATCH_BINDING)
+    kwargs.update(overrides)
+    with pytest.raises(ValueError):
+        events.PatchApplied(**make_envelope(state=domain.RunState.EXECUTE), **kwargs)
+
+
+def _tool_requested(**overrides: object) -> events.ToolRequested:
+    kwargs = dict(tool=domain.ToolName.READ_FILE, tool_call_id="tc-0-1", redacted_arguments_json="{}")
+    kwargs.update(overrides)
+    return events.ToolRequested(**make_envelope(), **kwargs)
+
+
+def test_tool_requested_provider_call_id_is_optional_and_validated() -> None:
+    assert _tool_requested().provider_call_id is None
+    assert _tool_requested(provider_call_id="call_abc-1").provider_call_id == "call_abc-1"
+    for bad in ("", "a b", "x" * 129, "caf\u00e9"):
+        with pytest.raises(ValueError):
+            _tool_requested(provider_call_id=bad)
+
+
+def _rejected(**overrides: object) -> events.ModelResponseRejected:
+    kwargs = dict(
+        request_id="req-1",
+        rejection_reason=events.ResponseRejectionReason.NOT_A_MODEL_TURN,
+        error=OperationalError(code=ErrorCode.MODEL_RESPONSE_MALFORMED, error_id="e1", message="m"),
+    )
+    kwargs.update(overrides)
+    return events.ModelResponseRejected(**make_envelope(), **kwargs)
+
+
+def test_model_response_rejected_construction_and_validation() -> None:
+    assert _rejected().rejection_reason is events.ResponseRejectionReason.NOT_A_MODEL_TURN
+    with pytest.raises(ValueError):
+        _rejected(request_id="")
+    with pytest.raises(ValueError):
+        _rejected(rejection_reason="not_a_model_turn")
+    with pytest.raises(ValueError):
+        _rejected(error=OperationalError(code=ErrorCode.MODEL_RESPONSE_FAILED_STATUS, error_id="e", message="m"))
+    assert {r.value for r in events.ResponseRejectionReason} == {"not_a_model_turn", "status_unrecognized"}
+    assert events.EVENT_CLASSES_BY_TYPE[events.EventType.MODEL_RESPONSE_REJECTED] is events.ModelResponseRejected
+
+
+def test_model_response_rejected_round_trips_through_asdict() -> None:
+    import dataclasses
+
+    event = _rejected()
+    rebuilt = events.ModelResponseRejected(**dataclasses.asdict(event) | {
+        "error": OperationalError(**dataclasses.asdict(event)["error"]),
+    })
+    assert rebuilt == event
+
+
+def test_run_finished_for_model_response_incomplete_carries_no_error() -> None:
+    kwargs = dict(
+        terminal_reason=domain.TerminalReason.MODEL_RESPONSE_INCOMPLETE,
+        total_cost_microusd=None,
+        total_tokens=0,
+        total_duration_seconds=0.0,
+        iterations_used=1,
+    )
+    events.RunFinished(**make_envelope(state=domain.RunState.DONE), **kwargs)
+    with pytest.raises(ValueError):
+        events.RunFinished(
+            **make_envelope(state=domain.RunState.DONE),
+            **kwargs,
+            error=OperationalError(code=ErrorCode.MODEL_RESPONSE_MALFORMED, error_id="e", message="m"),
+        )

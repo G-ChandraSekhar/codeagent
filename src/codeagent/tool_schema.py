@@ -103,6 +103,7 @@ class ArgumentRejection(str, Enum):
     CURSOR_MISMATCH = "cursor_mismatch"
     EVIDENCE_REF_INVALID = "evidence_ref_invalid"
     CHANGE_UNCHANGED = "change_unchanged"
+    QUERY_CONTROL_CHARACTER = "query_control_character"
 
 
 class ToolArgumentError(ValueError):
@@ -387,8 +388,13 @@ class SearchTextArgs:
     def __post_init__(self) -> None:
         _require_str(self.query, "query")
         _require_chars(self.query, "query", MAX_QUERY_CHARS, allow_empty=False)
-        if "\x00" in self.query or "\n" in self.query:
-            raise ToolArgumentError(ArgumentRejection.WRONG_TYPE, "query must not contain NUL or newline")
+        # Every C0/C1 control except tab (ledger D4b, J4): canonical JSON
+        # would escape it, but it stays part of the semantic query, which a
+        # later audit or report layer could decode or render.
+        if any(_is_control(ch) and ch != "\t" for ch in self.query):
+            raise ToolArgumentError(
+                ArgumentRejection.QUERY_CONTROL_CHARACTER, "query must not contain control characters other than tab"
+            )
         check_relative_path(self.path, allow_root=True)
         _require_int(self.limit, "limit", 1, SEARCH_LIMIT_MAX)
         if self.cursor is not None:
@@ -578,6 +584,25 @@ def parse_tool_arguments(tool: ToolName, raw: bytes) -> ToolArgs:
         verification_intent=f["verification_intent"],
         risk_notes=f.get("risk_notes", ""),
     )
+
+
+@dataclass(frozen=True)
+class PatchOperation:
+    """Replace exactly one occurrence of `expected_text` with `new_text`
+    in the file at `relative_path` (relative to the worktree root).
+
+    Deliberately unvalidated: `patch.GitPatchApplier` performs its own
+    defence-in-depth checks. Lives here, re-exported by `patch`, so the
+    controller can build one from an approved `ProposedChange` without an
+    import cycle (`patch` imports `controller`)."""
+
+    relative_path: str
+    expected_text: str
+    new_text: str
+
+    @classmethod
+    def from_change(cls, change: ProposedChange) -> PatchOperation:
+        return cls(change.path, change.expected_text, change.new_text)
 
 
 # --- Redaction and digests ------------------------------------------------------

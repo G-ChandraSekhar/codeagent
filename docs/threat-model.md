@@ -234,6 +234,19 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   content) — mitigated by patch validation (planned), not eliminated
 - Owning milestone/spike: Milestone 2 (patch validation), Milestone 3 (process
   policy)
+- **Ledger D4b status (2026-10-20; accepted at joint review; local macOS evidence only, Linux CI pending; ADR 0007, Accepted):** a scripted test-only fake model now drives the read-only tools, so
+  repository content does reach a model context. It reaches only the
+  in-memory `ModelContext` of the fake; events keep their redaction (no file
+  content, snippets, verification output, `expected_text` or `new_text`). The
+  model can still propose a legal `apply_patch` change with attacker-influenced
+  content; it is applied only after approval of its digest-bound proposal, and
+  D5 validation is still absent. D7 must define redaction and disclosure
+  controls before any live model. Not mitigated beyond that.
+- **`.git` host-path disclosure (D4a control, now model-reachable in D4b):** a
+  linked worktree's `.git` file names a host path. `.git` (case-insensitively,
+  and `git~1`) is refused at the policy stage before any filesystem access, and
+  an inode rule refuses aliases at execution; D4b's model-driven tests show the
+  host path in no event. Residual: a same-user hard link (assumption A4).
 
 **T-A2 — Illegal tool/state combination.**
 - Asset/objective: O4
@@ -249,6 +262,12 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   controller actually calls `check_tool_call` before dispatch (a controller
   bug, not a domain-layer gap)
 - Owning milestone/spike: Milestone 1 (controller wiring)
+- **Ledger D4b status (2026-10-20; accepted at joint review; local macOS evidence only, Linux CI pending; ADR 0007, Accepted):** the turn loop checks
+  `domain.legal_tools(state)` at the policy stage for every model-requested
+  call: `apply_patch` requested by the model in `EXPLORE` is denied
+  (`tool_not_legal_in_state`) with a full `ToolRequested`/`PolicyDecisionRecorded`/
+  `ToolCompleted` triple and is non-terminal. `apply_patch` is dispatched only
+  by the controller after approval.
 
 **T-A3 — Oversized, out-of-scope, or excessive-file-count patch.**
 - Asset/objective: O1, O4
@@ -265,6 +284,10 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
 - Residual risk: "off-plan" detection logic doesn't exist yet; a patch that
   matches the declared file list but is still excessive isn't caught
 - Owning milestone/spike: Milestone 2
+- **Ledger D4b status (2026-10-20; accepted at joint review; local macOS evidence only, Linux CI pending; ADR 0007, Accepted):** a plan carries exactly
+  one `ProposedChange` (`path`, `expected_text`, `new_text`, within D4a's byte
+  limits) and the approved path set is that single path, so an off-plan file is
+  refused. Size and excessive-change policy remain D5; not newly mitigated.
 
 **T-A4 — Model weakens or deletes tests / benchmark evaluators.**
 - Asset/objective: O5 (trustworthy result), evaluation integrity
@@ -283,6 +306,10 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
 - Residual risk: "weakened assertion" detection is heuristic by nature and
   cannot be complete
 - Owning milestone/spike: Milestone 5 (repair loop / success contract), Milestone 6 (benchmark harness)
+- **Ledger D4b status (2026-10-20; accepted at joint review; local macOS evidence only, Linux CI pending; ADR 0007, Accepted):** unchanged and **unmitigated**:
+  the model may now propose a change to a test file, applied after approval.
+  Test-file rules are D5; until D5 lands, D6/D7 must not expose model-driven
+  editing.
 
 **T-A5 — Malformed or adversarial tool-call arguments.**
 - Asset/objective: O5, O2

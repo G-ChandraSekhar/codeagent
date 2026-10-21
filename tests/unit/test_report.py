@@ -22,7 +22,7 @@ import json
 import pytest
 
 from codeagent import domain, events
-from codeagent.controller import PlanProposal, RunConfig, RunController
+from codeagent.controller import RunConfig, RunController
 from codeagent.report import build_report, render_json, render_text
 from tests.support.fakes import (
     FakeApprovalProvider,
@@ -30,19 +30,16 @@ from tests.support.fakes import (
     FakeEvidenceSink,
     FakeModel,
     FakePatchApplier,
-    FakeRepositoryReader,
+    FakeRepositoryTools,
     FakeVerifier,
     FakeWorkspace,
     SteppingClock,
+    make_plan,
 )
 
 _LIFECYCLE_ID = "b" * 32
 
-PLAN = PlanProposal(
-    problem_hypothesis="idempotency key dropped on retry",
-    proposed_file_paths=("jobs/worker.py",),
-    verification_intent="python3 -B -m unittest tests.test_worker",
-)
+PLAN = make_plan()
 
 
 def _build(
@@ -67,7 +64,7 @@ def _build(
         FakeApprovalProvider(approval_decisions),
         FakeVerifier(verification_outcomes, baseline_outcome=baseline_outcome),
         FakePatchApplier(patch_should_fail),
-        FakeRepositoryReader(),
+        FakeRepositoryTools(),
         FakeWorkspace(),
         FakeCheckpointSession(),
         FakeEvidenceSink(),

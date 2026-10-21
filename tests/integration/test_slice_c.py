@@ -48,15 +48,14 @@ import pytest
 from codeagent import domain, events
 from codeagent.checkpoint_ref import CheckpointRef, new_lifecycle_id
 from codeagent.checkpoint_session import CheckpointSession
-from codeagent.controller import PlanProposal, RunConfig, RunController, SystemClock
+from codeagent.controller import RunConfig, RunController, SystemClock
 from codeagent.evidence import FilesystemEvidenceSink, parse_artifact
 from codeagent.executor import CONTAINER_NAME_PREFIX, DockerVerifier
-from codeagent.patch import GitPatchApplier, PatchOperation
-from codeagent._read_adapter import RepoToolsReaderAdapter
+from codeagent.patch import GitPatchApplier
 from codeagent.repo_tools import RepoTools
 from codeagent.report import build_report, render_json, render_text
 from codeagent.workspace import GitWorktree
-from tests.support.fakes import FIXTURE_VERIFY_COMMAND, FakeApprovalProvider, MarkerGatedFakeModel
+from tests.support.fakes import FIXTURE_VERIFY_COMMAND, FakeApprovalProvider, MarkerGatedFakeModel, make_plan
 from tests.support.fixture_repo import real_fixture_repo
 
 # The real bug marker actually present in the fixture's committed
@@ -113,11 +112,8 @@ FIXED = (
     "    already_processed.add(job.idempotency_key)"
 )
 
-PLAN = PlanProposal(
-    problem_hypothesis="idempotency key dropped on retry",
-    proposed_file_paths=("jobs/worker.py",),
-    verification_intent="python3 -B -m unittest tests.test_worker",
-)
+# Ledger D4b (U6): the patch content comes from the approved proposal.
+PLAN = make_plan(expected_text=BUGGY, new_text=FIXED)
 
 
 def _assert_real_duration(seconds: float) -> None:
@@ -160,11 +156,8 @@ def test_real_docker_e2e_failing_baseline_then_passing_verification() -> None:
 
         with worktree_lifecycle as worktree_path:
             verifier = DockerVerifier(worktree_path, command=FIXTURE_VERIFY_COMMAND, clock=SystemClock())
-            applier = GitPatchApplier(
-                worktree_path,
-                (PatchOperation("jobs/worker.py", BUGGY, FIXED),),
-            )
-            reader = RepoToolsReaderAdapter(RepoTools(worktree_path))
+            applier = GitPatchApplier(worktree_path)
+            reader = RepoTools(worktree_path)
             model = MarkerGatedFakeModel(
                 read_path="jobs/worker.py", marker=BUG_MARKER, plan=PLAN
             )

@@ -25,14 +25,14 @@ class ProcessJobTests(unittest.TestCase):
 
         first = process_job(job, already_processed)
         self.assertEqual(first, "processed")
-        self.assertEqual(job.retry_count, 1)
+        self.assertEqual(job.retry_count, 1, "CODEAGENT_FIXTURE_MARKER retry_count_after_first_process")
 
         second = process_job(job, already_processed)
         self.assertEqual(second, "duplicate")
         # The bug: retry_count keeps climbing even when the call is
         # immediately short-circuited as a duplicate. A duplicate
         # detection is not a genuine retry attempt.
-        self.assertEqual(job.retry_count, 1)
+        self.assertEqual(job.retry_count, 1, "CODEAGENT_FIXTURE_MARKER retry_count_after_duplicate")
 
 
 if __name__ == "__main__":

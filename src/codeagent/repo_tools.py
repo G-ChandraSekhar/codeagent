@@ -560,38 +560,6 @@ class RepoTools:
         summary = f"{len(page.items)} line(s), {content_bytes} byte(s), page_truncated={str(truncated).lower()}"
         return ToolOutcome(ok=True, payload=payload, summary=summary)
 
-    def read_whole_file(self, relative_path: str) -> ToolOutcome:
-        """Transitional, for `_read_adapter` only (deleted with it in D4b):
-        the legacy read path's semantics through the same descriptor-relative
-        walk, one open and at most READ_CONTENT_CAP_BYTES of UTF-8 content
-        with any number of lines. Never reads more than the cap plus one."""
-
-        def body(ctx: _CallDescriptors) -> ToolOutcome:
-            try:
-                components = check_relative_path(relative_path, allow_root=False)
-            except ToolArgumentError as exc:
-                raise _input(exc.message) from None
-            frag = safe_path_fragment(relative_path)
-            admin = self._admin_identity(ctx)
-            fd, _st = self._open_file(ctx, components, admin, frag)
-            data = b""
-            while True:
-                chunk = self._read_once(fd, READ_CONTENT_CAP_BYTES + 1 - len(data))
-                if not chunk:
-                    break
-                data += chunk
-                if len(data) > READ_CONTENT_CAP_BYTES:
-                    raise _execution(f"file exceeds the {READ_CONTENT_CAP_BYTES}-byte read limit: {frag!r}")
-            try:
-                content = data.decode("utf-8")
-            except UnicodeDecodeError:
-                raise _execution(f"file is not valid UTF-8: {frag!r}") from None
-            return ToolOutcome(
-                ok=True, payload={"content": content, "byte_count": len(data)}, summary=f"{len(data)} byte(s)"
-            )
-
-        return self._run(body)
-
     # -- list_directory -----------------------------------------------------
 
     def list_directory(self, args: ListDirectoryArgs, should_stop: Callable[[], bool] = _never) -> ToolOutcome:

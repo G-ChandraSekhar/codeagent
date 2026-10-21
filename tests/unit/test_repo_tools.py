@@ -29,13 +29,17 @@ from codeagent.repo_tools import (
     LIST_RESERVE,
     RepoTools,
 )
+from codeagent.domain import ToolName
 from codeagent.tool_schema import (
+    ArgumentRejection,
     ListDirectoryArgs,
     ReadFileArgs,
     SearchTextArgs,
+    ToolArgumentError,
     ToolCleanupUnconfirmedError,
     canonical_json_bytes,
     encode_search_cursor,
+    parse_tool_arguments,
 )
 
 SRC = pathlib.Path(__file__).resolve().parents[2] / "src" / "codeagent"
@@ -816,7 +820,6 @@ def _calls(tmp_path):
         lambda stop=repo_tools._never: tools.read_file(ReadFileArgs("d/a.py"), stop),
         lambda stop=repo_tools._never: tools.list_directory(ListDirectoryArgs("d"), stop),
         lambda stop=repo_tools._never: tools.search_text(SearchTextArgs("needle"), stop),
-        lambda stop=repo_tools._never: tools.read_whole_file("d/a.py"),
     ]
 
 
@@ -912,7 +915,7 @@ def test_every_close_is_attempted_after_a_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(repo_tools.os, "open", tracking_open)
     monkeypatch.setattr(repo_tools, "_close", fault)
     with pytest.raises(ToolCleanupUnconfirmedError):
-        tools.read_whole_file("a/b/c/x.py")
+        tools.read_file(ReadFileArgs("a/b/c/x.py"))
     # The first in-call release fails and unwinds; __exit__ still closes
     # every remaining descriptor, so every opened descriptor gets a close.
     assert fault.calls == len(opened)
@@ -970,7 +973,7 @@ def test_payload_examples_are_valid_canonical_json(tmp_path):
 
 def test_fresh_interpreter_imports_succeed_in_both_orders():
     for order in (["repo_tools", "controller"], ["controller", "repo_tools"]):
-        code = "; ".join(f"import codeagent.{m}" for m in order + ["_read_adapter", "tool_schema"])
+        code = "; ".join(f"import codeagent.{m}" for m in order + ["tool_schema"])
         subprocess.run([sys.executable, "-c", code], check=True)
 
 
@@ -1247,3 +1250,31 @@ def test_registration_failure_through_a_tool_call_leaks_nothing(tmp_path, monkey
     outcome, escaped = _call_catching(tools)
     assert outcome is None and escaped is original
     assert _open_fds() == before
+
+
+# --- ledger D4b (U16): replacements for the retired test_reader.py -----------
+
+
+def test_read_file_absolute_path_is_refused_before_any_read(tmp_path):
+    (tmp_path / "secret").write_text("HOST_SECRET\n")
+    with pytest.raises(ToolArgumentError) as info:
+        parse_tool_arguments(ToolName.READ_FILE, json.dumps({"path": str(tmp_path / "secret")}).encode())
+    assert info.value.reason is ArgumentRejection.PATH_ABSOLUTE
+    assert "absolute" in str(info.value) and "HOST_SECRET" not in str(info.value)
+
+
+def test_read_file_messages_never_contain_the_worktree_path(tmp_path):
+    _tree(tmp_path, {"bad.py": b"\xff\xfe", "d/x.py": "x\n"})
+    os.symlink(tmp_path / "d/x.py", tmp_path / "l.py")
+    tools = RepoTools(tmp_path)
+    for rel in ("missing.py", "bad.py", "l.py", "d/x.py/y", "nope/x.py"):
+        outcome = tools.read_file(ReadFileArgs(rel))
+        assert not outcome.ok
+        message = outcome.error.message
+        assert str(tmp_path) not in message and str(tmp_path.resolve()) not in message
+
+
+def test_each_read_failure_gets_a_distinct_error_id(tmp_path):
+    tools = RepoTools(tmp_path)
+    ids = {tools.read_file(ReadFileArgs("missing.py")).error.error_id for _ in range(5)}
+    assert len(ids) == 5

@@ -33,6 +33,20 @@ def _status(repo) -> str:
     ).stdout
 
 
+
+class _Bound:
+    """Ledger D4b test adapter: binds the operations for these call sites;
+    every call still goes through the real
+    `GitPatchApplier(worktree).apply(..., operations)`."""
+
+    def __init__(self, worktree, operations) -> None:
+        self._applier = GitPatchApplier(worktree)
+        self._operations = operations
+
+    def apply(self, run_id, iteration, approved_paths):
+        return self._applier.apply(run_id, iteration, approved_paths, self._operations)
+
+
 def test_successful_patch_produces_real_diff_and_commit() -> None:
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-patch-ok") as worktree:
@@ -40,7 +54,7 @@ def test_successful_patch_produces_real_diff_and_commit() -> None:
                 ["git", "-C", str(worktree), "rev-parse", "HEAD"], capture_output=True, text=True
             ).stdout.strip()
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -90,7 +104,7 @@ def test_validation_failures_leave_worktree_and_original_unchanged(
         with GitWorktree(repo, run_id="r-patch-fail") as worktree:
             worktree_before = (worktree / "jobs" / "worker.py").read_text()
 
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree, (PatchOperation(relative_path, expected_text, "y"),)
             ).apply("r-patch-fail", 0, frozenset({relative_path}))
 
@@ -116,7 +130,7 @@ def test_rejects_symlink_escape() -> None:
             link = Path(worktree) / "jobs" / "evil_link.py"
             os.symlink(outside_target, link)
 
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree, (PatchOperation("jobs/evil_link.py", "outside", "y"),)
             ).apply("r-symlink", 0, frozenset({"jobs/evil_link.py"}))
 
@@ -143,7 +157,7 @@ def test_rejects_unapproved_target_before_any_write_or_commit() -> None:
             ).stdout.strip()
             before_content = (worktree / "jobs" / "worker.py").read_bytes()
 
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             ).apply("r-unapproved", 0, frozenset({"jobs/other_file.py"}))
@@ -172,7 +186,7 @@ def test_rejects_empty_operations() -> None:
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-empty-ops") as worktree:
             with pytest.raises(ValueError):
-                GitPatchApplier(worktree, ())
+                GitPatchApplier(worktree).apply("r-empty-ops", 0, frozenset({"jobs/worker.py"}), ())
 
 
 def test_rejects_more_than_one_operation() -> None:
@@ -183,8 +197,10 @@ def test_rejects_more_than_one_operation() -> None:
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-multi-ops") as worktree:
             with pytest.raises(ValueError):
-                GitPatchApplier(
-                    worktree,
+                GitPatchApplier(worktree).apply(
+                    "r-multi-ops",
+                    0,
+                    frozenset({"jobs/worker.py"}),
                     (
                         PatchOperation("jobs/worker.py", "a", "b"),
                         PatchOperation("jobs/worker.py", "c", "d"),
@@ -195,7 +211,7 @@ def test_rejects_more_than_one_operation() -> None:
 def test_rejects_empty_expected_text() -> None:
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-empty-expected") as worktree:
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree, (PatchOperation("jobs/worker.py", "", "y"),)
             ).apply("r-empty-expected", 0, frozenset({"jobs/worker.py"}))
             assert not result.success
@@ -206,7 +222,7 @@ def test_rejects_empty_expected_text() -> None:
 def test_rejects_noop_replacement() -> None:
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-noop") as worktree:
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, ORIGINAL_SNIPPET),),
             ).apply("r-noop", 0, frozenset({"jobs/worker.py"}))
@@ -234,7 +250,7 @@ def test_rejects_non_utf8_file_as_structured_failure_not_an_exception() -> None:
 
             # Must not raise UnicodeDecodeError — must come back as a
             # structured PatchResult failure.
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree, (PatchOperation("jobs/binary.py", "anything", "y"),)
             ).apply("r-non-utf8", 0, frozenset({"jobs/binary.py"}))
             assert not result.success
@@ -268,7 +284,7 @@ def test_error_messages_never_contain_absolute_worktree_path_or_raw_git_stderr(
 
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-sanitized-error") as worktree:
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             ).apply("r-sanitized-error", 0, frozenset({"jobs/worker.py"}))
@@ -349,7 +365,7 @@ def test_apply_rejects_a_preexisting_dirty_staged_index() -> None:
                 capture_output=True,
             )
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -367,7 +383,7 @@ def test_apply_rejects_oversized_replacement_content(monkeypatch) -> None:
 
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-oversized") as worktree:
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -403,7 +419,7 @@ def test_apply_rejects_a_target_with_an_unsafe_filter_attribute() -> None:
                 capture_output=True,
             )
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -428,7 +444,7 @@ def test_apply_rejects_an_unstaged_gitattributes_edit_that_would_govern_add() ->
             # Unstaged working-tree .gitattributes edit only -- never added.
             (worktree / ".gitattributes").write_text("jobs/worker.py filter=lfs\n")
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -447,7 +463,7 @@ def test_apply_uses_object_format_aware_hardened_commit_verification() -> None:
     outside the module under test."""
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-verify") as worktree:
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -513,7 +529,7 @@ def test_apply_is_immune_to_a_preexisting_replacement_ref_on_the_parent_commit()
                 capture_output=True,
             )
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -542,7 +558,7 @@ def test_apply_rejects_a_target_with_a_live_eol_transformation() -> None:
                 capture_output=True,
             )
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -572,7 +588,7 @@ def test_apply_rejects_a_target_with_a_live_ident_transformation() -> None:
                 capture_output=True,
             )
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -620,7 +636,7 @@ def test_apply_refuses_a_top_level_gitattributes_patch_target_before_any_mutatio
                 check=True,
             ).stdout.strip()
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation(".gitattributes", "# marker v1\n", "# marker v2\n"),),
             )
@@ -657,7 +673,7 @@ def test_apply_refuses_a_nested_gitattributes_patch_target() -> None:
                 capture_output=True,
             )
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (
                     PatchOperation(
@@ -729,7 +745,7 @@ def test_apply_maps_an_injected_timeout_during_add_to_application_failure(monkey
 
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-timeout") as worktree:
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -761,7 +777,7 @@ def test_apply_maps_an_injected_clean_baseline_timeout_to_substrate_failure(monk
 
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-baseline-timeout") as worktree:
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -788,7 +804,7 @@ def test_apply_maps_malformed_attribute_output_to_a_structured_failure(monkeypat
             monkeypatch.setattr(
                 patch_module._git_safety, "check_attributes_for_paths", failing_check_attributes
             )
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -814,7 +830,7 @@ def test_apply_maps_filter_enumeration_failure_to_a_structured_failure(monkeypat
             monkeypatch.setattr(
                 patch_module._git_safety, "enumerate_filter_neutralization", failing_enumerate
             )
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -839,7 +855,7 @@ def test_apply_maps_staged_entry_lookup_failure_to_application_failure(monkeypat
 
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-staged-entry-fail") as worktree:
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -871,7 +887,7 @@ def test_apply_maps_commit_verification_read_commit_header_failure(monkeypatch) 
                 check=True,
             ).stdout.strip()
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             )
@@ -905,7 +921,7 @@ def test_apply_rejects_replacement_text_with_an_unpaired_surrogate() -> None:
     unhandled UnicodeEncodeError."""
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-surrogate") as worktree:
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree,
                 (
                     PatchOperation(
@@ -951,7 +967,7 @@ def test_apply_sanitizes_a_path_resolve_failure(monkeypatch) -> None:
                     raised = exc
 
                 # Also confirm apply()'s own public result stays sanitized.
-                result = GitPatchApplier(
+                result = _Bound(
                     worktree,
                     (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
                 ).apply("r-resolve-fail", 0, frozenset({"jobs/worker.py"}))
@@ -1005,7 +1021,7 @@ def test_apply_runs_end_to_end_in_a_sha256_repository() -> None:
         )
 
         with GitWorktree(repo, run_id="r-sha256") as worktree:
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree, (PatchOperation("worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),)
             )
             result = applier.apply("r-sha256", 0, frozenset({"worker.py"}))
@@ -1036,7 +1052,7 @@ def test_apply_refuses_a_reported_commit_success_with_unchanged_head(monkeypatch
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-fake-success") as worktree:
             monkeypatch.setattr(patch_module._git_safety, "run_git", fake_commit_no_op)
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             ).apply("r-fake-success", 0, frozenset({"jobs/worker.py"}))
@@ -1073,7 +1089,7 @@ def test_apply_accepts_a_reported_commit_failure_after_an_exact_valid_commit(mon
                 check=True,
             ).stdout.strip()
             monkeypatch.setattr(patch_module._git_safety, "run_git", fake_commit_reports_failure)
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             ).apply("r-fake-failure", 0, frozenset({"jobs/worker.py"}))
@@ -1122,7 +1138,7 @@ def test_apply_refuses_a_changed_head_with_the_wrong_parent(monkeypatch) -> None
             monkeypatch.setattr(
                 patch_module.GitPatchApplier, "_observe_head", spoofing_observe_head
             )
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree,
                 (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),),
             ).apply("r-wrong-parent", 0, frozenset({"jobs/worker.py"}))
@@ -1155,7 +1171,7 @@ def test_apply_never_widens_a_glob_shaped_path_to_a_pathspec_sweep() -> None:
                 capture_output=True,
             )
 
-            applier = GitPatchApplier(
+            applier = _Bound(
                 worktree,
                 (PatchOperation("jobs/a.txt", "target marker\n", "patched marker\n"),),
             )
@@ -1194,7 +1210,7 @@ def test_apply_sanitizes_a_real_symlink_loop_runtime_error() -> None:
             except patch_module._ValidationFailure as exc:
                 raised = exc
 
-            result = GitPatchApplier(
+            result = _Bound(
                 worktree, (PatchOperation("jobs/loop_a", "x", "y"),)
             ).apply("r-real-symlink-loop", 0, frozenset({"jobs/loop_a"}))
 

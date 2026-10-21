@@ -46,6 +46,8 @@ LEGAL_TRANSITIONS: dict[tuple[RunState, Trigger], RunState] = {
     (RunState.EXECUTE, Trigger.PATCH_APPLIED): RunState.VERIFY,
     (RunState.VERIFY, Trigger.VERIFICATION_PASSED): RunState.DONE,
     (RunState.VERIFY, Trigger.VERIFICATION_FAILED): RunState.EXPLORE,
+    # Ledger D4b (U13): a valid INCOMPLETE model response, from EXPLORE only.
+    (RunState.EXPLORE, Trigger.MODEL_RESPONSE_INCOMPLETE): RunState.DONE,
 }
 
 TERMINAL_REASONS_BY_TRIGGER: dict[Trigger, TerminalReason] = {
@@ -55,6 +57,7 @@ TERMINAL_REASONS_BY_TRIGGER: dict[Trigger, TerminalReason] = {
     Trigger.POLICY_VIOLATION: TerminalReason.POLICY_VIOLATION,
     Trigger.CANCELLED: TerminalReason.CANCELLED,
     Trigger.UNRECOVERABLE_ERROR: TerminalReason.UNRECOVERABLE_ERROR,
+    Trigger.MODEL_RESPONSE_INCOMPLETE: TerminalReason.MODEL_RESPONSE_INCOMPLETE,
 }
 
 EXPECTED_ABORT_TRIGGERS = {
@@ -414,6 +417,7 @@ def test_trigger_values_are_pinned() -> None:
         "policy_violation",
         "cancelled",
         "unrecoverable_error",
+        "model_response_incomplete",
     }
 
 
@@ -425,6 +429,7 @@ def test_terminal_reason_values_are_pinned() -> None:
         "policy_violation",
         "cancelled",
         "unrecoverable_error",
+        "model_response_incomplete",
     }
 
 

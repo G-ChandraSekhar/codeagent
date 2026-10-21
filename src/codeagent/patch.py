@@ -4,7 +4,7 @@ replacement in a single file — plus a real, structurally-verified Git
 commit as the checkpoint.
 
 This is NOT the Milestone 2 patch engine. It supports **exactly one**
-operation (enforced at construction) and nothing else — no add/delete/
+operation per `apply()` call (enforced there) and nothing else — no add/delete/
 rename, no multiple operations, no fuzzy matching, no general path
 validation beyond what this one operation needs. Multiple operations
 against the same file starting from the same original content would
@@ -94,12 +94,12 @@ inclusion. See `_safe_path_fragment`.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
 from pathlib import Path
 
 from codeagent import _git_safety
 from codeagent.controller import PatchResult
 from codeagent.errors import ErrorCode, OperationalError
+from codeagent.tool_schema import PatchOperation
 
 _MAX_MESSAGE_PATH_LENGTH = 200
 
@@ -121,16 +121,6 @@ def _safe_path_fragment(value: str) -> str:
     if len(cleaned) > _MAX_MESSAGE_PATH_LENGTH:
         cleaned = cleaned[:_MAX_MESSAGE_PATH_LENGTH] + "...(truncated)"
     return cleaned
-
-
-@dataclass(frozen=True)
-class PatchOperation:
-    """Replace exactly one occurrence of `expected_text` with `new_text`
-    in the file at `relative_path` (relative to the worktree root)."""
-
-    relative_path: str
-    expected_text: str
-    new_text: str
 
 
 class _ValidationFailure(Exception):
@@ -303,21 +293,15 @@ def _check_attribute_safety(
 
 class GitPatchApplier:
     """Applies exactly one PatchOperation inside a real worktree and
-    commits it as the checkpoint. Constructed with the operation to
-    apply — see module docstring for why this is fixed at construction
-    rather than accepting arbitrary patches at call time, and why it's
-    exactly one rather than a tuple.
+    commits it as the checkpoint. Constructed with the trusted worktree
+    path only; the operation arrives at `apply()` time and, in a real run,
+    comes solely from the approved, digest-bound model proposal (ledger
+    D4b). Multi-operation transactional patching is ledger D5.
     """
 
-    def __init__(self, worktree_path: Path, operations: tuple[PatchOperation, ...]) -> None:
-        if len(operations) != 1:
-            raise ValueError(
-                "GitPatchApplier supports exactly one PatchOperation "
-                f"(got {len(operations)}) — multi-operation transactional patching "
-                "is Milestone 2 work, not partially implemented here"
-            )
+    def __init__(self, worktree_path: Path) -> None:
         self._worktree_path = Path(worktree_path)
-        self._operation = operations[0]
+        self._operation: PatchOperation | None = None
         self._next_error_id_seq = 0
 
     def _next_error_id(self, run_id: str) -> str:
@@ -339,10 +323,14 @@ class GitPatchApplier:
         )
 
     def apply(
-        self, run_id: str, iteration: int, approved_paths: frozenset[str]
+        self,
+        run_id: str,
+        iteration: int,
+        approved_paths: frozenset[str],
+        operations: tuple[PatchOperation, ...],
     ) -> PatchResult:
-        """Apply the configured operation, or reject it, and report what
-        actually happened.
+        """Apply `operations[0]`, or reject it, and report what actually
+        happened.
 
         `approved_paths` is the *preventive* authorization boundary:
         the operation's target must be one of these paths — normally
@@ -355,7 +343,16 @@ class GitPatchApplier:
         would already have happened) — see controller.py's
         `_dispatch_apply_patch` docstring.
         """
-        operation = self._operation
+        if (
+            not isinstance(operations, tuple)
+            or len(operations) != 1
+            or not isinstance(operations[0], PatchOperation)
+        ):
+            raise ValueError(
+                "GitPatchApplier.apply supports exactly one PatchOperation — "
+                "multi-operation transactional patching is ledger D5"
+            )
+        operation = self._operation = operations[0]
 
         if operation.relative_path not in approved_paths:
             return self._result(

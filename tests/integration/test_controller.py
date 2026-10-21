@@ -36,20 +36,17 @@ from tests.support.fakes import (
     FakeLifecycleOwnerPublisher,
     FakeModel,
     FakePatchApplier,
-    FakeRepositoryReader,
+    FakeRepositoryTools,
     FakeVerifier,
     FakeWorkspace,
     MarkerGatedFakeModel,
     SteppingClock,
+    make_plan,
 )
 
 _LIFECYCLE_ID = "a" * 32
 
-PLAN = PlanProposal(
-    problem_hypothesis="idempotency key dropped on retry",
-    proposed_file_paths=("jobs/worker.py",),
-    verification_intent="python3 -B -m unittest tests.test_worker",
-)
+PLAN = make_plan()
 
 
 def _build(
@@ -69,7 +66,7 @@ def _build(
     approval: object | None = None,
     verifier: object | None = None,
     patch_applier: object | None = None,
-    reader: object | None = None,
+    tools: object | None = None,
     workspace: object | None = None,
     session: object | None = None,
     evidence_sink: object | None = None,
@@ -93,7 +90,7 @@ def _build(
         patch_applier
         if patch_applier is not None
         else FakePatchApplier(patch_should_fail, failure_code=patch_failure_code),
-        reader if reader is not None else FakeRepositoryReader(),
+        tools if tools is not None else FakeRepositoryTools(),
         workspace if workspace is not None else FakeWorkspace(),
         session if session is not None else FakeCheckpointSession(),
         evidence_sink if evidence_sink is not None else FakeEvidenceSink(),
@@ -547,7 +544,7 @@ def test_confirmed_oom_kill_during_verification_aborts_the_run_without_repair_or
         FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
         verifier,
         FakePatchApplier(),
-        FakeRepositoryReader(),
+        FakeRepositoryTools(),
         FakeWorkspace(),
         FakeCheckpointSession(),
         FakeEvidenceSink(),
@@ -615,7 +612,7 @@ def test_patch_reporting_files_outside_the_approved_plan_aborts_the_run() -> Non
         FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
         FakeVerifier((events.VerificationOutcome.PASSED,)),
         FakePatchApplier(changed_paths=("unrelated_file.py",)),
-        FakeRepositoryReader(),
+        FakeRepositoryTools(),
         FakeWorkspace(),
         FakeCheckpointSession(),
         FakeEvidenceSink(),
@@ -643,26 +640,23 @@ def test_patch_reporting_files_outside_the_approved_plan_aborts_the_run() -> Non
 
 
 def test_patch_reporting_a_subset_of_approved_files_is_accepted() -> None:
-    """The check is issubset, not equality — a plan may approve several
-    files while a given patch only touches one of them."""
+    """The check is issubset, not equality. Ledger D4b (U6, disclosed): a
+    plan now carries exactly one change, so a strict subset of a nonempty
+    approved set is no longer representable; this keeps the accepted
+    single-file case on the same `issubset` check."""
     config = RunConfig(
         run_id="r-scope-subset",
         task_statement="fix retry bug",
         approval_mode=domain.ApprovalMode.INTERACTIVE,
         lifecycle_id=_LIFECYCLE_ID,
     )
-    plan_with_two_files = PlanProposal(
-        problem_hypothesis=PLAN.problem_hypothesis,
-        proposed_file_paths=("jobs/worker.py", "jobs/other.py"),
-        verification_intent=PLAN.verification_intent,
-    )
     controller = RunController(
         config,
-        FakeModel(plan_with_two_files),
+        FakeModel(PLAN),
         FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
         FakeVerifier((events.VerificationOutcome.PASSED,)),
         FakePatchApplier(changed_paths=("jobs/worker.py",)),
-        FakeRepositoryReader(),
+        FakeRepositoryTools(),
         FakeWorkspace(),
         FakeCheckpointSession(),
         FakeEvidenceSink(),
@@ -718,7 +712,7 @@ def test_read_file_result_summary_never_contains_raw_content() -> None:
     file's actual content."""
     secret_content = "SECRET_MARKER_never_persisted"
     controller = _build(
-        "r-read-no-leak", reader=FakeRepositoryReader(content=secret_content)
+        "r-read-no-leak", tools=FakeRepositoryTools(content=secret_content)
     )
     controller.run()
 
@@ -746,7 +740,7 @@ def test_fake_model_derives_plan_only_after_seeing_real_read_evidence() -> None:
     controller = _build(
         "r-evidence-gated",
         model=gated_model,
-        reader=FakeRepositoryReader(content=f"...\n{marker}\n..."),
+        tools=FakeRepositoryTools(content=f"...\n{marker}\n..."),
     )
 
     finished = controller.run()
@@ -779,7 +773,7 @@ def test_fake_model_gate_actually_fails_without_the_marker() -> None:
     controller = _build(
         "r-evidence-gate-fails",
         model=gated_model,
-        reader=FakeRepositoryReader(content="content without the marker"),
+        tools=FakeRepositoryTools(content="content without the marker"),
     )
 
     finished = controller.run()
@@ -793,17 +787,24 @@ def test_fake_model_gate_actually_fails_without_the_marker() -> None:
 
 
 def test_illegal_read_path_aborts_the_run_without_reading_host_content() -> None:
-    """A read failure (bad path, symlink escape, oversized, non-UTF-8,
-    etc.) is an operational failure: the run aborts as
-    UNRECOVERABLE_ERROR without ever reaching PROPOSE_PLAN, PLAN, or
-    APPROVAL, and without consuming any repair/revision budget."""
-    controller = _build("r-read-fails", reader=FakeRepositoryReader(should_fail=True))
+    """Ledger D4b (U2, disclosed): a failed read is non-terminal feedback.
+    A model that keeps retrying a failing read never reaches PROPOSE_PLAN,
+    PLAN, or APPROVAL; the run ends on the per-pass tool-call budget (25),
+    never as an operational failure, and consumes no repair/revision
+    budget."""
+    controller = _build("r-read-fails", tools=FakeRepositoryTools(should_fail=True))
 
     finished = controller.run()
 
-    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
-    assert finished.error is not None
-    assert finished.error.code is ErrorCode.TOOL_INPUT_INVALID
+    assert finished.terminal_reason is domain.TerminalReason.BUDGET_EXCEEDED
+    assert finished.error is None
+    (budget,) = [e for e in controller.log.events if isinstance(e, events.BudgetExceeded)]
+    assert budget.kind is domain.BudgetKind.TOOL_CALLS and budget.limit_value == 25
+    failed_reads = [
+        e for e in controller.log.events if isinstance(e, events.ToolCompleted) and not e.success
+    ]
+    assert len(failed_reads) == 25
+    assert all(e.error.code is ErrorCode.TOOL_INPUT_INVALID for e in failed_reads)
     assert not any(isinstance(e, events.PlanProposed) for e in controller.log.events)
     assert not any(isinstance(e, events.ApprovalRecorded) for e in controller.log.events)
     assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
@@ -1387,6 +1388,21 @@ class _SentinelTeardownFailure(Exception):
 _INJECTED_MARKER = "fixture-injected-unexpected-collaborator-failure"
 
 
+def _raise_on_plan_turn(model: FakeModel, exc: BaseException) -> None:
+    """Ledger D4b: the model's plan turn is its second `respond()` call
+    (the first reads); make exactly that call raise."""
+    real = model.respond
+    calls = {"n": 0}
+
+    def respond(context):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise exc
+        return real(context)
+
+    model.respond = respond  # type: ignore[method-assign]
+
+
 def _raise_unexpected(*_args: object, **_kwargs: object) -> None:
     raise _UnexpectedCollaboratorFailure(_INJECTED_MARKER)
 
@@ -1485,7 +1501,7 @@ def test_unexpected_exception_from_model_propose_plan_is_terminalized() -> None:
     """Phase: explore/plan (the model's propose_plan call, after a
     successful read)."""
     model = FakeModel(PLAN)
-    model.propose_plan = _raise_unexpected  # type: ignore[method-assign]
+    _raise_on_plan_turn(model, _UnexpectedCollaboratorFailure(_INJECTED_MARKER))
     controller = _build("r-unexpected-plan", model=model)
 
     finished = controller.run()
@@ -1639,7 +1655,7 @@ def test_evidence_capture_failure_overrides_unclassified_failure_on_fallback_pat
     the triggering failure is the new fallback path rather than one of
     the controller's own typed-result returns."""
     model = FakeModel(PLAN)
-    model.propose_plan = _raise_unexpected  # type: ignore[method-assign]
+    _raise_on_plan_turn(model, _UnexpectedCollaboratorFailure(_INJECTED_MARKER))
     evidence_sink = FakeEvidenceSink(raise_error=RuntimeError("sink-boom-should-never-leak"))
     workspace = FakeWorkspace()
     session = FakeCheckpointSession()
@@ -1680,7 +1696,7 @@ def test_workspace_dispose_failure_overrides_unclassified_failure_on_fallback_pa
     exactly once regardless."""
     owner = FakeLifecycleOwnerPublisher()
     model = FakeModel(PLAN)
-    model.propose_plan = _raise_unexpected  # type: ignore[method-assign]
+    _raise_on_plan_turn(model, _UnexpectedCollaboratorFailure(_INJECTED_MARKER))
     workspace = FakeWorkspace()
     workspace.dispose_error = RuntimeError("dispose-boom-should-never-leak")
     session = FakeCheckpointSession()
@@ -1722,11 +1738,7 @@ def test_base_exception_not_an_exception_propagates_unconverted(exc_cls: type[Ba
     unimplemented) remains the sole owner of cancellation semantics;
     this slice makes no claim about them."""
     model = FakeModel(PLAN)
-
-    def _raise_base(*_a: object, **_kw: object) -> None:
-        raise exc_cls()
-
-    model.propose_plan = _raise_base  # type: ignore[method-assign]
+    _raise_on_plan_turn(model, exc_cls())
     controller = _build("r-base-exception", model=model)
 
     with pytest.raises(exc_cls):
@@ -1879,7 +1891,10 @@ _LONGEST_PATH = dict(
     ),
     verification_outcomes=(events.VerificationOutcome.TEST_FAILURE, events.VerificationOutcome.PASSED),
 )
-_PASS = ["C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "C14", "C15"]
+# Ledger D4b (U8/J2): a pass is the read turn (C5 first request, C25 after
+# its returned turn, C26/C27 around its tool), the plan turn (C24 later
+# request, C25, C26/C27 around propose_plan), then C12-C15.
+_PASS = ["C5", "C25", "C26", "C27", "C24", "C25", "C26", "C27", "C12", "C13", "C14", "C15"]
 # The complete ordered check-site list for the longest path: revision, then
 # a failed verification and repair, then a pass (plan section 3.2).
 _EXPECTED_SITES = (
@@ -1964,7 +1979,7 @@ def test_approval_operation_cancelled_terminates_cancelled_without_approval_reco
     """M14."""
 
     class Cancels:
-        def decide(self, visit_index):
+        def decide(self, request):
             raise OperationCancelled()
 
     controller = _build("r-approval-cancel", approval=Cancels())
@@ -1991,11 +2006,9 @@ def test_blocking_cancellable_approval_provider_with_a_real_source():
 def test_operation_cancelled_elsewhere_is_unclassified():
     """M15: only `decide()` maps OperationCancelled to CANCELLED."""
 
-    class Model(FakeModel):
-        def propose_plan(self, read_result):
-            raise OperationCancelled()
-
-    controller = _build("r-oc-elsewhere", model=Model(PLAN))
+    model = FakeModel(PLAN)
+    _raise_on_plan_turn(model, OperationCancelled())
+    controller = _build("r-oc-elsewhere", model=model)
     finished = controller.run()
     assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
     assert finished.error.code is ErrorCode.UNCLASSIFIED_FAILURE
@@ -2092,25 +2105,38 @@ def test_precedence_evidence_failure_outranks_cancellation():
     assert finished.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
 
 
-@pytest.mark.parametrize("which", ["read", "patch", "verification"])
+def test_pending_cancellation_during_a_failed_read_is_observed_at_c27():
+    """Ledger D4b (U2, disclosed; was this file's rank-4 "read" case): a
+    failed read is returned feedback, not an operational failure, so a
+    cancellation requested during it is observed at C27 and the run ends
+    CANCELLED, with the failed read still paired."""
+    source = _source()
+
+    class Reader(FakeRepositoryTools):
+        def read_file(self, args, should_stop):
+            source.request("t")
+            return super().read_file(args, should_stop)
+
+    controller = _build("r-p4-read", tools=Reader(should_fail=True))
+    controller._cancellation = source.token
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED and finished.error is None
+    assert controller._cancellation_sites[-1][0] == "C27"
+    (done,) = [e for e in controller.log.events if isinstance(e, events.ToolCompleted)]
+    assert not done.success and done.error.code is ErrorCode.TOOL_INPUT_INVALID
+
+
+@pytest.mark.parametrize("which", ["patch", "verification"])
 def test_precedence_returned_failure_outranks_a_pending_cancellation(which):
     """Rank 4 over rank 5: the failed call's own code is reported."""
     source = _source()
     kwargs = {}
     expected = None
-    if which == "read":
-        class Reader(FakeRepositoryReader):
-            def read_file(self, relative_path):
-                source.request("t")
-                return super().read_file(relative_path)
-
-        kwargs["reader"] = Reader(should_fail=True)
-        expected = ErrorCode.TOOL_INPUT_INVALID
-    elif which == "patch":
+    if which == "patch":
         class Applier(FakePatchApplier):
-            def apply(self, run_id, iteration, approved_paths):
+            def apply(self, run_id, iteration, approved_paths, operations):
                 source.request("t")
-                return super().apply(run_id, iteration, approved_paths)
+                return super().apply(run_id, iteration, approved_paths, operations)
 
         kwargs["patch_applier"] = Applier(should_fail=True)
         expected = ErrorCode.PATCH_VALIDATION_FAILED
@@ -2137,9 +2163,9 @@ def test_pending_cancellation_during_the_patch_is_observed_at_c19():
     source = _source()
 
     class Applier(FakePatchApplier):
-        def apply(self, run_id, iteration, approved_paths):
+        def apply(self, run_id, iteration, approved_paths, operations):
             source.request("t")
-            return super().apply(run_id, iteration, approved_paths)
+            return super().apply(run_id, iteration, approved_paths, operations)
 
     controller = _build("r-patch-pending", patch_applier=Applier())
     controller._cancellation = source.token

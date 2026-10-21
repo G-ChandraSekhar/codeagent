@@ -169,9 +169,9 @@ def test_search_query_rules():
     assert _reason(SearchTextArgs, "") is ArgumentRejection.EMPTY
     assert _reason(SearchTextArgs, "q" * 201) is ArgumentRejection.TOO_LONG
     assert isinstance(SearchTextArgs("q" * 200), SearchTextArgs)
+    # Ledger D4b (U17): tightened from "raises" to the exact J4 reason.
     for bad in ("a\nb", "a\x00b"):
-        with pytest.raises(ToolArgumentError):
-            SearchTextArgs(bad)
+        assert _reason(SearchTextArgs, bad) is ArgumentRejection.QUERY_CONTROL_CHARACTER
     assert _reason(SearchTextArgs, "q", limit=101) is ArgumentRejection.OUT_OF_RANGE
 
 
@@ -423,3 +423,73 @@ def test_tool_schema_imports_only_domain_and_errors():
         if isinstance(node, ast.Import):
             internal.update(a.name for a in node.names if a.name.startswith("codeagent"))
     assert internal == {"codeagent.domain", "codeagent.errors"}
+
+
+# --- ledger D4b: J4 query control characters, U17 enum pin --------------------
+
+
+@pytest.mark.parametrize("bad", ["a\x00b", "a\nb", "a\x1bb", "a\x7fb", "a\x85b", "\r"])
+def test_query_control_characters_are_rejected_with_the_fixed_message(bad):
+    with pytest.raises(ToolArgumentError) as info:
+        SearchTextArgs(bad)
+    assert info.value.reason is ArgumentRejection.QUERY_CONTROL_CHARACTER
+    assert str(info.value) == "query must not contain control characters other than tab"
+
+
+@pytest.mark.parametrize("ok", ["a\tb", "a\u202eb", "a\u2066b"])
+def test_query_tab_and_bidi_format_characters_are_accepted(ok):
+    # Bidi format characters are a documented residual (ADR 0007, J4).
+    assert SearchTextArgs(ok).query == ok
+
+
+def test_query_control_character_redaction_is_categorical_only():
+    sentinel = "SENTINEL_QUERY_7f3a"
+    raw = json.dumps({"query": sentinel + "\x1b"}).encode()
+    with pytest.raises(ToolArgumentError) as info:
+        parse_tool_arguments(ToolName.SEARCH_TEXT, raw)
+    assert info.value.reason is ArgumentRejection.QUERY_CONTROL_CHARACTER
+    redacted = redact_invalid_arguments(info.value.reason, raw)
+    import hashlib
+
+    assert json.loads(redacted) == {
+        "invalid": "query_control_character",
+        "raw_bytes": len(raw),
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    assert sentinel not in redacted and sentinel not in str(info.value)
+
+
+def test_argument_rejection_members_are_pinned():
+    assert [m.value for m in ArgumentRejection] == [
+        "not_bytes",
+        "oversized",
+        "not_model_callable",
+        "invalid_utf8",
+        "invalid_json",
+        "duplicate_key",
+        "non_finite_number",
+        "not_an_object",
+        "unknown_key",
+        "missing_key",
+        "null_value",
+        "wrong_type",
+        "out_of_range",
+        "too_long",
+        "empty",
+        "lone_surrogate",
+        "path_empty",
+        "path_absolute",
+        "path_dotdot",
+        "path_dot",
+        "path_empty_component",
+        "path_backslash",
+        "path_control_character",
+        "path_too_long",
+        "path_too_deep",
+        "administrative_path",
+        "cursor_invalid",
+        "cursor_mismatch",
+        "evidence_ref_invalid",
+        "change_unchanged",
+        "query_control_character",
+    ]

@@ -32,9 +32,11 @@ applies (`_dispatch_apply_patch`).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,7 +54,46 @@ from codeagent.checkpoint_session import CheckpointIntent, CheckpointPublication
 from codeagent.errors import ErrorCode, OperationalError
 from codeagent.evidence import EvidenceReceipt, EvidenceSink
 from codeagent.lifecycle_owner import OwnerStatePublicationError
-from codeagent.tool_schema import ToolCleanupUnconfirmedError
+from codeagent.model_protocol import (
+    BASELINE_MAX_BYTES,
+    BASELINE_TAIL_BYTES,
+    CONTEXT_CAP_BYTES,
+    CONTEXT_ENVELOPE_MAX_BYTES,
+    DROPPABLE_KINDS,
+    MALFORMED_CHARGE_CAP,
+    REVISION_ITEM_MAX_BYTES,
+    TOOL_RESULT_ITEM_MAX_BYTES,
+    VERIFICATION_ITEM_MAX_BYTES,
+    VERIFICATION_TAIL_BYTES,
+    Classified,
+    FeedbackItem,
+    FeedbackKind,
+    ModelClient,
+    ModelContext,
+    ParsedCall,
+    classify_turn,
+    encoded_tail,
+    valid_model_name,
+)
+from codeagent.tool_schema import (
+    MAX_NOTE_BYTES,
+    ArgumentRejection,
+    ListDirectoryArgs,
+    PatchOperation,
+    PlanDigests,
+    ProposedChange,
+    ProposePlanArgs,
+    ReadFileArgs,
+    SearchTextArgs,
+    ToolCleanupUnconfirmedError,
+    ToolOutcome,
+    canonical_json_bytes,
+    compute_digests,
+    is_meaningful_note,
+    redact_arguments,
+    redact_invalid_arguments,
+    sanitize_recorded_text,
+)
 
 
 def _canonical_json(payload: dict[str, object]) -> str:
@@ -64,46 +105,10 @@ def _require_nonnegative_int(name: str, value: int) -> None:
         raise ValueError(f"{name} must be >= 0, got {value!r}")
 
 
-@dataclass(frozen=True)
-class PlanProposal:
-    problem_hypothesis: str
-    proposed_file_paths: tuple[str, ...]
-    verification_intent: str
-
-
-@dataclass(frozen=True)
-class ReadResult:
-    """What actually happened reading one file — RunController reports
-    these fields verbatim, same discipline as PatchResult/
-    VerificationResult: it never invents content or a byte count.
-
-    Deliberately narrow: this is Milestone 1's single-file,
-    read-before-plan vertical slice, not Milestone 2's general
-    repository-read result shape. No directory listing, no pagination,
-    no binary content. Transitional: deleted in D4b with the legacy read
-    path (`codeagent._read_adapter`).
-    """
-
-    success: bool
-    content: str | None
-    byte_count: int
-    error: OperationalError | None = None
-
-    def __post_init__(self) -> None:
-        if self.success:
-            if self.content is None:
-                raise ValueError("a successful ReadResult must have content")
-            if self.byte_count < 0:
-                raise ValueError("a successful ReadResult must have byte_count >= 0")
-            if self.error is not None:
-                raise ValueError("a successful ReadResult must not carry an error")
-        else:
-            if self.content is not None:
-                raise ValueError("a failed ReadResult must have content is None")
-            if self.byte_count != 0:
-                raise ValueError("a failed ReadResult must have byte_count == 0")
-            if self.error is None:
-                raise ValueError("a failed ReadResult must carry an error")
+# Ledger D4b (readiness addendum R4-J2): a plan is exactly the strictly
+# parsed, immutable `propose_plan` arguments; `tool_schema.compute_digests`
+# is the only digest implementation.
+PlanProposal = ProposePlanArgs
 
 
 @dataclass(frozen=True)
@@ -233,56 +238,85 @@ class SystemClock:
         return time.monotonic()
 
 
-class ModelClient(Protocol):
-    """Two-step and deliberately narrow, scoped only to Milestone 1's
-    read-before-plan vertical slice: the model first names one file to
-    read (`request_read_path`), then proposes a plan once given that
-    file's actual read evidence (`propose_plan`). RunController never
-    calls `propose_plan` without first dispatching the read the model
-    asked for and passing back its real `ReadResult` — see
-    `RunController._explore_and_propose_plan`.
+class RepositoryTools(Protocol):
+    """The read-only repository toolkit the turn loop dispatches to (ledger
+    D4a/D4b): `codeagent.repo_tools.RepoTools`, or a fake. Each call returns
+    a `ToolOutcome`; an unconfirmed descriptor cleanup raises
+    `tool_schema.ToolCleanupUnconfirmedError` (D4 plan revision 5 §7.4).
+    `check_search_cursor` is the policy-stage, filesystem-free chain check:
+    None, or a categorical rejection string."""
 
-    This is NOT the future live-provider protocol. A real model makes
-    arbitrary, budget-aware tool calls in whatever order it chooses
-    (list_directory, read_file, search_text, repeated reads, then
-    propose_plan) — that general multi-tool loop is separate, later
-    work. This shape exists only so the deterministic fake model used
-    today is genuinely evidence-driven instead of proposing a plan
-    independently of the read it triggers; do not extend it to carry
-    more of the future protocol's responsibility than that.
-    """
-
-    def request_read_path(self) -> str: ...
-    def propose_plan(self, read_result: ReadResult) -> PlanProposal: ...
+    def read_file(self, args: ReadFileArgs, should_stop: Callable[[], bool]) -> ToolOutcome: ...
+    def list_directory(self, args: ListDirectoryArgs, should_stop: Callable[[], bool]) -> ToolOutcome: ...
+    def search_text(self, args: SearchTextArgs, should_stop: Callable[[], bool]) -> ToolOutcome: ...
+    def check_search_cursor(self, args: SearchTextArgs) -> str | None: ...
 
 
-class RepositoryReader(Protocol):
-    """Reads exactly one UTF-8 text file and reports what happened —
-    same verbatim-report discipline as PatchApplier/Verifier: never
-    derives or invents content, always reports a structured ReadResult
-    rather than letting a filesystem exception escape.
+@dataclass(frozen=True)
+class ApprovalRequest:
+    """What an approval provider is asked to approve: one plan revision and
+    the digests that bind the approval to exactly that proposal."""
 
-    Deliberately narrow, matching ModelClient's scope above: Milestone
-    1's read-before-plan slice only. No directory listing, no
-    pagination, no binary content, no search — see
-    codeagent._read_adapter.RepoToolsReaderAdapter (the real
-    implementation, over codeagent.repo_tools) and
-    tests/support/fakes.FakeRepositoryReader (the deterministic fake).
-    An implementation may raise
-    `tool_schema.ToolCleanupUnconfirmedError`; `_dispatch_read_file`
-    routes it (D4 plan revision 5 §7.4).
-    """
+    plan_revision: int
+    plan_digest: str
+    change_digest: str
+    material_change: bool
+    args: PlanProposal
 
-    def read_file(self, relative_path: str) -> ReadResult: ...
+
+@dataclass(frozen=True)
+class ApprovalResponse:
+    """An approval decision and its optional operator note (D4 plan
+    revision 5 §8.4). Meaning is judged on the *original* note: it must hold
+    at least one letter, mark, number, punctuation or symbol character.
+    `REVISION_REQUESTED` requires such a note; for `APPROVED`/`REJECTED` a
+    meaningless note is normalised to None. Notes over 2 KiB or carrying a
+    lone surrogate are rejected outright. `recorded_note` is the sanitized
+    form written to events and feedback."""
+
+    decision: domain.ApprovalDecision
+    operator_note: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decision, domain.ApprovalDecision):
+            raise ValueError("decision must be an ApprovalDecision")
+        note = self.operator_note
+        if note is not None:
+            if not isinstance(note, str):
+                raise ValueError("operator_note must be a string")
+            if any(0xD800 <= ord(ch) <= 0xDFFF for ch in note):
+                raise ValueError("operator_note must not contain a lone surrogate")
+            if len(note.encode("utf-8")) > MAX_NOTE_BYTES:
+                raise ValueError("operator_note is too long")
+        meaningful = note is not None and is_meaningful_note(note)
+        if self.decision is domain.ApprovalDecision.REVISION_REQUESTED and not meaningful:
+            raise ValueError("a revision request requires a meaningful operator note")
+        if note is not None and not meaningful:
+            object.__setattr__(self, "operator_note", None)
+
+    @property
+    def recorded_note(self) -> str | None:
+        return None if self.operator_note is None else sanitize_recorded_text(self.operator_note)
+
+
+@dataclass(frozen=True)
+class ApprovedPlan:
+    """The complete immutable proposal that was approved, with its digests.
+    Dispatch recomputes both digests from `args` before applying."""
+
+    revision: int
+    args: PlanProposal
+    digests: PlanDigests
 
 
 class ApprovalProvider(Protocol):
     """A cancellable provider that stops waiting because the run's token
     was cancelled raises `codeagent.cancellation.OperationCancelled`; the
     controller maps that to `CANCELLED` only around this call (ADR 0005
-    Amendment 1 section 4)."""
+    Amendment 1 section 4). Any other exception, or a return that is not an
+    `ApprovalResponse`, is an unexpected failure (Slice 3C-3)."""
 
-    def decide(self, visit_index: int) -> domain.ApprovalDecision: ...
+    def decide(self, request: ApprovalRequest) -> ApprovalResponse: ...
 
 
 class Verifier(Protocol):
@@ -366,12 +400,11 @@ class LifecycleOwnerPublisher(Protocol):
 
 
 class PatchApplier(Protocol):
-    """Applies whatever patch the implementation is configured with and
-    reports what actually happened. Deliberately does not take the full
-    `plan` as an argument: `codeagent.patch.GitPatchApplier` (slice B)
-    is configured with its PatchOperation at construction, not derived
-    from the model's plan — see patch.py's module docstring for why
-    that's the right scope for this milestone.
+    """Applies exactly the given operations and reports what actually
+    happened. In a run, `operations` is built only from the approved,
+    digest-bound model proposal (ledger D4b); no caller-supplied patch
+    operations or patch content remain. The applier is constructed with
+    the trusted worktree path only.
 
     `approved_paths` *is* passed, and is the primary, preventive
     authorization boundary: an implementation must reject an operation
@@ -381,7 +414,11 @@ class PatchApplier(Protocol):
     """
 
     def apply(
-        self, run_id: str, iteration: int, approved_paths: frozenset[str]
+        self,
+        run_id: str,
+        iteration: int,
+        approved_paths: frozenset[str],
+        operations: tuple[PatchOperation, ...],
     ) -> PatchResult: ...
 
 
@@ -413,23 +450,62 @@ class RunConfig:
     # instead of looping again. Same "count already used vs. max"
     # semantics as max_repair_iterations.
     max_plan_revisions: int = 2
+    # Ledger D4b. Model-requested tool calls per exploration pass, charged
+    # one whole turn at a time; and the run's elapsed wall-clock budget, a
+    # soft deadline checked at safe points (an approval wait counts).
+    max_tool_calls_per_pass: int = 25
+    wall_clock_budget_seconds: float = 900.0
 
     def __post_init__(self) -> None:
         if not self.run_id:
             raise ValueError("run_id must be a nonempty string")
         if not self.task_statement:
             raise ValueError("task_statement must be a nonempty string")
+        if not isinstance(self.task_statement, str) or len(self.task_statement.encode("utf-8", "surrogatepass")) > 8 * 1024:
+            raise ValueError("task_statement must be at most 8 KiB of UTF-8")
+        if "\x00" in self.task_statement or any(0xD800 <= ord(ch) <= 0xDFFF for ch in self.task_statement):
+            raise ValueError("task_statement must not contain NUL or a lone surrogate")
+        if (
+            isinstance(self.max_tool_calls_per_pass, bool)
+            or not isinstance(self.max_tool_calls_per_pass, int)
+            or not 1 <= self.max_tool_calls_per_pass <= 1000
+        ):
+            raise ValueError("max_tool_calls_per_pass must be an integer from 1 to 1000")
+        budget = self.wall_clock_budget_seconds
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or not math.isfinite(budget)
+            or not 0 < budget <= 86_400
+        ):
+            raise ValueError("wall_clock_budget_seconds must be finite, above 0 and at most 86,400")
         if not self.repository_path:
             raise ValueError("repository_path must be a nonempty string")
         if not LIFECYCLE_ID_RE.fullmatch(self.lifecycle_id or ""):
             raise ValueError("lifecycle_id must be exactly 32 lowercase hexadecimal characters")
         _require_nonnegative_int("max_repair_iterations", self.max_repair_iterations)
         _require_nonnegative_int("max_plan_revisions", self.max_plan_revisions)
+        # Static context-fit proof (D4 plan revision 5 §10): everything that
+        # is never dropped, plus one maximal tool result, fits the cap.
+        never_dropped = (
+            len(canonical_json_bytes(self.task_statement))
+            + BASELINE_MAX_BYTES
+            + (self.max_repair_iterations + 1) * VERIFICATION_ITEM_MAX_BYTES
+            + (self.max_plan_revisions + 1) * REVISION_ITEM_MAX_BYTES
+        )
+        if never_dropped + TOOL_RESULT_ITEM_MAX_BYTES + CONTEXT_ENVELOPE_MAX_BYTES > CONTEXT_CAP_BYTES:
+            raise ValueError("the configured repair and revision budgets cannot fit the model context cap")
 
 
 class _CancellationObserved(Exception):
     """Raised only by `RunController._cancellation_check` and caught only
     by `run()`, before its ordinary-exception boundary."""
+
+
+class _DeadlineObserved(Exception):
+    """Raised by `RunController._cancellation_check` after the cancellation
+    check, when the soft wall-clock deadline has passed; caught only by
+    `run()`, which records `BudgetExceeded(WALL_CLOCK)` (ledger D4b)."""
 
 
 # ADR 0005 Amendment 1 section 3: the check sites that live inside
@@ -446,10 +522,24 @@ _TRANSITION_CHECK_SITES: dict[domain.Trigger, str] = {
     domain.Trigger.VERIFICATION_FAILED: "C23",
 }
 _DISPATCH_CHECK_SITES: dict[domain.ToolName, str] = {
-    domain.ToolName.READ_FILE: "C7",
-    domain.ToolName.PROPOSE_PLAN: "C11",
     domain.ToolName.APPLY_PATCH: "C18",
 }
+
+# Ledger D4b (readiness addendum J2): the turn loop's own sites. C5 is the
+# first model request of each pass (ADR 0005 Amendment 1 §8 counts passes
+# begun before it); C24 every later request in the pass; C25 the decision
+# point after a returned model outcome; C26 before every model-requested
+# tool triple; C27 the decision point after a returned tool outcome.
+_FIRST_REQUEST_SITE = "C5"
+_LATER_REQUEST_SITE = "C24"
+_MODEL_DECISION_SITE = "C25"
+_TOOL_DISPATCH_SITE = "C26"
+_TOOL_DECISION_SITE = "C27"
+_REPOSITORY_TOOLS = frozenset(
+    {domain.ToolName.LIST_DIRECTORY, domain.ToolName.READ_FILE, domain.ToolName.SEARCH_TEXT}
+)
+_DECISION_CHECKED = "checked"
+_DECISION_OPERATIONAL = "operational_failure_precedence"
 
 
 class EventLog:
@@ -484,8 +574,8 @@ class RunController:
       pass an event belongs to. An index, not a count — incremented on
       every return to EXPLORE, whether caused by a plan revision or a
       failed verification.
-    - `_approval_visit`: which APPROVAL visit this is (for
-      ApprovalProvider.decide).
+    - `_plan_revision`: the run-wide plan revision (1-based), bound into
+      every `ApprovalRequest` and `PlanProposed` by digest (ledger D4b).
     - `_verification_attempt`: which verification attempt this is (for
       Verifier.run) — only advances when EXECUTE/VERIFY is actually
       reached, so a plan revision (which never reaches VERIFY) cannot
@@ -517,7 +607,7 @@ class RunController:
         approval: ApprovalProvider,
         verifier: Verifier,
         patch_applier: PatchApplier,
-        reader: RepositoryReader,
+        tools: RepositoryTools,
         workspace: Workspace,
         session: CheckpointSessionLike,
         evidence_sink: EvidenceSink,
@@ -531,7 +621,7 @@ class RunController:
         self._approval = approval
         self._verifier = verifier
         self._patch_applier = patch_applier
-        self._reader = reader
+        self._tools = tools
         self._workspace = workspace
         self._session = session
         self._evidence_sink = evidence_sink
@@ -576,6 +666,24 @@ class RunController:
         # Every repository-tool descriptor-cleanup failure, by identity
         # (ledger D4a; D4 plan revision 5 §7.4). Never persisted.
         self._tool_cleanup_failures: list[ToolCleanupUnconfirmedError] = []
+        # Ledger D4b. The model name is validated once, here; an invalid one
+        # is a configuration error, not a run outcome.
+        model_name = getattr(model, "model_name", None)
+        if not valid_model_name(model_name):
+            raise ValueError("model.model_name must match [A-Za-z0-9._:-]{1,128}")
+        self._model_name: str = model_name
+        # The in-memory model-visible transcript (never persisted), the count
+        # of droppable items removed to fit the context cap, the baseline
+        # summary, and plan-revision state.
+        self._transcript: list[FeedbackItem] = []
+        self._dropped_count = 0
+        self._baseline_summary: dict[str, object] = {}
+        self._plan_revision = 0
+        self._last_approved_change_digest: str | None = None
+        self._run_started_mono: float | None = None
+        # Every returned model/tool outcome's decision point (C25/C27), as
+        # (site, next event sequence, kind); calls that raised get none.
+        self._post_return_decisions: list[tuple[str, int, str]] = []
 
     @property
     def tool_cleanup_failures(self) -> tuple[ToolCleanupUnconfirmedError, ...]:
@@ -598,22 +706,32 @@ class RunController:
     def _now(self) -> datetime:
         return self._clock.now()
 
-    def _fake_tick(self, amount: float = 0.01) -> float:
-        """Fabricated duration for a still-fake collaborator (model,
-        approval, verifier) — there is no real operation to time. Real
-        operations (patch application, slice B onward) measure actual
-        elapsed time via `self._clock.monotonic()` instead; see
-        `_dispatch_apply_patch`."""
-        self._total_duration += amount
-        return amount
-
     def _emit(self, event: events.Event) -> None:
         self.log.append(event)
 
     def _cancellation_check(self, site: str) -> None:
+        """One ordinary safe point: cancellation first, then the soft
+        wall-clock deadline (ledger D4b), then the caller's own work."""
         self._cancellation_sites.append((site, self.log.next_sequence()))
         if self._cancellation.is_cancelled():
             raise _CancellationObserved(site)
+        if self._deadline_exceeded():
+            raise _DeadlineObserved(site)
+
+    def _elapsed(self) -> float:
+        if self._run_started_mono is None:
+            return 0.0
+        return max(0.0, self._clock.monotonic() - self._run_started_mono)
+
+    def _deadline_exceeded(self) -> bool:
+        return self._run_started_mono is not None and self._elapsed() > self._c.wall_clock_budget_seconds
+
+    def _should_stop(self) -> bool:
+        """Handed to repository tools: a pure poll, never raising."""
+        return self._cancellation.is_cancelled() or self._deadline_exceeded()
+
+    def _record_decision(self, site: str, kind: str) -> None:
+        self._post_return_decisions.append((site, self.log.next_sequence(), kind))
 
     def _transition(self, iteration: int, trigger: domain.Trigger) -> domain.TransitionResult:
         if not (
@@ -703,6 +821,7 @@ class RunController:
         `_terminate(CANCELLED)`.
         """
         c = self._c
+        self._run_started_mono = self._clock.monotonic()
 
         self._emit(
             events.RunStarted(
@@ -720,12 +839,17 @@ class RunController:
         self._transition(0, domain.Trigger.RUN_STARTED)
 
         cancelled = False
+        deadline = False
         try:
             return self._run_after_start()
         except _CancellationObserved:
             if self._termination_started:
                 raise
             cancelled = True
+        except _DeadlineObserved:
+            if self._termination_started:
+                raise
+            deadline = True
         except Exception:
             if self._termination_started:
                 raise
@@ -736,6 +860,21 @@ class RunController:
         if cancelled:
             # Outside the handler, for the same clean-context reason as below.
             return self._terminate(self._pass_index, domain.Trigger.CANCELLED)
+
+        if deadline:
+            self._emit(
+                events.BudgetExceeded(
+                    run_id=c.run_id,
+                    sequence=self.log.next_sequence(),
+                    timestamp=self._now(),
+                    state=self.state,
+                    iteration=self._pass_index,
+                    kind=domain.BudgetKind.WALL_CLOCK,
+                    limit_value=c.wall_clock_budget_seconds,
+                    observed_value=self._elapsed(),
+                )
+            )
+            return self._terminate(self._pass_index, domain.Trigger.BUDGET_EXCEEDED)
 
         # Reached only when an ordinary Exception escaped
         # _run_after_start() and _terminate() had not yet started.
@@ -808,6 +947,13 @@ class RunController:
         )
         if baseline_result.cleanup_status is events.ContainerCleanupStatus.UNCONFIRMED:
             self._any_verifier_cleanup_unconfirmed = True
+        self._baseline_summary = {
+            "exit_code": baseline_result.exit_code,
+            "outcome": baseline_result.outcome.value,
+            "stderr_tail": encoded_tail(baseline_result.stderr, BASELINE_TAIL_BYTES),
+            "stdout_tail": encoded_tail(baseline_result.stdout, BASELINE_TAIL_BYTES),
+            "untrusted": True,
+        }
         if baseline_result.outcome is events.VerificationOutcome.CANCELLED:
             return self._terminate(0, domain.Trigger.CANCELLED)
         if baseline_result.outcome not in (
@@ -823,7 +969,6 @@ class RunController:
         self._transition(0, domain.Trigger.BASELINE_RECORDED)
 
         pass_index = 0
-        approval_visit = 0
         verification_attempt = 0
         repair_iterations_used = 0
         plan_revisions_used = 0
@@ -831,24 +976,24 @@ class RunController:
         while True:
             self._pass_index = pass_index
             self._passes_begun += 1
-            plan, read_error = self._explore_and_propose_plan(pass_index)
-            if plan is None:
-                # The read the model requested before proposing a plan
-                # failed (bad path, symlink escape, oversized, non-UTF-8,
-                # etc.) — an operational failure, not a normal domain
-                # outcome, so it aborts the run the same way a baseline
-                # or verification operational failure does, without
-                # consuming any repair/revision budget.
-                return self._terminate(
-                    pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=read_error
-                )
+            explored = self._explore_pass(pass_index)
+            if isinstance(explored, events.RunFinished):
+                return explored
+            plan, digests, revision, material = explored
             self._transition(pass_index, domain.Trigger.PLAN_PROPOSED)
             self._transition(pass_index, domain.Trigger.PLAN_RECORDED)
 
             self._cancellation_check("C14")
+            request = ApprovalRequest(
+                plan_revision=revision,
+                plan_digest=digests.plan_digest,
+                change_digest=digests.change_digest,
+                material_change=material,
+                args=plan,
+            )
             approval_cancelled = False
             try:
-                decision = self._approval.decide(approval_visit)
+                response = self._approval.decide(request)
             except OperationCancelled:
                 # Only here: raised anywhere else it is an ordinary
                 # unexpected exception (UNCLASSIFIED_FAILURE). No
@@ -856,6 +1001,9 @@ class RunController:
                 approval_cancelled = True
             if approval_cancelled:
                 return self._terminate(pass_index, domain.Trigger.CANCELLED)
+            if not isinstance(response, ApprovalResponse):
+                raise TypeError("the approval provider did not return an ApprovalResponse")
+            decision = response.decision
             self._emit(
                 events.ApprovalRecorded(
                     run_id=c.run_id,
@@ -865,9 +1013,13 @@ class RunController:
                     iteration=pass_index,
                     decision=decision,
                     approval_mode=c.approval_mode,
+                    plan_revision=revision,
+                    plan_digest=digests.plan_digest,
+                    operator_note=response.recorded_note,
                 )
             )
-            approval_visit += 1
+            # J3: the approval wait counts toward elapsed time; this ordinary
+            # safe point checks cancellation, then the soft deadline.
             self._cancellation_check("C15")
 
             if decision is domain.ApprovalDecision.REJECTED:
@@ -890,12 +1042,21 @@ class RunController:
                     )
                     return self._terminate(pass_index, domain.Trigger.BUDGET_EXCEEDED)
                 plan_revisions_used += 1
+                self._transcript.append(
+                    FeedbackItem(
+                        FeedbackKind.REVISION_REQUESTED,
+                        pass_index,
+                        {"operator_note": response.recorded_note, "plan_revision": revision},
+                    )
+                )
                 pass_index += 1
                 continue
 
             # APPROVED -> EXECUTE
+            self._last_approved_change_digest = digests.change_digest
+            approved = ApprovedPlan(revision=revision, args=plan, digests=digests)
             self._transition(pass_index, domain.Trigger.PLAN_APPROVED)
-            patch_ok, patch_error = self._dispatch_apply_patch(pass_index, plan)
+            patch_ok, patch_error = self._dispatch_apply_patch(pass_index, approved)
             if not patch_ok:
                 return self._terminate(
                     pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error
@@ -943,7 +1104,22 @@ class RunController:
 
             if verification_result.outcome is events.VerificationOutcome.TEST_FAILURE:
                 # An expected domain outcome, not an error: repair if
-                # budget allows.
+                # budget allows. Its bounded, sanitized output tails become
+                # never-dropped feedback for the next pass (in memory only).
+                self._transcript.append(
+                    FeedbackItem(
+                        FeedbackKind.VERIFICATION_FAILED,
+                        pass_index,
+                        {
+                            "exit_code": verification_result.exit_code,
+                            "outcome": verification_result.outcome.value,
+                            "plan_revision": revision,
+                            "stderr_tail": encoded_tail(verification_result.stderr, VERIFICATION_TAIL_BYTES),
+                            "stdout_tail": encoded_tail(verification_result.stdout, VERIFICATION_TAIL_BYTES),
+                            "untrusted": True,
+                        },
+                    )
+                )
                 self._transition(pass_index, domain.Trigger.VERIFICATION_FAILED)
                 if repair_iterations_used >= c.max_repair_iterations:
                     self._emit(
@@ -972,174 +1148,479 @@ class RunController:
                 pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=verification_result.error
             )
 
-    def _explore_and_propose_plan(
-        self, iteration: int
-    ) -> tuple[PlanProposal | None, OperationalError | None]:
-        """Read-before-plan, in that order: ask the model which file it
-        wants (`request_read_path`), actually dispatch that READ_FILE
-        tool call against the real worktree, and only then hand the
-        model its real ReadResult so `propose_plan` is genuinely
-        evidence-driven rather than independent of the read it
-        triggered — see ModelClient's docstring. Returns
-        (plan, None) on success, or (None, error) if the read failed
-        (an operational failure, handled by the caller the same way a
-        patch or verification operational failure is)."""
-        c = self._c
+    # ------------------------------------------------------------------
+    # Ledger D4b: the model-driven exploration pass
+    # ------------------------------------------------------------------
 
-        self._cancellation_check("C5")
-        read_path = self._model.request_read_path()
-        self._cancellation_check("C6")
-        read_result, read_error, read_tool_call_id = self._dispatch_read_file(
-            iteration, read_path
+    def _build_context(self, pass_index: int, used: int) -> tuple[ModelContext, frozenset[str]]:
+        """The model-visible context for one request, dropping the oldest
+        droppable feedback until it fits `CONTEXT_CAP_BYTES`, and the frozen
+        set of evidence IDs a plan in that turn may cite: successful
+        repository-tool results of the current pass, still retained."""
+
+        def make() -> ModelContext:
+            return ModelContext(
+                task_statement=self._c.task_statement,
+                baseline=self._baseline_summary,
+                pass_index=pass_index,
+                tool_calls_remaining=self._c.max_tool_calls_per_pass - used,
+                transcript=tuple(self._transcript),
+                dropped_count=self._dropped_count,
+            )
+
+        context = make()
+        while context.size > CONTEXT_CAP_BYTES:
+            index = next((i for i, item in enumerate(self._transcript) if item.kind in DROPPABLE_KINDS), None)
+            if index is None:  # unreachable: RunConfig's static fit proof
+                raise RuntimeError("the model context cannot fit its cap")
+            del self._transcript[index]
+            self._dropped_count += 1
+            context = make()
+        citable = frozenset(
+            item.body["tool_call_id"]
+            for item in self._transcript
+            if item.kind is FeedbackKind.TOOL_RESULT and item.pass_index == pass_index and item.body["ok"]
         )
-        if read_result is None:
-            return None, read_error
-        self._cancellation_check("C8")
+        return context, citable
 
-        self._cancellation_check("C9")
-        request_id = f"{c.run_id}-req-{iteration}"
+    def _emit_model_request_failed(self, pass_index: int, request_id: str) -> None:
+        self._emit(
+            events.ModelRequestFailed(
+                run_id=self._c.run_id,
+                sequence=self.log.next_sequence(),
+                timestamp=self._now(),
+                state=self.state,
+                iteration=pass_index,
+                request_id=request_id,
+                error=OperationalError(
+                    code=ErrorCode.MODEL_PROVIDER_REQUEST_FAILED,
+                    error_id=f"{request_id}-failed",
+                    message="model request raised before returning a response",
+                ),
+            )
+        )
+
+    def _request_model(self, pass_index: int, request_id: str, context: ModelContext) -> tuple[object, float]:
+        """One blocking model call with its pairing (D4 plan revision 6
+        §7.1a). If `respond()` raises, `ModelRequestFailed` is emitted and
+        the exception propagates: an ordinary `Exception` to Slice 3C-3
+        (row 3), an interrupt as the exact instance. No C25 decision is
+        recorded for a call that raised."""
         self._emit(
             events.ModelRequestStarted(
-                run_id=c.run_id,
+                run_id=self._c.run_id,
                 sequence=self.log.next_sequence(),
                 timestamp=self._now(),
                 state=self.state,
-                iteration=iteration,
+                iteration=pass_index,
                 request_id=request_id,
-                model_name="fake-model-v1",
+                model_name=self._model_name,
             )
         )
-        plan = self._model.propose_plan(read_result)
-        self._emit(
-            events.ModelResponseReceived(
-                run_id=c.run_id,
-                sequence=self.log.next_sequence(),
-                timestamp=self._now(),
-                state=self.state,
-                iteration=iteration,
-                request_id=request_id,
-                model_name="fake-model-v1",
-                response_id=f"{c.run_id}-resp-{iteration}",
-                status=events.ModelResponseStatus.COMPLETED,
-                latency_seconds=self._fake_tick(),
-                tool_call_count=1,
-            )
-        )
-        self._cancellation_check("C10")
-
-        tool_call_id = f"{c.run_id}-tc-plan-{iteration}"
-        self._dispatch_tool(
-            iteration,
-            domain.ToolName.PROPOSE_PLAN,
-            tool_call_id,
-            {"file_paths": list(plan.proposed_file_paths)},
-        )
-        self._emit(
-            events.ToolCompleted(
-                run_id=c.run_id,
-                sequence=self.log.next_sequence(),
-                timestamp=self._now(),
-                state=self.state,
-                iteration=iteration,
-                tool=domain.ToolName.PROPOSE_PLAN,
-                tool_call_id=tool_call_id,
-                success=True,
-                duration_seconds=self._fake_tick(),
-                result_summary="plan proposed",
-            )
-        )
-        self._emit(
-            events.PlanProposed(
-                run_id=c.run_id,
-                sequence=self.log.next_sequence(),
-                timestamp=self._now(),
-                state=self.state,
-                iteration=iteration,
-                problem_hypothesis=plan.problem_hypothesis,
-                # The read this plan was actually based on — a real
-                # cross-reference, not an invented citation.
-                evidence_refs=(read_tool_call_id,),
-                proposed_file_paths=plan.proposed_file_paths,
-                verification_intent=plan.verification_intent,
-                risk_notes="",
-            )
-        )
-        return plan, None
-
-    def _dispatch_read_file(
-        self, iteration: int, relative_path: str
-    ) -> tuple[ReadResult | None, OperationalError | None, str]:
-        """Dispatch READ_FILE as a real tool call in EXPLORE and report
-        exactly what the RepositoryReader says happened — never invented
-        data, same discipline as `_dispatch_apply_patch`. Returns
-        (result, error, tool_call_id): result is None (with error set)
-        on failure.
-
-        Placeholder disposition policy, same honest-but-unconsidered
-        shape as `_dispatch_apply_patch`'s: a failed read aborts the run
-        as UNRECOVERABLE_ERROR rather than being retried or reported to
-        the model as a recoverable tool error. A future controller with
-        budget/attempt-count context may replace this wholesale.
-        """
-        c = self._c
-        tool_call_id = f"{c.run_id}-tc-read-{iteration}"
-        self._dispatch_tool(
-            iteration,
-            domain.ToolName.READ_FILE,
-            tool_call_id,
-            {"relative_path": relative_path},
-        )
-
         start = self._clock.monotonic()
         try:
+            turn = self._model.respond(context)
+        except Exception:
+            self._total_duration += max(0.0, self._clock.monotonic() - start)
+            self._emit_model_request_failed(pass_index, request_id)
+            raise
+        except BaseException as interrupt:
             try:
-                result = self._reader.read_file(relative_path)
-            finally:
-                duration = self._clock.monotonic() - start
-                self._total_duration += duration
-        except ToolCleanupUnconfirmedError as cleanup:
-            # Returned to the existing caller, whose run-loop branch is the
-            # sole terminal owner (no safe point on that path).
-            error = self._record_tool_cleanup(iteration, domain.ToolName.READ_FILE, tool_call_id, cleanup, duration)
-            return None, error, tool_call_id
+                self._emit_model_request_failed(pass_index, request_id)
+            except BaseException as emit_failure:  # noqa: BLE001 - the interrupt must stay primary
+                attach_cleanup_failures(interrupt, (emit_failure,))
+            raise interrupt
+        latency = max(0.0, self._clock.monotonic() - start)
+        self._total_duration += latency
+        return turn, latency
 
-        if not result.success:
+    def _model_error(self, request_id: str, code: ErrorCode, message: str) -> OperationalError:
+        return OperationalError(code=code, error_id=f"{request_id}-{code.value}", message=message)
+
+    def _explore_pass(
+        self, pass_index: int
+    ) -> events.RunFinished | tuple[PlanProposal, PlanDigests, int, bool]:
+        """One EXPLORE pass: model turns until a valid plan is proposed or
+        the run ends. Returns `(plan, digests, revision, material_change)`,
+        or the `RunFinished` of a run that ended here. This loop is the sole
+        terminal owner for everything that happens inside the pass."""
+        c = self._c
+        used = 0
+        turn_index = 0
+        seq = 0
+        while True:
+            turn_index += 1
+            self._cancellation_check(_FIRST_REQUEST_SITE if turn_index == 1 else _LATER_REQUEST_SITE)
+            context, citable = self._build_context(pass_index, used)
+            request_id = f"{c.run_id}-req-{pass_index}-{turn_index}"
+            turn, latency = self._request_model(pass_index, request_id, context)
+            classified = classify_turn(turn)
+
+            if classified.rejected is not None:
+                error = self._model_error(
+                    request_id,
+                    ErrorCode.MODEL_RESPONSE_MALFORMED,
+                    "model client returned an object that is not a model turn"
+                    if classified.rejected.value == "not_a_model_turn"
+                    else "model client returned a turn with an unrecognized status",
+                )
+                self._emit(
+                    events.ModelResponseRejected(
+                        run_id=c.run_id,
+                        sequence=self.log.next_sequence(),
+                        timestamp=self._now(),
+                        state=self.state,
+                        iteration=pass_index,
+                        request_id=request_id,
+                        rejection_reason=classified.rejected,
+                        error=error,
+                    )
+                )
+                self._record_decision(_MODEL_DECISION_SITE, _DECISION_OPERATIONAL)
+                return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=error)
+
+            status = classified.status
+            defect = classified.metadata_defect
+            completed = status is events.ModelResponseStatus.COMPLETED
+            malformed = classified.metadata_defect or classified.malformed if completed else None
+            event_error: OperationalError | None = None
+            if malformed is not None:
+                event_error = self._model_error(
+                    request_id, ErrorCode.MODEL_RESPONSE_MALFORMED, f"malformed model response: {malformed.describe()}"
+                )
+            elif status is events.ModelResponseStatus.FAILED:
+                event_error = self._model_error(
+                    request_id, ErrorCode.MODEL_RESPONSE_FAILED_STATUS, "model response reported a failed status"
+                )
             self._emit(
-                events.ToolCompleted(
+                events.ModelResponseReceived(
                     run_id=c.run_id,
                     sequence=self.log.next_sequence(),
                     timestamp=self._now(),
                     state=self.state,
-                    iteration=iteration,
-                    tool=domain.ToolName.READ_FILE,
-                    tool_call_id=tool_call_id,
-                    success=False,
-                    duration_seconds=duration,
-                    result_summary="",
-                    error=result.error,
+                    iteration=pass_index,
+                    request_id=request_id,
+                    model_name=classified.model_name,
+                    response_id=classified.response_id,
+                    status=status,
+                    incomplete_reason=classified.incomplete_reason,
+                    input_tokens=classified.input_tokens,
+                    output_tokens=classified.output_tokens,
+                    latency_seconds=latency,
+                    tool_call_count=classified.tool_call_count,
+                    error=event_error,
                 )
             )
-            return None, result.error, tool_call_id
 
-        # Bounded summary and the tool_call_id above as the evidence
-        # reference — never the raw file content: that would persist
-        # (unbounded, potentially sensitive) repository content into
-        # the event log, which no event here is meant to carry.
+            if not completed:
+                # Run-ending statuses (revision 6 §7.1b). Returned operational
+                # failures outrank a pending cancellation (ADR 0005 row 4), so
+                # the token is not consulted for them.
+                if defect is not None or status in (
+                    events.ModelResponseStatus.FAILED,
+                    events.ModelResponseStatus.IN_PROGRESS,
+                    events.ModelResponseStatus.QUEUED,
+                ):
+                    self._record_decision(_MODEL_DECISION_SITE, _DECISION_OPERATIONAL)
+                    if defect is not None:
+                        error = self._model_error(
+                            request_id,
+                            ErrorCode.MODEL_RESPONSE_MALFORMED,
+                            f"malformed model response: {defect.describe()}",
+                        )
+                    elif status is events.ModelResponseStatus.FAILED:
+                        error = event_error
+                    else:
+                        error = self._model_error(
+                            request_id,
+                            ErrorCode.MODEL_RESPONSE_MALFORMED,
+                            "synchronous model request returned a non-final response status",
+                        )
+                    return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=error)
+                self._record_decision(_MODEL_DECISION_SITE, _DECISION_CHECKED)
+                if status is events.ModelResponseStatus.CANCELLED:
+                    return self._terminate(pass_index, domain.Trigger.CANCELLED)
+                # A valid INCOMPLETE is a non-error outcome: a pending
+                # cancellation or a passed deadline outranks it.
+                self._cancellation_check(_MODEL_DECISION_SITE)
+                return self._terminate(pass_index, domain.Trigger.MODEL_RESPONSE_INCOMPLETE)
+
+            self._record_decision(_MODEL_DECISION_SITE, _DECISION_CHECKED)
+            self._cancellation_check(_MODEL_DECISION_SITE)
+
+            # The atomic per-turn charge (rev 2 §9.2): before any ToolRequested.
+            if malformed is not None:
+                charge = min(max(classified.declared_calls, 1), MALFORMED_CHARGE_CAP)
+            else:
+                charge = len(classified.calls)
+            limit = c.max_tool_calls_per_pass
+            if used + charge > limit:
+                self._emit(
+                    events.BudgetExceeded(
+                        run_id=c.run_id,
+                        sequence=self.log.next_sequence(),
+                        timestamp=self._now(),
+                        state=self.state,
+                        iteration=pass_index,
+                        kind=domain.BudgetKind.TOOL_CALLS,
+                        limit_value=limit,
+                        observed_value=used,
+                        projected_value=used + charge,
+                    )
+                )
+                return self._terminate(pass_index, domain.Trigger.BUDGET_EXCEEDED)
+            used += charge
+
+            if malformed is not None:
+                self._transcript.append(
+                    FeedbackItem(
+                        FeedbackKind.MALFORMED_RESPONSE,
+                        pass_index,
+                        {"call_index": malformed.call_index, "reason": malformed.reason},
+                    )
+                )
+                continue
+
+            plan: PlanProposal | None = None
+            plan_seen = False
+            terminal: OperationalError | None = None
+            for call in classified.calls:
+                self._cancellation_check(_TOOL_DISPATCH_SITE)
+                seq += 1
+                tool_call_id = f"tc-{pass_index}-{seq}"
+                if plan_seen:
+                    self._deny_call(pass_index, tool_call_id, call, "after_propose_plan")
+                else:
+                    if call.tool is domain.ToolName.PROPOSE_PLAN:
+                        plan_seen = True
+                    reason = self._policy_denial(call, citable)
+                    if reason is not None:
+                        self._deny_call(pass_index, tool_call_id, call, reason)
+                    elif call.tool is domain.ToolName.PROPOSE_PLAN:
+                        self._accept_plan_call(pass_index, tool_call_id, call)
+                        plan = call.args
+                    else:
+                        terminal = self._execute_repository_call(pass_index, tool_call_id, call)
+                        if terminal is not None:
+                            break
+                self._record_decision(_TOOL_DECISION_SITE, _DECISION_CHECKED)
+                self._cancellation_check(_TOOL_DECISION_SITE)
+            if terminal is not None:
+                # The returned cleanup-unconfirmed route (§7.4): it outranks
+                # cancellation, so the token is not consulted.
+                self._record_decision(_TOOL_DECISION_SITE, _DECISION_OPERATIONAL)
+                return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=terminal)
+            if plan is not None:
+                return self._propose(pass_index, plan)
+
+    def _policy_denial(self, call: ParsedCall, citable: frozenset[str]) -> str | None:
+        """The policy stage, before any execution or filesystem access. A
+        categorical reason, or None if the call may run."""
+        if call.tool not in domain.legal_tools(self.state):
+            return "tool_not_legal_in_state"
+        if call.args is None:
+            rejection = call.rejection
+            if rejection is ArgumentRejection.ADMINISTRATIVE_PATH:
+                return "administrative_path"
+            if rejection is not None and rejection.value.startswith("path_"):
+                return f"path_not_permitted:{rejection.value}"
+            if rejection in (ArgumentRejection.CURSOR_INVALID, ArgumentRejection.CURSOR_MISMATCH):
+                return f"cursor_invalid:{rejection.value}"
+            return f"arguments_invalid:{rejection.value if rejection else 'unknown'}"
+        if isinstance(call.args, SearchTextArgs) and call.args.cursor is not None:
+            rejection_text = self._tools.check_search_cursor(call.args)
+            if rejection_text is not None:
+                return f"cursor_invalid:{rejection_text}"
+        if isinstance(call.args, ProposePlanArgs) and not set(call.args.evidence_refs) <= citable:
+            return "arguments_invalid:evidence_ref_invalid"
+        return None
+
+    def _redacted(self, call: ParsedCall) -> str:
+        if call.args is not None:
+            return redact_arguments(call.args)
+        return redact_invalid_arguments(call.rejection or ArgumentRejection.WRONG_TYPE, call.raw_arguments)
+
+    def _emit_tool_request(self, pass_index: int, tool_call_id: str, call: ParsedCall, allowed: bool, reason: str) -> None:
         self._emit(
-            events.ToolCompleted(
-                run_id=c.run_id,
+            events.ToolRequested(
+                run_id=self._c.run_id,
                 sequence=self.log.next_sequence(),
                 timestamp=self._now(),
                 state=self.state,
-                iteration=iteration,
-                tool=domain.ToolName.READ_FILE,
+                iteration=pass_index,
+                tool=call.tool,
                 tool_call_id=tool_call_id,
-                success=True,
-                duration_seconds=duration,
-                result_summary=f"read {result.byte_count} byte(s) from {relative_path!r}",
+                redacted_arguments_json=self._redacted(call),
+                provider_call_id=call.provider_call_id,
             )
         )
-        return result, None, tool_call_id
+        self._emit(
+            events.PolicyDecisionRecorded(
+                run_id=self._c.run_id,
+                sequence=self.log.next_sequence(),
+                timestamp=self._now(),
+                state=self.state,
+                iteration=pass_index,
+                tool=call.tool,
+                tool_call_id=tool_call_id,
+                allowed=allowed,
+                reason=reason,
+            )
+        )
+
+    def _emit_tool_completed(
+        self,
+        pass_index: int,
+        tool: domain.ToolName,
+        tool_call_id: str,
+        *,
+        duration: float,
+        summary: str = "",
+        error: OperationalError | None = None,
+    ) -> None:
+        self._emit(
+            events.ToolCompleted(
+                run_id=self._c.run_id,
+                sequence=self.log.next_sequence(),
+                timestamp=self._now(),
+                state=self.state,
+                iteration=pass_index,
+                tool=tool,
+                tool_call_id=tool_call_id,
+                success=error is None,
+                duration_seconds=duration,
+                result_summary=summary,
+                error=error,
+            )
+        )
+
+    def _deny_call(self, pass_index: int, tool_call_id: str, call: ParsedCall, reason: str) -> None:
+        self._emit_tool_request(pass_index, tool_call_id, call, False, reason)
+        self._emit_tool_completed(
+            pass_index,
+            call.tool,
+            tool_call_id,
+            duration=0.0,
+            error=OperationalError(
+                code=ErrorCode.TOOL_INPUT_INVALID,
+                error_id=f"{self._c.run_id}-{tool_call_id}-denied",
+                message=f"tool call denied: {reason}",
+            ),
+        )
+        self._transcript.append(
+            FeedbackItem(
+                FeedbackKind.TOOL_DENIED,
+                pass_index,
+                {
+                    "provider_call_id": call.provider_call_id,
+                    "reason": reason,
+                    "tool": call.tool.value,
+                    "tool_call_id": tool_call_id,
+                },
+            )
+        )
+
+    def _accept_plan_call(self, pass_index: int, tool_call_id: str, call: ParsedCall) -> None:
+        self._emit_tool_request(pass_index, tool_call_id, call, True, f"propose_plan is legal in state {self.state.value}")
+        self._emit_tool_completed(pass_index, call.tool, tool_call_id, duration=0.0, summary="plan proposed")
+
+    def _execute_repository_call(
+        self, pass_index: int, tool_call_id: str, call: ParsedCall
+    ) -> OperationalError | None:
+        """Run one allowed repository tool with the §7.3 wrapper. Returns the
+        fixed error of the cleanup-unconfirmed route (terminal), else None.
+        A tool body that raised keeps its `ToolCompleted` pairing and then
+        propagates; it gets no C27 decision."""
+        self._emit_tool_request(pass_index, tool_call_id, call, True, f"{call.tool.value} is legal in state {self.state.value}")
+        # The method is looked up inside the guard, so even a failing
+        # lookup keeps the ToolRequested/ToolCompleted pairing.
+        assert call.tool in _REPOSITORY_TOOLS
+        start = self._clock.monotonic()
+        cleanup: ToolCleanupUnconfirmedError | None = None
+        try:
+            outcome = getattr(self._tools, call.tool.value)(call.args, self._should_stop)
+            # Validated inside the guard, so a wrong return type still gets
+            # its ToolCompleted; the message never names the returned type.
+            if not isinstance(outcome, ToolOutcome):
+                raise TypeError("a repository tool did not return a ToolOutcome")
+        except ToolCleanupUnconfirmedError as exc:
+            cleanup = exc
+        except Exception:
+            failed_duration = max(0.0, self._clock.monotonic() - start)
+            self._total_duration += failed_duration
+            self._emit_tool_completed(
+                pass_index,
+                call.tool,
+                tool_call_id,
+                duration=failed_duration,
+                error=OperationalError(
+                    code=ErrorCode.TOOL_EXECUTION_FAILED,
+                    error_id=f"{self._c.run_id}-{tool_call_id}-unexpected",
+                    message="tool failed unexpectedly",
+                ),
+            )
+            raise
+        except BaseException as interrupt:
+            try:
+                self._emit_tool_completed(
+                    pass_index,
+                    call.tool,
+                    tool_call_id,
+                    duration=max(0.0, self._clock.monotonic() - start),
+                    error=OperationalError(
+                        code=ErrorCode.TOOL_EXECUTION_FAILED,
+                        error_id=f"{self._c.run_id}-{tool_call_id}-interrupted",
+                        message="tool interrupted",
+                    ),
+                )
+            except BaseException as emit_failure:  # noqa: BLE001 - the interrupt must stay primary
+                attach_cleanup_failures(interrupt, (emit_failure,))
+            raise interrupt
+        duration = max(0.0, self._clock.monotonic() - start)
+        self._total_duration += duration
+        if cleanup is not None:
+            return self._record_tool_cleanup(pass_index, call.tool, tool_call_id, cleanup, duration)
+        self._emit_tool_completed(
+            pass_index, call.tool, tool_call_id, duration=duration, summary=outcome.summary, error=outcome.error
+        )
+        body: dict[str, object] = {
+            "ok": outcome.ok,
+            "provider_call_id": call.provider_call_id,
+            "tool": call.tool.value,
+            "tool_call_id": tool_call_id,
+        }
+        if outcome.ok:
+            body["payload"] = outcome.payload
+        else:
+            assert outcome.error is not None
+            body["error"] = {"code": outcome.error.code.value, "message": outcome.error.message}
+        self._transcript.append(FeedbackItem(FeedbackKind.TOOL_RESULT, pass_index, body))
+        return None
+
+    def _propose(self, pass_index: int, plan: PlanProposal) -> tuple[PlanProposal, PlanDigests, int, bool]:
+        self._plan_revision += 1
+        revision = self._plan_revision
+        digests = compute_digests(plan)
+        material = digests.change_digest != self._last_approved_change_digest
+        self._emit(
+            events.PlanProposed(
+                run_id=self._c.run_id,
+                sequence=self.log.next_sequence(),
+                timestamp=self._now(),
+                state=self.state,
+                iteration=pass_index,
+                problem_hypothesis=sanitize_recorded_text(plan.problem_hypothesis),
+                evidence_refs=plan.evidence_refs,
+                proposed_file_paths=(plan.change.path,),
+                verification_intent=sanitize_recorded_text(plan.verification_intent),
+                risk_notes=sanitize_recorded_text(plan.risk_notes),
+                plan_revision=revision,
+                plan_digest=digests.plan_digest,
+                change_digest=digests.change_digest,
+                material_change=material,
+            )
+        )
+        return plan, digests, revision, material
 
     def _record_tool_cleanup(
         self,
@@ -1259,7 +1740,7 @@ class RunController:
         )
 
     def _dispatch_apply_patch(
-        self, iteration: int, plan: PlanProposal
+        self, iteration: int, approved: ApprovedPlan
     ) -> tuple[bool, OperationalError | None]:
         """One `apply_patch` transaction, in ADR 0003 Amendment 1/
         Amendment 2's exact accepted order: ToolRequested,
@@ -1272,12 +1753,25 @@ class RunController:
         and produces no success-shaped event at all. Returns (ok, error).
         """
         c = self._c
+        # Both digests are recomputed from the stored immutable proposal
+        # before anything is dispatched; a mismatch is a controller bug and
+        # fails closed (Slice 3C-3 -> UNCLASSIFIED_FAILURE).
+        if compute_digests(approved.args) != approved.digests:
+            raise RuntimeError("the approved plan no longer matches its digests")
+        change = approved.args.change
+        approved_paths = frozenset({change.path})
         tool_call_id = f"{c.run_id}-tc-patch-{iteration}"
         self._dispatch_tool(
             iteration,
             domain.ToolName.APPLY_PATCH,
             tool_call_id,
-            {"file_paths": list(plan.proposed_file_paths)},
+            {
+                "change_digest": approved.digests.change_digest,
+                "expected_sha256": hashlib.sha256(change.expected_text.encode("utf-8")).hexdigest(),
+                "new_sha256": hashlib.sha256(change.new_text.encode("utf-8")).hexdigest(),
+                "path": change.path,
+                "plan_revision": approved.revision,
+            },
         )
 
         start = self._clock.monotonic()
@@ -1302,62 +1796,46 @@ class RunController:
             )
             return False, error
 
-        # Step 3: the workspace entry gate. The expected commit is the
-        # sole trusted initial checkpoint SHA while no ref exists yet
-        # (ABSENT), or the ref's currently accepted checkpoint once one
-        # does — never a separately tracked value of this controller's
-        # own.
-        expected_commit = (
-            self._workspace.initial_commit
-            if self._session.intent is CheckpointIntent.ABSENT
-            else self._session.accepted_sha
-        )
+        # Steps 3-7 run behind one guard (ledger D4b correction pass): an
+        # unexpected exception from any collaborator still completes this
+        # tool triple with one sanitized failure, counts its duration once,
+        # and re-raises (Slice 3C-3). All emission stays outside the guard,
+        # so a failing emission never causes a second ToolCompleted.
         try:
-            self._workspace.entry_gate(expected_commit)
-        except Exception as exc:  # noqa: BLE001 — any Workspace implementation's own exception type
-            return _fail(
-                OperationalError(
-                    code=ErrorCode.WORKSPACE_ENTRY_GATE_FAILED,
-                    error_id=f"{c.run_id}-gate-{iteration}",
-                    message="the workspace entry gate refused this patch attempt",
-                )
+            failure, result = self._run_patch_transaction(iteration, approved_paths, change)
+        except Exception:
+            failed_duration = max(0.0, self._clock.monotonic() - start)
+            self._total_duration += failed_duration
+            self._emit_tool_completed(
+                iteration,
+                domain.ToolName.APPLY_PATCH,
+                tool_call_id,
+                duration=failed_duration,
+                error=OperationalError(
+                    code=ErrorCode.TOOL_EXECUTION_FAILED,
+                    error_id=f"{tool_call_id}-unexpected",
+                    message="tool failed unexpectedly",
+                ),
             )
-
-        # Step 4: lazy establishment, only from ABSENT (ADR 0003
-        # Amendment 1 point 4 / Amendment 2 section 1).
-        if self._session.intent is CheckpointIntent.ABSENT:
+            raise
+        except BaseException as interrupt:
             try:
-                self._session.establish(self._workspace.initial_commit)
-            except (CheckpointRefError, CheckpointSessionError, CheckpointPublicationError) as exc:
-                return _fail(self._map_checkpoint_error(exc, iteration))
-
-        # Step 5: the patch itself.
-        result = self._patch_applier.apply(
-            c.run_id, iteration, frozenset(plan.proposed_file_paths)
-        )
-        if not result.success:
-            return _fail(result.error)
-
-        # Step 6: the approved-path postcondition — defense-in-depth,
-        # not the primary enforcement (see PatchApplier's docstring and
-        # codeagent.patch.GitPatchApplier.apply, which must reject an
-        # unapproved target before any write or commit happens at all).
-        approved_paths = set(plan.proposed_file_paths)
-        actual_paths = set(result.changed_paths)
-        if not actual_paths.issubset(approved_paths):
-            return _fail(
-                OperationalError(
-                    code=ErrorCode.INTERNAL_INVARIANT_VIOLATION,
-                    error_id=f"{c.run_id}-scope-{iteration}",
-                    message="patch changed files outside the approved plan's proposed_file_paths",
+                self._emit_tool_completed(
+                    iteration,
+                    domain.ToolName.APPLY_PATCH,
+                    tool_call_id,
+                    duration=max(0.0, self._clock.monotonic() - start),
+                    error=OperationalError(
+                        code=ErrorCode.TOOL_EXECUTION_FAILED,
+                        error_id=f"{tool_call_id}-interrupted",
+                        message="tool interrupted",
+                    ),
                 )
-            )
-
-        # Step 7: advance the checkpoint ref to the newly accepted commit.
-        try:
-            self._session.advance(result.commit_hash)
-        except (CheckpointRefError, CheckpointSessionError, CheckpointPublicationError) as exc:
-            return _fail(self._map_checkpoint_error(exc, iteration))
+            except BaseException as emit_failure:  # noqa: BLE001 - the interrupt must stay primary
+                attach_cleanup_failures(interrupt, (emit_failure,))
+            raise interrupt
+        if failure is not None:
+            return _fail(failure)
 
         # Steps 8-10: only now, with the transaction fully accepted.
         duration = self._clock.monotonic() - start
@@ -1401,9 +1879,82 @@ class RunController:
                 files_changed=result.changed_paths,
                 checkpoint_id=checkpoint_id,
                 diff_bytes=result.diff_bytes,
+                plan_revision=approved.revision,
+                change_digest=approved.digests.change_digest,
             )
         )
         return True, None
+
+    def _run_patch_transaction(
+        self, iteration: int, approved_paths: frozenset[str], change: ProposedChange
+    ) -> tuple[OperationalError | None, PatchResult | None]:
+        """Steps 3-7 of `_dispatch_apply_patch`, emitting nothing: either a
+        mapped failure, or the accepted `PatchResult` once the checkpoint
+        ref has advanced. Unexpected exceptions propagate to the caller's
+        guard."""
+        c = self._c
+        # Step 3: the workspace entry gate. The expected commit is the
+        # sole trusted initial checkpoint SHA while no ref exists yet
+        # (ABSENT), or the ref's currently accepted checkpoint once one
+        # does — never a separately tracked value of this controller's
+        # own.
+        expected_commit = (
+            self._workspace.initial_commit
+            if self._session.intent is CheckpointIntent.ABSENT
+            else self._session.accepted_sha
+        )
+        try:
+            self._workspace.entry_gate(expected_commit)
+        except Exception as exc:  # noqa: BLE001 — any Workspace implementation's own exception type
+            return (
+                OperationalError(
+                    code=ErrorCode.WORKSPACE_ENTRY_GATE_FAILED,
+                    error_id=f"{c.run_id}-gate-{iteration}",
+                    message="the workspace entry gate refused this patch attempt",
+                ),
+                None,
+            )
+
+        # Step 4: lazy establishment, only from ABSENT (ADR 0003
+        # Amendment 1 point 4 / Amendment 2 section 1).
+        if self._session.intent is CheckpointIntent.ABSENT:
+            try:
+                self._session.establish(self._workspace.initial_commit)
+            except (CheckpointRefError, CheckpointSessionError, CheckpointPublicationError) as exc:
+                return self._map_checkpoint_error(exc, iteration), None
+
+        # Step 5: the patch itself.
+        # The approved, digest-bound model proposal is the sole source of
+        # patch operations (ledger D4b).
+        result = self._patch_applier.apply(
+            c.run_id, iteration, approved_paths, (PatchOperation.from_change(change),)
+        )
+        if not isinstance(result, PatchResult):
+            raise TypeError("the patch applier did not return a PatchResult")
+        if not result.success:
+            return result.error, None
+
+        # Step 6: the approved-path postcondition — defense-in-depth,
+        # not the primary enforcement (see PatchApplier's docstring and
+        # codeagent.patch.GitPatchApplier.apply, which must reject an
+        # unapproved target before any write or commit happens at all).
+        actual_paths = set(result.changed_paths)
+        if not actual_paths.issubset(approved_paths):
+            return (
+                OperationalError(
+                    code=ErrorCode.INTERNAL_INVARIANT_VIOLATION,
+                    error_id=f"{c.run_id}-scope-{iteration}",
+                    message="patch changed files outside the approved plan's proposed_file_paths",
+                ),
+                None,
+            )
+
+        # Step 7: advance the checkpoint ref to the newly accepted commit.
+        try:
+            self._session.advance(result.commit_hash)
+        except (CheckpointRefError, CheckpointSessionError, CheckpointPublicationError) as exc:
+            return self._map_checkpoint_error(exc, iteration), None
+        return None, result
 
     def _fallback_evidence_receipt(self, pass_index: int, reason: str) -> EvidenceReceipt:
         return EvidenceReceipt(

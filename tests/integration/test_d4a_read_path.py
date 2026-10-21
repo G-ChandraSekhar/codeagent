@@ -1,9 +1,11 @@
-"""Ledger D4a: the legacy read path over the descriptor-relative toolkit,
-and the controller's single terminal route for an unconfirmed
+"""The controller's single terminal route for an unconfirmed
 repository-tool descriptor cleanup (D4 plan revision 5 §7.4–§7.5).
 
-R31a (real `RepoTools` with an injected close fault) and R23b (module
-boundaries). No Docker.
+Ledger D4b converted this file from D4a's R31a (the legacy read path
+through the deleted `_read_adapter`) into R31b: the same checks through
+the model-driven dispatcher, with the EXPLORE turn loop as the sole
+terminal owner and no later call dispatched. R23b (module boundaries) is
+kept. Real `RepoTools` with an injected close fault; no Docker.
 """
 
 from __future__ import annotations
@@ -15,9 +17,8 @@ import sys
 import pytest
 
 from codeagent import domain, events, repo_tools
-from codeagent._read_adapter import RepoToolsReaderAdapter
 from codeagent.cancellation import CLEANUP_FAILURES_ATTRIBUTE, CancellationSource
-from codeagent.controller import PlanProposal, RunConfig, RunController
+from codeagent.controller import RunConfig, RunController
 from codeagent.errors import ErrorCode
 from codeagent.repo_tools import RepoTools
 from codeagent.tool_schema import ToolCleanupUnconfirmedError
@@ -30,16 +31,16 @@ from tests.support.fakes import (
     FakeVerifier,
     FakeWorkspace,
     SteppingClock,
+    make_plan,
 )
+from tests.support.scripted_model import ScriptedModel, list_directory_call, read_file_call, turn
 
 SRC = pathlib.Path(__file__).resolve().parents[2] / "src" / "codeagent"
 MESSAGE = "repository tool descriptor cleanup unconfirmed"
-PLAN = PlanProposal(
-    problem_hypothesis="h", proposed_file_paths=("worker.py",), verification_intent="python3 -B -m unittest"
-)
+PLAN = make_plan("worker.py", expected_text="def process_job(): ...\n", new_text="def process_job(): pass\n")
 
 
-def _controller(reader, *, cancellation=None) -> RunController:
+def _controller(tools, *, cancellation=None, model=None) -> RunController:
     config = RunConfig(
         run_id="r-d4a",
         task_statement="fix",
@@ -49,11 +50,11 @@ def _controller(reader, *, cancellation=None) -> RunController:
     kwargs = {"cancellation": cancellation} if cancellation is not None else {}
     return RunController(
         config,
-        FakeModel(PLAN),
+        model if model is not None else FakeModel(PLAN),
         FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)),
         FakeVerifier((events.VerificationOutcome.PASSED,), baseline_outcome=events.VerificationOutcome.TEST_FAILURE),
         FakePatchApplier(False),
-        reader,
+        tools,
         FakeWorkspace(),
         FakeCheckpointSession(),
         FakeEvidenceSink(),
@@ -101,7 +102,7 @@ def _assert_terminal_route(controller, finished):
 def test_close_fault_takes_the_single_terminal_route(worktree, monkeypatch):
     fault = _CloseFault()
     monkeypatch.setattr(repo_tools, "_close", fault)
-    controller = _controller(RepoToolsReaderAdapter(RepoTools(worktree)))
+    controller = _controller(RepoTools(worktree))
     calls = []
     real = RunController._terminate
 
@@ -112,7 +113,7 @@ def test_close_fault_takes_the_single_terminal_route(worktree, monkeypatch):
     monkeypatch.setattr(RunController, "_terminate", spy)
     finished = controller.run()
     _assert_terminal_route(controller, finished)
-    assert calls == ["_run_after_start"]  # the run loop, never _dispatch_read_file
+    assert calls == ["_explore_pass"]  # the turn loop, never the dispatcher
     (retained,) = controller.tool_cleanup_failures
     assert retained.close_failures == tuple(fault.raised) and retained.body_failure is None
     assert controller.deferred_interrupt is None
@@ -126,7 +127,7 @@ def test_body_interrupt_is_deferred_not_raised(worktree, monkeypatch):
         raise interrupt
 
     monkeypatch.setattr(repo_tools, "_read", read)
-    controller = _controller(RepoToolsReaderAdapter(RepoTools(worktree)))
+    controller = _controller(RepoTools(worktree))
     try:
         finished = controller.run()
     except BaseException as exc:  # noqa: BLE001 - an escape must fail, not abort, the session
@@ -143,7 +144,7 @@ def test_body_interrupt_with_confirmed_cleanup_propagates_exactly(worktree, monk
         raise interrupt
 
     monkeypatch.setattr(repo_tools, "_read", read)
-    controller = _controller(RepoToolsReaderAdapter(RepoTools(worktree)))
+    controller = _controller(RepoTools(worktree))
     with pytest.raises(KeyboardInterrupt) as info:
         controller.run()
     assert info.value is interrupt
@@ -152,7 +153,7 @@ def test_body_interrupt_with_confirmed_cleanup_propagates_exactly(worktree, monk
 def test_an_earlier_deferred_interrupt_keeps_priority(worktree, monkeypatch):
     monkeypatch.setattr(repo_tools, "_close", _CloseFault())
     monkeypatch.setattr(repo_tools, "_read", lambda fd, n: (_ for _ in ()).throw(KeyboardInterrupt()))
-    controller = _controller(RepoToolsReaderAdapter(RepoTools(worktree)))
+    controller = _controller(RepoTools(worktree))
     earlier = SystemExit()
     controller._deferred_interrupt = earlier
     try:
@@ -172,7 +173,7 @@ def test_pending_cancellation_does_not_override_the_cleanup_failure(worktree, mo
 
     monkeypatch.setattr(repo_tools, "_read", read)
     monkeypatch.setattr(repo_tools, "_close", _CloseFault())
-    controller = _controller(RepoToolsReaderAdapter(RepoTools(worktree)), cancellation=source.token)
+    controller = _controller(RepoTools(worktree), cancellation=source.token)
     finished = controller.run()
     assert source.token.is_cancelled()
     _assert_terminal_route(controller, finished)
@@ -180,16 +181,20 @@ def test_pending_cancellation_does_not_override_the_cleanup_failure(worktree, mo
 
 def test_duration_of_the_failed_read_is_accounted(worktree, monkeypatch):
     monkeypatch.setattr(repo_tools, "_close", _CloseFault())
-    controller = _controller(RepoToolsReaderAdapter(RepoTools(worktree)))
+    controller = _controller(RepoTools(worktree))
     finished = controller.run()
     (completed,) = _read_completed(controller)
     baseline = next(e for e in controller.log.events if isinstance(e, events.BaselineRecorded))
     assert completed.duration_seconds > 0
-    assert finished.total_duration_seconds == pytest.approx(baseline.duration_seconds + completed.duration_seconds)
+    # Ledger D4b (U3): the total also includes each model request's latency.
+    latency = sum(e.latency_seconds for e in controller.log.events if isinstance(e, events.ModelResponseReceived))
+    assert finished.total_duration_seconds == pytest.approx(
+        baseline.duration_seconds + latency + completed.duration_seconds
+    )
 
 
 def test_emission_failure_propagates_with_the_interrupt_attached(monkeypatch):
-    controller = _controller(RepoToolsReaderAdapter(RepoTools(pathlib.Path("."))))
+    controller = _controller(RepoTools(pathlib.Path(".")))
     interrupt = KeyboardInterrupt()
     cleanup = ToolCleanupUnconfirmedError((OSError("x"),), interrupt)
     boom = RuntimeError("log broken")
@@ -206,30 +211,46 @@ def test_emission_failure_propagates_with_the_interrupt_attached(monkeypatch):
     assert controller.deferred_interrupt is None
 
 
-def test_a_raising_fake_reader_takes_the_same_route():
+def test_a_raising_fake_toolkit_takes_the_same_route():
     cleanup = ToolCleanupUnconfirmedError((OSError("SENTINEL_CLOSE_TEXT"),), None)
 
-    class Reader:
-        def read_file(self, relative_path):
+    class Tools:
+        def read_file(self, args, should_stop):
             raise cleanup
 
-    controller = _controller(Reader())
+        def check_search_cursor(self, args):  # pragma: no cover - never reached
+            return None
+
+    controller = _controller(Tools())
     finished = controller.run()
     _assert_terminal_route(controller, finished)
     assert controller.tool_cleanup_failures == (cleanup,)
 
 
-def test_adapter_does_not_catch_the_cleanup_error(worktree, monkeypatch):
+def test_no_later_call_is_dispatched_after_the_cleanup_route(worktree, monkeypatch):
+    """R31b: the cleanup route ends the turn; a second call in the same
+    turn is never requested, and no later model request is made."""
     monkeypatch.setattr(repo_tools, "_close", _CloseFault())
-    with pytest.raises(ToolCleanupUnconfirmedError):
-        RepoToolsReaderAdapter(RepoTools(worktree)).read_file("worker.py")
+    model = ScriptedModel([turn(read_file_call("worker.py"), list_directory_call("."))])
+    controller = _controller(RepoTools(worktree), model=model)
+    finished = controller.run()
+    _assert_terminal_route(controller, finished)
+    requested = [e.tool for e in controller.log.events if isinstance(e, events.ToolRequested)]
+    assert requested == [domain.ToolName.READ_FILE]
+    assert len(model.contexts) == 1
+    assert sum(isinstance(e, events.ModelRequestStarted) for e in controller.log.events) == 1
 
 
-def test_legacy_path_denies_the_git_administrative_entry(tmp_path):
+def test_model_path_denies_the_git_administrative_entry(tmp_path):
     (tmp_path / ".git").write_text("gitdir: /SENTINEL/host/path\n")
-    result = RepoToolsReaderAdapter(RepoTools(tmp_path)).read_file(".git")
-    assert not result.success and result.error.code is ErrorCode.TOOL_INPUT_INVALID
-    assert "SENTINEL" not in result.error.message
+    (tmp_path / "worker.py").write_text("x\n")
+    model = ScriptedModel([turn(read_file_call(".git"))] + [turn(read_file_call("worker.py"))] * 30)
+    controller = _controller(RepoTools(tmp_path), model=model)
+    controller.run()
+    first = next(e for e in controller.log.events if isinstance(e, events.ToolCompleted))
+    assert not first.success and first.error.code is ErrorCode.TOOL_INPUT_INVALID
+    for event in controller.log.events:
+        assert "SENTINEL" not in repr(event)
 
 
 # --- R23b: module boundaries ---------------------------------------------------
@@ -253,23 +274,18 @@ def test_cleanup_error_is_defined_only_in_the_neutral_module():
         assert ("ToolCleanupUnconfirmedError" in defined) == (module.name == "tool_schema.py"), module.name
 
 
-def test_controller_never_imports_the_toolkit_or_adapter():
+def test_controller_never_imports_the_toolkit():
     imported = _imports("controller.py")
     assert "codeagent.tool_schema" in imported
-    assert not {"codeagent.repo_tools", "codeagent._read_adapter"} & imported
+    assert "codeagent.repo_tools" not in imported
 
 
-def test_adapter_has_no_except_for_the_cleanup_error():
-    tree = ast.parse((SRC / "_read_adapter.py").read_text())
-    assert not any(isinstance(n, ast.ExceptHandler) for n in ast.walk(tree))
-
-
-def test_reader_module_is_gone():
+def test_reader_and_transitional_adapter_modules_are_gone():
     assert not (SRC / "reader.py").exists()
+    assert not (SRC / "_read_adapter.py").exists()
 
 
-def test_read_whole_file_is_used_only_by_the_transitional_adapter():
-    """D4b deletes `RepoTools.read_whole_file` together with
-    `_read_adapter.py`; nothing else may come to depend on it."""
-    users = {m.name for m in SRC.glob("*.py") if "read_whole_file" in m.read_text()}
-    assert users == {"repo_tools.py", "_read_adapter.py"}
+def test_read_whole_file_is_gone():
+    """Ledger D4b deleted `RepoTools.read_whole_file` with `_read_adapter.py`."""
+    assert not any("read_whole_file" in m.read_text() for m in SRC.glob("*.py"))
+    assert not hasattr(RepoTools, "read_whole_file")

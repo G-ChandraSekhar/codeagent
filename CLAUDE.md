@@ -3156,8 +3156,8 @@ Stage 2 (of the four-stage planning process in
   [39476859443](https://github.com/G-ChandraSekhar/codeagent/actions/runs/39476859443),
   push-triggered, `success`; the result is summarized in `ENGINEERING_LOG.md`'s
   D4a Linux-CI entry). It is a prerequisite and does not complete ledger D4
-  (only D4b does). D4b has not started, and D4a alone does not make a model
-  drive a run. (Historical: the bullets below record the pre-commit local
+  (only D4b does). D4b had not started then, and D4a alone does not make a
+  model drive a run (D4b's status is the next bullet). (Historical: the bullets below record the pre-commit local
   work; their earlier "uncommitted, no Linux CI" wording was true then.)
   - **Linux CI evidence limits:**
     - The complete-suite step uses `pytest -q`, which does not identify its
@@ -3192,15 +3192,47 @@ Stage 2 (of the four-stage planning process in
   - **Accepted residual:** an interrupt in the instant between `os.open`
     returning and entry into the ownership guard can still leak the root
     descriptor.
-  - **Deferred:** ledger, threat-model and ADR 0007 updates wait for D4b.
-- **Next:** D4b (the model-driven exploration and repair loop, which
-  completes ledger D4) is the recommended next primary slice, since no
-  model drives a run. D4 and D5 are
-  prerequisites for D6; D5's substrate waits for the C-1 ADR 0004 amendment,
-  and D5's integration depends on D4. Remaining planning range D4–D10:
-  228–460 h (cumulative D1–D10 314–600 h; D1–D3 86–140 h) — component
-  planning estimates, not hours spent or commitments
-  (`docs/V1_COMPLETION_LEDGER.md`).
+  - **Deferred:** ledger, threat-model and ADR 0007 updates waited for D4b
+    (done in D4b).
+- **Ledger D4b: model-driven exploration and repair loop** (D4 plan
+  revisions 5 and 6, the D4b readiness addendum J1–J4; ADR 0007, **Accepted
+  2026-10-20**) is **implemented, locally verified on macOS (2026-10-20) and
+  accepted at joint review; Linux CI pending.** Not operator-reachable:
+  the only model is the test-only `ScriptedModel`/`FakeModel`, and no bundled
+  module imports `_lifecycle_run` (T41).
+  - **What it adds:** `model_protocol.py` (byte-level `ModelTurn`/`ToolCall`,
+    `classify_turn`, the in-memory `ModelContext` with a 224 KiB cap);
+    `events.ModelResponseRejected` and plan-binding fields;
+    `Trigger`/`TerminalReason.MODEL_RESPONSE_INCOMPLETE` (EXPLORE-only,
+    non-abort); the controller turn loop (strict pairing, §7.1b precedence,
+    safe points C1–C5 and C12–C27 with C6–C11 retired, atomic per-turn
+    tool-call charge, soft wall-clock deadline, current-pass retained
+    evidence, digest-bound approval with notes);
+    `ArgumentRejection.QUERY_CONTROL_CHARACTER`.
+  - **Patch seam:** `GitPatchApplier(worktree_path)` and
+    `apply(..., operations)`; the approved, digest-bound change is the sole
+    source of the patch operation. `run_lifecycle_aware` has no
+    `patch_operations`.
+  - **Removed:** `_read_adapter.py`, `RepoTools.read_whole_file`,
+    `ReadResult`, `RepositoryReader`, `tests/unit/test_reader.py` (U16
+    mapping in `ENGINEERING_LOG.md`).
+  - **Verified (macOS, `CODEAGENT_REQUIRE_DOCKER=1`, after the joint-review
+    correction pass: the `ToolOutcome` check inside the tool guard, failed-tool
+    duration counted, and one guard around the `apply_patch` transaction so an
+    unexpected failure still completes its triple):** full suite 4,809 passed,
+    2 skipped (the two non-UTF-8-filename tests); 15-file direct set 1,567
+    passed, 2 skipped, forward and reverse; real Docker A20–A22 and
+    cancellation E1–E12 pass; 82 mutations caught by assertion, MR38 reported
+    as equivalent; no leftovers; `git diff --check` clean.
+  - **Remaining risks:** one stale `expected_text` ends the run until D5;
+    feedback can carry repository content into the (fake) model context, so
+    D7 must add redaction before a live model; the wall-clock deadline is
+    soft; bidi format characters are a D6 residual; T-A4 is unmitigated.
+- **Next:** Linux CI confirmation of D4b; after D4, D5
+  (substrate waits for the C-1 ADR 0004 amendment) and then D6. Remaining
+  planning range D4–D10: 277–537 h (cumulative D1–D10 363–677 h; D1–D3
+  86–140 h; D4 re-estimated to 79–132 h) — component planning estimates, not
+  hours spent or commitments (`docs/V1_COMPLETION_LEDGER.md`).
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

@@ -1,5 +1,6 @@
 """Deterministic test doubles implementing controller.py's collaborator
-Protocols (ModelClient, ApprovalProvider, Verifier, PatchApplier, Clock).
+Protocols (ModelClient, RepositoryTools, ApprovalProvider, Verifier,
+PatchApplier, Clock).
 
 Not production code. Lives under tests/ specifically so it can never be
 imported from src/codeagent by accident — see the correction-pass
@@ -9,15 +10,20 @@ depending on concrete fake types directly.
 
 from __future__ import annotations
 
+import dataclasses
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from codeagent import domain, events
 from codeagent.checkpoint_session import CheckpointIntent
-from codeagent.controller import PatchResult, PlanProposal, ReadResult, VerificationResult
+from codeagent.controller import ApprovalResponse, PatchResult, PlanProposal, VerificationResult
 from codeagent.errors import ErrorCode, OperationalError
 from codeagent.evidence import EvidenceReceipt
 from codeagent.lifecycle_owner import OwnerStatePublicationError
+from codeagent.model_protocol import FeedbackKind, ModelContext, ModelTurn
+from codeagent.tool_schema import ProposedChange, ProposePlanArgs, ToolOutcome
+from tests.support.scripted_model import propose_plan_call, read_file_call, turn
 
 # FakeVerifier's own choice, not a controller-level restriction: this
 # synthetic harness only fabricates PASSED/TEST_FAILURE, since it has
@@ -57,73 +63,128 @@ def _require_fake_supported(name: str, outcomes: tuple[events.VerificationOutcom
         )
 
 
-class FakeModel:
-    """Two-step per ModelClient's narrow Protocol: requests one read
-    path, then always proposes the same canned plan once given the
-    read evidence. Records `last_read_result` so a test can assert
-    the controller actually passed real read evidence through — see
-    test_controller.py's evidence-propagation test — without this fake
-    conditioning its *behavior* on that evidence (see
-    MarkerGatedFakeModel below for a fake that does).
+# Placeholder evidence: the fakes below replace it with the controller-
+# minted ID of the read they actually received (ledger D4b, §8.3).
+_PLACEHOLDER_EVIDENCE = ("tc-0-1",)
 
-    `read_path` defaults to the plan's own first proposed file path —
-    the fixture's usual case where the model reads exactly the file it
-    later proposes to patch.
-    """
+
+def make_plan(
+    path: str = "jobs/worker.py",
+    *,
+    problem_hypothesis: str = "idempotency key dropped on retry",
+    verification_intent: str = "python3 -B -m unittest tests.test_worker",
+    expected_text: str = "    job.retry_count += 1\n",
+    new_text: str = "    pass\n",
+    risk_notes: str = "",
+) -> PlanProposal:
+    """A model-proposable plan with a placeholder evidence reference."""
+    return ProposePlanArgs(
+        problem_hypothesis=problem_hypothesis,
+        evidence_refs=_PLACEHOLDER_EVIDENCE,
+        change=ProposedChange(path, expected_text, new_text),
+        verification_intent=verification_intent,
+        risk_notes=risk_notes,
+    )
+
+
+@dataclass(frozen=True)
+class ReadEvidence:
+    """What a fake model actually received from its last read."""
+
+    success: bool
+    content: str | None
+
+
+def _last_read(context: ModelContext) -> tuple[str, ReadEvidence] | None:
+    """The newest current-pass `read_file` result in the context: its
+    controller-minted tool-call ID and its content."""
+    for item in reversed(context.transcript):
+        body = item.body
+        if item.kind is FeedbackKind.TOOL_RESULT and item.pass_index == context.pass_index and body["tool"] == "read_file":
+            if not body["ok"]:
+                return body["tool_call_id"], ReadEvidence(False, None)
+            content = "".join(text for _, text in body["payload"]["lines"])
+            return body["tool_call_id"], ReadEvidence(True, content)
+    return None
+
+
+class FakeModel:
+    """A deterministic two-turn model per pass (ledger D4b): the first turn
+    reads `read_path`, the next proposes `plan`, citing the controller-minted
+    ID of the read it received. It never conditions its plan on the read's
+    content (see `MarkerGatedFakeModel`), but records it as
+    `last_read_result`. A failed read is retried, so a reader that always
+    fails exhausts the per-pass tool-call budget.
+
+    `read_path` defaults to the plan's own target path."""
+
+    model_name = "fake-model-v1"
 
     def __init__(self, plan: PlanProposal, read_path: str | None = None) -> None:
         self._plan = plan
-        self._read_path = read_path if read_path is not None else plan.proposed_file_paths[0]
-        self.last_read_result: ReadResult | None = None
+        self._read_path = read_path if read_path is not None else plan.change.path
+        self.last_read_result: ReadEvidence | None = None
+        self.contexts: list[ModelContext] = []
 
-    def request_read_path(self) -> str:
-        return self._read_path
+    def _proposal(self, context: ModelContext) -> ModelTurn:
+        found = _last_read(context)
+        if found is None or not found[1].success:
+            if found is not None:
+                self.last_read_result = found[1]
+            return turn(read_file_call(self._read_path))
+        tool_call_id, evidence = found
+        self.last_read_result = evidence
+        self._check(evidence)
+        return turn(propose_plan_call(dataclasses.replace(self._plan, evidence_refs=(tool_call_id,))))
 
-    def propose_plan(self, read_result: ReadResult) -> PlanProposal:
-        self.last_read_result = read_result
-        return self._plan
+    def _check(self, evidence: ReadEvidence) -> None:
+        pass
+
+    def respond(self, context: ModelContext) -> ModelTurn:
+        self.contexts.append(context)
+        return self._proposal(context)
 
 
-class MarkerGatedFakeModel:
+class MarkerGatedFakeModel(FakeModel):
     """Test-only model whose plan is genuinely conditioned on the read
-    evidence it receives, rather than merely recording it: propose_plan
-    raises unless the given ReadResult succeeded and its content
-    contains `marker`. Used specifically to prove the controller passes
-    real content through before asking for a plan, not to model any
-    future live-provider decision logic — see ModelClient's docstring
-    on why that broader shape is explicitly out of scope here.
-    """
+    evidence it receives: it proposes only after a successful read whose
+    content contains `marker`, and raises otherwise. Used to prove the
+    controller passes real content to the model before a plan exists."""
 
     def __init__(self, read_path: str, marker: str, plan: PlanProposal) -> None:
-        self._read_path = read_path
+        super().__init__(plan, read_path)
         self._marker = marker
-        self._plan = plan
-        self.last_read_result: ReadResult | None = None
 
-    def request_read_path(self) -> str:
-        return self._read_path
-
-    def propose_plan(self, read_result: ReadResult) -> PlanProposal:
-        self.last_read_result = read_result
-        if not read_result.success or self._marker not in (read_result.content or ""):
+    def _check(self, evidence: ReadEvidence) -> None:
+        if not evidence.success or self._marker not in (evidence.content or ""):
             raise AssertionError(
-                "MarkerGatedFakeModel.propose_plan was called without the expected "
+                "MarkerGatedFakeModel was asked to propose without the expected "
                 f"read evidence (marker {self._marker!r} not found) — the controller "
-                "must dispatch a successful READ_FILE and pass its real content "
-                "before ever calling propose_plan"
+                "must dispatch a successful read_file and pass its real content "
+                "before the model proposes a plan"
             )
-        return self._plan
 
 
 class FakeApprovalProvider:
-    def __init__(self, decisions: tuple[domain.ApprovalDecision, ...]) -> None:
+    """Answers each `decide()` with the next configured decision (the last
+    one repeats). A revision request carries a meaningful note, as the
+    accepted `ApprovalResponse` contract requires."""
+
+    def __init__(
+        self, decisions: tuple[domain.ApprovalDecision, ...], *, revision_note: str = "please revise the plan"
+    ) -> None:
         if not decisions:
             raise ValueError("decisions must be a nonempty tuple")
         self._decisions = decisions
+        self._revision_note = revision_note
+        self.requests: list = []
 
-    def decide(self, visit_index: int) -> domain.ApprovalDecision:
-        i = min(visit_index, len(self._decisions) - 1)
-        return self._decisions[i]
+    def decide(self, request) -> ApprovalResponse:
+        self.requests.append(request)
+        i = min(len(self.requests) - 1, len(self._decisions) - 1)
+        decision = self._decisions[i]
+        note = self._revision_note if decision is domain.ApprovalDecision.REVISION_REQUESTED else None
+        return ApprovalResponse(decision, note)
 
 
 class FakeVerifier:
@@ -217,10 +278,12 @@ class FakePatchApplier:
         self._changed_paths = changed_paths
         self._failure_code = failure_code
         self._n = 0
+        self.operations: list[tuple] = []
 
     def apply(
-        self, run_id: str, iteration: int, approved_paths: frozenset[str]
+        self, run_id: str, iteration: int, approved_paths: frozenset[str], operations: tuple
     ) -> PatchResult:
+        self.operations.append(operations)
         # Deliberately does NOT enforce approved_paths itself — this
         # fake exists partly to let test_controller.py's plan-scope
         # test simulate a PatchApplier that fails to do the real,
@@ -248,37 +311,59 @@ class FakePatchApplier:
         )
 
 
-class FakeRepositoryReader:
-    """No real filesystem involved — see
-    codeagent._read_adapter.RepoToolsReaderAdapter for the real
-    implementation this fakes. Returns the same configured
-    content for any relative_path unless `should_fail`; doesn't validate
-    the path itself (path validation is the real reader's job, exercised
-    against real content in test_reader.py and the real Docker E2E)."""
+class FakeRepositoryTools:
+    """A filesystem-free `controller.RepositoryTools` double. `read_file`
+    returns `content` for any path (or a fixed failure when `should_fail`);
+    path validation is the real `RepoTools`'s job, exercised against real
+    directories in `test_repo_tools.py` and the real Docker E2E."""
 
     def __init__(self, content: str = "fixture content", should_fail: bool = False) -> None:
         self._content = content
         self._should_fail = should_fail
         self._n = 0
+        self.calls: list[tuple[str, object]] = []
 
-    def read_file(self, relative_path: str) -> ReadResult:
+    def _failure(self) -> ToolOutcome:
         self._n += 1
-        if self._should_fail:
-            return ReadResult(
-                success=False,
-                content=None,
-                byte_count=0,
-                error=OperationalError(
-                    code=ErrorCode.TOOL_INPUT_INVALID,
-                    error_id=f"fake-read-err-{self._n}",
-                    message="fixture-forced read failure",
-                ),
-            )
-        return ReadResult(
-            success=True,
-            content=self._content,
-            byte_count=len(self._content.encode("utf-8")),
+        return ToolOutcome(
+            ok=False,
+            payload=None,
+            summary="",
+            error=OperationalError(
+                code=ErrorCode.TOOL_INPUT_INVALID,
+                error_id=f"fake-read-err-{self._n}",
+                message="fixture-forced read failure",
+            ),
         )
+
+    def read_file(self, args, should_stop) -> ToolOutcome:
+        self.calls.append(("read_file", args))
+        if self._should_fail:
+            return self._failure()
+        lines = [[i, line] for i, line in enumerate(self._content.splitlines(keepends=True), start=1)]
+        payload = {"eof": True, "lines": lines, "next_start_line": None, "page_truncated": False}
+        return ToolOutcome(ok=True, payload=payload, summary=f"{len(lines)} line(s)")
+
+    def list_directory(self, args, should_stop) -> ToolOutcome:
+        self.calls.append(("list_directory", args))
+        payload = {"entries": [], "next_cursor": None, "page_truncated": False}
+        return ToolOutcome(ok=True, payload=payload, summary="0 entr(ies)")
+
+    def search_text(self, args, should_stop) -> ToolOutcome:
+        self.calls.append(("search_text", args))
+        payload = {
+            "excluded": {},
+            "next_cursor": None,
+            "page_coverage_complete": True,
+            "page_truncated": False,
+            "results": [],
+            "search_complete": True,
+            "unsearched": {},
+        }
+        return ToolOutcome(ok=True, payload=payload, summary="0 result(s)")
+
+    def check_search_cursor(self, args) -> str | None:
+        return None
 
 
 class SteppingClock:
@@ -492,7 +577,7 @@ class BlockingCancellableApprovalProvider:
         self._poll = poll_seconds
         self._deadline = deadline_seconds
 
-    def decide(self, visit_index: int) -> domain.ApprovalDecision:
+    def decide(self, request) -> ApprovalResponse:
         import time
 
         from codeagent.cancellation import OperationCancelled

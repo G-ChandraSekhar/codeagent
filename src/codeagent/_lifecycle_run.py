@@ -71,8 +71,7 @@ from .executor import (
     DockerVerifierLifecycleContext,
 )
 from .lifecycle_store import LifecycleStoreError, create_shared_lifecycle_publishers, prepare_lifecycle
-from .patch import GitPatchApplier, PatchOperation
-from ._read_adapter import RepoToolsReaderAdapter
+from .patch import GitPatchApplier
 from .repo_tools import RepoTools
 from .workspace import GitWorktree
 
@@ -359,7 +358,6 @@ def run_lifecycle_aware(
     task_statement: str,
     approval_mode: domain.ApprovalMode,
     evidence_root: Path | str,
-    patch_operations: tuple[PatchOperation, ...],
     model: ModelClient,
     approval: ApprovalProvider,
     verify_command: tuple[str, ...] = DEFAULT_COMMAND,
@@ -417,8 +415,8 @@ def run_lifecycle_aware(
                 lifecycle_context=DockerVerifierLifecycleContext(publisher=publishers.container_publisher),
                 cancellation=cancellation,
             ),
-            GitPatchApplier(path, patch_operations),
-            RepoToolsReaderAdapter(RepoTools(path)),
+            GitPatchApplier(path),
+            RepoTools(path),
             worktree,
             CheckpointSession(
                 CheckpointRef(source, lease.lifecycle_id),
