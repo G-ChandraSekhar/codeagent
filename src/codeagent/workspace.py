@@ -87,6 +87,7 @@ Amendment 2) — `dispose()`/`preserve()`/`__exit__`:
 
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -96,7 +97,12 @@ from typing import Literal
 
 from codeagent import _git_safety
 from codeagent._lifecycle_fs import LifecycleFsError
-from codeagent.state_root import LeafObservation, _WorktreeLeafReservation
+from codeagent.state_root import (
+    AdminScanResult,
+    LeafObservation,
+    _WorktreeLeafReservation,
+    scan_worktree_admin_entries,
+)
 from codeagent.worktree_lifecycle import (
     ABSENT_WORKTREE_TRANSITION,
     WorktreeIntent,
@@ -107,6 +113,9 @@ from codeagent.worktree_lifecycle import (
 )
 
 _WORKTREE_TEMPDIR_PREFIX = "codeagent-worktree-"
+# A SHA-1 or SHA-256 object-id shape; the length is then checked against the
+# repository's own object format (ADR 0004 Amendment 20 section 3).
+_OID_SHAPE_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 class GitWorktreeError(Exception):
@@ -228,6 +237,7 @@ class GitWorktree:
         *,
         reservation: _WorktreeLeafReservation | None = None,
         worktree_publisher: WorktreeTransitionPublisher | None = None,
+        materialize_commit: str | None = None,
     ) -> None:
         # Slice 3C-2 correction pass: a bare type annotation is not
         # enforced by Python — an arbitrary duck-typed object exposing
@@ -241,6 +251,19 @@ class GitWorktree:
         if reservation is not None and not isinstance(reservation, _WorktreeLeafReservation):
             raise GitWorktreeError(
                 "reservation must be a genuine worktree-leaf reservation object"
+            )
+        # ADR 0004 Amendment 20 section 3 (C1): an explicit materialization
+        # commit is shape-checked here, with no Git call and no echo of the
+        # value; `__enter__` then checks it against the repository's own
+        # object format and that it names a commit, before any mutation.
+        if materialize_commit is not None and (
+            not isinstance(materialize_commit, str)
+            or not _OID_SHAPE_RE.fullmatch(materialize_commit)
+            or set(materialize_commit) == {"0"}
+        ):
+            raise GitWorktreeError(
+                "materialize_commit must be a 40- or 64-character lowercase hexadecimal "
+                "object id, not all zero"
             )
         # ADR 0004 Amendment 11: an optional, unwired producer seam. When
         # supplied, the publisher's identity is bound against the
@@ -267,6 +290,14 @@ class GitWorktree:
             if publisher_lifecycle_id != reservation.lifecycle_id:
                 raise GitWorktreeError(
                     "the worktree publisher's lifecycle does not match the reserved location"
+                )
+            # ADR 0004 Amendment 20 (D-2(a)): publisher-mode disposal publishes
+            # `absent` only after a zero-match admin scan, which needs the
+            # trusted common directory the reservation carries.
+            if reservation.canonical_common_dir is None:
+                raise GitWorktreeError(
+                    "a worktree publisher requires a reserved location carrying the trusted "
+                    "repository common directory"
                 )
         # ADR 0006 section 6: a one-time capability check, before any
         # repository access at all.
@@ -300,6 +331,8 @@ class GitWorktree:
         # never touches its descriptors directly; it calls only
         # `verify_identity()` and, on full success, `consume()`.
         self._reservation = reservation
+        # None: materialize the source repository's HEAD, exactly as before.
+        self._materialize_commit = materialize_commit
         # "active": ordinary state, not yet disposed or preserved.
         # "disposed": dispose() has confirmed exact removal.
         # "preserved": the controller deliberately retained this
@@ -317,6 +350,12 @@ class GitWorktree:
         self.lifecycle_error: GitWorktreeLifecycleError | None = None
         self._disposing_published = False
         self._disposal_publication_attempted = False
+
+    @property
+    def disposition(self) -> str:
+        """`"active"`, `"disposed"` or `"preserved"`; read-only (ADR 0004
+        Amendment 20 Q4 reads it before a recreation)."""
+        return self._disposition
 
     @property
     def initial_commit(self) -> str:
@@ -349,6 +388,28 @@ class GitWorktree:
         result = _run(self.source_repo_path, "rev-parse", "--is-inside-work-tree")
         if result.returncode != 0 or result.stdout.strip() != "true":
             raise GitWorktreeError("source repository path is not a git working tree")
+
+    def _materialization_commit(self) -> str:
+        """The commit this incarnation is created from (ADR 0004 Amendment
+        20 section 3, C1). Without `materialize_commit`, the source HEAD,
+        unchanged. With it, refused before any Git mutation unless its
+        length is the repository's own object format (detected from the
+        repository, never inferred from the value) and
+        `rev-parse --verify <oid>^{commit}` names that same object, which
+        rejects a missing object, a tree, a blob, and a tag."""
+        if self._materialize_commit is None:
+            return self._rev_parse("HEAD")
+        commit = self._materialize_commit
+        try:
+            object_format = _git_safety.detect_object_format(self.source_repo_path)
+        except _git_safety.GitSafetyError as exc:
+            raise GitWorktreeError("the source repository's object format could not be determined") from exc
+        if len(commit) != object_format.hex_length:
+            raise GitWorktreeError("materialize_commit is not an object id of the repository's object format")
+        result = _run(self.source_repo_path, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}")
+        if result.returncode != 0 or result.stdout.strip() != commit:
+            raise GitWorktreeError("materialize_commit does not name a commit in the source repository")
+        return commit
 
     def _rev_parse(self, ref: str) -> str:
         result = _run(self.source_repo_path, "rev-parse", ref)
@@ -446,7 +507,7 @@ class GitWorktree:
         # is None, so re-entry is allowed above) must not carry forward a
         # stale cleanup_error from that earlier attempt.
         self.cleanup_error = None
-        source_head = self._rev_parse("HEAD")
+        source_head = self._materialization_commit()
 
         if self._reservation is None:
             try:
@@ -814,7 +875,26 @@ class GitWorktree:
             pass
 
         registration_status = self._registration_status(worktree_path)
+        admin_absent = True
+        admin_error: LifecycleFsError | None = None
         if self._publisher is not None:
+            assert self._reservation is not None
+            # Publisher mode only (ADR 0004 Amendment 20, D-2(a)): Git keeps
+            # an admin directory under `<common-dir>/worktrees/` that
+            # `git worktree list` may not report, and a leftover one makes the
+            # next incarnation's entry `<lifecycle_id>1`. Only a fresh
+            # `NONE_FOUND` counts; every other result, and any scan error
+            # (including a descriptor-close failure), fails closed.
+            try:
+                admin_absent = (
+                    scan_worktree_admin_entries(
+                        self._reservation.canonical_common_dir, self._reservation.lifecycle_id
+                    )
+                    is AdminScanResult.NONE_FOUND
+                )
+            except LifecycleFsError as exc:
+                admin_absent = False
+                admin_error = exc
             # Publisher mode only (ADR 0004 Amendment 11): `absent` needs
             # an fd-relative, no-follow observation of the reserved leaf —
             # a pathname `exists()` follows symlinks and reports a dangling
@@ -822,7 +902,6 @@ class GitWorktree:
             # be open; once closed this is `UNKNOWN` and disposal fails
             # closed. Every no-publisher path keeps the observation below,
             # unchanged.
-            assert self._reservation is not None
             directory_absent = self._reservation.observe_leaf() is LeafObservation.ABSENT
         else:
             try:
@@ -830,7 +909,11 @@ class GitWorktree:
             except OSError:
                 directory_absent = False
 
-        if registration_status is not False or not directory_absent:
+        if registration_status is not False or not directory_absent or not admin_absent:
+            if admin_error is not None:
+                raise GitWorktreeCleanupError(
+                    "the git worktree could not be confirmed exactly removed"
+                ) from admin_error
             raise GitWorktreeCleanupError(
                 "the git worktree could not be confirmed exactly removed"
             )

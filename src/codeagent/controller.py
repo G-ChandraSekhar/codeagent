@@ -39,6 +39,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum, unique
 from pathlib import Path
 from typing import Protocol
 
@@ -399,6 +400,79 @@ class LifecycleOwnerPublisher(Protocol):
     def complete(self) -> None: ...
 
 
+@dataclass(frozen=True)
+class RecreationResult:
+    """What one recreation attempt (ADR 0004 Amendment 20 sections 3 and
+    7) reports back. `workspace` is the incarnation the controller must
+    hold afterwards: the new one for `RECREATED` and `ADOPTED_THEN_FAILED`,
+    `None` (keep the current object) for every other outcome. The receipt
+    fields and `error` become `WorkspaceRecreationFinished`'s, which
+    validates their shape."""
+
+    outcome: events.RecreationOutcome
+    workspace: "Workspace | None" = None
+    artifact_id: str | None = None
+    sha256_payload: str | None = None
+    bytes_written: int | None = None
+    evidence_complete: bool | None = None
+    error: OperationalError | None = None
+
+
+class WorkspaceRecreator(Protocol):
+    """Optional collaborator (ADR 0004 Amendment 20 section 2): the
+    composition performs a live-run recreation; this controller only
+    decides (Q1) and records it (section 6).
+
+    - `begin()` evaluates Q2-Q6 without any mutation. It returns the newly
+      minted sequence *k* (1-99), or `None` for a refusal, which is not an
+      attempt: no sequence is consumed and nothing is created.
+    - `recreate(k)` runs Phases E, D, R and C for that attempt and reports
+      the outcome. It is called only after `WorkspaceRecreationStarted`
+      for *k* has been emitted, and at most once per *k*."""
+
+    def begin(self, *, trigger_code: ErrorCode, checkpoint_id: str | None) -> int | None: ...
+    def recreate(self, sequence: int) -> RecreationResult: ...
+
+
+@unique
+class PatchFailureStage(str, Enum):
+    """Which step of one `apply_patch` transaction returned its failure."""
+
+    ENTRY_GATE = "entry_gate"
+    ESTABLISH = "establish"
+    APPLY = "apply"
+    POSTCONDITION = "postcondition"
+    ADVANCE = "advance"
+
+
+_ADVANCE_UNCHANGED_CODES = frozenset(
+    {ErrorCode.CHECKPOINT_REF_UPDATE_REJECTED, ErrorCode.CHECKPOINT_REF_OPERATION_FAILED}
+)
+
+
+def classify_recreation_trigger(
+    stage: PatchFailureStage | None, code: ErrorCode | None, session_intent: CheckpointIntent
+) -> ErrorCode | None:
+    """ADR 0004 Amendment 20 section 2, Q1's contamination classification:
+    the trigger code when a handled patch failure is a recreation
+    candidate, else `None`. Only while the checkpoint session is `PRESENT`:
+    (a) `PATCH_APPLICATION_FAILED` from the apply step (a write happened);
+    (b) an `advance()` failure mapped to a confirmed-`UNCHANGED` code, which
+    left the ref at its accepted commit while the worktree moved on;
+    (c) an entry-gate refusal (earlier contamination). Every pre-write
+    refusal, any establish failure, the postcondition, and every other
+    checkpoint outcome is never a candidate."""
+    if session_intent is not CheckpointIntent.PRESENT or stage is None or code is None:
+        return None
+    if stage is PatchFailureStage.APPLY and code is ErrorCode.PATCH_APPLICATION_FAILED:
+        return code
+    if stage is PatchFailureStage.ADVANCE and code in _ADVANCE_UNCHANGED_CODES:
+        return code
+    if stage is PatchFailureStage.ENTRY_GATE and code is ErrorCode.WORKSPACE_ENTRY_GATE_FAILED:
+        return code
+    return None
+
+
 class PatchApplier(Protocol):
     """Applies exactly the given operations and reports what actually
     happened. In a run, `operations` is built only from the approved,
@@ -615,6 +689,7 @@ class RunController:
         event_log: EventLog | None = None,
         lifecycle_owner: LifecycleOwnerPublisher | None = None,
         cancellation: CancellationToken = NEVER_CANCELLED,
+        workspace_recreator: WorkspaceRecreator | None = None,
     ) -> None:
         self._c = config
         self._model = model
@@ -634,6 +709,21 @@ class RunController:
         # authority (ADR 0003 Amendment 2), replacing the removed
         # caller-controlled RunConfig.initial_checkpoint_id.
         self._last_checkpoint_id: str | None = workspace.initial_commit
+        # ADR 0004 Amendment 20 (M2): the run origin H0, fixed here. After a
+        # recreation the current incarnation's `initial_commit` is its own
+        # materialization commit, never the run's origin.
+        self._origin_commit: str = workspace.initial_commit
+        # ADR 0004 Amendment 20 section 2: an optional recreator. `None` (the
+        # default) keeps today's behavior: a contaminating failure ends the run.
+        self._recreator = workspace_recreator
+        # Which step of the current `apply_patch` transaction failed (Q1).
+        self._patch_failure_stage: PatchFailureStage | None = None
+        # True once a recreation attempt has begun (`begin()` returned *k*).
+        self._recreation_attempted = False
+        # Set before WorkspaceRecreationFinished for an `UNCONFIRMED`
+        # outcome (M8): teardown then skips disposal, ref deletion and
+        # `complete()`, exactly as for an unconfirmed worktree cleanup.
+        self._recreation_cleanup_unconfirmed = False
         # Tracked across the whole run (Milestone 2 slice 2B-2): any
         # single verifier cleanup-unconfirmed occurrence — baseline or
         # any verification attempt — forces the workspace/ref to be
@@ -1058,9 +1148,7 @@ class RunController:
             self._transition(pass_index, domain.Trigger.PLAN_APPROVED)
             patch_ok, patch_error = self._dispatch_apply_patch(pass_index, approved)
             if not patch_ok:
-                return self._terminate(
-                    pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error
-                )
+                return self._route_patch_failure(pass_index, patch_error)
             self._cancellation_check("C19")
 
             self._transition(pass_index, domain.Trigger.PATCH_APPLIED)
@@ -1899,13 +1987,15 @@ class RunController:
         # does — never a separately tracked value of this controller's
         # own.
         expected_commit = (
-            self._workspace.initial_commit
+            self._origin_commit
             if self._session.intent is CheckpointIntent.ABSENT
             else self._session.accepted_sha
         )
+        self._patch_failure_stage = None
         try:
             self._workspace.entry_gate(expected_commit)
         except Exception as exc:  # noqa: BLE001 — any Workspace implementation's own exception type
+            self._patch_failure_stage = PatchFailureStage.ENTRY_GATE
             return (
                 OperationalError(
                     code=ErrorCode.WORKSPACE_ENTRY_GATE_FAILED,
@@ -1919,8 +2009,9 @@ class RunController:
         # Amendment 1 point 4 / Amendment 2 section 1).
         if self._session.intent is CheckpointIntent.ABSENT:
             try:
-                self._session.establish(self._workspace.initial_commit)
+                self._session.establish(self._origin_commit)
             except (CheckpointRefError, CheckpointSessionError, CheckpointPublicationError) as exc:
+                self._patch_failure_stage = PatchFailureStage.ESTABLISH
                 return self._map_checkpoint_error(exc, iteration), None
 
         # Step 5: the patch itself.
@@ -1932,6 +2023,7 @@ class RunController:
         if not isinstance(result, PatchResult):
             raise TypeError("the patch applier did not return a PatchResult")
         if not result.success:
+            self._patch_failure_stage = PatchFailureStage.APPLY
             return result.error, None
 
         # Step 6: the approved-path postcondition — defense-in-depth,
@@ -1940,6 +2032,7 @@ class RunController:
         # unapproved target before any write or commit happens at all).
         actual_paths = set(result.changed_paths)
         if not actual_paths.issubset(approved_paths):
+            self._patch_failure_stage = PatchFailureStage.POSTCONDITION
             return (
                 OperationalError(
                     code=ErrorCode.INTERNAL_INVARIANT_VIOLATION,
@@ -1953,8 +2046,98 @@ class RunController:
         try:
             self._session.advance(result.commit_hash)
         except (CheckpointRefError, CheckpointSessionError, CheckpointPublicationError) as exc:
+            self._patch_failure_stage = PatchFailureStage.ADVANCE
             return self._map_checkpoint_error(exc, iteration), None
         return None, result
+
+    def _recreation_can_continue(self) -> bool:
+        """Q1's "the run will continue" (ADR 0004 Amendment 20 section 2).
+        Always False until D5 integration adds the domain transition that
+        returns a recreated patch failure to the repair loop (N4): with no
+        such transition the run cannot continue, so no recreation is
+        attempted and `run()` never calls the recreator."""
+        return False
+
+    def _route_patch_failure(self, pass_index: int, patch_error: OperationalError | None) -> events.RunFinished:
+        """A failed `apply_patch`: recreate when Q1 and the verifier part of
+        Q3 hold and a recreator exists; otherwise end the run exactly as
+        before, through the triggering error."""
+        trigger = classify_recreation_trigger(
+            self._patch_failure_stage,
+            patch_error.code if patch_error is not None else None,
+            self._session.intent,
+        )
+        if (
+            self._recreator is None
+            or trigger is None
+            or self._any_verifier_cleanup_unconfirmed
+            or not self._recreation_can_continue()
+        ):
+            return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error)
+        finished = self._attempt_recreation(pass_index, trigger, patch_error)
+        if finished is None:
+            raise RuntimeError("continuing after RECREATED requires the D5 integration repair transition")
+        return finished
+
+    def _attempt_recreation(
+        self, pass_index: int, trigger: ErrorCode, triggering_error: OperationalError | None
+    ) -> events.RunFinished | None:
+        """One recreation attempt (ADR 0004 Amendment 20 sections 2, 3, 6,
+        6.1). Returns `None` only for `RECREATED`; every other path ends the
+        run. Neither event emission is retried or suppressed: a failure
+        propagates to `run()`'s Amendment 9 boundary, and nothing here is
+        repeated. All bookkeeping is final before the Finished emission, so
+        teardown acts on the actual current incarnation."""
+        assert self._recreator is not None
+        checkpoint_id = self._session.accepted_sha
+        sequence = self._recreator.begin(trigger_code=trigger, checkpoint_id=checkpoint_id)
+        if sequence is None:
+            # A Q2-Q6 refusal is not an attempt: no event, no sequence, no
+            # artifact; the run ends through the triggering error.
+            return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=triggering_error)
+        self._recreation_attempted = True
+        self._emit(
+            events.WorkspaceRecreationStarted(
+                run_id=self._c.run_id,
+                sequence=self.log.next_sequence(),
+                timestamp=self._now(),
+                state=self.state,
+                iteration=pass_index,
+                recreation_sequence=sequence,
+                trigger_code=trigger,
+                checkpoint_id=checkpoint_id,
+            )
+        )
+        result = self._recreator.recreate(sequence)
+        if not isinstance(result, RecreationResult) or not isinstance(result.outcome, events.RecreationOutcome):
+            raise TypeError("the workspace recreator did not return a RecreationResult")
+        adopts = result.outcome in (events.RecreationOutcome.RECREATED, events.RecreationOutcome.ADOPTED_THEN_FAILED)
+        if adopts != (result.workspace is not None):
+            raise ValueError("a recreation result carries a workspace exactly when its incarnation is adopted")
+        # Bookkeeping, final before the Finished emission (section 6.1).
+        if adopts:
+            self._workspace = result.workspace
+        if result.outcome is events.RecreationOutcome.UNCONFIRMED:
+            self._recreation_cleanup_unconfirmed = True
+        self._emit(
+            events.WorkspaceRecreationFinished(
+                run_id=self._c.run_id,
+                sequence=self.log.next_sequence(),
+                timestamp=self._now(),
+                state=self.state,
+                iteration=pass_index,
+                recreation_sequence=sequence,
+                outcome=result.outcome,
+                artifact_id=result.artifact_id,
+                sha256_payload=result.sha256_payload,
+                bytes_written=result.bytes_written,
+                evidence_complete=result.evidence_complete,
+                error=result.error,
+            )
+        )
+        if result.outcome is events.RecreationOutcome.RECREATED:
+            return None
+        return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=result.error)
 
     def _fallback_evidence_receipt(self, pass_index: int, reason: str) -> EvidenceReceipt:
         return EvidenceReceipt(
@@ -1985,15 +2168,33 @@ class RunController:
         Emitted in the run's current (pre-terminal) state, matching
         Event's ordering convention for a causative event.
         """
-        try:
-            receipt = self._evidence_sink.capture(
-                worktree_path=self._workspace.path,
-                source_repo_path=self._workspace.source_repo_path,
-                initial_commit=self._workspace.initial_commit,
-                lifecycle_id=self._c.lifecycle_id,
+        if self._recreation_attempted and self._workspace.path is None:
+            # ADR 0004 Amendment 20 section 5.4: after a post-disposal
+            # recreation failure no worktree exists; the sink is not called.
+            # This never substitutes for the recreation artifact, which Phase
+            # E published before that incarnation was disposed.
+            receipt = EvidenceReceipt(
+                success=False,
+                complete=False,
+                artifact_id=None,
+                sha256_payload=None,
+                bytes_written=None,
+                error=OperationalError(
+                    code=ErrorCode.EVIDENCE_CAPTURE_FAILED,
+                    error_id=f"{self._c.run_id}-evidence-no-worktree-{pass_index}",
+                    message="no worktree exists to capture terminal evidence from",
+                ),
             )
-        except Exception:  # noqa: BLE001 — a sink must never be able to block teardown
-            receipt = self._fallback_evidence_receipt(pass_index, "sink-raised")
+        else:
+            try:
+                receipt = self._evidence_sink.capture(
+                    worktree_path=self._workspace.path,
+                    source_repo_path=self._workspace.source_repo_path,
+                    initial_commit=self._origin_commit,
+                    lifecycle_id=self._c.lifecycle_id,
+                )
+            except Exception:  # noqa: BLE001 — a sink must never be able to block teardown
+                receipt = self._fallback_evidence_receipt(pass_index, "sink-raised")
 
         try:
             self._emit(
@@ -2108,6 +2309,12 @@ class RunController:
                 self._workspace.preserve()
             except Exception:  # noqa: BLE001 — a preserve() failure must not block RunFinished
                 worktree_cleanup_unconfirmed = True
+        elif self._recreation_cleanup_unconfirmed:
+            # ADR 0004 Amendment 20 section 7 (M8): owned resources of a
+            # failed recreation may remain. No disposal (the current object
+            # may be an already-disposed incarnation), no ref deletion, no
+            # complete(); reconciliation owns what is left.
+            worktree_cleanup_unconfirmed = True
         else:
             try:
                 self._workspace.dispose()

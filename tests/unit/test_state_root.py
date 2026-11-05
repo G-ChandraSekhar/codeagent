@@ -933,6 +933,36 @@ def test_reservation_exposes_bound_identity(tmp_path):
         state_root.close()
 
 
+def test_reservation_carries_canonical_common_dir_read_only(tmp_path):
+    """ADR 0004 Amendment 20 (D-2(a)): carried exactly as given, read-only,
+    and `None` when the caller supplies none."""
+    common = str(tmp_path / "repo" / ".git")
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    try:
+        with state_root.reserve_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID, canonical_common_dir=common) as reservation:
+            assert reservation.canonical_common_dir == common
+            with pytest.raises(AttributeError):
+                reservation.canonical_common_dir = "/elsewhere"
+            assert reservation.canonical_common_dir == common
+        with state_root.reserve_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID_2) as reservation:
+            assert reservation.canonical_common_dir is None
+    finally:
+        state_root.close()
+
+
+@pytest.mark.parametrize("bad", ["relative/.git", "", "/with\0nul", b"/bytes/.git", 7])
+def test_reservation_rejects_an_untrusted_common_dir_before_creating_anything(tmp_path, bad):
+    state_root = _state_root_for_worktree_tests(tmp_path)
+    try:
+        with pytest.raises(lf.LifecycleFsError) as excinfo:
+            state_root.reserve_worktree_leaf(_REPO_KEY, _LIFECYCLE_ID, canonical_common_dir=bad)
+        assert excinfo.value.reason is lf.LifecycleFsFailure.INVALID_COMPONENT
+        assert str(excinfo.value) == "canonical_common_dir must be an absolute path string"
+        assert not (Path(state_root.path) / "worktrees").exists()
+    finally:
+        state_root.close()
+
+
 def test_observe_leaf_reserved_inode_then_absent_after_removal(tmp_path):
     """The retained leaf descriptor still refers to the now-unlinked
     inode, yet the fd-relative no-follow lookup of the name is a confirmed

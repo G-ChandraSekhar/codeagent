@@ -22,8 +22,10 @@ from pathlib import Path
 import pytest
 
 from codeagent import lifecycle_store as ls
+from codeagent import repo_identity as ri
+from codeagent import workspace as ws
 from codeagent import worktree_lifecycle as wl
-from codeagent.workspace import GitWorktree
+from codeagent.workspace import GitWorktree, GitWorktreeCleanupError
 
 
 def _run(*args, cwd=None):
@@ -97,7 +99,9 @@ def test_real_publisher_full_forward_cycle(tmp_path, monkeypatch, object_format)
         writer, current = lease.open_projection_writer()
         bundle = ls.create_shared_lifecycle_publishers(writer, current)
         publisher = _ReloadingPublisher(bundle.worktree_publisher, writer)
-        with lease.state_root.reserve_worktree_leaf(lease.repo_key, lease.lifecycle_id) as reservation:
+        with lease.state_root.reserve_worktree_leaf(
+            lease.repo_key, lease.lifecycle_id, canonical_common_dir=lease.identity.canonical_common_dir
+        ) as reservation:
             worktree = GitWorktree(repo, run_id="wt-e2e", reservation=reservation, worktree_publisher=publisher)
             with worktree as path:
                 assert _is_registered(repo, path)
@@ -114,6 +118,49 @@ def test_real_publisher_full_forward_cycle(tmp_path, monkeypatch, object_format)
         # The shared cursor tracked every write -- no spurious staleness.
         assert bundle.cursor.current.worktree == wl.ABSENT_WORKTREE_TRANSITION
         assert writer.refresh() == bundle.cursor.current
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize("object_format", [None, "sha256"])
+def test_reservation_common_dir_is_the_lease_identity_and_gates_absent(tmp_path, monkeypatch, object_format):
+    """ADR 0004 Amendment 20 (D-2(a)) provenance, end to end: the reservation
+    carries the lease's validated `canonical_common_dir`, and the real
+    publisher's `absent` lands only once the admin entry is gone."""
+    repo = _make_repo(tmp_path, object_format=object_format)
+    monkeypatch.setenv("CODEAGENT_STATE_DIR", str(tmp_path / "state-root"))
+    lease = ls.prepare_lifecycle(str(repo), run_id="wt-provenance")
+    try:
+        writer, current = lease.open_projection_writer()
+        bundle = ls.create_shared_lifecycle_publishers(writer, current)
+        with lease.state_root.reserve_worktree_leaf(
+            lease.repo_key, lease.lifecycle_id, canonical_common_dir=lease.identity.canonical_common_dir
+        ) as reservation:
+            assert reservation.canonical_common_dir == lease.identity.canonical_common_dir
+            assert reservation.canonical_common_dir == ri.discover_repository_identity_and_context(str(repo))[0].canonical_common_dir
+            worktree = GitWorktree(
+                repo, run_id="wt-provenance", reservation=reservation, worktree_publisher=bundle.worktree_publisher
+            )
+            path = worktree.__enter__()
+            leftover = Path(lease.identity.canonical_common_dir) / "worktrees" / lease.lifecycle_id
+            real_run = ws._run
+
+            def run(cwd, *args, **kwargs):
+                result = real_run(cwd, *args, **kwargs)
+                if args[:2] == ("worktree", "remove"):
+                    leftover.mkdir(parents=True, exist_ok=True)
+                return result
+
+            monkeypatch.setattr(ws, "_run", run)
+            with pytest.raises(GitWorktreeCleanupError):
+                worktree.dispose()
+            monkeypatch.setattr(ws, "_run", real_run)
+            # Durably still disposing: absent was never attempted.
+            assert writer.refresh().worktree.intent is wl.WorktreeIntent.DISPOSING
+            assert not _is_registered(repo, path)
+            leftover.rmdir()
+            worktree.dispose()
+            assert writer.refresh().worktree == wl.ABSENT_WORKTREE_TRANSITION
     finally:
         lease.close()
 
@@ -152,7 +199,9 @@ def _enter_and_sigkill(repo_path: str, state_dir: str, id_file: str, stop_intent
             if transition.intent.value == stop_intent:
                 os.kill(os.getpid(), signal.SIGKILL)
 
-    reservation = lease.state_root.reserve_worktree_leaf(lease.repo_key, lease.lifecycle_id)
+    reservation = lease.state_root.reserve_worktree_leaf(
+        lease.repo_key, lease.lifecycle_id, canonical_common_dir=lease.identity.canonical_common_dir
+    )
     worktree = ws_child.GitWorktree(
         repo_path, run_id=f"wt-sigkill-{stop_intent}", reservation=reservation, worktree_publisher=_Killer()
     )

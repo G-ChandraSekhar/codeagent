@@ -2314,6 +2314,7 @@ def test_no_rmtree_or_prune_reference_exists_in_workspace_module() -> None:
 import ast  # noqa: E402
 
 from codeagent import worktree_lifecycle as wl  # noqa: E402
+from codeagent import repo_identity as ri  # noqa: E402
 from codeagent import workspace as ws  # noqa: E402
 from codeagent.workspace import GitWorktreeLifecycleError  # noqa: E402
 
@@ -2352,6 +2353,16 @@ def _bound_publisher(reservation, **kwargs) -> RecordingWorktreePublisher:
         lifecycle_id=reservation.lifecycle_id,
         state_root_id=reservation.state_root_id,
         **kwargs,
+    )
+
+
+def _reserve_for_publisher(state_root, repo: Path):
+    """Publisher-mode reservation (ADR 0004 Amendment 20, D-2(a)): carries
+    the trusted common directory from real repository discovery, as
+    production takes it from `LifecycleLease.identity`."""
+    identity, _context = ri.discover_repository_identity_and_context(str(repo))
+    return state_root.reserve_worktree_leaf(
+        _WT_REPO_KEY, _WT_LIFECYCLE_ID, canonical_common_dir=identity.canonical_common_dir
     )
 
 
@@ -2484,7 +2495,7 @@ def test_real_git_publication_ordering_for_all_four_transitions(reservation_repo
     head = _head(repo)
     holder: dict = {}
 
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
 
         def observe(transition):
             path = reservation.path
@@ -2536,7 +2547,7 @@ def test_real_git_publication_ordering_for_all_four_transitions(reservation_repo
 
 def test_creating_failure_mutates_no_git_and_latches(reservation_repo) -> None:
     repo, state_root = reservation_repo
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
         publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.CREATING)
         worktree = GitWorktree(repo, run_id="r-c", reservation=reservation, worktree_publisher=publisher)
         with mock.patch.object(ws, "_run", wraps=ws._run) as run_spy:
@@ -2567,7 +2578,7 @@ def test_creating_failure_mutates_no_git_and_latches(reservation_repo) -> None:
 def test_present_failure_retains_registered_worktree_outside_enter_cleanup(reservation_repo, reason) -> None:
     repo, state_root = reservation_repo
     head = _head(repo)
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
         publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.PRESENT, reason=reason)
         worktree = GitWorktree(repo, run_id="r-p", reservation=reservation, worktree_publisher=publisher)
         with mock.patch.object(
@@ -2598,7 +2609,7 @@ def test_present_failure_retains_registered_worktree_outside_enter_cleanup(reser
 
 def test_disposing_failure_prevents_removal_and_never_republishes(reservation_repo) -> None:
     repo, state_root = reservation_repo
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
         publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.DISPOSING)
         worktree = GitWorktree(repo, run_id="r-d", reservation=reservation, worktree_publisher=publisher)
         path = worktree.__enter__()
@@ -2627,7 +2638,7 @@ def test_disposing_failure_prevents_removal_and_never_republishes(reservation_re
 
 def test_absent_failure_after_confirmed_removal_stays_latched_despite_disposed(reservation_repo) -> None:
     repo, state_root = reservation_repo
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
         publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.ABSENT)
         worktree = GitWorktree(repo, run_id="r-a", reservation=reservation, worktree_publisher=publisher)
         path = worktree.__enter__()
@@ -2659,7 +2670,7 @@ def test_absent_failure_after_confirmed_removal_stays_latched_despite_disposed(r
 
 def test_body_exception_is_not_masked_by_lifecycle_failure(reservation_repo) -> None:
     repo, state_root = reservation_repo
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
         publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.ABSENT)
         worktree = GitWorktree(repo, run_id="r-mask", reservation=reservation, worktree_publisher=publisher)
         with pytest.raises(ValueError, match="body failure"):
@@ -2671,7 +2682,7 @@ def test_body_exception_is_not_masked_by_lifecycle_failure(reservation_repo) -> 
 
 def test_body_exception_not_masked_when_already_latched(reservation_repo) -> None:
     repo, state_root = reservation_repo
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
         publisher = _bound_publisher(reservation, fail_on=wl.WorktreeIntent.DISPOSING)
         worktree = GitWorktree(repo, run_id="r-mask2", reservation=reservation, worktree_publisher=publisher)
         with pytest.raises(ValueError, match="body failure"):
@@ -2686,7 +2697,7 @@ def test_body_exception_not_masked_when_already_latched(reservation_repo) -> Non
 
 def test_physical_retry_after_cleanup_error_skips_disposing_republish(reservation_repo) -> None:
     repo, state_root = reservation_repo
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
         publisher = _bound_publisher(reservation)
         worktree = GitWorktree(repo, run_id="r-retry", reservation=reservation, worktree_publisher=publisher)
         worktree.__enter__()
@@ -2717,7 +2728,7 @@ def test_physical_retry_after_cleanup_error_skips_disposing_republish(reservatio
 
 def test_preserve_publishes_nothing(reservation_repo) -> None:
     repo, state_root = reservation_repo
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
         publisher = _bound_publisher(reservation)
         worktree = GitWorktree(repo, run_id="r-pres", reservation=reservation, worktree_publisher=publisher)
         with worktree as path:
@@ -2729,7 +2740,7 @@ def test_preserve_publishes_nothing(reservation_repo) -> None:
 
 def test_lifecycle_aware_disposal_with_closed_reservation_descriptors_fails_closed(reservation_repo) -> None:
     repo, state_root = reservation_repo
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
         publisher = _bound_publisher(reservation)
         worktree = GitWorktree(repo, run_id="r-closed", reservation=reservation, worktree_publisher=publisher)
         path = worktree.__enter__()
@@ -2749,7 +2760,7 @@ def test_concurrent_entry_publishes_creating_exactly_once(reservation_repo) -> N
     import threading
 
     repo, state_root = reservation_repo
-    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+    with _reserve_for_publisher(state_root, repo) as reservation:
         publisher = _bound_publisher(reservation)
         worktrees = [
             GitWorktree(repo, run_id=f"r-race-{i}", reservation=reservation, worktree_publisher=publisher)
@@ -2799,6 +2810,422 @@ def test_no_publisher_legacy_tempdir_mode_unchanged(reservation_repo) -> None:
         assert path.exists()
     assert not path.exists()
     assert worktree.lifecycle_error is None
+
+
+# --- ADR 0004 Amendment 20 (D-2(a)): the admin-entry gate before `absent` ---
+
+
+def test_publisher_without_trusted_common_dir_refused_before_git(reservation_repo, no_git_allowed) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        assert reservation.canonical_common_dir is None
+        publisher = _bound_publisher(reservation)
+        with pytest.raises(GitWorktreeError) as excinfo:
+            GitWorktree(repo, run_id="r-no-common", reservation=reservation, worktree_publisher=publisher)
+        assert str(excinfo.value) == (
+            "a worktree publisher requires a reserved location carrying the trusted "
+            "repository common directory"
+        )
+        assert publisher.events == []
+        assert reservation._state is sr._ReservationState.RESERVED
+
+
+def _admin_dir(repo: Path) -> Path:
+    identity, _context = ri.discover_repository_identity_and_context(str(repo))
+    return Path(identity.canonical_common_dir) / "worktrees"
+
+
+def _assert_absent_not_attempted(worktree, publisher, path, repo) -> None:
+    assert publisher.intents == [wl.WorktreeIntent.CREATING, wl.WorktreeIntent.PRESENT, wl.WorktreeIntent.DISPOSING]
+    assert worktree.lifecycle_error is None
+    assert worktree._disposition == "active"
+    assert worktree.path == path
+    assert not _is_registered(repo, path)  # the physical removal itself happened
+
+
+@pytest.mark.parametrize(
+    "result", ["MATCH_FOUND", "UNEXPECTED_SUBSTRATE", "LIMIT_EXCEEDED", "INSPECTION_FAILED"]
+)
+def test_dispose_fails_closed_on_every_non_zero_admin_result(reservation_repo, monkeypatch, result) -> None:
+    repo, state_root = reservation_repo
+    with _reserve_for_publisher(state_root, repo) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(repo, run_id="r-admin", reservation=reservation, worktree_publisher=publisher)
+        path = worktree.__enter__()
+        calls: list = []
+
+        def scan(common, lifecycle_id):
+            calls.append((common, lifecycle_id))
+            return sr.AdminScanResult[result]
+
+        monkeypatch.setattr(ws, "scan_worktree_admin_entries", scan)
+        with pytest.raises(GitWorktreeCleanupError) as excinfo:
+            worktree.dispose()
+        assert str(excinfo.value) == "the git worktree could not be confirmed exactly removed"
+        assert excinfo.value.__cause__ is None
+        assert calls == [(reservation.canonical_common_dir, reservation.lifecycle_id)]
+        _assert_absent_not_attempted(worktree, publisher, path, repo)
+        # A later retry with a clean scan completes, without republishing disposing.
+        monkeypatch.undo()
+        worktree.dispose()
+        assert publisher.intents[-2:] == [wl.WorktreeIntent.DISPOSING, wl.WorktreeIntent.ABSENT]
+        assert publisher.intents.count(wl.WorktreeIntent.DISPOSING) == 1
+        assert worktree._disposition == "disposed"
+
+
+def test_dispose_fails_closed_when_the_admin_scan_raises(reservation_repo, monkeypatch) -> None:
+    repo, state_root = reservation_repo
+    with _reserve_for_publisher(state_root, repo) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(repo, run_id="r-admin-raise", reservation=reservation, worktree_publisher=publisher)
+        path = worktree.__enter__()
+        cleanup = lf.LifecycleFsError(lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED, "scan close failed")
+
+        def scan(common, lifecycle_id):
+            raise cleanup
+
+        monkeypatch.setattr(ws, "scan_worktree_admin_entries", scan)
+        with pytest.raises(GitWorktreeCleanupError) as excinfo:
+            worktree.dispose()
+        assert excinfo.value.__cause__ is cleanup
+        assert "scan close failed" not in str(excinfo.value)
+        _assert_absent_not_attempted(worktree, publisher, path, repo)
+        monkeypatch.undo()
+        worktree.dispose()
+        assert publisher.intents[-1] is wl.WorktreeIntent.ABSENT
+
+
+def test_dispose_real_leftover_admin_entry_blocks_absent(reservation_repo, monkeypatch) -> None:
+    """A real admin directory left under `<common-dir>/worktrees/` after the
+    removal -- what made the next incarnation `<id>1` in the C-1 experiment."""
+    repo, state_root = reservation_repo
+    with _reserve_for_publisher(state_root, repo) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(repo, run_id="r-admin-real", reservation=reservation, worktree_publisher=publisher)
+        path = worktree.__enter__()
+        leftover = _admin_dir(repo) / reservation.lifecycle_id
+        real_run = ws._run
+
+        def run(cwd, *args, **kwargs):
+            result = real_run(cwd, *args, **kwargs)
+            if args[:2] == ("worktree", "remove"):
+                leftover.mkdir(parents=True)
+            return result
+
+        monkeypatch.setattr(ws, "_run", run)
+        with pytest.raises(GitWorktreeCleanupError):
+            worktree.dispose()
+        monkeypatch.undo()
+        _assert_absent_not_attempted(worktree, publisher, path, repo)
+        assert sr.scan_worktree_admin_entries(reservation.canonical_common_dir, reservation.lifecycle_id) is (
+            sr.AdminScanResult.MATCH_FOUND
+        )
+        leftover.rmdir()
+        worktree.dispose()
+        assert publisher.intents[-1] is wl.WorktreeIntent.ABSENT
+
+
+def test_dispose_real_admin_scan_overflow_blocks_absent(reservation_repo, monkeypatch) -> None:
+    repo, state_root = reservation_repo
+    with _reserve_for_publisher(state_root, repo) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(repo, run_id="r-admin-limit", reservation=reservation, worktree_publisher=publisher)
+        path = worktree.__enter__()
+        unrelated = _admin_dir(repo) / "unrelated-entry"
+        unrelated.mkdir(parents=True)
+        try:
+            monkeypatch.setattr(sr, "_ADMIN_SCAN_MAX_ENTRIES", 0)
+            with pytest.raises(GitWorktreeCleanupError):
+                worktree.dispose()
+            monkeypatch.undo()
+            _assert_absent_not_attempted(worktree, publisher, path, repo)
+            worktree.dispose()  # an unrelated entry within the real bound is not a match
+            assert publisher.intents[-1] is wl.WorktreeIntent.ABSENT
+        finally:
+            unrelated.rmdir()
+
+
+def test_dispose_real_admin_scan_cleanup_failure_blocks_absent(reservation_repo, monkeypatch) -> None:
+    repo, state_root = reservation_repo
+    with _reserve_for_publisher(state_root, repo) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(repo, run_id="r-admin-close", reservation=reservation, worktree_publisher=publisher)
+        path = worktree.__enter__()
+
+        def failing_cleanup(fds, primary):
+            lf.close_confirmed(fds)
+            raise lf.LifecycleFsError(lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED, "simulated") from primary
+
+        monkeypatch.setattr(sr, "_dominant_cleanup", failing_cleanup)
+        with pytest.raises(GitWorktreeCleanupError) as excinfo:
+            worktree.dispose()
+        monkeypatch.undo()
+        assert isinstance(excinfo.value.__cause__, lf.LifecycleFsError)
+        assert excinfo.value.__cause__.reason is lf.LifecycleFsFailure.CLEANUP_UNCONFIRMED
+        _assert_absent_not_attempted(worktree, publisher, path, repo)
+        worktree.dispose()
+        assert publisher.intents[-1] is wl.WorktreeIntent.ABSENT
+
+
+def test_dispose_gate_order_is_remove_registration_admin_leaf_then_absent(reservation_repo, monkeypatch) -> None:
+    repo, state_root = reservation_repo
+    with _reserve_for_publisher(state_root, repo) as reservation:
+        order: list[str] = []
+        publisher = _bound_publisher(reservation, observer=lambda t: order.append(f"publish:{t.intent.value}"))
+        worktree = GitWorktree(repo, run_id="r-admin-order", reservation=reservation, worktree_publisher=publisher)
+        worktree.__enter__()
+        order.clear()
+        real_run, real_reg = ws._run, GitWorktree._registration_status
+        real_scan, real_leaf = ws.scan_worktree_admin_entries, sr._WorktreeLeafReservation.observe_leaf
+
+        def run(cwd, *args, **kwargs):
+            if args[:2] == ("worktree", "remove"):
+                order.append("remove")
+            return real_run(cwd, *args, **kwargs)
+
+        def reg(self, p):
+            order.append("registration")
+            return real_reg(self, p)
+
+        def scan(common, lifecycle_id):
+            order.append("admin")
+            return real_scan(common, lifecycle_id)
+
+        def leaf(self):
+            order.append("leaf")
+            return real_leaf(self)
+
+        monkeypatch.setattr(ws, "_run", run)
+        monkeypatch.setattr(GitWorktree, "_registration_status", reg)
+        monkeypatch.setattr(ws, "scan_worktree_admin_entries", scan)
+        monkeypatch.setattr(sr._WorktreeLeafReservation, "observe_leaf", leaf)
+        worktree.dispose()
+    assert order == ["publish:disposing", "remove", "registration", "admin", "leaf", "publish:absent"]
+
+
+def test_no_publisher_disposal_never_runs_the_admin_scan(reservation_repo, monkeypatch) -> None:
+    repo, state_root = reservation_repo
+    monkeypatch.setattr(
+        ws, "scan_worktree_admin_entries", mock.Mock(side_effect=AssertionError("must not be used"))
+    )
+    with _reserve_for_publisher(state_root, repo) as reservation:
+        with GitWorktree(repo, run_id="r-nopub-admin", reservation=reservation) as path:
+            pass
+        assert not _is_registered(repo, path)
+    with GitWorktree(repo, run_id="r-legacy-admin") as legacy_path:
+        pass
+    assert not legacy_path.exists()
+
+
+def test_production_reservation_common_dir_comes_only_from_the_lease_identity() -> None:
+    """The one production `reserve_worktree_leaf` call supplies
+    `canonical_common_dir` as exactly `lease.identity.canonical_common_dir`."""
+    root = Path(__file__).resolve().parents[2] / "src" / "codeagent"
+    calls = []
+    for source in sorted(root.glob("*.py")):
+        if source.name == "state_root.py":
+            continue
+        for node in ast.walk(ast.parse(source.read_text())):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "reserve_worktree_leaf":
+                calls.append((source.name, node))
+    assert [name for name, _ in calls] == ["_lifecycle_run.py"]
+    keywords = {kw.arg: ast.unparse(kw.value) for kw in calls[0][1].keywords}
+    assert keywords == {"canonical_common_dir": "lease.identity.canonical_common_dir"}
+
+
+# --- ADR 0004 Amendment 20 (C1): GitWorktree(materialize_commit=...) ---
+
+
+def _second_commit(repo: Path) -> tuple[str, str]:
+    """Add a later commit; return (earlier, later)."""
+    earlier = _head(repo)
+    (repo / "later.txt").write_text("later\n")
+    assert _git_raw(repo, "add", "later.txt").returncode == 0
+    assert _git_raw(repo, "commit", "-q", "-m", "later").returncode == 0
+    return earlier, _head(repo)
+
+
+def _git_calls(monkeypatch) -> list[tuple[str, ...]]:
+    calls: list[tuple[str, ...]] = []
+    real = ws._run
+
+    def spy(cwd, *args, **kwargs):
+        calls.append(args)
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(ws, "_run", spy)
+    return calls
+
+
+def test_materialize_commit_default_is_the_source_head(reservation_repo, monkeypatch) -> None:
+    repo, _state_root = reservation_repo
+    head = _head(repo)
+    monkeypatch.setattr(
+        _git_safety, "detect_object_format", mock.Mock(side_effect=AssertionError("not used by default"))
+    )
+    worktree = GitWorktree(repo, run_id="r-mc-default")
+    with worktree as path:
+        assert worktree.initial_commit == head == _head(path)
+
+
+def test_materialize_commit_creates_the_worktree_at_an_earlier_commit(reservation_repo) -> None:
+    repo, state_root = reservation_repo
+    earlier, later = _second_commit(repo)
+    with _reserve_for_publisher(state_root, repo) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(
+            repo, run_id="r-mc", reservation=reservation, worktree_publisher=publisher, materialize_commit=earlier
+        )
+        with worktree as path:
+            assert _head(path) == earlier != later
+            assert worktree.initial_commit == earlier
+            assert not (path / "later.txt").exists()
+            assert (path / "jobs" / "worker.py").exists()
+            worktree.entry_gate(earlier)
+    assert [event[1] for event in publisher.events] == [earlier, earlier, earlier, None]
+    assert publisher.intents == [
+        wl.WorktreeIntent.CREATING, wl.WorktreeIntent.PRESENT, wl.WorktreeIntent.DISPOSING, wl.WorktreeIntent.ABSENT,
+    ]
+    assert _head(repo) == later  # the source checkout is untouched
+
+
+def test_materialize_commit_equal_to_head_in_tempdir_mode(reservation_repo) -> None:
+    repo, _state_root = reservation_repo
+    head = _head(repo)
+    worktree = GitWorktree(repo, run_id="r-mc-head", materialize_commit=head)
+    with worktree as path:
+        assert worktree.initial_commit == head == _head(path)
+    assert not path.exists()
+
+
+def test_materialize_commit_in_a_sha256_repository(tmp_path) -> None:
+    repo = tmp_path / "sha256"
+    if subprocess.run(["git", "init", "-q", "--object-format=sha256", str(repo)], capture_output=True).returncode:
+        pytest.skip("installed git does not support --object-format=sha256")
+    (repo / "a.txt").write_text("a\n")
+    assert _git_raw(repo, "add", "a.txt").returncode == 0
+    assert _git_raw(repo, "commit", "-q", "-m", "a").returncode == 0
+    earlier, _later = _second_commit(repo)
+    assert len(earlier) == 64
+    worktree = GitWorktree(repo, run_id="r-mc-256", materialize_commit=earlier)
+    with worktree as path:
+        assert _head(path) == earlier and not (path / "later.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["0" * 40, "0" * 64, "A" * 40, "a" * 39, "a" * 41, "a" * 63, "a" * 65, "g" * 40, "a" * 40 + "\n",
+     "", "HEAD", "HEAD~1", "--orphan", 7, b"a" * 40],
+    ids=repr,
+)
+def test_materialize_commit_bad_shape_refused_before_any_git(reservation_repo, no_git_allowed, value) -> None:
+    repo, state_root = reservation_repo
+    with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+        with pytest.raises(GitWorktreeError) as excinfo:
+            GitWorktree(repo, run_id="r-mc-shape", reservation=reservation, materialize_commit=value)
+        assert str(excinfo.value) == (
+            "materialize_commit must be a 40- or 64-character lowercase hexadecimal object id, not all zero"
+        )
+        assert reservation._state is sr._ReservationState.RESERVED
+
+
+def _assert_refused_before_mutation(repo, state_root, monkeypatch, commit, message, *, rev_parse_allowed=True):
+    with _reserve_for_publisher(state_root, repo) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(
+            repo, run_id="r-mc-refuse", reservation=reservation, worktree_publisher=publisher,
+            materialize_commit=commit,
+        )
+        calls = _git_calls(monkeypatch)
+        with pytest.raises(GitWorktreeError) as excinfo:
+            worktree.__enter__()
+        assert str(excinfo.value) == message
+        assert not any(call[:2] == ("worktree", "add") for call in calls)
+        assert not any(call and call[0] in ("read-tree", "checkout") for call in calls)
+        if not rev_parse_allowed:
+            assert not any(call and call[0] == "rev-parse" for call in calls)
+        assert publisher.events == []
+        assert reservation._state is sr._ReservationState.RESERVED
+        assert worktree.path is None and worktree.cleanup_error is None and worktree.lifecycle_error is None
+        assert not _is_registered(repo, reservation.path)
+        path = reservation.path
+    assert not os.path.lexists(path)  # the reservation's own exit removed the empty leaf
+
+
+def test_materialize_commit_of_the_wrong_format_is_refused_without_resolving_it(reservation_repo, monkeypatch) -> None:
+    repo, state_root = reservation_repo
+    _assert_refused_before_mutation(
+        repo, state_root, monkeypatch, "a" * 64,
+        "materialize_commit is not an object id of the repository's object format", rev_parse_allowed=False,
+    )
+
+
+@pytest.mark.parametrize("kind", ["missing", "tree", "blob", "annotated_tag"])
+def test_materialize_commit_that_is_not_a_commit_is_refused(reservation_repo, monkeypatch, kind) -> None:
+    repo, state_root = reservation_repo
+    earlier, _later = _second_commit(repo)
+    if kind == "missing":
+        commit = "1" * 40
+    elif kind == "tree":
+        commit = _git_raw(repo, "rev-parse", f"{earlier}^{{tree}}").stdout.strip()
+    elif kind == "blob":
+        commit = _git_raw(repo, "rev-parse", f"{earlier}:jobs/worker.py").stdout.strip()
+    else:
+        assert _git_raw(repo, "tag", "-a", "t1", "-m", "tag", earlier).returncode == 0
+        commit = _git_raw(repo, "rev-parse", "t1").stdout.strip()
+        assert commit != earlier
+    assert len(commit) == 40
+    _assert_refused_before_mutation(
+        repo, state_root, monkeypatch, commit, "materialize_commit does not name a commit in the source repository"
+    )
+
+
+def test_materialize_commit_fails_closed_when_the_object_format_is_unknown(reservation_repo, monkeypatch) -> None:
+    repo, state_root = reservation_repo
+    cause = _git_safety.GitSafetyError(_git_safety.GitSafetyFailure.OBJECT_FORMAT_UNAVAILABLE, "unavailable")
+    monkeypatch.setattr(_git_safety, "detect_object_format", mock.Mock(side_effect=cause))
+    _assert_refused_before_mutation(
+        repo, state_root, monkeypatch, _head(repo),
+        "the source repository's object format could not be determined", rev_parse_allowed=False,
+    )
+
+
+def test_materialize_commit_validation_precedes_tempdir_creation(reservation_repo, monkeypatch) -> None:
+    repo, _state_root = reservation_repo
+    created = mock.Mock(side_effect=AssertionError("no tempdir before validation"))
+    monkeypatch.setattr(ws.tempfile, "TemporaryDirectory", created)
+    worktree = GitWorktree(repo, run_id="r-mc-tmp", materialize_commit="1" * 40)
+    with pytest.raises(GitWorktreeError, match="does not name a commit"):
+        worktree.__enter__()
+    created.assert_not_called()
+
+
+def test_materialize_commit_keeps_enter_time_cleanup_after_creating(reservation_repo, monkeypatch) -> None:
+    """A Git failure after `creating(C)` runs the unchanged exact cleanup."""
+    repo, state_root = reservation_repo
+    earlier, _later = _second_commit(repo)
+    real = ws._run
+
+    def failing_checkout(cwd, *args, **kwargs):
+        if args[:1] == ("checkout",):
+            return subprocess.CompletedProcess(args, 1, "", "")
+        return real(cwd, *args, **kwargs)
+
+    with _reserve_for_publisher(state_root, repo) as reservation:
+        publisher = _bound_publisher(reservation)
+        worktree = GitWorktree(
+            repo, run_id="r-mc-clean", reservation=reservation, worktree_publisher=publisher,
+            materialize_commit=earlier,
+        )
+        monkeypatch.setattr(ws, "_run", failing_checkout)
+        with pytest.raises(GitWorktreeError, match="materializing the worktree's files failed"):
+            worktree.__enter__()
+        monkeypatch.undo()
+        assert publisher.events == [(wl.WorktreeIntent.CREATING, earlier, None)]
+        assert worktree.cleanup_error is None
+        assert not _is_registered(repo, reservation.path)
+        path = reservation.path
+    assert not os.path.lexists(path)
 
 
 # --- Static scope proofs (AST-based; strings and docstrings ignored) ---

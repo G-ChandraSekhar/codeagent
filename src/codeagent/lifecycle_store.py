@@ -80,9 +80,14 @@ from .container_lifecycle import ContainerRole
 from .lifecycle_owner import OwnerStatePublicationError, OwnerStatePublicationFailure
 from .worktree_lifecycle import ABSENT_WORKTREE_TRANSITION, WorktreeIntent, WorktreeTransition
 from .worktree_lifecycle import WorktreePublicationError, WorktreePublicationFailure
-from .repo_identity import discover_repository_identity_and_context, load_or_create_repo_json
+from .repo_identity import RepositoryIdentity, discover_repository_identity_and_context, load_or_create_repo_json
 from .state_locks import LockError, LockKind, LockScope, acquire_lifecycle_lock, acquire_repository_lock
-from .state_root import init_state_root, open_or_create_canonical_root, validate_state_root_containment
+from .state_root import (
+    TrustedRepositoryContext,
+    init_state_root,
+    open_or_create_canonical_root,
+    validate_state_root_containment,
+)
 
 LIFECYCLE_JSON_FILENAME = "lifecycle.json"
 LIFECYCLE_LOCK_FILENAME = "lifecycle.lock"
@@ -1057,10 +1062,31 @@ class LifecycleLease:
         # (Slice 3B-2, ADR 0004 Amendment 3) — never inferred from a
         # caller-supplied SHA or from untrusted projection content.
         self.object_format = object_format
+        # ADR 0004 Amendment 20 (M7): the validated repository identity and
+        # the trusted repository context, set once by `prepare_lifecycle()`
+        # and exposed only through the read-only properties below. Live-run
+        # recreation takes its admin-scan and registration-listing inputs
+        # from these, never from projection content or a caller.
+        self._identity: RepositoryIdentity | None = None
+        self._context: TrustedRepositoryContext | None = None
         # ADR 0004 Amendment 18: entries admitted past only because the
         # operator acknowledged their unresolved resources.
         self.unresolved_acknowledged: tuple[UnresolvedAcknowledgement, ...] = ()
         self._closed = False
+
+    @property
+    def identity(self) -> RepositoryIdentity | None:
+        """The identity `load_or_create_repo_json` validated (the same
+        object automatic reconciliation received); `None` only on a lease
+        not produced by a successful `prepare_lifecycle()`."""
+        return self._identity
+
+    @property
+    def context(self) -> TrustedRepositoryContext | None:
+        """The trusted repository context `prepare_lifecycle()` discovered
+        and validated state-root containment against; `None` only on a
+        lease not produced by a successful `prepare_lifecycle()`."""
+        return self._context
 
     def __enter__(self) -> "LifecycleLease":
         return self
@@ -2375,6 +2401,8 @@ def prepare_lifecycle(source_repo_path: Path | str, *, run_id: str) -> Lifecycle
 
         validated_identity = load_or_create_repo_json(state_root, identity, repository_lock)
         lease.object_format = validated_identity.object_format
+        lease._identity = validated_identity
+        lease._context = context
 
         # Automatic pre-run reconciliation (ADR 0004 Amendment 1
         # section 10, Amendment 2 — Milestone 3 Slice 3B-1): after

@@ -267,6 +267,14 @@ class ErrorCode(str, Enum):
     # itself could not be confirmed before normal baseline/model/tool
     # execution began.
     LIFECYCLE_STATE_PUBLICATION_FAILED = "lifecycle_state_publication_failed"
+    # ADR 0004 Amendment 20 section 6: a live-run worktree recreation that
+    # passed Phase E (a confirmed complete evidence artifact exists) but did
+    # not end `RECREATED` -- disposal, the fresh reservation, or the new
+    # incarnation could not be confirmed, or the new incarnation failed its
+    # entry gate. Carried by `WorkspaceRecreationFinished.error` and by the
+    # run's original terminal error; an evidence failure before disposal
+    # keeps its own `EVIDENCE_*` code instead.
+    WORKSPACE_RECREATION_FAILED = "workspace_recreation_failed"
 
 
 ERROR_DOMAIN_BY_CODE: dict[ErrorCode, ErrorDomain] = {
@@ -300,6 +308,7 @@ ERROR_DOMAIN_BY_CODE: dict[ErrorCode, ErrorDomain] = {
     ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED: ErrorDomain.LIFECYCLE,
     ErrorCode.CHECKPOINT_LIFECYCLE_PUBLICATION_FAILED: ErrorDomain.LIFECYCLE,
     ErrorCode.LIFECYCLE_STATE_PUBLICATION_FAILED: ErrorDomain.LIFECYCLE,
+    ErrorCode.WORKSPACE_RECREATION_FAILED: ErrorDomain.LIFECYCLE,
 }
 
 

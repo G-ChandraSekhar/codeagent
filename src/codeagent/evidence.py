@@ -2,10 +2,13 @@
 
 Implements the evidence-capture design accepted in ADR 0003 Amendment 2
 ("Durable evidence") and ADR 0006 Amendment 4 (`git diff` as a governed
-filter/external-diff/textconv execution point). Attempted exactly once
-per run, at terminal teardown, by `RunController._terminate` — always,
-regardless of the run's underlying domain outcome, and never blocking
-any subsequent cleanup step (see `controller.py`).
+filter/external-diff/textconv execution point). The terminal capture is
+attempted exactly once per run, at terminal teardown, by
+`RunController._terminate` — always, regardless of the run's underlying
+domain outcome, and never blocking any subsequent cleanup step (see
+`controller.py`). ADR 0004 Amendment 20 section 4 adds recreation
+members of the same lifecycle's evidence series (`recreation_sequence`,
+version-2 header); nothing calls that yet.
 
 Scope boundary:
 
@@ -45,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 from dataclasses import dataclass
@@ -66,6 +70,38 @@ MAX_STATUS_BYTES = 1 * 1024 * 1024
 ARTIFACT_MAGIC = b"CAEV"
 ARTIFACT_SCHEMA_VERSION = 1
 ARTIFACT_SUFFIX = ".evidence"
+
+# ADR 0004 Amendment 20 section 4: recreation members of a lifecycle's
+# evidence series. The terminal artifact keeps schema version 1 and its
+# `<lifecycle_id>.evidence` name byte for byte; each recreation member *k*
+# (1-99) is `<lifecycle_id>.recreation-<kk>.evidence` with a version-2
+# header. Every member's temp names derive from its own artifact id, so a
+# leftover from one member never blocks another.
+RECREATION_ARTIFACT_SCHEMA_VERSION = 2
+RECREATION_SEQUENCE_MIN = 1
+RECREATION_SEQUENCE_MAX = 99
+_HEX32_RE = re.compile(r"[0-9a-f]{32}")  # used with fullmatch() only
+_V1_HEADER_KEYS = frozenset(
+    {
+        "schema_version",
+        "lifecycle_id",
+        "status",
+        "payload_encoding",
+        "payload_type",
+        "bytes_written",
+        "bytes_total",
+        "complete",
+        "sha256_payload",
+        "sha256_full_stream",
+    }
+)
+_V2_HEADER_KEYS = _V1_HEADER_KEYS | {"kind", "sequence", "base_commit"}
+
+
+@dataclass(frozen=True)
+class _RecreationMember:
+    sequence: int
+    base_commit: str
 
 
 @dataclass(frozen=True)
@@ -267,11 +303,135 @@ def _build_header(
     )
 
 
+def _trusted_format(object_format: object) -> _git_safety.ObjectFormat:
+    """The caller's explicit trusted object format (ADR 0004 Amendment 20
+    section 4) -- never inferred from an OID's length or an artifact field."""
+    if not isinstance(object_format, str):
+        raise EvidenceSinkError("a recreation artifact requires a trusted object format")
+    try:
+        return _git_safety.ObjectFormat(object_format)
+    except ValueError:
+        raise EvidenceSinkError("the trusted object format is not sha1 or sha256") from None
+
+
+def _is_valid_oid(value: object, object_format: _git_safety.ObjectFormat) -> bool:
+    """Exact lowercase hex of the trusted format's length, never all-zero."""
+    return (
+        isinstance(value, str)
+        and len(value) == object_format.hex_length
+        and all(ch in "0123456789abcdef" for ch in value)
+        and value != "0" * object_format.hex_length
+    )
+
+
+def _is_valid_sequence(value: object) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and RECREATION_SEQUENCE_MIN <= value <= RECREATION_SEQUENCE_MAX
+    )
+
+
+def _recreation_member(sequence: object, object_format: object, base_commit: object) -> _RecreationMember:
+    """Validate a recreation capture's arguments before any Git or file I/O."""
+    if not _is_valid_sequence(sequence):
+        raise EvidenceSinkError("the recreation sequence is not an integer from 1 to 99")
+    trusted = _trusted_format(object_format)
+    if not _is_valid_oid(base_commit, trusted):
+        raise EvidenceSinkError("the recreation base commit is not a valid object id for the trusted format")
+    return _RecreationMember(sequence=sequence, base_commit=base_commit)
+
+
+def _artifact_id(lifecycle_id: str, member: _RecreationMember | None) -> str:
+    if member is None:
+        return lifecycle_id
+    return f"{lifecycle_id}.recreation-{member.sequence:02d}"
+
+
+def _build_recreation_header(
+    *, lifecycle_id: str, complete: bool, bytes_written: int, sha256_payload: str, member: _RecreationMember
+) -> bytes:
+    """Version 2: every version-1 field, unchanged in meaning, plus `kind`,
+    `sequence` and `base_commit`. No object-format field is carried; a
+    reader must supply the trusted format itself."""
+    header = json.loads(
+        _build_header(
+            lifecycle_id=lifecycle_id, complete=complete, bytes_written=bytes_written, sha256_payload=sha256_payload
+        )
+    )
+    header["schema_version"] = RECREATION_ARTIFACT_SCHEMA_VERSION
+    header["kind"] = "recreation"
+    header["sequence"] = member.sequence
+    header["base_commit"] = member.base_commit
+    return json.dumps(header, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def parse_artifact_strict(raw: bytes, *, object_format: str | None) -> tuple[dict, bytes]:
+    """Parse and fully validate an evidence artifact (ADR 0004 Amendment 20
+    section 4). Version 1 (terminal) needs no object format. Version 2
+    (recreation) is refused unless the caller supplies the trusted object
+    format, which alone decides `base_commit`'s required length. Raises
+    `ValueError` with a fixed message on any violation."""
+    header, payload = _strict_header(raw)
+    version = header.get("schema_version")
+    if type(version) is not int:
+        raise ValueError("not an evidence artifact: unsupported schema version")
+    if version == ARTIFACT_SCHEMA_VERSION:
+        if set(header) != _V1_HEADER_KEYS:
+            raise ValueError("not an evidence artifact: unexpected version-1 header fields")
+    elif version == RECREATION_ARTIFACT_SCHEMA_VERSION:
+        if object_format is None:
+            raise ValueError("a version-2 evidence artifact requires a trusted object format")
+        try:
+            trusted = _trusted_format(object_format)
+        except EvidenceSinkError as exc:
+            raise ValueError(exc.message) from None
+        if set(header) != _V2_HEADER_KEYS:
+            raise ValueError("not an evidence artifact: unexpected version-2 header fields")
+        if header["kind"] != "recreation":
+            raise ValueError("not an evidence artifact: unknown kind")
+        if not _is_valid_sequence(header["sequence"]):
+            raise ValueError("not an evidence artifact: sequence is not an integer from 1 to 99")
+        if not _is_valid_oid(header["base_commit"], trusted):
+            raise ValueError("not an evidence artifact: base_commit is invalid for the trusted format")
+    else:
+        raise ValueError("not an evidence artifact: unsupported schema version")
+
+    if not isinstance(header["lifecycle_id"], str) or not _HEX32_RE.fullmatch(header["lifecycle_id"]):
+        raise ValueError("not an evidence artifact: malformed lifecycle_id")
+    complete = header["complete"]
+    if not isinstance(complete, bool) or header["status"] != ("complete" if complete else "incomplete"):
+        raise ValueError("not an evidence artifact: inconsistent completeness")
+    if header["payload_encoding"] != "binary" or header["payload_type"] != "unified-diff":
+        raise ValueError("not an evidence artifact: unknown payload encoding or type")
+    written = header["bytes_written"]
+    if type(written) is not int or written != len(payload):
+        raise ValueError("not an evidence artifact: bytes_written does not match the payload")
+    if header["sha256_payload"] != hashlib.sha256(payload).hexdigest():
+        raise ValueError("not an evidence artifact: sha256_payload does not match the payload")
+    expected_total = written if complete else None
+    expected_stream = header["sha256_payload"] if complete else None
+    total = header["bytes_total"]
+    if not (total is None if expected_total is None else type(total) is int and total == expected_total):
+        raise ValueError("not an evidence artifact: totals inconsistent with completeness")
+    if header["sha256_full_stream"] != expected_stream:
+        raise ValueError("not an evidence artifact: totals inconsistent with completeness")
+    return header, payload
+
+
 def parse_artifact(raw: bytes) -> tuple[dict, bytes]:
     """Parse a published evidence artifact's bytes into `(header,
     payload)`. Used by tests (and any future reader) to round-trip the
     exact framed format `_publish` writes: magic, big-endian header
     length, canonical JSON header, then raw payload bytes."""
+    header_bytes, payload = _split_frame(raw)
+    header = json.loads(header_bytes.decode("utf-8"))
+    return header, payload
+
+
+def _split_frame(raw: bytes) -> tuple[bytes, bytes]:
+    """The shared framing rules: magic, big-endian header length, header
+    bytes, then the payload. Fixed-wording `ValueError` on any violation."""
     if raw[:4] != ARTIFACT_MAGIC:
         raise ValueError("not an evidence artifact: bad magic")
     if len(raw) < 8:
@@ -281,8 +441,49 @@ def parse_artifact(raw: bytes) -> tuple[dict, bytes]:
     header_end = header_start + header_len
     if header_end > len(raw):
         raise ValueError("not an evidence artifact: truncated header")
-    header = json.loads(raw[header_start:header_end].decode("utf-8"))
-    payload = raw[header_end:]
+    return raw[header_start:header_end], raw[header_end:]
+
+
+class _StrictJsonRejection(Exception):
+    pass
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _StrictJsonRejection
+        result[key] = value
+    return result
+
+
+def _reject_constant(_name: str) -> object:
+    raise _StrictJsonRejection  # NaN/Infinity are not JSON
+
+
+def _strict_header(raw: object) -> tuple[dict, bytes]:
+    """Strict-reader decoding: bytes only, valid UTF-8, strict JSON with no
+    duplicate key (at any depth) and no NaN/Infinity, and a top-level
+    object. Every failure is a fixed-wording `ValueError`; no decoder
+    message (which can quote input) is ever surfaced or chained."""
+    if not isinstance(raw, (bytes, bytearray)):
+        raise ValueError("not an evidence artifact: input is not bytes")
+    header_bytes, payload = _split_frame(bytes(raw))
+    try:
+        header = json.loads(
+            header_bytes.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+        )
+    except _StrictJsonRejection:
+        raise ValueError("not an evidence artifact: the header has a duplicate key or a non-JSON constant") from None
+    except (ValueError, RecursionError):
+        # ValueError covers UnicodeDecodeError, JSONDecodeError, and the plain
+        # ValueError Python raises for an integer literal beyond its
+        # digit-conversion limit, whose runtime-specific text must not escape.
+        raise ValueError("not an evidence artifact: the header is not valid UTF-8 JSON") from None
+    if not isinstance(header, dict):
+        raise ValueError("not an evidence artifact: the header is not a JSON object")
     return header, payload
 
 
@@ -362,7 +563,22 @@ class FilesystemEvidenceSink:
         source_repo_path: Path,
         initial_commit: str,
         lifecycle_id: str,
+        recreation_sequence: int | None = None,
+        object_format: str | None = None,
     ) -> EvidenceReceipt:
+        """With `recreation_sequence` (ADR 0004 Amendment 20 section 4),
+        capture recreation member *k* of this lifecycle's series:
+        `initial_commit` is its base commit, validated against the
+        explicitly supplied trusted `object_format` before any Git or file
+        I/O. Without it, the terminal capture is exactly as before
+        (`object_format` is then unused)."""
+        member: _RecreationMember | None = None
+        if recreation_sequence is not None:
+            try:
+                member = _recreation_member(recreation_sequence, object_format, initial_commit)
+            except EvidenceSinkError as exc:
+                return self._capture_failed(str(exc))
+        discriminator = _artifact_id(lifecycle_id, member)
         try:
             output_dir = self._prepare_output_dir(Path(worktree_path), Path(source_repo_path))
             neutralization = _git_safety.enumerate_filter_neutralization(worktree_path)
@@ -385,6 +601,7 @@ class FilesystemEvidenceSink:
                 complete=complete,
                 sha256_payload=sha256_payload,
                 bytes_written=bytes_written,
+                member=member,
             )
         except _CollisionError as exc:
             return EvidenceReceipt(
@@ -393,7 +610,7 @@ class FilesystemEvidenceSink:
                 artifact_id=None,
                 sha256_payload=None,
                 bytes_written=None,
-                error=self._error(ErrorCode.EVIDENCE_ARTIFACT_COLLISION, str(exc), lifecycle_id),
+                error=self._error(ErrorCode.EVIDENCE_ARTIFACT_COLLISION, str(exc), discriminator),
             )
         except _DurabilityAmbiguousError as exc:
             # ADR 0003 Amendment 2's terminal precedence: EVIDENCE_INCOMPLETE
@@ -416,7 +633,7 @@ class FilesystemEvidenceSink:
                 artifact_id=exc.artifact_id,
                 sha256_payload=exc.sha256_payload,
                 bytes_written=exc.bytes_written,
-                error=self._error(code, message, lifecycle_id),
+                error=self._error(code, message, discriminator),
             )
         except EvidenceSinkError as exc:
             return self._capture_failed(str(exc))
@@ -428,7 +645,7 @@ class FilesystemEvidenceSink:
                 artifact_id=artifact_id,
                 sha256_payload=sha256_payload,
                 bytes_written=bytes_written,
-                error=self._error(ErrorCode.EVIDENCE_INCOMPLETE, "capture was incomplete", lifecycle_id),
+                error=self._error(ErrorCode.EVIDENCE_INCOMPLETE, "capture was incomplete", discriminator),
             )
 
         return EvidenceReceipt(
@@ -533,16 +750,24 @@ class FilesystemEvidenceSink:
         complete: bool,
         sha256_payload: str,
         bytes_written: int,
+        member: _RecreationMember | None = None,
     ) -> str:
-        artifact_id = lifecycle_id
+        artifact_id = _artifact_id(lifecycle_id, member)
+        if member is None:
+            collision_message = f"an evidence artifact already exists for lifecycle {lifecycle_id!r}"
+        else:
+            collision_message = (
+                f"an evidence artifact already exists for lifecycle {lifecycle_id!r} "
+                f"recreation member {member.sequence:02d}"
+            )
         final_path = output_dir / f"{artifact_id}{ARTIFACT_SUFFIX}"
         if final_path.exists():
-            raise _CollisionError(
-                f"an evidence artifact already exists for lifecycle {lifecycle_id!r}"
-            )
+            raise _CollisionError(collision_message)
 
-        payload_tmp = output_dir / f".{lifecycle_id}.payload.tmp"
-        artifact_tmp = output_dir / f".{lifecycle_id}.artifact.tmp"
+        # Per-member temp names; for the terminal artifact these are the
+        # original `.<lifecycle_id>.payload.tmp`/`.artifact.tmp`.
+        payload_tmp = output_dir / f".{artifact_id}.payload.tmp"
+        artifact_tmp = output_dir / f".{artifact_id}.artifact.tmp"
 
         try:
             payload_fd = _open_private_temp(payload_tmp)
@@ -552,12 +777,21 @@ class FilesystemEvidenceSink:
             finally:
                 os.close(payload_fd)
 
-            header_bytes = _build_header(
-                lifecycle_id=lifecycle_id,
-                complete=complete,
-                bytes_written=bytes_written,
-                sha256_payload=sha256_payload,
-            )
+            if member is None:
+                header_bytes = _build_header(
+                    lifecycle_id=lifecycle_id,
+                    complete=complete,
+                    bytes_written=bytes_written,
+                    sha256_payload=sha256_payload,
+                )
+            else:
+                header_bytes = _build_recreation_header(
+                    lifecycle_id=lifecycle_id,
+                    complete=complete,
+                    bytes_written=bytes_written,
+                    sha256_payload=sha256_payload,
+                    member=member,
+                )
             artifact_fd = _open_private_temp(artifact_tmp)
             try:
                 _write_all(artifact_fd, ARTIFACT_MAGIC)
@@ -577,9 +811,7 @@ class FilesystemEvidenceSink:
         except FileExistsError as exc:
             _best_effort_unlink(payload_tmp)
             _best_effort_unlink(artifact_tmp)
-            raise _CollisionError(
-                f"an evidence artifact already exists for lifecycle {lifecycle_id!r}"
-            ) from exc
+            raise _CollisionError(collision_message) from exc
         except OSError as exc:
             _best_effort_unlink(payload_tmp)
             _best_effort_unlink(artifact_tmp)

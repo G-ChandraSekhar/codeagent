@@ -126,6 +126,68 @@ def test_prepare_lifecycle_source_repo_path_is_working_tree_root_not_common_dir(
         lease.close()
 
 
+def test_prepare_lifecycle_lease_identity_and_context_are_the_validated_inputs(tmp_path, monkeypatch):
+    """ADR 0004 Amendment 20 (M7): the lease exposes exactly the identity
+    `load_or_create_repo_json` validated and the context discovery
+    returned -- the same objects automatic reconciliation received."""
+    from codeagent import reconciliation as rc
+
+    repo = _make_repo(tmp_path)
+    _set_state_dir(monkeypatch, tmp_path)
+    seen = {}
+    real_load = ls.load_or_create_repo_json
+    real_reconcile = rc.reconcile_repository
+
+    def load(*args, **kwargs):
+        seen["validated"] = real_load(*args, **kwargs)
+        return seen["validated"]
+
+    def reconcile(**kwargs):
+        seen["reconcile_identity"] = kwargs["identity"]
+        seen["reconcile_context"] = kwargs["context"]
+        return real_reconcile(**kwargs)
+
+    monkeypatch.setattr(ls, "load_or_create_repo_json", load)
+    monkeypatch.setattr(rc, "reconcile_repository", reconcile)
+    lease = ls.prepare_lifecycle(str(repo), run_id="run-1")
+    try:
+        assert lease.identity is seen["validated"]
+        assert lease.identity is seen["reconcile_identity"]
+        assert lease.context is seen["reconcile_context"]
+        assert lease.identity.repo_key == lease.repo_key
+        assert lease.identity.object_format == lease.object_format
+        identity, context = ri.discover_repository_identity_and_context(str(repo))
+        assert lease.identity == identity
+        assert lease.context == context
+    finally:
+        lease.close()
+
+
+def test_lease_identity_and_context_are_read_only(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    _set_state_dir(monkeypatch, tmp_path)
+    lease = ls.prepare_lifecycle(str(repo), run_id="run-1")
+    try:
+        identity, context = lease.identity, lease.context
+        with pytest.raises(AttributeError):
+            lease.identity = identity
+        with pytest.raises(AttributeError):
+            lease.context = context
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            lease.identity.canonical_common_dir = "/elsewhere"
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            lease.context.working_tree_root = "/elsewhere"
+        assert lease.identity is identity and lease.context is context
+    finally:
+        lease.close()
+
+
+def test_lease_identity_and_context_are_unset_outside_prepare_lifecycle():
+    lease = ls.LifecycleLease()
+    assert lease.identity is None
+    assert lease.context is None
+
+
 def test_prepare_lifecycle_two_runs_get_distinct_lifecycle_ids(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path)
     _set_state_dir(monkeypatch, tmp_path)

@@ -6074,3 +6074,915 @@ job log.
   shapes; T-E1, T-F2 and every other threat are unchanged.
 - Nothing is wired to an operator entry point, and **Gate O remains
   unsatisfied until D3 lands**.
+
+## Amendment 20 (Accepted 2026-11-02): live-run worktree recreation at the last checkpoint (C-1)
+
+**Status: Accepted 2026-11-02 (revision 3), after joint review.** This is the C-1 amendment that
+ledger deliverable D5 requires before any recreation code. It changes no code,
+test, ledger or threat-model text. It defines ADR 0003's discard-and-recreate on
+the continue path:
+- who owns each step;
+- the durable order, including a mandatory pre-disposal evidence phase;
+- the evidence-artifact series;
+- the audit events;
+- the outcome of every failure;
+- the reconciliation outcome at every durable boundary.
+
+The build order, test matrix and estimate are in the companion D5/C-1 readiness
+plan.
+
+**Joint-review decisions applied in revision 2:**
+- **D-1** accepted in principle: B5 stays a blocking residual whose only exit is
+  `ABANDONED_UNRESOLVED` (§8).
+- **D-2(a)** accepted: the bounded admin scan moves into the shared lower-level
+  module, and publisher-mode `absent` requires zero matching admin entries (§3
+  step D3).
+- **D-3** rejected as written. ADR 0003 Amendment 2 §2 requires a durable,
+  self-describing evidence artifact *before* a contaminated worktree is discarded
+  for recreation. Revision 1 captured evidence only at termination, after the
+  worktree was gone. Revision 2 adds Phase E (§3), the artifact series (§4) and
+  the evidence outcomes (§5). The terminal `no-worktree` result survives only as a
+  deterministic fallback (§5.4) and never substitutes for Phase E.
+
+**Other revision-2 corrections:**
+- Q1 now states exactly which refusals never recreate, and why an entry-gate
+  failure can still mean contamination (§2).
+- One explicit audit contract (§6).
+- RG1 asserts the full projection sequence (§11).
+- A real owner-SIGKILL test for B7 (§11).
+- B5 and B7 leaks are separated (§8).
+- The mutation list is recounted (§11).
+
+**Revision-3 corrections** (documentation only):
+- **Ordering.** Q2–Q6 are evaluated before a sequence number is minted. A
+  refusal is not an attempt: it emits no event, consumes no sequence and creates
+  no artifact (§2, §6).
+- **Emission failures.** Behaviour is defined for a failed Started and a failed
+  Finished emission (§6.1).
+- **Manual repair.** The B5 and B7 wording no longer prescribes an unguarded ref
+  deletion or a repository-wide `prune` (§8a).
+- **Object format.** `base_commit` is validated against the trusted repository
+  object format (§4).
+- **Recount.** Tests and mutations are recounted (§11).
+
+### 1. Findings that constrain the design
+
+Each finding was checked against the code at `cd1b665`. M3 was also checked with
+a disposable Git experiment (Git 2.54.0) in a scratch directory.
+
+- **M1. `GitWorktree` cannot materialize a given commit.** `__enter__` always
+  adds the worktree at the source `HEAD`, and publishes that commit as
+  `expected_head`. Recreation must materialize the last accepted checkpoint `C`.
+- **M2. `Workspace.initial_commit` has two meanings.** It is the incarnation's
+  materialization commit. The controller also uses it as the run origin `H0`: for
+  the terminal evidence diff, for lazy establishment, and to seed
+  `_last_checkpoint_id`. After recreation at `C` the two values differ.
+- **M3. The owner's disposal never checks Git admin entries.** Publisher-mode
+  `dispose()` confirms that the registration is absent and that `observe_leaf()`
+  returns `ABSENT`, then publishes `absent`. It never scans
+  `<common-dir>/worktrees/`. In the experiment, a leftover `<lifecycle_id>` admin
+  directory made Git name the next incarnation's entry `<lifecycle_id>1`.
+  Amendment 13 then refuses any later crash of that incarnation, because its
+  admin count is not exactly one.
+- **M4. Amendment 17's exclusion premise no longer holds.** Amendment 17 refuses
+  "a never-registered `creating` worktree with a checkpoint ref" on the grounds
+  that the owner cannot produce one. Recreation produces exactly that (B6).
+- **M5. The Amendment 11 §5 gap recurs, now beside a ref** (B5). Amendment 16
+  refuses the shape ("a leaf entry exists").
+- **M6. Amendment 14 assumes a single incarnation.** R1 and R2 name one worktree
+  and one reservation.
+- **M7. The lease lacks the trusted inputs recreation needs.** `LifecycleLease`
+  does not keep the validated `RepositoryIdentity` (`canonical_common_dir`) or
+  the `TrustedRepositoryContext` (`working_tree_root`) that the admin scan and
+  the registration listing need.
+- **M8. A failed recreation could lead teardown to delete the ref early.** After
+  incarnation *n* is disposed, the controller's `_workspace.dispose()` is a
+  no-op. Teardown would therefore delete the ref even if incarnation *n+1* left
+  owned resources behind.
+- **M9. The evidence sink supports only one artifact per lifecycle.**
+  `FilesystemEvidenceSink._publish` names the artifact `<lifecycle_id>.evidence`,
+  and its temp files `.<lifecycle_id>.payload.tmp` and
+  `.<lifecycle_id>.artifact.tmp`. Its header has no kind, sequence or base
+  commit, and it always diffs against the commit it is given. A second capture
+  in the same run is a structured collision. A leftover temp file (when an
+  unlink could not be confirmed) makes every later capture in that run fail.
+- **M10. ADR 0003 Amendment 2 §2 requires evidence before recreation; revision 1
+  disposed first.** This is the D-3 rejection; it is resolved by §3 Phase E.
+- **M11. Stale text.** The `reserve_worktree_leaf` docstring (ledger C-1), and
+  `evidence.py`'s "attempted exactly once per run, at terminal teardown", become
+  stale; both are corrected when D5 lands.
+
+**New contradictions found in revision 2.** Each is stated here, not silently
+resolved:
+- **N1. The untracked-path rule versus D5's `add` operation.** ADR 0003
+  Amendment 2 §2 makes any untracked path mark evidence incomplete, "because
+  today's patch engine cannot create files". D5 adds `add`. A post-write failure
+  during an `add` leaves an untracked file, so Phase E's evidence would always be
+  incomplete, and §5.1 would then forbid continuing.
+  - D5's four-operation work must re-derive that rule before recreation can
+    continue after an `add` failure.
+  - Until it does, such a failure terminates the run. That is safe:
+    ADR 0003 point 5 allows termination.
+- **N2. The 1 MiB bound.** ADR 0003 Amendment 2 says the 1 MiB bound "must be
+  re-derived, not assumed, before any multi-file or add-file patch capability
+  exists". That applies to recreation artifacts too. D5 owns the re-derivation;
+  this amendment keeps the current bound for every artifact.
+- **N3. Terminal versus recreation evidence.** ADR 0003 Amendment 2 §2's opening
+  sentence covers both recreation and terminal destruction. Its §4 lets terminal
+  teardown attempt evidence and never block on it. This amendment reads §2
+  strictly for recreation (no disposal without a confirmed artifact, §5.1) and
+  leaves the accepted terminal behaviour (§4–§5) unchanged. The asymmetry is
+  deliberate: recreation can always fall back to terminating, while terminal
+  teardown cannot wait. Joint review has accepted this reading (§13).
+- **N4. No repair transition after a patch failure.** The domain state machine
+  terminates on patch failure. Returning to the repair loop after `RECREATED`
+  needs a `domain.py` transition, which belongs to D5 integration, not to this
+  amendment.
+
+Checked and consistent:
+- Amendment 10's `absent → creating` edge is legal in `ACTIVE`, and
+  `expected_head` stays immutable within each incarnation.
+- I5 holds.
+- Amendment 19's premise holds, given Q3.
+- The repository lock covers the whole run (Amendment 14 §1).
+- A4 is unchanged.
+
+### 2. Who may recreate, and when
+
+Recreation happens inside a live run, under both locks, in `ACTIVE`.
+- The **controller** decides, and records the attempt (§6).
+- The **composition's recreator** (`workspace_recreator`, default `None`)
+  performs it.
+- With `None`, a contaminating failure terminates the run, exactly as today. That
+  is ADR 0003-compliant.
+
+**Q1, contamination.** "Pre-write" below means before *this* attempt writes
+anything. The entry gate is different: it judges the worktree that *earlier*
+steps left behind.
+
+- **Never recreate**, because the worktree is unchanged by this attempt and was
+  trusted at the gate. The run follows D5's ordinary handling of the failure;
+  these are never recreation triggers:
+  - `PATCH_VALIDATION_FAILED`: every current site raises it before the target is
+    opened for writing (`_ValidationFailure`, and the unapproved-path check);
+  - `PATCH_UNSUPPORTED_GIT_SUBSTRATE` (the `_SubstrateFailure` sites reached
+    from `apply()` are all pre-write);
+  - `PATCH_REPOSITORY_OBJECTS_UNAVAILABLE` (the pre-write availability check);
+  - policy, approval and digest refusals;
+  - checkpoint `establish()` failures;
+  - any checkpoint failure that leaves the session non-`PRESENT`. These
+    terminate by Q2: a transitional record refuses further work.
+
+  D5's four-operation engine must keep the property that these codes are raised
+  only before the first write. A code raised after a write must be
+  `PATCH_APPLICATION_FAILED`.
+- **Recreate, if the run continues and the session is `PRESENT`:**
+  - **(a)** `PATCH_APPLICATION_FAILED`: a write has happened.
+  - **(b)** an `advance()` failure whose confirmed-`UNCHANGED` collapse left the
+    ref at `A`, while the worktree's `HEAD` is already the unaccepted commit `B`.
+  - **(c)** `WORKSPACE_ENTRY_GATE_FAILED`. The gate runs before this attempt
+    writes, but it observes whether the worktree still equals the last accepted
+    checkpoint (`HEAD == C`, clean index and tree, no untracked paths). A failure
+    means some earlier event changed it. Possible causes:
+    - an earlier write that was not classified as contaminating;
+    - an out-of-band same-user change (A4);
+    - an engine defect.
+
+    ADR 0003 point 6 says such a worktree is "interrupted or contaminated" and
+    "must never be resumed or trusted, only discarded … and, if the run
+    continues, recreated". Case (c) is therefore detection of earlier
+    contamination, not a pre-write refusal of the proposal.
+
+**Q2.** `CheckpointSession.intent` is `PRESENT`; `C := accepted_sha`, an exact
+object-format OID.
+
+**Q3.**
+- No verifier cleanup was unconfirmed this run.
+- The shared cursor's projection is:
+  - state `ACTIVE`;
+  - both container records `absent`;
+  - `checkpoint_ref == present(C)`;
+  - worktree `present(H)`, where `H` is the current incarnation's
+    materialization commit.
+
+**Q4.** The current incarnation is active (not preserved), with no latched
+`lifecycle_error`. Its reservation is `CONSUMED` and still open.
+
+**Q5.** A fresh no-deref `CheckpointRef.observe()` equals `C`.
+`git worktree add` is given the OID `C`, never the ref name.
+
+**Q6.** Fewer than 99 recreations have been started in this run, and fewer
+than D5's recreation budget, which is independently limited to 99 or less.
+Q6 reads the recreator's count of minted sequences; it does not mint one.
+
+**Order and refusal.**
+1. Q1 identifies a *recreation candidate*.
+2. Q2–Q6 are then evaluated without any mutation and before any sequence
+   number is minted.
+3. If any of Q2–Q6 fails, there is **no recreation attempt**:
+   - no `WorkspaceRecreationStarted` or `WorkspaceRecreationFinished` is
+     emitted;
+   - no sequence number is consumed;
+   - no artifact is created;
+   - nothing lifecycle-owned is touched.
+
+   The run terminates through the **triggering error** (the error already
+   recorded on the failed `apply_patch` `ToolCompleted`). Ordinary teardown
+   then captures terminal evidence of incarnation *n* and disposes of it.
+4. Only when Q1–Q6 all pass does the recreator mint *k* (step S0, §3).
+
+At most one recreation runs per triggering failure, and a recreation never
+recurses.
+
+### 3. The protocol (owner, live run)
+
+**S0. Mint and announce.** This step runs only after Q1–Q6 all pass.
+1. The recreator mints *k*: one more than the previous *k*, starting at 1. By
+   Q6, *k* is in 1–99.
+2. The controller first updates its attempt bookkeeping (§6.1).
+3. It then emits `WorkspaceRecreationStarted` with *k*.
+4. Phase E begins only after that emission returns normally.
+
+**Phase E: evidence of the contaminated incarnation *n*.** Nothing
+lifecycle-owned is mutated in this phase.
+
+- **E1.** Capture with the existing sink, extended as described in §4:
+  - the current worktree path, and the trusted source path;
+  - base commit `C`;
+  - `lifecycle_id`, kind `recreation`, sequence *k*.
+
+  The capture is strictly observational: one bounded `git status` and one
+  bounded `git diff --binary --full-index --find-renames --no-ext-diff
+  --no-textconv C --`, run under one shared filter-neutralization set, exactly as
+  ADR 0003 Amendment 2 §3 specifies for terminal capture.
+
+  The diff against `C` records exactly what is about to be discarded:
+  - committed but unaccepted changes (case b);
+  - staged changes;
+  - unstaged changes.
+- **E2.** Continue only on a confirmed complete artifact (§5.1). Otherwise the
+  outcome is `EVIDENCE_NOT_CONFIRMED`, and nothing in Phases D–C runs.
+
+**Phase D: dispose of incarnation *n*.**
+- **D1.** `disposing(H)` (Amendment 11).
+- **D2.** One `git worktree remove --force <exact path>`. Its exit status is
+  never evidence.
+- **D3.** Three fresh observations: the exact registration is absent; the shared
+  bounded admin scan finds zero `<lifecycle_id>[0-9]*` matches (D-2(a)); and
+  `observe_leaf()` is `ABSENT`.
+- **D4.** `disposing → absent`, published only after D3 confirms all three.
+- **D5.** Close reservation *n* exactly once. It is `CONSUMED`, so closing
+  removes nothing. Nothing ever touches it again, including after a close
+  failure.
+
+**Phase R: a fresh reservation.**
+- **R1.** One new `StateRoot.reserve_worktree_leaf(repo_key, lifecycle_id)` at
+  the same deterministic path. This is the only way an incarnation obtains a
+  reservation. The leaf is created exclusively, with mode 0700.
+
+**Phase C: create incarnation *n+1* at `C`.**
+- **C1.** A new `GitWorktree(..., reservation=n+1, worktree_publisher=<the same
+  shared publisher>, materialize_commit=C)`. Before any Git mutation, `C` is
+  validated as an exact object-format OID that resolves to a commit.
+- **C2.** Amendment 11's entry sequence, at `C`:
+  - claim, then the pre-Git identity check;
+  - `creating(C)`;
+  - `add --no-checkout --detach <path> C`;
+  - `read-tree C`, then the ADR 0006 filter-safety check, then `checkout`;
+  - the post-Git checks, then `consume()`;
+  - `present(C)`.
+- **C3.** `entry_gate(C)` on *n+1*.
+- **C4.** The controller replaces its workspace with *n+1*. The outcome is
+  `RECREATED`.
+
+**Unchanged and changed across incarnations:**
+
+| Item | Across incarnations |
+|---|---|
+| `lifecycle_id` (also the evidence series identity), run directory, both locks, state `ACTIVE`, `reconciliation` counters, `failure` (null) | unchanged |
+| Checkpoint ref and its record `present(C)` | unchanged; never written, moved or deleted (I5; the original decision's §9) |
+| Container records | `absent` throughout |
+| Run origin `H0` | held by the controller from construction; the terminal evidence base (M2) |
+| Worktree record | `present(H) → disposing(H) → absent → creating(C) → present(C)`; the new incarnation's `expected_head` is `C`, immutable (Amendment 10) |
+| Reservation, `GitWorktree`, leaf inode, admin entry, recreation artifact | new for each incarnation |
+
+No incarnation number is persisted in the projection. Before the next
+incarnation is reserved, the previous one's registration, admin entry and leaf
+have all been confirmed absent, so ownership never depends on telling
+incarnations apart. The evidence sequence *k* is in-memory, and it is recorded in
+events and in the artifact header (§4, §6).
+
+### 4. The evidence-artifact series
+
+- **Series identity.** The series is identified by `lifecycle_id`, which
+  `new_lifecycle_id()` mints internally from `os.urandom`; it is never caller or
+  model input.
+  - Members are the recreation artifacts *k* = 1…99, then at most one terminal
+    artifact. That is at most 100 artifacts per run.
+  - The composition's recreator mints *k*, only at S0, after Q1–Q6 all pass.
+    It starts at 1, increases by exactly one per attempt, never repeats, and is
+    never persisted or accepted from input. A Q2–Q6 refusal mints nothing.
+  - The event sequence and the artifact sequence are always the same *k*, in
+    1–99. If S0's Started emission fails, *k* has been consumed, but no artifact
+    *k* exists and the run terminates (§6.1). There is therefore never a later
+    member that skips *k*.
+  - A dead run never resumes: the next run has a new `lifecycle_id` and its own
+    series. There is therefore no restart or reuse case.
+- **Names**, in the validated evidence root:
+
+  | Artifact | Final name | Temp names |
+  |---|---|---|
+  | Recreation *k* | `<lifecycle_id>.recreation-<kk>.evidence`, where `kk` is two digits, zero-padded, `01`–`99` | `.<lifecycle_id>.recreation-<kk>.payload.tmp`, `.<lifecycle_id>.recreation-<kk>.artifact.tmp` |
+  | Terminal (unchanged) | `<lifecycle_id>.evidence` | `.<lifecycle_id>.payload.tmp`, `.<lifecycle_id>.artifact.tmp` |
+
+  - Because the width is fixed, lexical order equals sequence order. The
+    terminal artifact, when one exists, is written last.
+  - Each member has its own temp names, so a temp leftover whose unlink could not
+    be confirmed never blocks another member (fixes M9).
+- **`artifact_id`.** The final name without `.evidence`. For the terminal
+  artifact this is `lifecycle_id`, exactly as today.
+- **Header.** The terminal artifact keeps schema version 1, byte for byte. A run
+  with no recreation therefore produces exactly today's artifact, receipt and
+  event.
+
+  A recreation artifact uses schema version 2, with the same magic and framing.
+  Its header has every version-1 field, unchanged in meaning, plus three more:
+  - `"kind": "recreation"`;
+  - `"sequence": k`, an integer from 1 to 99;
+  - `"base_commit": C`, an exact OID in the repository's object format.
+
+  **Object-format authority.** The writer and the strict version-2 validator
+  both receive the trusted object format (`sha1` or `sha256`) as an explicit
+  argument. It comes from the lifecycle's validated repository identity
+  (`LifecycleLease.object_format`, which comes from
+  `RepositoryIdentity.object_format`). It is never inferred from the OID's
+  length, from any header field, or from other artifact content. The header
+  itself carries no object-format field that a reader could trust instead.
+
+  A version-1 header implies the terminal kind with base `H0`. `parse_artifact`
+  is already format-agnostic. A version-2 reader rejects:
+  - an unknown kind;
+  - a sequence outside 1–99;
+  - a `base_commit` that is not lowercase hex of exactly the length for the
+    supplied trusted format, or is the all-zero OID (so a 64-hex value in a
+    SHA-1 repository is refused);
+  - a version-2 header without `kind`.
+
+  A reader that has no trusted object format available cannot validate a
+  version-2 header and must refuse it.
+- **Publication.** Exactly ADR 0003 Amendment 2 §2's rules:
+  - 0700/0600 permissions;
+  - component-aware containment outside the worktree and the source (and, per
+    Amendment 14 §4, outside the state root);
+  - temp write and `fsync`, a no-replace hard link, then a directory `fsync`;
+  - the 1 MiB bound (N2);
+  - the untracked-path rule (N1).
+- **Collision.** An existing file at the final name, before or at `link`, is
+  `EVIDENCE_ARTIFACT_COLLISION`. Nothing is ever overwritten, renamed or deleted
+  at a final name. An existing temp name is `EVIDENCE_CAPTURE_FAILED` (`O_EXCL`).
+- **Never cleaned.** Artifacts and temp leftovers in the evidence root are never
+  removed by CodeAgent. Reconciliation never looks at the evidence root.
+
+### 5. Evidence outcomes and precedence
+
+**5.1 Continuation requires a confirmed complete artifact.** Phase D may begin
+only when E1's receipt is `success=True, complete=True, error=None`. That means
+the artifact was:
+- fully captured;
+- published under its own name;
+- unlinked from its temps;
+- covered by a directory `fsync`.
+
+Anything else gives `EVIDENCE_NOT_CONFIRMED`. ADR 0003 Amendment 2 §2's rule
+that "incompleteness always prevents a clean result" forbids letting a later
+`PASSED` follow discarded state whose evidence is incomplete or unconfirmed.
+
+**5.2 The four non-confirmed results.** Each leaves incarnation *n* untouched
+and current. Its error code is the receipt's own:
+
+| Receipt | Artifact on disk | Recreation error |
+|---|---|---|
+| Incomplete preview (truncated, or an untracked path) | published, labelled incomplete in its header | `EVIDENCE_INCOMPLETE` |
+| Durability unconfirmed (after the link) | published, never removed | `EVIDENCE_DURABILITY_UNCONFIRMED`, or `EVIDENCE_INCOMPLETE` if also incomplete (the sink's existing rule) |
+| Collision | someone else's file at the name, untouched | `EVIDENCE_ARTIFACT_COLLISION` |
+| Capture failed | none at the final name; temps unlinked on a best-effort basis | `EVIDENCE_CAPTURE_FAILED` |
+
+**5.3 Interaction with terminal teardown and precedence.** After
+`EVIDENCE_NOT_CONFIRMED`:
+- the run terminates with trigger `UNRECOVERABLE_ERROR`, and its original error
+  is the recreation error above;
+- ordinary terminal teardown then runs unchanged:
+  - it attempts terminal evidence against `H0` under the terminal name, which
+    never collides with a recreation name;
+  - it disposes incarnation *n*;
+  - it deletes the ref only if disposal is confirmed;
+  - it calls `complete()`.
+
+`RunFinished.error` follows ADR 0003 Amendment 2 §5's precedence, unchanged:
+1. cleanup unconfirmed;
+2. the terminal evidence codes;
+3. the original error (here, the recreation evidence code).
+
+Both evidence attempts are recorded: the recreation one in
+`WorkspaceRecreationFinished` (§6), the terminal one in `EvidenceCaptured`.
+
+**5.4 Terminal evidence when no worktree exists.** This applies after a
+post-disposal failure (`FAILED_NOTHING_OWNED` or `UNCONFIRMED`, §7).
+`_capture_evidence` does not call the sink. It emits the capture-failed
+`EvidenceCaptured` shape with `EVIDENCE_CAPTURE_FAILED` and a fixed `no-worktree`
+message.
+
+This fallback is deterministic, but it is never evidence of the discarded state.
+That state's artifact already exists: Phase D cannot begin without a confirmed
+recreation artifact (§5.1).
+
+Because precedence is unchanged, `RunFinished.error` is then
+`EVIDENCE_CAPTURE_FAILED`, or `LIFECYCLE_CLEANUP_UNCONFIRMED`. The recreation
+failure itself is carried by `WorkspaceRecreationFinished`.
+
+### 6. Audit contract (required)
+
+The run trace gets two new event types. A *recreation attempt* exists only
+once Q1–Q6 have all passed and S0 has minted *k*. Each attempt emits exactly
+one `WorkspaceRecreationStarted` (at S0), then exactly one
+`WorkspaceRecreationFinished` (after the attempt's last step), unless the
+process dies or an emission fails (§6.1).
+
+A Q2–Q6 refusal emits neither event (§2). Both events are emitted in the run's
+current state, before any domain transition. Neither contains a path, file
+content, Git output or exception text.
+
+- **`WorkspaceRecreationStarted`**:
+  - the event envelope;
+  - `recreation_sequence` *k* (1–99);
+  - `trigger_code`, one of `PATCH_APPLICATION_FAILED`, the mapped
+    checkpoint-advance code for case (b), or `WORKSPACE_ENTRY_GATE_FAILED`;
+  - `checkpoint_id` = `C`.
+- **`WorkspaceRecreationFinished`**:
+  - the envelope and `recreation_sequence` (the same *k*, 1–99);
+  - `outcome`, one of `RECREATED`, `EVIDENCE_NOT_CONFIRMED`,
+    `DISPOSAL_FAILED`, `FAILED_NOTHING_OWNED`, `UNCONFIRMED`,
+    `ADOPTED_THEN_FAILED`;
+  - the recreation artifact's receipt (`artifact_id`, `sha256_payload`,
+    `bytes_written`, `evidence_complete`). These are present together exactly
+    when an artifact was published under the recreation name; absent together
+    otherwise;
+  - `error`: `None` exactly for `RECREATED`. Otherwise it is an
+    `OperationalError` with a fixed message. Its code is:
+    - the §5.2 code for `EVIDENCE_NOT_CONFIRMED`;
+    - `WORKSPACE_RECREATION_FAILED` (the proposed name, `ErrorDomain.LIFECYCLE`,
+      pinned by `errors.py` tests) for every other outcome.
+- **Cross-validation, pinned by event tests:**
+  - Finished never precedes its Started;
+  - the sequences are equal and strictly increasing across attempts;
+  - every `recreation_sequence` is in 1–99;
+  - a Started with no Finished is legal only as the last recreation event, in a
+    trace that ends without a `RunFinished` (the process died) or whose
+    `RunFinished` reports `UNRECOVERABLE_ERROR` (§6.1);
+  - `RECREATED` requires a complete receipt;
+  - `EVIDENCE_NOT_CONFIRMED` requires an `EVIDENCE_*` code;
+  - every outcome after Phase E requires a complete receipt.
+- **Effect on the run.** For every outcome except `RECREATED`, the run
+  terminates, and the run's original error is exactly
+  `WorkspaceRecreationFinished.error` (§5.3 for precedence).
+  `EvidenceCaptured` stays terminal-only.
+
+#### 6.1 Emission failures
+
+Both emission sites use the controller's ordinary `_emit`. Event construction
+and validation raise before anything is appended, so a failed emission leaves no
+partial record. Neither site retries, and neither suppresses the failure.
+
+**Started fails (at S0).**
+- It occurs after Q1–Q6, and before Phase E or any lifecycle mutation.
+- *k* is consumed. No artifact *k* exists.
+- The ordinary exception propagates to Amendment 9's run boundary.
+  `_terminate()` runs exactly once, on the untouched incarnation *n* and its
+  reservation. Teardown is ordinary: terminal evidence, disposal of *n*, ref
+  deletion only if that disposal is confirmed, `complete()`.
+- Classification: `UNRECOVERABLE_ERROR`, with error `UNCLASSIFIED_FAILURE`,
+  unless Amendment 2's unchanged precedence selects a cleanup or evidence code.
+  The triggering error remains on its `ToolCompleted`.
+- A `BaseException` here takes Amendment 14's raise path. That is equally safe,
+  because nothing has changed.
+
+**Finished fails (after the attempt's last step).**
+- **Before the emission.** By then the attempt's physical work is complete. The
+  controller and recreator have already finished all of their bookkeeping:
+  - the recreator's current incarnation and current reservation;
+  - the controller's workspace reference (*n+1* for `RECREATED` and
+    `ADOPTED_THEN_FAILED`, *n* otherwise);
+  - the `UNCONFIRMED` teardown flag;
+  - the outcome, retained in controller memory.
+- **The emission itself.** It is attempted exactly once. Its failure never
+  causes recreation, evidence capture, disposal, reservation or materialization
+  to run again.
+- **Classification.** The ordinary exception reaches Amendment 9's boundary.
+  `_terminate()` runs exactly once, on the actual current incarnation and
+  reservation, and is gated by the retained outcome:
+  - after `UNCONFIRMED`, ref deletion and `complete()` are skipped;
+  - after `DISPOSAL_FAILED`, *n* is the workspace, and the physical retry and
+    gating are the existing ones;
+  - after `RECREATED`, teardown disposes *n+1* normally. The run never
+    continues to the repair loop.
+
+  The run ends `UNRECOVERABLE_ERROR` with `UNCLASSIFIED_FAILURE`, unless the
+  unchanged precedence selects `LIFECYCLE_CLEANUP_UNCONFIRMED` or an evidence
+  code. A `BaseException` takes Amendment 14's raise path, whose R2 stages act on
+  the same current objects.
+- **What survives.** The original recreation result is retained only in memory,
+  for teardown gating; it is never reported. The trace shows the Started without
+  its Finished. Any recreation artifact already published stays in the evidence
+  root, never deleted, so the audit record of the discarded state survives the
+  lost event.
+
+### 7. Outcomes and ownership (live owner)
+
+"Ordinary teardown" means `_terminate()` unchanged. "Confirmed not installed"
+means the publication failed with `NOT_INSTALLED`; any other publication failure
+makes the cursor's belief unreliable.
+
+| Step that fails | What is left | Outcome | Teardown | Next admission if the owner then dies |
+|---|---|---|---|---|
+| Q2–Q6 (not an attempt, §2) | *n*, untouched; no artifact, no events, no sequence | none; the run terminates through the triggering error | ordinary: terminal evidence, then dispose *n* | ordinary |
+| S0's Started emission (§6.1) | *n*, untouched; no artifact; *k* consumed | none reported | ordinary, through Amendment 9's boundary (`UNCLASSIFIED_FAILURE`) | ordinary |
+| E1 or E2 (§5.2) | *n*, untouched; an artifact per §5.2 | `EVIDENCE_NOT_CONFIRMED` | ordinary (§5.3) | ordinary |
+| D1 | *n* intact; `disposing` possibly installed | `DISPOSAL_FAILED` | *n* stays current; terminal evidence from *n*; `dispose()` re-raises the latch, so ref deletion and `complete()` are skipped | A17 |
+| D2–D3, including an admin entry found | *n* partly or fully removed; `disposing(H)` installed | `DISPOSAL_FAILED` | terminal evidence attempted from the remaining worktree; one physical retry (the existing behaviour); the ref is deleted only if that retry is confirmed | A17, or Amendment 13's `REFUSED` |
+| D4 `absent` | *n* removed; latched | `DISPOSAL_FAILED` | terminal evidence: `no-worktree` (§5.4); ref deletion skipped | A17 collapse, or A16 |
+| D5 close | nothing owned | `FAILED_NOTHING_OWNED` | ordinary (`no-worktree` evidence; the ref is deleted; `complete()`); the close failure is reported under `RESERVATION` | ordinary |
+| R1 `FileExistsError` | a foreign entry, untouched | `FAILED_NOTHING_OWNED` | ordinary | ordinary |
+| R1 other failure | unknown | a fresh no-follow observation: `ABSENT` gives `FAILED_NOTHING_OWNED`, else `UNCONFIRMED` | per the outcome | A16, or `BLOCKED` (B5) |
+| C1–C2 before `creating`, or `creating` confirmed not installed | the reservation exit removes the empty leaf | leaf confirmed removed: `FAILED_NOTHING_OWNED`; otherwise `UNCONFIRMED` | per the outcome | ordinary, or `BLOCKED` |
+| `creating(C)`, other publication failure | the leaf is removed; the record may be `creating(C)` | `UNCONFIRMED` | ref deletion and `complete()` skipped | the §9 row |
+| C2 Git or verification failure after `creating(C)` | enter-time exact cleanup, then the reservation exit | if both are confirmed and a fresh D3 triple confirms absence, publish the caller-confirmed `creating → absent`. Confirmed: `FAILED_NOTHING_OWNED`; otherwise `UNCONFIRMED` | per the outcome | ordinary, §9, or A17 |
+| `present(C)` | registered, materialized, retained; `path` unpublished | `UNCONFIRMED`; *n+1* never adopted | ref deletion and `complete()` skipped | A17 |
+| C3 entry gate | *n+1* `present(C)`, owned | `ADOPTED_THEN_FAILED`; *n+1* adopted | ordinary: terminal evidence from *n+1*, then dispose it | ordinary, or A17 |
+
+`UNCONFIRMED` makes `_terminate()` treat the worktree as cleanup-unconfirmed
+(M8), so `LIFECYCLE_CLEANUP_UNCONFIRMED` dominates. Nothing is refreshed or
+retried, apart from teardown's existing physical-disposal retry.
+
+**Ownership.**
+
+| Resource | Owner | Rule |
+|---|---|---|
+| Lease, state root, trusted identity and context | composition | whole run; the lease gains read-only `identity` and `context`, set once in `prepare_lifecycle()` (M7) |
+| Shared cursor and its four publishers | composition | whole run; every incarnation uses the same `worktree_publisher` |
+| Evidence sink | composition constructs it; the controller (terminal) and the recreator (Phase E) share one instance | |
+| Recreation sequence counter | recreator | in memory only; monotonic |
+| Reservation *k* | composition | from R1 until the next D5 or the final `RESERVATION` stage; closed exactly once; at most one open at a time |
+| Incarnation *k* | composition constructs and enters it; held by the controller as its workspace | intermediate disposal by the recreator (Phase D); final disposal only in `_terminate()` |
+| Checkpoint ref and session | controller | untouched by recreation |
+| Recreation decision and audit events | controller | Q1, the verifier part of Q3, and the §6 events |
+| Dead-run leftovers | reconciler | §9; evidence-root files never |
+
+**Amendment 14, narrowly revised.**
+- **R1.** The recreator may dispose incarnations 1…*n*−1 inside `run()`, before
+  `RunFinished`. After `run()` returns, nothing is mutated.
+- **R2.** `WORKTREE_PHYSICAL` and `RESERVATION` apply to the objects that are
+  current when `run()` returns or raises. An earlier reservation's close failure
+  is retained, reported once under `RESERVATION`, and never retried.
+- On the raise path, `GitWorktree.__exit__` runs only for the current
+  incarnation, and only if it was entered.
+
+### 8. Crash and resume at every durable boundary
+
+The starting point is `ACTIVE`, worktree `present(H)`, ref `present(C)`, and
+both containers `absent`. The owner is SIGKILLed at each boundary, and the next
+admission runs a reconciliation pass. Evidence-root files are never inspected or
+removed by reconciliation.
+
+| # | Boundary | Durable worktree, ref | Physical state | Evidence root | Next pass |
+|---|---|---|---|---|---|
+| E0 | after `WorkspaceRecreationStarted`, before any temp file | `present(H)`, `present(C)` | registered, dirty | nothing new | A17: `RECONCILED` |
+| E1 | while temps are written | as E0 | as E0 | `.…recreation-kk.*.tmp` leftovers (0600, never trusted) | A17: `RECONCILED`; the temps stay |
+| E2 | after the hard link, before the temp unlink or directory `fsync` | as E0 | as E0 | artifact published, durability unconfirmed; temps may remain | A17: `RECONCILED`; the artifact stays |
+| E3 | after confirmed publication, before D1 | as E0 | as E0 | artifact durable | A17: `RECONCILED` |
+| B1 | after `disposing(H)` | `disposing(H)`, `present(C)` | registered | artifact durable | A17: `RECONCILED` |
+| B2 | during or after D2, before `absent` | `disposing(H)`, `present(C)` | fully or partly removed | artifact durable | A17 (collapse or D2): `RECONCILED`; partial: Amendment 13's `FAILED`/`REFUSED`, so `BLOCKED` |
+| B3 | after `absent`, through D5 | `absent`, `present(C)` | nothing | artifact durable | A16: `RECONCILED` |
+| B4 | durability-unconfirmed `absent` | `disposing(H)` or `absent` | nothing | artifact durable | A17 collapse, or A16: `RECONCILED` |
+| B5 | after R1, before `creating(C)` is durable | `absent`, `present(C)` | empty 0700 leaf; no Git state | artifact durable | A16 `REFUSED`: **`BLOCKED`** (§8a) |
+| B6 | after `creating(C)`, before `add` writes anything | `creating(C)`, `present(C)` | empty or absent leaf; unregistered; zero admin entries | artifact durable | **§9 row: `RECONCILED`** |
+| B7 | inside `add`: an admin entry exists but is not listed, or is listed but the leaf has no `.git` file | `creating(C)`, `present(C)` | partial Git state | artifact durable | `REFUSED`: **`BLOCKED`** (§8a) |
+| B8 | after `add` through `checkout` | `creating(C)`, `present(C)` | registered, `.git` file present | artifact durable | A17: `RECONCILED` |
+| B9 | enter-time cleanup in progress | `creating(C)`, `present(C)` | registered (A17); an unregistered empty or absent leaf (§9); unregistered with content (`REFUSED`) | artifact durable | as listed |
+| B10 | after the failure-path `creating → absent` | `absent`, `present(C)` | nothing | artifact durable | A16: `RECONCILED` |
+| B11 | after `present(C)`, including durability-unconfirmed | `creating(C)` or `present(C)`, `present(C)` | registered | artifact durable | A17: `RECONCILED` |
+| B12 | later in the run | the existing rows (A17; A19 verification family) | | | unchanged |
+
+`attempts_total` and each row's resume rules are unchanged. A `CLEANING` state
+(after a failed recreation and `begin_cleanup()`) takes the same rows. A dead run
+never writes its terminal artifact. That is unchanged: a missing `RunFinished`
+identifies the interrupted run.
+
+#### 8a. Accepted blocking residuals: B5 and B7 are different
+
+Both exit only by `codeagent reconcile --abandon ID --acknowledge-unresolved
+--reason …` (`ABANDONED_UNRESOLVED`). Normal abandonment is refused, because
+resources remain. Neither ever reports `CLEAN`.
+
+- **B5 leaks** the checkpoint ref and one empty, owner-only 0700 leaf directory.
+  It leaves no Git registration, admin entry or file content. CodeAgent does
+  not repair this shape.
+  - Manual repair is expert work.
+  - The ref may be deleted only by a compare-and-swap that names the expected
+    value `C` (for example, `git update-ref --no-deref -d
+    refs/codeagent/runs/<lifecycle_id>/checkpoint <C>`), after checking that
+    `C` is the recorded `accepted_sha`.
+  - An unguarded deletion, with no expected OID, is never appropriate.
+  - The empty leaf is removed only after it has been confirmed empty and
+    unregistered.
+  - The window runs from the exclusive `mkdir` to one durable projection
+    publication.
+  - Closing it would need a projection record before the leaf exists, which
+    breaks Amendment 12's premise ("`creating` is published only after the owner
+    exclusively created that leaf"). D-1 accepts the residual in principle.
+- **B7 leaks** the checkpoint ref, plus Git's own partial state from an
+  interrupted `git worktree add`. That state can include:
+  - an admin directory under `<common-dir>/worktrees/`, with or without its
+    `gitdir` file;
+  - possibly a listed registration;
+  - a leaf with or without a `.git` file;
+  - possibly partially checked-out content.
+
+  It needs targeted, expert Git-level repair of exactly this lifecycle's admin
+  entry, registration and leaf, plus the same compare-and-swap ref deletion as
+  B5. A repository-wide sweep such as `git worktree prune` is not prescribed: it
+  can act on other worktrees' entries, and I2 forbids that kind of generic
+  operation for CodeAgent itself. Git's `add` is not atomic, so this window is
+  inherent. It is unchanged from the first incarnation.
+
+**Other residuals (A4, unchanged).** A same-user process can:
+- occupy the path between D5 and R1 (giving `FAILED_NOTHING_OWNED`, and the
+  foreign entry is untouched);
+- swap directories during materialization (caught by the identity checks);
+- race Amendment 12's `rmdir` in the §9 row;
+- tamper with the evidence root (caught by collision and containment).
+
+### 9. New reconciliation row: an unregistered `creating` worktree, then its ref
+
+- **Eligible shape.** Amendment 17's predicate, unchanged.
+- **Routing changes.** In Amendment 17's locked row, `creating` with no
+  registration now goes here instead of returning `REFUSED`. Amendment 17's
+  other routes are unchanged.
+- **Gate A** (zero mutation if it stops):
+  - container listing 1;
+  - Amendment 12's complete evidence set, except "ref absent": unregistered; zero
+    admin entries; a leaf that is an empty, owned, 0700 directory (same inode by
+    name and by descriptor) or absent;
+  - Amendment 17's read-only ref gate.
+- **Phase W:**
+  - `RECONCILING` (+1 only on a fresh cycle; the only increment);
+  - Amendment 12 steps 2–5 (the `rmdir` if the leaf is present, the close, the
+    re-listing and admin scan, the reconciler-only `creating → absent`).
+- **Gate B:** container listing 2, then a fresh ref observation. This is the only
+  source of the deletion SHA.
+- **Phase R:** Amendment 16 M2–M4, then `RECONCILED` last.
+- **Outcomes:** Amendment 12's tables (Phase W) and Amendment 17's (Gates A and
+  B, Phase R), unchanged.
+- **Resume:**
+  - after Phase W: Amendment 16's row;
+  - before Phase W completes: this row, through Amendment 12's resume shapes A
+    and B.
+- **Trace:** additive only (Amendment 12's worktree fields, plus Amendment 17's
+  `gate_observation`/`container_gate`). `schema_version` stays 1.
+- **What does not change:** `reconciliation.py` still contains no
+  filesystem-removal call.
+
+### 10. Accepted text narrowly revised by this amendment
+
+- **ADR 0003 Amendment 2:**
+  - §2 is applied strictly before recreation (§5.1);
+  - the sink is extended to the §4 series;
+  - the terminal artifact and the §4–§5 terminal behaviour are unchanged;
+  - N1 and N2 are D5's re-derivation obligations.
+- **Amendment 11 §2 step 4:** in publisher mode, `absent` additionally requires
+  zero admin matches.
+- **Amendment 14 R1 and R2:** as in §7.
+- **Amendment 17:** the never-registered `creating` exclusion is replaced by §9.
+- **Unchanged:** Amendment 10's table, Amendment 12's premise, §5's projection
+  schema, and the event schema version policy. The two new events are additive
+  and pinned exhaustively.
+
+### 11. Required verification (when D5 implements this)
+
+**Unit tests:**
+- the lifecycle-store edges in `ACTIVE`;
+- the lease fields;
+- fresh-reservation and consumed-reservation refusal;
+- `materialize_commit` validation;
+- `absent` gated on admin entries, with parity for the moved scan;
+- the sink series:
+  - names, header version 2, the version-1 terminal byte-identical;
+  - per-member temp names;
+  - the 1–99 bound and the reader's rejections;
+  - each receipt shape, per kind;
+- the §6 event validation and cross-validation;
+- the controller:
+  - Q1 classification, with every never-recreate code and each recreate case
+    (a)–(c);
+  - every §7 outcome;
+  - §5.3 precedence;
+  - the §5.4 fallback;
+  - `H0` used for terminal evidence;
+- Amendment 14 R1/R2 accounting.
+
+**Real Git (no Docker):**
+- **RG1.** A dirty contamination leads to a full recreation. Assert each of the
+  following:
+  - the **complete projection sequence**
+    `present(H) → disposing(H) → absent → creating(C) → present(C)`, read from
+    the installed `lifecycle.json` after each publication, with no other
+    worktree write in between;
+  - the ref record stays `present(C)` and the ref object is unchanged throughout;
+  - `HEAD == C`, and the tree is clean;
+  - exactly one admin entry, named `<id>`;
+  - `<id>.recreation-01.evidence` exists, with a version-2 header (`kind`,
+    `sequence` 1, `base_commit` C) whose payload is the diff against `C`;
+  - the artifact's publication precedes `disposing(H)` (an ordering spy on
+    both);
+  - the Started and Finished events, with outcome `RECREATED`.
+- **RG2.** A confirmed-`UNCHANGED` advance leads to recreation at `A`. The
+  artifact's diff contains the unaccepted commit `B`'s changes.
+- **RG3.** Three successive recreations:
+  - artifacts `-01`, `-02` and `-03`, then terminal `<id>.evidence`;
+  - no collision or overwrite;
+  - the sequences in the events and headers agree.
+- **RG4.** SHA-256, or a skip.
+- **RG5.** A stale admin entry injected after D2 makes disposal fail closed: no
+  `absent`, no reservation.
+- **RG6.** A foreign directory planted between D5 and R1 gives
+  `FAILED_NOTHING_OWNED`. The directory is untouched, and the run ends
+  `COMPLETE`.
+- **RG7.** A pre-placed file at `<id>.recreation-01.evidence` gives
+  `EVIDENCE_NOT_CONFIRMED` (collision):
+  - the foreign file is byte-identical afterwards;
+  - no disposal happens before terminal teardown;
+  - terminal `<id>.evidence` is still written;
+  - `RunFinished.error` follows §5.3.
+- **RG8.** A temp leftover for member 1 (unlink forced to fail) does not prevent
+  member 2 from publishing.
+- **RG9 (D5 integration, real Docker).** The scripted model contaminates, the
+  run recreates, the revised patch passes.
+
+**Real owner-SIGKILL tests** (a spawned child, as in `_child_run_and_sigkill`):
+- **E1, E2, E3:** `RECONCILED`. The evidence-root contents are asserted to be
+  exactly as in §8; nothing removes them.
+- **B1, B2 (a stand-in), B3, B6, B8, B10, B11:** `RECONCILED`, with full
+  physical cleanup.
+- **B5:**
+  - `BLOCKED`;
+  - normal `--abandon` refused;
+  - `--acknowledge-unresolved` records `ABANDONED_UNRESOLVED`;
+  - the next admission proceeds with `LifecycleLease.unresolved_acknowledged`
+    naming the entry;
+  - the ref and the empty leaf are still present, and nothing else.
+- **B7, two variants.** The owner is really SIGKILLed. Git's partial state is
+  produced by a deterministic stand-in for `git worktree add`, as in Amendment
+  13 §6; it is a model of the partial state, not proof of every Git
+  interleaving:
+  - **(a)** a real `add`, with the admin entry's `gitdir` file removed. The
+    entry is then admin-present but unlisted.
+  - **(b)** a real `add`, with the leaf's `.git` file removed. The worktree is
+    then listed but not materialized.
+
+  For each variant, assert:
+  - `reconcile --dry-run` reports `BLOCKED`, with no write;
+  - automatic admission is `RECONCILIATION_BLOCKED`, with zero mutation;
+  - normal `--abandon` is refused;
+  - forced acknowledgement succeeds;
+  - the next admission proceeds;
+  - the ref, the admin entry, any registration and the leaf all remain exactly
+    as left.
+
+**Reconciler SIGKILL** at each §9 durable write.
+
+**Fault injection:**
+- each worktree publication (`disposing`, `absent`, `creating`, `present`,
+  `creating → absent`) × {`NOT_INSTALLED`, `DURABILITY_UNCONFIRMED`, `STALE`};
+- the Git steps; post-Git identity; `consume()`;
+- the reservation exit, the old reservation's close, `reserve` raising;
+- admin-scan `UNKNOWN`/overflow, a listing failure, `observe_leaf()` `UNKNOWN`;
+- each of Q2–Q6 failing: no Started or Finished event, the recreator's minted
+  count unchanged, no artifact, no sink call, no lifecycle publication, and
+  termination through the triggering error. Q6 is exercised both at the
+  99-recreation format bound and at a smaller D5 budget;
+- **Started emission failure** (`_emit` raising at S0):
+  - no artifact and no Phase E sink call;
+  - no `disposing`, no reservation;
+  - `_terminate()` called exactly once, on incarnation *n*;
+  - `UNCLASSIFIED_FAILURE`, or the precedence-selected code;
+  - no second Started;
+- **Finished emission failure**, once for each of `RECREATED`,
+  `EVIDENCE_NOT_CONFIRMED`, `DISPOSAL_FAILED`, `FAILED_NOTHING_OWNED`,
+  `UNCONFIRMED` and `ADOPTED_THEN_FAILED`:
+  - the sink's recreation capture, `dispose()`, `reserve_worktree_leaf()` and
+    `GitWorktree.__enter__` each run at most once;
+  - no second Finished;
+  - `_terminate()` runs once, on the actual current incarnation and
+    reservation;
+  - ref deletion and `complete()` are gated exactly as the retained outcome
+    requires;
+  - no return to the repair loop;
+  - the published artifact remains;
+- a `KeyboardInterrupt` at the Finished emission, through the composition: R2
+  acts on the current objects;
+- a version-2 header validated with a trusted `sha1` format and a 64-hex
+  `base_commit` is refused, and vice versa. A reader given no trusted format
+  refuses;
+- **evidence:**
+  - truncation at the bound;
+  - an untracked path;
+  - a collision before the link, and at the link;
+  - a temp `O_EXCL` failure;
+  - a write, `fsync` or link failure;
+  - an unlink failure after the link;
+  - a directory `fsync` failure after the link.
+
+  Each must give exactly the §5.2 row, and no D1 publication.
+
+**Mutation checks.** Revision 1 listed 17 categories (18 concrete runs, with Q3
+and Q5 separate) but claimed 19. The missing case was the §9 row accepting a
+leaf that fails Amendment 12's evidence. Revision 2 adds it, and 11 evidence
+mutations, for 29 categories and 30 concrete runs. Revision 3 adds 7 (30–36).
+That makes **36 categories and 37 concrete runs**: only category 10 has two
+concrete runs. Each must fail a test; each source is restored and
+SHA-256-verified.
+
+1. Reuse the consumed reservation.
+2. Reserve before `absent`.
+3. Skip the admin scan before `absent`.
+4. Materialize the source `HEAD` instead of `C`.
+5. `expected_head = H` for the new incarnation.
+6. Write, move or delete the ref during recreation.
+7. Terminal evidence based on the incarnation's commit instead of `H0`.
+8. Delete the ref after `UNCONFIRMED`.
+9. Adopt an incarnation whose `present` was not published.
+10. Drop Q3 (10a) or Q5 (10b): two runs.
+11. Recreate on a never-recreate code (`PATCH_VALIDATION_FAILED`).
+12. `creating → absent` without the fresh D3 confirmation.
+13. Restore Amendment 17's blanket refusal.
+14. Skip Gate B in §9.
+15. A double increment in §9.
+16. Retry a failed reservation close.
+17. R2 uses the first reservation instead of the current one.
+18. The §9 row accepts a leaf that is non-empty, not 0700, or foreign-owned.
+19. Phase D before Phase E (dispose before the artifact is published).
+20. Continue on an incomplete artifact.
+21. Continue on a durability-unconfirmed artifact.
+22. Overwrite on collision (`replace` instead of a no-replace link).
+23. Reuse a sequence number (no increment): RG3 must fail.
+24. Publish a recreation artifact under the terminal name.
+25. A recreation artifact based on `H0` instead of `C`.
+26. Accept sequence 100, or a sequence from input.
+27. Shared temp names across members: RG8 must fail.
+28. Omit `WorkspaceRecreationFinished` on a failure path.
+29. Treat the §5.4 `no-worktree` fallback as success, or as a substitute for
+    Phase E.
+30. Emit Started (or Finished) for a Q2–Q6 refusal.
+31. Mint *k* before Q2–Q6 are evaluated: the refusal test's
+    "minted count unchanged" assertion must fail.
+32. Swallow a failed Started emission and run Phase E anyway.
+33. Retry a failed Started emission.
+34. After a failed Finished emission, retry the emission or repeat any
+    recreation step.
+35. Update the current-incarnation, reservation or workspace bookkeeping
+    after the Finished emission instead of before: the Finished-failure tests
+    must see teardown act on the wrong object.
+36. Validate `base_commit` by OID length alone, or by a format read from the
+    artifact, instead of the trusted object format.
+
+### 12. Non-claims
+
+- No crash consistency and no cross-resource atomicity (ADR 0003 point 8).
+- Uncheckpointed work is lost by design. Phase E preserves a diff of it, not the
+  work itself.
+- Evidence durability is process-crash only, not power loss (ADR 0004 §5).
+- Evidence-root leftovers (temps, unconfirmed artifacts) are never cleaned.
+- B5 and B7 block until an operator acknowledges them, and leak as §8a states.
+- A4 is unchanged.
+- Nothing becomes operator-reachable before D6. T-E1 and T-F1 are unchanged.
+  T-F2 gains reconciler-level coverage for the §9 shape only.
+
+### 13. Decisions
+
+- **D-1:** accepted in principle (§8a).
+- **D-2(a):** accepted (§3 D3, §10).
+- **D-3:** rejected as written; replaced by Phase E, §4–§6, and the §5.4
+  fallback.
+
+**Accepted at joint review:**
+- **N1:** a safe limitation pending D5's re-derivation.
+- **N2:** mandatory D5 work.
+- **N3:** the asymmetry between strict recreation and attempted terminal
+  evidence.
+- **N4:** D5 integration.
+- **The 99-member format bound,** with the actual recreation budget limited
+  independently to 99 or less.
+
+**Revision 3 accepted at joint review (2026-11-02):** the §2 ordering, §6.1,
+the §8a wording, §4's object-format authority and the §11 recount. Nothing in
+this amendment remains open. Implementation status is recorded here when D5
+lands.

@@ -960,3 +960,463 @@ def test_hostile_process_filter_does_not_execute_through_capture(tmp_path):
     assert not marker.exists()
     if not receipt.success:
         assert receipt.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 20 section 4: the evidence-artifact series. The
+# terminal artifact stays schema version 1, byte for byte; recreation
+# members are `<lifecycle_id>.recreation-<kk>.evidence` with a version-2
+# header. Nothing calls the recreation path from the controller yet.
+# ---------------------------------------------------------------------------
+
+_SERIES_ID = "5e" * 16
+
+
+def _changed_repo(tmp_path, object_format=None):
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    init = ["git", "init", "-q"] + ([f"--object-format={object_format}"] if object_format else []) + [str(repo)]
+    result = subprocess.run(init, capture_output=True, text=True, env=_clean_env())
+    if result.returncode != 0:
+        pytest.skip("installed git does not support --object-format=sha256")
+    base = _initial_commit(repo)
+    (repo / "a.txt").write_text("line1\nchanged\n")
+    return repo, base
+
+
+def _capture(tmp_path, repo, base, out="out", **kwargs):
+    return _sink(tmp_path / out).capture(
+        worktree_path=repo, source_repo_path=tmp_path / "src", initial_commit=base, lifecycle_id=_SERIES_ID, **kwargs
+    )
+
+
+def _frame(header: dict, payload: bytes) -> bytes:
+    data = json.dumps(header, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return evidence.ARTIFACT_MAGIC + len(data).to_bytes(4, "big") + data + payload
+
+
+def test_terminal_artifact_bytes_match_the_version_1_format_exactly(tmp_path):
+    repo, base = _changed_repo(tmp_path)
+    receipt = _capture(tmp_path, repo, base)
+    payload = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--binary", "--full-index", "--find-renames", "--no-ext-diff",
+         "--no-textconv", base, "--"],
+        check=True, capture_output=True, env=_clean_env(),
+    ).stdout
+    digest = __import__("hashlib").sha256(payload).hexdigest()
+    expected = _frame(
+        {
+            "schema_version": 1, "lifecycle_id": _SERIES_ID, "status": "complete", "payload_encoding": "binary",
+            "payload_type": "unified-diff", "bytes_written": len(payload), "bytes_total": len(payload),
+            "complete": True, "sha256_payload": digest, "sha256_full_stream": digest,
+        },
+        payload,
+    )
+    assert (tmp_path / "out" / f"{_SERIES_ID}.evidence").read_bytes() == expected
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == [f"{_SERIES_ID}.evidence"]
+    assert (receipt.success, receipt.complete, receipt.artifact_id, receipt.error) == (True, True, _SERIES_ID, None)
+    header, _ = evidence.parse_artifact_strict(expected, object_format=None)
+    assert "kind" not in header
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+@pytest.mark.parametrize("sequence", [1, 99])
+def test_recreation_member_name_header_and_receipt(tmp_path, object_format, sequence):
+    repo, base = _changed_repo(tmp_path, object_format if object_format == "sha256" else None)
+    assert len(base) == (64 if object_format == "sha256" else 40)
+    receipt = _capture(tmp_path, repo, base, recreation_sequence=sequence, object_format=object_format)
+    artifact_id = f"{_SERIES_ID}.recreation-{sequence:02d}"
+    assert (receipt.success, receipt.complete, receipt.artifact_id, receipt.error) == (True, True, artifact_id, None)
+    path = tmp_path / "out" / f"{artifact_id}.evidence"
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == [path.name]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    header, payload = evidence.parse_artifact_strict(path.read_bytes(), object_format=object_format)
+    assert header["schema_version"] == 2
+    assert (header["kind"], header["sequence"], header["base_commit"]) == ("recreation", sequence, base)
+    assert header["lifecycle_id"] == _SERIES_ID and header["complete"] is True
+    assert receipt.sha256_payload == header["sha256_payload"] and receipt.bytes_written == len(payload)
+    assert b"changed" in payload
+    assert "object_format" not in header
+
+
+@pytest.mark.parametrize("sequence", [0, 100, -1, True, "1", 1.0])
+def test_recreation_sequence_outside_1_to_99_is_refused_before_any_io(tmp_path, sequence):
+    repo, base = _changed_repo(tmp_path)
+    receipt = _capture(tmp_path, repo, base, recreation_sequence=sequence, object_format="sha1")
+    assert receipt.success is False and receipt.artifact_id is None
+    assert receipt.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("object_format", [None, "SHA1", "md5", "", b"sha1", 1])
+def test_recreation_without_a_trusted_object_format_is_refused(tmp_path, object_format):
+    repo, base = _changed_repo(tmp_path)
+    receipt = _capture(tmp_path, repo, base, recreation_sequence=1, object_format=object_format)
+    assert receipt.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+    assert not (tmp_path / "out").exists()
+
+
+def test_recreation_cross_format_base_commit_is_refused(tmp_path):
+    repo, base = _changed_repo(tmp_path)
+    receipt = _capture(tmp_path, repo, base, recreation_sequence=1, object_format="sha256")
+    assert receipt.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+    assert receipt.error.message == "the recreation base commit is not a valid object id for the trusted format"
+    assert not (tmp_path / "out").exists()
+    receipt = _capture(tmp_path, repo, "ab" * 32, recreation_sequence=1, object_format="sha1")
+    assert receipt.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    "base", ["0" * 40, "A" * 40, "a" * 39, "a" * 41, "g" * 40, " " + "a" * 39, 7]
+)
+def test_recreation_all_zero_or_malformed_base_commit_is_refused(tmp_path, base):
+    repo, _ = _changed_repo(tmp_path)
+    receipt = _capture(tmp_path, repo, base, recreation_sequence=1, object_format="sha1")
+    assert receipt.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+    assert not (tmp_path / "out").exists()
+
+
+def _recreation_header(base, **overrides):
+    payload = b"diff"
+    digest = __import__("hashlib").sha256(payload).hexdigest()
+    header = {
+        "schema_version": 2, "lifecycle_id": _SERIES_ID, "status": "complete", "payload_encoding": "binary",
+        "payload_type": "unified-diff", "bytes_written": 4, "bytes_total": 4, "complete": True,
+        "sha256_payload": digest, "sha256_full_stream": digest, "kind": "recreation", "sequence": 1,
+        "base_commit": base,
+    }
+    header.update(overrides)
+    return _frame({k: v for k, v in header.items() if v is not _DROP}, payload)
+
+
+_DROP = object()
+
+
+def test_strict_parser_needs_the_trusted_format_for_version_2():
+    raw = _recreation_header("a" * 40)
+    assert evidence.parse_artifact_strict(raw, object_format="sha1")[0]["sequence"] == 1
+    with pytest.raises(ValueError, match="requires a trusted object format"):
+        evidence.parse_artifact_strict(raw, object_format=None)
+    with pytest.raises(ValueError, match="base_commit is invalid"):
+        evidence.parse_artifact_strict(raw, object_format="sha256")  # never inferred from the 40-hex length
+    with pytest.raises(ValueError):
+        evidence.parse_artifact_strict(raw, object_format="SHA1")
+    assert evidence.parse_artifact_strict(_recreation_header("b" * 64), object_format="sha256")[0]["base_commit"] == "b" * 64
+    with pytest.raises(ValueError, match="base_commit is invalid"):
+        evidence.parse_artifact_strict(_recreation_header("b" * 64), object_format="sha1")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sequence": 0}, {"sequence": 100}, {"sequence": True}, {"sequence": "1"},
+        {"kind": "terminal"}, {"kind": _DROP}, {"base_commit": "0" * 40}, {"base_commit": "A" * 40},
+        {"extra": 1}, {"schema_version": 3}, {"schema_version": True}, {"bytes_written": 5},
+        {"sha256_payload": "0" * 64}, {"status": "incomplete"}, {"bytes_total": None},
+        {"lifecycle_id": "X" * 32}, {"payload_type": "other"},
+    ],
+)
+def test_strict_parser_refuses_a_malformed_version_2_header(overrides):
+    with pytest.raises(ValueError):
+        evidence.parse_artifact_strict(_recreation_header("a" * 40, **overrides), object_format="sha1")
+
+
+def test_strict_parser_refuses_version_2_fields_in_a_version_1_header():
+    raw = _recreation_header("a" * 40, schema_version=1)
+    with pytest.raises(ValueError, match="unexpected version-1 header fields"):
+        evidence.parse_artifact_strict(raw, object_format="sha1")
+
+
+def test_recreation_collision_never_overwrites(tmp_path):
+    repo, base = _changed_repo(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir(mode=0o700)
+    existing = out / f"{_SERIES_ID}.recreation-01.evidence"
+    existing.write_bytes(b"foreign")
+    receipt = _capture(tmp_path, repo, base, recreation_sequence=1, object_format="sha1")
+    assert receipt.error.code is ErrorCode.EVIDENCE_ARTIFACT_COLLISION and receipt.artifact_id is None
+    assert receipt.error.error_id == f"evidence-{_SERIES_ID}.recreation-01-{ErrorCode.EVIDENCE_ARTIFACT_COLLISION.value}"
+    assert existing.read_bytes() == b"foreign"
+    assert sorted(p.name for p in out.iterdir()) == [existing.name]
+    # Other members and the terminal artifact are unaffected by it.
+    assert _capture(tmp_path, repo, base, recreation_sequence=2, object_format="sha1").success
+    assert _capture(tmp_path, repo, base).success
+
+
+def test_recreation_collision_at_link_time_never_overwrites(tmp_path, monkeypatch):
+    repo, base = _changed_repo(tmp_path)
+    real_link = os.link
+
+    def racing_link(src, dst, *a, **k):
+        Path(dst).write_bytes(b"raced in")
+        return real_link(src, dst, *a, **k)
+
+    monkeypatch.setattr(evidence.os, "link", racing_link)
+    receipt = _capture(tmp_path, repo, base, recreation_sequence=3, object_format="sha1")
+    assert receipt.error.code is ErrorCode.EVIDENCE_ARTIFACT_COLLISION
+    final = tmp_path / "out" / f"{_SERIES_ID}.recreation-03.evidence"
+    assert final.read_bytes() == b"raced in"
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == [final.name]
+
+
+def test_members_and_terminal_never_collide_with_each_other(tmp_path):
+    repo, base = _changed_repo(tmp_path)
+    for sequence in (1, 2, 99):
+        assert _capture(tmp_path, repo, base, recreation_sequence=sequence, object_format="sha1").success
+    assert _capture(tmp_path, repo, base).success
+    names = sorted(p.name for p in (tmp_path / "out").iterdir())
+    assert names == [f"{_SERIES_ID}.evidence"] + [f"{_SERIES_ID}.recreation-{k:02d}.evidence" for k in (1, 2, 99)]
+    assert _capture(tmp_path, repo, base, recreation_sequence=2, object_format="sha1").error.code is (
+        ErrorCode.EVIDENCE_ARTIFACT_COLLISION
+    )
+
+
+def test_every_member_has_its_own_temp_names(tmp_path, monkeypatch):
+    repo, base = _changed_repo(tmp_path)
+    opened: list[str] = []
+    real_open = evidence._open_private_temp
+
+    def spy(path):
+        opened.append(Path(path).name)
+        return real_open(path)
+
+    monkeypatch.setattr(evidence, "_open_private_temp", spy)
+    _capture(tmp_path, repo, base, recreation_sequence=1, object_format="sha1")
+    _capture(tmp_path, repo, base, recreation_sequence=2, object_format="sha1")
+    _capture(tmp_path, repo, base)
+    assert opened == [
+        f".{_SERIES_ID}.recreation-01.payload.tmp", f".{_SERIES_ID}.recreation-01.artifact.tmp",
+        f".{_SERIES_ID}.recreation-02.payload.tmp", f".{_SERIES_ID}.recreation-02.artifact.tmp",
+        f".{_SERIES_ID}.payload.tmp", f".{_SERIES_ID}.artifact.tmp",
+    ]
+
+
+def test_a_member_1_temp_leftover_does_not_block_member_2_or_terminal(tmp_path, monkeypatch):
+    repo, base = _changed_repo(tmp_path)
+    monkeypatch.setattr(evidence, "_best_effort_unlink", lambda path: False)
+    first = _capture(tmp_path, repo, base, recreation_sequence=1, object_format="sha1")
+    monkeypatch.undo()
+    assert first.error.code is ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED
+    leftovers = {f".{_SERIES_ID}.recreation-01.payload.tmp", f".{_SERIES_ID}.recreation-01.artifact.tmp"}
+    assert leftovers <= {p.name for p in (tmp_path / "out").iterdir()}
+    assert _capture(tmp_path, repo, base, recreation_sequence=2, object_format="sha1").success
+    assert _capture(tmp_path, repo, base).success
+    assert leftovers <= {p.name for p in (tmp_path / "out").iterdir()}  # never cleaned by later members
+
+
+def _fail_nth(monkeypatch, name, n, exc):
+    real = getattr(os, name)
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == n:
+            raise exc
+        return real(*a, **k)
+
+    monkeypatch.setattr(evidence.os, name, flaky)
+
+
+_KINDS = {"terminal": {}, "recreation": {"recreation_sequence": 7, "object_format": "sha1"}}
+
+
+def _final(tmp_path, kind):
+    stem = _SERIES_ID if kind == "terminal" else f"{_SERIES_ID}.recreation-07"
+    return tmp_path / "out" / f"{stem}.evidence"
+
+
+@pytest.mark.parametrize("kind", list(_KINDS))
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ("write", lambda mp: mp.setattr(evidence.os, "write", lambda fd, data: 0)),
+        ("payload_fsync", lambda mp: _fail_nth(mp, "fsync", 1, OSError("fsync"))),
+        ("artifact_fsync", lambda mp: _fail_nth(mp, "fsync", 2, OSError("fsync"))),
+        ("link", lambda mp: _fail_nth(mp, "link", 1, PermissionError("link"))),
+    ],
+    ids=lambda f: f[0] if isinstance(f, tuple) else f,
+)
+def test_pre_publication_failures_publish_nothing_and_leave_no_temps(tmp_path, monkeypatch, kind, failure):
+    repo, base = _changed_repo(tmp_path)
+    failure[1](monkeypatch)
+    receipt = _capture(tmp_path, repo, base, **_KINDS[kind])
+    monkeypatch.undo()
+    assert receipt.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+    assert (receipt.artifact_id, receipt.sha256_payload, receipt.bytes_written) == (None, None, None)
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", list(_KINDS))
+@pytest.mark.parametrize("failure", ["unlink", "directory_fsync"])
+def test_post_link_ambiguity_keeps_the_published_artifact(tmp_path, monkeypatch, kind, failure):
+    repo, base = _changed_repo(tmp_path)
+    if failure == "unlink":
+        _fail_nth(monkeypatch, "unlink", 1, PermissionError("unlink"))
+    else:
+        _fail_nth(monkeypatch, "fsync", 3, OSError("directory fsync"))
+    receipt = _capture(tmp_path, repo, base, **_KINDS[kind])
+    monkeypatch.undo()
+    assert receipt.error.code is ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED
+    assert receipt.complete is True and receipt.artifact_id == _final(tmp_path, kind).name[: -len(".evidence")]
+    header, payload = evidence.parse_artifact_strict(_final(tmp_path, kind).read_bytes(), object_format="sha1")
+    assert header["complete"] is True and b"changed" in payload
+
+
+def test_incomplete_recreation_member_is_published_labelled_incomplete(tmp_path):
+    repo, base = _changed_repo(tmp_path)
+    (repo / "new.txt").write_text("untracked")
+    receipt = _capture(tmp_path, repo, base, recreation_sequence=4, object_format="sha1")
+    assert receipt.error.code is ErrorCode.EVIDENCE_INCOMPLETE and receipt.complete is False
+    assert receipt.artifact_id == f"{_SERIES_ID}.recreation-04"
+    raw = (tmp_path / "out" / f"{_SERIES_ID}.recreation-04.evidence").read_bytes()
+    header, _ = evidence.parse_artifact_strict(raw, object_format="sha1")
+    assert (header["complete"], header["status"], header["bytes_total"]) == (False, "incomplete", None)
+
+
+# --- Strict-reader input validation (Step 3 correction) ---
+
+
+def _frame_text(text: bytes, payload: bytes = b"diff") -> bytes:
+    return evidence.ARTIFACT_MAGIC + len(text).to_bytes(4, "big") + text + payload
+
+
+def _canonical(header: dict) -> bytes:
+    return json.dumps(header, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _v1_header(**overrides) -> dict:
+    digest = __import__("hashlib").sha256(b"diff").hexdigest()
+    header = {
+        "schema_version": 1, "lifecycle_id": _SERIES_ID, "status": "complete", "payload_encoding": "binary",
+        "payload_type": "unified-diff", "bytes_written": 4, "bytes_total": 4, "complete": True,
+        "sha256_payload": digest, "sha256_full_stream": digest,
+    }
+    header.update(overrides)
+    return header
+
+
+def _v2_header(**overrides) -> dict:
+    header = _v1_header(schema_version=2, kind="recreation", sequence=1, base_commit="a" * 40)
+    header.update(overrides)
+    return header
+
+
+_VERSIONS = {"v1": (_v1_header, None), "v2": (_v2_header, "sha1")}
+
+
+def _assert_strict_refusal(raw: bytes, object_format, message: str) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        evidence.parse_artifact_strict(raw, object_format=object_format)
+    assert excinfo.type is ValueError
+    assert str(excinfo.value) == message
+    assert excinfo.value.__cause__ is None
+
+
+def test_canonical_v1_and_v2_headers_parse_unchanged():
+    for build, object_format in _VERSIONS.values():
+        raw = _frame_text(_canonical(build()))
+        header, payload = evidence.parse_artifact_strict(raw, object_format=object_format)
+        assert header == build() and payload == b"diff"
+        assert evidence.parse_artifact(raw) == (header, payload)
+
+
+@pytest.mark.parametrize("text", [b"[]", b'"header"', b"1", b"1.5", b"true", b"false", b"null"])
+@pytest.mark.parametrize("object_format", [None, "sha1"])
+def test_strict_reader_refuses_a_non_object_header(text, object_format):
+    _assert_strict_refusal(_frame_text(text), object_format, "not an evidence artifact: the header is not a JSON object")
+
+
+@pytest.mark.parametrize("version", list(_VERSIONS))
+@pytest.mark.parametrize("value", [1.0, 2.0, True, False, "1", "2", None])
+def test_strict_reader_refuses_a_non_integer_schema_version(version, value):
+    build, object_format = _VERSIONS[version]
+    raw = _frame_text(_canonical(build(schema_version=value)))
+    _assert_strict_refusal(raw, object_format, "not an evidence artifact: unsupported schema version")
+
+
+@pytest.mark.parametrize("version", list(_VERSIONS))
+@pytest.mark.parametrize("suffix", ["\n", " ", "0", "\r\n"])
+def test_strict_reader_refuses_a_lifecycle_id_with_trailing_characters(version, suffix):
+    build, object_format = _VERSIONS[version]
+    raw = _frame_text(_canonical(build(lifecycle_id=_SERIES_ID + suffix)))
+    _assert_strict_refusal(raw, object_format, "not an evidence artifact: malformed lifecycle_id")
+
+
+def _with_duplicate(header: dict, key: str, value) -> bytes:
+    text = _canonical(header)
+    extra = json.dumps({key: value}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")[1:-1]
+    return b"{" + extra + b"," + text[1:]
+
+
+_DUPLICATE_MESSAGE = "not an evidence artifact: the header has a duplicate key or a non-JSON constant"
+
+
+@pytest.mark.parametrize(
+    "version, key, conflicting",
+    [
+        ("v1", "schema_version", 2), ("v1", "lifecycle_id", "b" * 32), ("v1", "complete", False),
+        ("v2", "schema_version", 1), ("v2", "kind", "terminal"), ("v2", "sequence", 99),
+        ("v2", "base_commit", "b" * 40), ("v2", "lifecycle_id", "b" * 32),
+    ],
+)
+@pytest.mark.parametrize("identical", [True, False])
+def test_strict_reader_refuses_duplicate_keys(version, key, conflicting, identical):
+    build, object_format = _VERSIONS[version]
+    header = build()
+    raw = _frame_text(_with_duplicate(header, key, header[key] if identical else conflicting))
+    _assert_strict_refusal(raw, object_format, _DUPLICATE_MESSAGE)
+    # The non-strict reader's existing contract is unchanged: json keeps one value.
+    assert evidence.parse_artifact(raw)[0][key] == header[key]
+
+
+def test_strict_reader_refuses_a_nested_duplicate_and_non_json_constants():
+    nested = _canonical(_v1_header())[:-1] + b',"extra":{"a":1,"a":1}}'
+    _assert_strict_refusal(_frame_text(nested), None, _DUPLICATE_MESSAGE)
+    for constant in (b"NaN", b"Infinity", b"-Infinity"):
+        raw = _frame_text(_canonical(_v1_header())[:-1] + b',"bytes_total":' + constant + b"}")
+        _assert_strict_refusal(raw, None, _DUPLICATE_MESSAGE)
+
+
+@pytest.mark.parametrize(
+    "raw, message",
+    [
+        (_frame_text(b"\xff\xfe"), "not an evidence artifact: the header is not valid UTF-8 JSON"),
+        (_frame_text(b'{"schema_version":'), "not an evidence artifact: the header is not valid UTF-8 JSON"),
+        (_frame_text(b"[" * 100_000), "not an evidence artifact: the header is not valid UTF-8 JSON"),
+        (b"XXXX", "not an evidence artifact: bad magic"),
+        (evidence.ARTIFACT_MAGIC + b"\x00\x00", "not an evidence artifact: truncated before header length"),
+        (evidence.ARTIFACT_MAGIC + (99).to_bytes(4, "big") + b"{}", "not an evidence artifact: truncated header"),
+    ],
+    ids=["bad-utf8", "bad-json", "deep-nesting", "bad-magic", "short", "truncated"],
+)
+def test_strict_reader_malformed_input_raises_fixed_value_errors(raw, message):
+    _assert_strict_refusal(raw, None, message)
+
+
+@pytest.mark.parametrize("raw", ["text", None, 7, memoryview(b"CAEV")])
+def test_strict_reader_refuses_non_bytes_input(raw):
+    _assert_strict_refusal(raw, None, "not an evidence artifact: input is not bytes")
+
+
+def test_real_captured_artifacts_parse_identically_under_both_readers(tmp_path):
+    repo, base = _changed_repo(tmp_path)
+    assert _capture(tmp_path, repo, base).success
+    assert _capture(tmp_path, repo, base, recreation_sequence=1, object_format="sha1").success
+    for name, object_format in ((f"{_SERIES_ID}.evidence", None), (f"{_SERIES_ID}.recreation-01.evidence", "sha1")):
+        raw = (tmp_path / "out" / name).read_bytes()
+        assert evidence.parse_artifact_strict(raw, object_format=object_format) == evidence.parse_artifact(raw)
+
+
+def test_strict_reader_hides_the_integer_digit_limit_error():
+    """A JSON integer beyond Python's digit-conversion limit makes
+    `json.loads` raise a plain ValueError with a runtime-specific message;
+    the strict reader replaces it with its fixed wording."""
+    import sys
+
+    digits = sys.get_int_max_str_digits() + 1
+    text = _canonical(_v1_header())[:-1] + b',"extra":' + b"9" * digits + b"}"
+    with pytest.raises(ValueError) as lax:
+        evidence.parse_artifact(_frame_text(text))  # the lax reader's contract is unchanged
+    assert "digit" in str(lax.value).lower()
+    _assert_strict_refusal(_frame_text(text), None, "not an evidence artifact: the header is not valid UTF-8 JSON")

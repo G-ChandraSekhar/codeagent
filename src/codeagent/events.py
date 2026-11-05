@@ -76,6 +76,9 @@ class EventType(str, Enum):
     BUDGET_EXCEEDED = "budget_exceeded"
     RUN_FINISHED = "run_finished"
     EVIDENCE_CAPTURED = "evidence_captured"
+    # ADR 0004 Amendment 20 section 6: the live-run recreation audit pair.
+    WORKSPACE_RECREATION_STARTED = "workspace_recreation_started"
+    WORKSPACE_RECREATION_FINISHED = "workspace_recreation_finished"
 
 
 @unique
@@ -143,6 +146,19 @@ class ResponseRejectionReason(str, Enum):
 
     NOT_A_MODEL_TURN = "not_a_model_turn"
     STATUS_UNRECOGNIZED = "status_unrecognized"
+
+
+@unique
+class RecreationOutcome(str, Enum):
+    """`WorkspaceRecreationFinished.outcome` (ADR 0004 Amendment 20
+    sections 6-7). Only `RECREATED` lets the run continue."""
+
+    RECREATED = "recreated"
+    EVIDENCE_NOT_CONFIRMED = "evidence_not_confirmed"
+    DISPOSAL_FAILED = "disposal_failed"
+    FAILED_NOTHING_OWNED = "failed_nothing_owned"
+    UNCONFIRMED = "unconfirmed"
+    ADOPTED_THEN_FAILED = "adopted_then_failed"
 
 
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -1006,6 +1022,205 @@ class RunFinished(Event):
             )
 
 
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendment 20 section 6: the live-run worktree-recreation audit
+# contract. Validation messages are fixed and never echo a field value.
+# ---------------------------------------------------------------------------
+
+RECREATION_SEQUENCE_MIN = 1
+RECREATION_SEQUENCE_MAX = 99
+
+# Q1's legal recreation triggers: a post-write patch failure, an entry-gate
+# refusal (earlier contamination), and the two codes the controller maps a
+# confirmed-UNCHANGED `advance()` failure to. The event cannot tell an
+# UNCHANGED advance from an UNCHANGED establish (both map to these codes);
+# that distinction is the controller's Q1 classification, not this schema's.
+RECREATION_TRIGGER_CODES: frozenset[ErrorCode] = frozenset(
+    {
+        ErrorCode.PATCH_APPLICATION_FAILED,
+        ErrorCode.WORKSPACE_ENTRY_GATE_FAILED,
+        ErrorCode.CHECKPOINT_REF_UPDATE_REJECTED,
+        ErrorCode.CHECKPOINT_REF_OPERATION_FAILED,
+    }
+)
+
+_OID_SHAPE_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_RECREATION_ARTIFACT_ID_RE = re.compile(r"(?P<lifecycle>[0-9a-f]{32})\.recreation-(?P<kk>[0-9]{2})")
+
+
+def _require_recreation_sequence(value: object) -> None:
+    if type(value) is not int or not RECREATION_SEQUENCE_MIN <= value <= RECREATION_SEQUENCE_MAX:
+        raise ValueError("recreation_sequence must be an integer from 1 to 99")
+
+
+def _require_oid_shape(name: str, value: object) -> None:
+    """A SHA-1 or SHA-256 object-id shape (the event has no trusted object
+    format to decide between them); never the all-zero OID."""
+    if not isinstance(value, str) or not _OID_SHAPE_RE.fullmatch(value) or set(value) == {"0"}:
+        raise ValueError(f"{name} must be a 40- or 64-character lowercase hexadecimal object id, not all zero")
+
+
+@dataclass(frozen=True, kw_only=True)
+class WorkspaceRecreationStarted(Event):
+    """One recreation attempt has begun: Q1-Q6 all passed and sequence *k*
+    was minted (S0). Carries no path, output, or exception text."""
+
+    event_type: ClassVar[EventType] = EventType.WORKSPACE_RECREATION_STARTED
+    recreation_sequence: int
+    trigger_code: ErrorCode
+    checkpoint_id: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _require_recreation_sequence(self.recreation_sequence)
+        if not isinstance(self.trigger_code, ErrorCode) or self.trigger_code not in RECREATION_TRIGGER_CODES:
+            raise ValueError("trigger_code is not a legal recreation trigger")
+        _require_oid_shape("checkpoint_id", self.checkpoint_id)
+
+
+# The evidence receipt shapes ADR 0004 Amendment 20 section 5.2 allows
+# when Phase E did not confirm a complete artifact: code -> required
+# (receipt present, evidence_complete).
+_EVIDENCE_NOT_CONFIRMED_SHAPES: dict[ErrorCode, tuple[bool, bool | None]] = {
+    ErrorCode.EVIDENCE_INCOMPLETE: (True, False),
+    ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED: (True, True),
+    ErrorCode.EVIDENCE_ARTIFACT_COLLISION: (False, None),
+    ErrorCode.EVIDENCE_CAPTURE_FAILED: (False, None),
+}
+
+# Outcomes reached only after Phase E confirmed a complete artifact.
+_POST_EVIDENCE_FAILURE_OUTCOMES: frozenset[RecreationOutcome] = frozenset(
+    {
+        RecreationOutcome.DISPOSAL_FAILED,
+        RecreationOutcome.FAILED_NOTHING_OWNED,
+        RecreationOutcome.UNCONFIRMED,
+        RecreationOutcome.ADOPTED_THEN_FAILED,
+    }
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class WorkspaceRecreationFinished(Event):
+    """The categorical outcome of recreation attempt *k*. The receipt
+    (`artifact_id`, `sha256_payload`, `bytes_written`, `evidence_complete`)
+    describes the recreation artifact published under this attempt's own
+    name, present together exactly when one was published."""
+
+    event_type: ClassVar[EventType] = EventType.WORKSPACE_RECREATION_FINISHED
+    recreation_sequence: int
+    outcome: RecreationOutcome
+    artifact_id: str | None = None
+    sha256_payload: str | None = None
+    bytes_written: int | None = None
+    evidence_complete: bool | None = None
+    error: OperationalError | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _require_recreation_sequence(self.recreation_sequence)
+        if not isinstance(self.outcome, RecreationOutcome):
+            raise ValueError("outcome must be a RecreationOutcome")
+        present = (
+            self.artifact_id is not None,
+            self.sha256_payload is not None,
+            self.bytes_written is not None,
+            self.evidence_complete is not None,
+        )
+        if len(set(present)) != 1:
+            raise ValueError(
+                "artifact_id, sha256_payload, bytes_written, and evidence_complete must be "
+                "present or absent together"
+            )
+        has_receipt = present[0]
+        if has_receipt:
+            match = (
+                _RECREATION_ARTIFACT_ID_RE.fullmatch(self.artifact_id) if isinstance(self.artifact_id, str) else None
+            )
+            if match is None or int(match["kk"]) != self.recreation_sequence:
+                raise ValueError("artifact_id must name this attempt's recreation artifact")
+            _require_digest("sha256_payload", self.sha256_payload)
+            if type(self.bytes_written) is not int or self.bytes_written < 0:
+                raise ValueError("bytes_written must be a nonnegative integer")
+            if type(self.evidence_complete) is not bool:
+                raise ValueError("evidence_complete must be a bool")
+        if self.error is not None and not isinstance(self.error, OperationalError):
+            raise ValueError("error must be an OperationalError or None")
+
+        if self.outcome is RecreationOutcome.RECREATED:
+            if self.error is not None:
+                raise ValueError("RECREATED requires error=None")
+            if not has_receipt or self.evidence_complete is not True:
+                raise ValueError("RECREATED requires a complete evidence receipt")
+            return
+        if self.error is None:
+            raise ValueError("every outcome other than RECREATED requires an error")
+        if self.outcome is RecreationOutcome.EVIDENCE_NOT_CONFIRMED:
+            shape = _EVIDENCE_NOT_CONFIRMED_SHAPES.get(self.error.code)
+            if shape is None:
+                raise ValueError("EVIDENCE_NOT_CONFIRMED requires an EVIDENCE_* error code")
+            if (has_receipt, self.evidence_complete) != shape:
+                raise ValueError("the evidence receipt shape does not match the evidence error code")
+            return
+        # One of the four post-Phase-E failure outcomes.
+        if self.error.code is not ErrorCode.WORKSPACE_RECREATION_FAILED:
+            raise ValueError("an outcome after confirmed evidence requires WORKSPACE_RECREATION_FAILED")
+        if not has_receipt or self.evidence_complete is not True:
+            raise ValueError("an outcome after confirmed evidence requires a complete evidence receipt")
+
+
+def validate_recreation_trace(trace: "list[Event] | tuple[Event, ...]") -> None:
+    """Pure cross-validation of one run trace's recreation audit pairs (ADR
+    0004 Amendment 20 sections 4, 6 and 6.1). Raises `ValueError` with a
+    fixed message. Not called by the controller yet.
+
+    - Started sequences are exactly 1, 2, 3, ...: the recreator mints *k*
+      by one per attempt from 1, and a failed Started emission or process
+      death ends the run, so no later gap is ever legitimate.
+    - A Finished needs its own open Started, with the same sequence, and at
+      most one Finished per Started.
+    - No recreation event may follow `RunFinished`.
+    - An unmatched Started must be the last recreation event, and is legal
+      only in a trace with no `RunFinished` (the process died) or whose
+      later `RunFinished` is `UNRECOVERABLE_ERROR` (an emission failed)."""
+    open_sequence: int | None = None
+    expected_next = RECREATION_SEQUENCE_MIN
+    finished: set[int] = set()
+    run_finished: RunFinished | None = None
+    for event in trace:
+        if isinstance(event, RunFinished):
+            if run_finished is None:
+                run_finished = event
+            continue
+        if not isinstance(event, (WorkspaceRecreationStarted, WorkspaceRecreationFinished)):
+            continue
+        if run_finished is not None:
+            raise ValueError("a recreation event follows RunFinished")
+        if isinstance(event, WorkspaceRecreationStarted):
+            if open_sequence is not None:
+                raise ValueError("a recreation event follows an unmatched WorkspaceRecreationStarted")
+            if event.recreation_sequence != expected_next:
+                raise ValueError("WorkspaceRecreationStarted sequences must start at 1 and increase by exactly one")
+            open_sequence = event.recreation_sequence
+            expected_next = open_sequence + 1
+        else:
+            if open_sequence is None:
+                if event.recreation_sequence in finished:
+                    raise ValueError("a WorkspaceRecreationStarted has more than one WorkspaceRecreationFinished")
+                raise ValueError("a WorkspaceRecreationFinished has no WorkspaceRecreationStarted")
+            if event.recreation_sequence != open_sequence:
+                raise ValueError("a WorkspaceRecreationFinished does not match its WorkspaceRecreationStarted")
+            finished.add(open_sequence)
+            open_sequence = None
+    if (
+        open_sequence is not None
+        and run_finished is not None
+        and run_finished.terminal_reason is not TerminalReason.UNRECOVERABLE_ERROR
+    ):
+        raise ValueError(
+            "an unmatched WorkspaceRecreationStarted requires no RunFinished or an "
+            "UNRECOVERABLE_ERROR RunFinished"
+        )
+
 AnyEvent = (
     RunStarted
     | BaselineRecorded
@@ -1025,6 +1240,8 @@ AnyEvent = (
     | BudgetExceeded
     | RunFinished
     | EvidenceCaptured
+    | WorkspaceRecreationStarted
+    | WorkspaceRecreationFinished
 )
 
 EVENT_CLASSES_BY_TYPE: dict[EventType, type[Event]] = {
@@ -1046,4 +1263,6 @@ EVENT_CLASSES_BY_TYPE: dict[EventType, type[Event]] = {
     BudgetExceeded.event_type: BudgetExceeded,
     RunFinished.event_type: RunFinished,
     EvidenceCaptured.event_type: EvidenceCaptured,
+    WorkspaceRecreationStarted.event_type: WorkspaceRecreationStarted,
+    WorkspaceRecreationFinished.event_type: WorkspaceRecreationFinished,
 }

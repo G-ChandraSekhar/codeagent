@@ -1624,6 +1624,9 @@ def test_event_type_values_are_pinned() -> None:
         "budget_exceeded",
         "run_finished",
         "evidence_captured",
+        # ADR 0004 Amendment 20 section 6 (D5/C-1 step 4).
+        "workspace_recreation_started",
+        "workspace_recreation_finished",
     }
 
 
@@ -2066,3 +2069,366 @@ def test_run_finished_for_model_response_incomplete_carries_no_error() -> None:
             **kwargs,
             error=OperationalError(code=ErrorCode.MODEL_RESPONSE_MALFORMED, error_id="e", message="m"),
         )
+
+
+# --------------------------------------------------------------------
+# ADR 0004 Amendment 20 section 6: the recreation audit contract
+# (D5/C-1 step 4). Nothing emits these events yet.
+# --------------------------------------------------------------------
+
+import dataclasses as _dataclasses  # noqa: E402
+import itertools as _itertools  # noqa: E402
+
+_REC_LID = "ab" * 16
+_REC_DIGEST = "c" * 64
+_UNCONTROLLED = "/private/SECRET-PATH\ntraceback"
+_ENVELOPE_FIELDS = {"run_id", "sequence", "timestamp", "state", "iteration", "schema_version"}
+_TRIGGERS = sorted(events.RECREATION_TRIGGER_CODES, key=lambda c: c.value)
+_POST_EVIDENCE = [
+    events.RecreationOutcome.DISPOSAL_FAILED,
+    events.RecreationOutcome.FAILED_NOTHING_OWNED,
+    events.RecreationOutcome.UNCONFIRMED,
+    events.RecreationOutcome.ADOPTED_THEN_FAILED,
+]
+
+
+def _rec_error(code: ErrorCode) -> OperationalError:
+    return OperationalError(code=code, error_id="rec-1", message="fixed")
+
+
+def _started(sequence=1, trigger=ErrorCode.PATCH_APPLICATION_FAILED, checkpoint="1" * 40):
+    return events.WorkspaceRecreationStarted(
+        **make_envelope(state=domain.RunState.EXECUTE),
+        recreation_sequence=sequence,
+        trigger_code=trigger,
+        checkpoint_id=checkpoint,
+    )
+
+
+def _receipt_for(sequence: int, complete: bool | None) -> dict[str, object]:
+    if complete is None:
+        return {}
+    return dict(
+        artifact_id=f"{_REC_LID}.recreation-{sequence:02d}",
+        sha256_payload=_REC_DIGEST,
+        bytes_written=12,
+        evidence_complete=complete,
+    )
+
+
+def _finished(outcome=events.RecreationOutcome.RECREATED, sequence=1, receipt=True, error=None, **overrides):
+    kwargs = dict(_receipt_for(sequence, receipt), **overrides)
+    return events.WorkspaceRecreationFinished(
+        **make_envelope(state=domain.RunState.EXECUTE),
+        recreation_sequence=sequence,
+        outcome=outcome,
+        error=error,
+        **kwargs,
+    )
+
+
+def test_recreation_outcome_values_are_pinned() -> None:
+    assert {o.name: o.value for o in events.RecreationOutcome} == {
+        "RECREATED": "recreated",
+        "EVIDENCE_NOT_CONFIRMED": "evidence_not_confirmed",
+        "DISPOSAL_FAILED": "disposal_failed",
+        "FAILED_NOTHING_OWNED": "failed_nothing_owned",
+        "UNCONFIRMED": "unconfirmed",
+        "ADOPTED_THEN_FAILED": "adopted_then_failed",
+    }
+
+
+def test_recreation_outcome_values_never_collide_with_error_codes() -> None:
+    assert {o.value for o in events.RecreationOutcome}.isdisjoint({c.value for c in ErrorCode})
+
+
+def test_recreation_trigger_codes_are_pinned() -> None:
+    assert events.RECREATION_TRIGGER_CODES == {
+        ErrorCode.PATCH_APPLICATION_FAILED,
+        ErrorCode.WORKSPACE_ENTRY_GATE_FAILED,
+        ErrorCode.CHECKPOINT_REF_UPDATE_REJECTED,
+        ErrorCode.CHECKPOINT_REF_OPERATION_FAILED,
+    }
+
+
+def test_recreation_events_carry_no_path_output_or_exception_fields() -> None:
+    started = {f.name for f in _dataclasses.fields(events.WorkspaceRecreationStarted)}
+    finished = {f.name for f in _dataclasses.fields(events.WorkspaceRecreationFinished)}
+    assert started == _ENVELOPE_FIELDS | {"recreation_sequence", "trigger_code", "checkpoint_id"}
+    assert finished == _ENVELOPE_FIELDS | {
+        "recreation_sequence", "outcome", "artifact_id", "sha256_payload", "bytes_written", "evidence_complete",
+        "error",
+    }
+
+
+@pytest.mark.parametrize("trigger", _TRIGGERS, ids=lambda c: c.value)
+@pytest.mark.parametrize("checkpoint", ["1" * 40, "2" * 64, "0" * 39 + "1"])
+@pytest.mark.parametrize("sequence", [1, 50, 99])
+def test_started_accepts_every_legal_trigger_oid_shape_and_sequence(trigger, checkpoint, sequence) -> None:
+    e = _started(sequence, trigger, checkpoint)
+    assert (e.recreation_sequence, e.trigger_code, e.checkpoint_id) == (sequence, trigger, checkpoint)
+    assert e.event_type is events.EventType.WORKSPACE_RECREATION_STARTED
+
+
+_BAD_SEQUENCES = [0, 100, -1, True, False, 1.0, "1", None]
+
+
+@pytest.mark.parametrize("sequence", _BAD_SEQUENCES, ids=repr)
+def test_started_refuses_an_invalid_sequence(sequence) -> None:
+    with pytest.raises(ValueError, match=r"^recreation_sequence must be an integer from 1 to 99$"):
+        _started(sequence)
+
+
+@pytest.mark.parametrize("code", [c for c in ErrorCode if c not in events.RECREATION_TRIGGER_CODES], ids=lambda c: c.value)
+def test_started_refuses_every_non_trigger_error_code(code) -> None:
+    with pytest.raises(ValueError, match=r"^trigger_code is not a legal recreation trigger$"):
+        _started(trigger=code)
+
+
+@pytest.mark.parametrize("trigger", ["patch_application_failed", None, 1])
+def test_started_refuses_a_non_enum_trigger(trigger) -> None:
+    with pytest.raises(ValueError, match=r"^trigger_code is not a legal recreation trigger$"):
+        _started(trigger=trigger)
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    ["0" * 40, "0" * 64, "A" * 40, "a" * 39, "a" * 41, "a" * 63, "a" * 65, "g" * 40, "a" * 40 + "\n", "",
+     None, 7, b"a" * 40, _UNCONTROLLED],
+    ids=repr,
+)
+def test_started_refuses_an_invalid_checkpoint_id(checkpoint) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        _started(checkpoint=checkpoint)
+    assert str(excinfo.value) == (
+        "checkpoint_id must be a 40- or 64-character lowercase hexadecimal object id, not all zero"
+    )
+
+
+# --- WorkspaceRecreationFinished: the full outcome x code x receipt matrix ---
+
+_RECEIPT_VARIANTS = {"none": None, "complete": True, "incomplete": False}
+_EVIDENCE_SHAPES = {
+    ErrorCode.EVIDENCE_INCOMPLETE: "incomplete",
+    ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED: "complete",
+    ErrorCode.EVIDENCE_ARTIFACT_COLLISION: "none",
+    ErrorCode.EVIDENCE_CAPTURE_FAILED: "none",
+}
+
+
+def _finished_is_legal(outcome, code, receipt) -> bool:
+    if outcome is events.RecreationOutcome.RECREATED:
+        return code is None and receipt == "complete"
+    if code is None:
+        return False
+    if outcome is events.RecreationOutcome.EVIDENCE_NOT_CONFIRMED:
+        return _EVIDENCE_SHAPES.get(code) == receipt
+    return code is ErrorCode.WORKSPACE_RECREATION_FAILED and receipt == "complete"
+
+
+@pytest.mark.parametrize(
+    "outcome, code, receipt",
+    list(_itertools.product(events.RecreationOutcome, [None, *ErrorCode], _RECEIPT_VARIANTS)),
+    ids=lambda v: getattr(v, "value", v) if v is not None else "no-error",
+)
+def test_finished_matrix(outcome, code, receipt) -> None:
+    error = _rec_error(code) if code is not None else None
+    if _finished_is_legal(outcome, code, receipt):
+        e = _finished(outcome, receipt=_RECEIPT_VARIANTS[receipt], error=error)
+        assert e.outcome is outcome and e.error == error
+        assert e.event_type is events.EventType.WORKSPACE_RECREATION_FINISHED
+    else:
+        with pytest.raises(ValueError):
+            _finished(outcome, receipt=_RECEIPT_VARIANTS[receipt], error=error)
+
+
+def test_finished_matrix_has_exactly_the_documented_legal_cells() -> None:
+    legal = {
+        (o, c, r)
+        for o, c, r in _itertools.product(events.RecreationOutcome, [None, *ErrorCode], _RECEIPT_VARIANTS)
+        if _finished_is_legal(o, c, r)
+    }
+    assert legal == {
+        (events.RecreationOutcome.RECREATED, None, "complete"),
+        (events.RecreationOutcome.EVIDENCE_NOT_CONFIRMED, ErrorCode.EVIDENCE_INCOMPLETE, "incomplete"),
+        (events.RecreationOutcome.EVIDENCE_NOT_CONFIRMED, ErrorCode.EVIDENCE_DURABILITY_UNCONFIRMED, "complete"),
+        (events.RecreationOutcome.EVIDENCE_NOT_CONFIRMED, ErrorCode.EVIDENCE_ARTIFACT_COLLISION, "none"),
+        (events.RecreationOutcome.EVIDENCE_NOT_CONFIRMED, ErrorCode.EVIDENCE_CAPTURE_FAILED, "none"),
+        *((o, ErrorCode.WORKSPACE_RECREATION_FAILED, "complete") for o in _POST_EVIDENCE),
+    }
+
+
+@pytest.mark.parametrize("sequence", _BAD_SEQUENCES, ids=repr)
+def test_finished_refuses_an_invalid_sequence(sequence) -> None:
+    with pytest.raises(ValueError, match=r"^recreation_sequence must be an integer from 1 to 99$"):
+        events.WorkspaceRecreationFinished(
+            **make_envelope(), recreation_sequence=sequence, outcome=events.RecreationOutcome.RECREATED,
+            **_receipt_for(1, True),
+        )
+
+
+@pytest.mark.parametrize("sequence", [1, 99])
+def test_finished_accepts_both_sequence_bounds(sequence) -> None:
+    assert _finished(sequence=sequence).artifact_id == f"{_REC_LID}.recreation-{sequence:02d}"
+
+
+_RECEIPT_KEYS = ["artifact_id", "sha256_payload", "bytes_written", "evidence_complete"]
+
+
+@pytest.mark.parametrize(
+    "kept",
+    [set(c) for n in range(1, 4) for c in _itertools.combinations(_RECEIPT_KEYS, n)],
+    ids=lambda kept: "+".join(sorted(kept)),
+)
+def test_finished_refuses_a_partial_receipt(kept) -> None:
+    receipt = {k: v for k, v in _receipt_for(1, True).items() if k in kept}
+    with pytest.raises(ValueError, match="present or absent together"):
+        events.WorkspaceRecreationFinished(
+            **make_envelope(), recreation_sequence=1, outcome=events.RecreationOutcome.RECREATED, **receipt
+        )
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("artifact_id", f"{_REC_LID}.recreation-02", "artifact_id must name this attempt's recreation artifact"),
+        ("artifact_id", f"{_REC_LID}.recreation-00", "artifact_id must name this attempt's recreation artifact"),
+        ("artifact_id", _REC_LID, "artifact_id must name this attempt's recreation artifact"),
+        ("artifact_id", f"{_REC_LID.upper()}.recreation-01", "artifact_id must name this attempt's recreation artifact"),
+        ("artifact_id", f"{_REC_LID}.recreation-01\n", "artifact_id must name this attempt's recreation artifact"),
+        ("artifact_id", f"{_REC_LID}.recreation-1", "artifact_id must name this attempt's recreation artifact"),
+        ("artifact_id", _UNCONTROLLED, "artifact_id must name this attempt's recreation artifact"),
+        ("artifact_id", 7, "artifact_id must name this attempt's recreation artifact"),
+        ("sha256_payload", "C" * 64, "sha256_payload must be 64 lowercase hexadecimal characters"),
+        ("sha256_payload", _UNCONTROLLED, "sha256_payload must be 64 lowercase hexadecimal characters"),
+        ("bytes_written", -1, "bytes_written must be a nonnegative integer"),
+        ("bytes_written", True, "bytes_written must be a nonnegative integer"),
+        ("bytes_written", 1.0, "bytes_written must be a nonnegative integer"),
+        ("evidence_complete", 1, "evidence_complete must be a bool"),
+        ("evidence_complete", "true", "evidence_complete must be a bool"),
+    ],
+    ids=lambda v: repr(v)[:40],
+)
+def test_finished_refuses_a_malformed_receipt_field_without_echo(field, value, message) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        _finished(**{field: value})
+    assert str(excinfo.value) == message
+    assert "SECRET-PATH" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("outcome", ["recreated", None, ErrorCode.WORKSPACE_RECREATION_FAILED])
+def test_finished_refuses_a_non_enum_outcome(outcome) -> None:
+    with pytest.raises(ValueError, match=r"^outcome must be a RecreationOutcome$"):
+        events.WorkspaceRecreationFinished(**make_envelope(), recreation_sequence=1, outcome=outcome)
+
+
+@pytest.mark.parametrize("error", ["error text", {"code": "x"}, ErrorCode.WORKSPACE_RECREATION_FAILED])
+def test_finished_refuses_a_non_operational_error(error) -> None:
+    with pytest.raises(ValueError, match=r"^error must be an OperationalError or None$"):
+        _finished(events.RecreationOutcome.UNCONFIRMED, error=error)
+
+
+def test_finished_messages_never_echo_the_error_message() -> None:
+    error = OperationalError(code=ErrorCode.UNCLASSIFIED_FAILURE, error_id="x", message=_UNCONTROLLED)
+    for outcome in events.RecreationOutcome:
+        with pytest.raises(ValueError) as excinfo:
+            _finished(outcome, error=error)
+        assert "SECRET-PATH" not in str(excinfo.value)
+
+
+# --- Trace cross-validation ---
+
+
+def _run_finished(reason):
+    error = None
+    if reason is domain.TerminalReason.POLICY_VIOLATION:
+        error = _rec_error(ErrorCode.POLICY_VIOLATION_SEVERE)
+    elif reason is domain.TerminalReason.UNRECOVERABLE_ERROR:
+        error = _rec_error(ErrorCode.UNCLASSIFIED_FAILURE)
+    return events.RunFinished(
+        **make_envelope(state=domain.RunState.DONE),
+        terminal_reason=reason, total_cost_microusd=None, total_tokens=0, total_duration_seconds=0.0,
+        iterations_used=0, error=error,
+    )
+
+
+def _trace(spec):
+    """'S3' -> Started(3), 'F3' -> Finished(3, RECREATED), 'U' -> RunFinished(UNRECOVERABLE_ERROR),
+    'V' -> RunFinished(VERIFICATION_PASSED), 'X' -> an unrelated event."""
+    out = []
+    for token in spec.split():
+        if token[0] == "S":
+            out.append(_started(int(token[1:])))
+        elif token[0] == "F":
+            out.append(_finished(sequence=int(token[1:])))
+        elif token == "U":
+            out.append(_run_finished(domain.TerminalReason.UNRECOVERABLE_ERROR))
+        elif token == "V":
+            out.append(_run_finished(domain.TerminalReason.VERIFICATION_PASSED))
+        else:
+            out.append(events.RunStarted(
+                **make_envelope(state=domain.RunState.INIT), repository_path="/r", task_statement="t",
+                verify_command=("pytest",), approval_mode=domain.ApprovalMode.INTERACTIVE,
+            ))
+    return out
+
+
+_COUNTER = "WorkspaceRecreationStarted sequences must start at 1 and increase by exactly one"
+_AFTER_RUN_FINISHED = "a recreation event follows RunFinished"
+
+
+@pytest.mark.parametrize(
+    "spec",
+    ["", "X V", "S1 F1", "S1 F1 S2 F2 V", "X S1 X F1 X S2 X F2 V", "S1 F1 S2 F2 S3 F3 V",
+     "S1 F1 S2 F2 S3", "S1", "S1 F1 S2", "S1 U", "S1 F1 S2 U", "X S1 X U", "S1 F1 S2 X U"],
+)
+def test_recreation_trace_accepts(spec) -> None:
+    events.validate_recreation_trace(_trace(spec))
+    events.validate_recreation_trace(tuple(_trace(spec)))
+
+
+@pytest.mark.parametrize(
+    "spec, message",
+    [
+        ("F1", "a WorkspaceRecreationFinished has no WorkspaceRecreationStarted"),
+        ("F1 S1", "a WorkspaceRecreationFinished has no WorkspaceRecreationStarted"),
+        ("S1 F1 F1", "a WorkspaceRecreationStarted has more than one WorkspaceRecreationFinished"),
+        ("S1 F2", "a WorkspaceRecreationFinished does not match its WorkspaceRecreationStarted"),
+        ("S1 F1 S2 F1", "a WorkspaceRecreationFinished does not match its WorkspaceRecreationStarted"),
+        ("S2 F1", _COUNTER),
+        ("S2 F2", _COUNTER),
+        ("S3 F3", _COUNTER),
+        ("S99 F99", _COUNTER),
+        ("S2", _COUNTER),
+        ("S1 F1 S3 F3", _COUNTER),
+        ("S1 F1 S3", _COUNTER),
+        ("S2 F2 S3 F3", _COUNTER),
+        ("S1 F1 S1 F1", _COUNTER),
+        ("S2 F2 S1 F1", _COUNTER),
+        ("S1 S2", "a recreation event follows an unmatched WorkspaceRecreationStarted"),
+        ("S1 S2 F2", "a recreation event follows an unmatched WorkspaceRecreationStarted"),
+        ("S1 F1 S2 S3 U", "a recreation event follows an unmatched WorkspaceRecreationStarted"),
+        ("S1 V", "an unmatched WorkspaceRecreationStarted requires no RunFinished or an UNRECOVERABLE_ERROR RunFinished"),
+        ("V S1", _AFTER_RUN_FINISHED),
+        ("U S1", _AFTER_RUN_FINISHED),
+        ("U S1 F1", _AFTER_RUN_FINISHED),
+        ("S1 F1 U S2 F2", _AFTER_RUN_FINISHED),
+        ("S1 F1 V S2 F2", _AFTER_RUN_FINISHED),
+        ("S1 U F1", _AFTER_RUN_FINISHED),
+        ("S1 F1 U F1", _AFTER_RUN_FINISHED),
+        ("S1 F1 S2 X V", "an unmatched WorkspaceRecreationStarted requires no RunFinished or an UNRECOVERABLE_ERROR RunFinished"),
+    ],
+)
+def test_recreation_trace_refuses(spec, message) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        events.validate_recreation_trace(_trace(spec))
+    assert str(excinfo.value) == message
+
+
+@pytest.mark.parametrize(
+    "reason", [r for r in domain.TerminalReason if r is not domain.TerminalReason.UNRECOVERABLE_ERROR],
+    ids=lambda r: r.value,
+)
+def test_an_unmatched_started_is_refused_with_every_non_unrecoverable_run_finished(reason) -> None:
+    with pytest.raises(ValueError, match="requires no RunFinished or an UNRECOVERABLE_ERROR RunFinished"):
+        events.validate_recreation_trace([_started(1), _run_finished(reason)])

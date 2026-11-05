@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import secrets
 import stat
 import threading
@@ -334,7 +335,9 @@ class StateRoot:
         validate_hex32(lifecycle_id, field_name="lifecycle_id")
         return _open_abandoned_leaf(self, repo_key, lifecycle_id)
 
-    def reserve_worktree_leaf(self, repo_key: str, lifecycle_id: str) -> "_WorktreeLeafReservation":
+    def reserve_worktree_leaf(
+        self, repo_key: str, lifecycle_id: str, *, canonical_common_dir: str | None = None
+    ) -> "_WorktreeLeafReservation":
         """Milestone 3 Slice 3C-2 (ADR 0004 sections 8/16's already-accepted
         deterministic worktree layout, made real for the first time by this
         method). Opens/creates `worktrees/<repo_key>/` via the same managed,
@@ -362,9 +365,25 @@ class StateRoot:
         parent descriptor is closed before the original failure propagates
         (chained `from` it if that close itself fails — never silently
         discarded, never masking the original failure).
+
+        ADR 0004 Amendment 20 (D-2(a)): `canonical_common_dir`, when given,
+        must be the validated `RepositoryIdentity.canonical_common_dir` (in
+        production, `LifecycleLease.identity.canonical_common_dir`). It is
+        carried read-only for publisher-mode disposal's admin-entry gate and
+        is checked here, as an absolute, NUL-free string, before anything is
+        created.
         """
         validate_hex32(repo_key, field_name="repo_key")
         validate_hex32(lifecycle_id, field_name="lifecycle_id")
+        if canonical_common_dir is not None and (
+            not isinstance(canonical_common_dir, str)
+            or not os.path.isabs(canonical_common_dir)
+            or "\0" in canonical_common_dir
+        ):
+            raise LifecycleFsError(
+                LifecycleFsFailure.INVALID_COMPONENT,
+                "canonical_common_dir must be an absolute path string",
+            )
         parent_fd = open_managed_directory_chain(self.root_fd, ["worktrees", repo_key])
         try:
             leaf_fd = create_exclusive_directory_at(parent_fd, lifecycle_id)
@@ -383,6 +402,7 @@ class StateRoot:
             repo_key=repo_key,
             lifecycle_id=lifecycle_id,
             state_root_id=self.state_root_id,
+            canonical_common_dir=canonical_common_dir,
         )
 
     def close(self) -> None:
@@ -502,8 +522,10 @@ class _WorktreeLeafReservation:
         repo_key: str,
         lifecycle_id: str,
         state_root_id: str,
+        canonical_common_dir: str | None = None,
     ) -> None:
         self._path = path
+        self._canonical_common_dir = canonical_common_dir
         self._parent_fd = parent_fd
         self._leaf_fd = leaf_fd
         self._leaf_name = leaf_name
@@ -533,6 +555,19 @@ class _WorktreeLeafReservation:
     @property
     def state_root_id(self) -> str:
         return self._state_root_id
+
+    @property
+    def canonical_common_dir(self) -> str | None:
+        """ADR 0004 Amendment 20 (D-2(a)): the trusted repository common
+        directory for the admin-entry gate, or `None` when the caller
+        supplied none (permitted only without a worktree publisher)."""
+        return self._canonical_common_dir
+
+    @property
+    def consumed_and_open(self) -> bool:
+        """True only for a `CONSUMED` reservation whose descriptors are still
+        open (ADR 0004 Amendment 20 Q4). Read-only."""
+        return self._state is _ReservationState.CONSUMED and not self._descriptors_closed
 
     def observe_leaf(self) -> LeafObservation:
         """Observational, non-mutating, never raises (ADR 0004 Amendment
@@ -895,6 +930,132 @@ def _reservation_removal_error(result: _LeafRemovalResult) -> LifecycleFsError |
     else:
         message = "the worktree-leaf reservation's removal could not be confirmed"
     return LifecycleFsError(LifecycleFsFailure.CLEANUP_UNCONFIRMED, message)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0004 Amendments 12/13, shared by Amendment 20 (D-2(a)): the bounded,
+# names-only Git admin-directory scan, moved here unchanged from
+# reconciliation.py so the owner's disposal and the reconciler use one
+# implementation. `canonical_common_dir` must come from the validated
+# repository identity, never from projection content or a caller.
+# ---------------------------------------------------------------------------
+
+# ADR 0004 Amendment 12: the bounded, read-only Git admin-directory scan.
+# Only entry names are read (never stat'd, opened, or followed). Git names
+# a linked worktree's admin directory after the worktree directory's own
+# name, appending decimal digits on a collision.
+_ADMIN_SCAN_MAX_ENTRIES = 4096
+_ADMIN_SCAN_MAX_NAME_BYTES = 262_144
+_ADMIN_NAME_RE = re.compile(rb"^(?P<id>[0-9a-f]{32})(?P<suffix>[0-9]+)?$")
+
+
+@unique
+class AdminScanResult(str, Enum):
+    NONE_FOUND = "none_found"
+    MATCH_FOUND = "match_found"
+    UNEXPECTED_SUBSTRATE = "unexpected_substrate"
+    LIMIT_EXCEEDED = "limit_exceeded"
+    INSPECTION_FAILED = "inspection_failed"
+
+
+class _AdminScanDiagnostic(Exception):
+    """Private, categorical-only cause for an admin-scan cleanup failure:
+    carries the scan result already decided, never names or paths."""
+
+    def __init__(self, result: AdminScanResult) -> None:
+        super().__init__(result.value)
+        self.result = result
+
+
+def scan_worktree_admin_entries(canonical_common_dir: str, lifecycle_id: str) -> AdminScanResult:
+    """Bounded, read-only scan of `<common-dir>/worktrees/` for an admin
+    entry Git would have created for this lifecycle's worktree (ADR 0004
+    Amendment 12). `git worktree list` does not report an admin directory
+    whose `gitdir` file was never written, so registration absence alone
+    does not prove Git holds nothing for this path.
+
+    Every locally opened descriptor is closed exactly once; a close
+    failure raises `LifecycleFsError(CLEANUP_UNCONFIRMED)` (chained from a
+    categorical diagnostic of the result already decided) and dominates
+    every result. Never reads admin-file contents, never stats or opens an
+    entry, never follows a symlink, never deletes anything."""
+    opened: list[int] = []
+    try:
+        result = _scan_admin_entries_into(opened, canonical_common_dir, lifecycle_id)
+    except BaseException as exc:
+        _dominant_cleanup(opened, exc)
+        raise
+    _dominant_cleanup(opened, _AdminScanDiagnostic(result))
+    return result
+
+
+def count_worktree_admin_entries(canonical_common_dir: str, lifecycle_id: str) -> int | str:
+    """ADR 0004 Amendment 13: the same bounded, names-only, close-once scan,
+    counting every admin name for this lifecycle instead of stopping at
+    the first. Returns 0, 1, "many", or "unknown" (limit exceeded, an
+    inspection failure, or a `worktrees/` that is not a real directory).
+    A descriptor-close failure raises `LifecycleFsError(CLEANUP_UNCONFIRMED)`
+    and dominates, exactly as `scan_worktree_admin_entries`."""
+    opened: list[int] = []
+    counter = [0]
+    try:
+        result = _scan_admin_entries_into(opened, canonical_common_dir, lifecycle_id, counter=counter)
+    except BaseException as exc:
+        _dominant_cleanup(opened, exc)
+        raise
+    _dominant_cleanup(opened, _AdminScanDiagnostic(result))
+    if result in (AdminScanResult.NONE_FOUND, AdminScanResult.MATCH_FOUND):
+        return counter[0] if counter[0] < 2 else "many"
+    return "unknown"
+
+
+def _scan_admin_entries_into(
+    opened: list[int], canonical_common_dir: str, lifecycle_id: str, *, counter: list[int] | None = None
+) -> AdminScanResult:
+    flags = os.O_RDONLY | _directory_flag() | _nofollow_flag() | _cloexec_flag()
+    try:
+        common_fd = os.open(canonical_common_dir, flags)
+    except OSError:
+        return AdminScanResult.INSPECTION_FAILED
+    opened.append(common_fd)
+    # A failed CLOEXEC check propagates (SUBSTRATE_UNAVAILABLE); the caller
+    # closes every opened descriptor once, chained from that exact error.
+    _assert_cloexec(common_fd)
+    try:
+        worktrees_fd = os.open("worktrees", flags, dir_fd=common_fd)
+    except FileNotFoundError:
+        return AdminScanResult.NONE_FOUND  # Git creates worktrees/ lazily
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return AdminScanResult.UNEXPECTED_SUBSTRATE
+        return AdminScanResult.INSPECTION_FAILED
+    opened.append(worktrees_fd)
+    _assert_cloexec(worktrees_fd)
+
+    target = lifecycle_id.encode("ascii")
+    entries = 0
+    name_bytes = 0
+    try:
+        with os.scandir(worktrees_fd) as it:
+            for entry in it:
+                name = os.fsencode(entry.name)
+                # Bounds are enforced before any name is interpreted, so no
+                # entry -- matching or not -- is ever considered past them.
+                entries += 1
+                name_bytes += len(name)
+                if entries > _ADMIN_SCAN_MAX_ENTRIES or name_bytes > _ADMIN_SCAN_MAX_NAME_BYTES:
+                    return AdminScanResult.LIMIT_EXCEEDED
+                match = _ADMIN_NAME_RE.fullmatch(name)
+                if match is not None and match["id"] == target:
+                    if counter is None:
+                        return AdminScanResult.MATCH_FOUND
+                    counter[0] += 1
+    except OSError:
+        return AdminScanResult.INSPECTION_FAILED
+    if counter is not None and counter[0]:
+        return AdminScanResult.MATCH_FOUND
+    return AdminScanResult.NONE_FOUND
+
 
 
 @unique
