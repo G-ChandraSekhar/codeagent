@@ -9,7 +9,9 @@ runs below replace only the verifier.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import errno
 import json
 import os
 import shutil
@@ -350,11 +352,46 @@ def test_recreate_refuses_replay(h) -> None:
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _held_leaf_identity(reservation):
+    """A duplicate of the reservation's leaf descriptor, closed exactly once on
+    every exit path. Holding it keeps the old incarnation's inode allocated, so
+    `samestat` against the recreated path cannot be fooled by a filesystem that
+    reuses a freed inode number (Linux CI run 42130282872)."""
+    fd = os.dup(reservation.fileno())
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _fd_closed(fd) -> bool:
+    try:
+        os.fstat(fd)
+    except OSError as exc:
+        return exc.errno == errno.EBADF
+    return False
+
+
+def test_held_leaf_identity_survives_the_reservation_and_closes_on_failure(h) -> None:
+    with pytest.raises(AssertionError, match="later assertion"):
+        with _held_leaf_identity(h.reservation) as fd:
+            held = fd
+            assert os.path.samestat(os.fstat(fd), os.stat(h.leaf, follow_symlinks=False))
+            raise AssertionError("later assertion")
+    assert _fd_closed(held)
+    assert h.reservation.consumed_and_open, "the reservation's own descriptor was touched"
+
+
 def test_full_recreation_at_c(h) -> None:
+    with _held_leaf_identity(h.reservation) as old_fd:
+        _full_recreation_at_c(h, old_fd)
+
+
+def _full_recreation_at_c(h, old_fd) -> None:
     order: list = []
     installed = _record_publications(h, order)
     calls = _spy_sink(h, order)
-    old_inode = os.stat(h.leaf).st_ino
     rec = h.recreator()
     exits = []
     real_exit = h.reservation.__exit__
@@ -385,8 +422,10 @@ def test_full_recreation_at_c(h) -> None:
     assert (header["kind"], header["sequence"], header["base_commit"]) == ("recreation", 1, h.c)
     assert b"contaminating" in payload and b"+# accepted" not in payload
     assert result.artifact_id == f"{h.lease.lifecycle_id}.recreation-01" and result.evidence_complete is True
-    # The new incarnation: HEAD C, clean, same path, new inode, one admin entry.
-    assert Path(new.path) == h.leaf and os.stat(h.leaf).st_ino != old_inode
+    # The new incarnation: HEAD C, clean, same path, a distinct directory, one admin entry.
+    assert Path(new.path) == h.leaf
+    old_identity = os.fstat(old_fd)  # still usable after the old reservation closed
+    assert not os.path.samestat(old_identity, os.stat(h.leaf, follow_symlinks=False))
     assert _git(new.path, "rev-parse", "HEAD") == h.c and _git(new.path, "status", "--porcelain") == ""
     assert "contaminating" not in (new.path / "jobs" / "worker.py").read_text()
     assert _admin_names(h.lease) == [h.lease.lifecycle_id]
