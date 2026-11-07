@@ -913,12 +913,23 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   Amendment 17 chains that row with Amendment 16's checkpoint-ref row:
   when the same materialized worktree still has a checkpoint ref and both
   containers are absent, one pass removes the worktree first, then
-  re-lists containers and re-observes the ref before deleting it. None of
-  these mechanisms is **wired** to any CLI or controller composition path.
+  re-lists containers and re-observes the ref before deleting it. ADR 0004
+  Amendment 20 §9 (Steps 1–8 checkpoint, 2026-11-06) replaces Amendment
+  17's never-registered `creating` exclusion: when Amendment 12's evidence
+  holds (unregistered, zero admin entries, the leaf an empty owned 0700
+  directory or absent), one pass removes the leaf, records the worktree
+  `absent`, re-lists containers and re-observes the ref, then deletes the
+  ref. Its B5/B7 neighbours still block, with `ABANDONED_UNRESOLVED` as
+  the only exit, and live-run recreation itself is unreachable (N4).
+  **Reachability:** the Amendment 12, 13, 17 and 20 §9 rows are narrow
+  accepted rows in the shared reconciler. They are reached through
+  internal automatic admission reconciliation (`prepare_lifecycle()`) and
+  through the maintenance-only `codeagent reconcile`. They are not
+  reachable through an operator task-running `solve` path, which does not
+  exist (D6).
   Still unresolved and still blocking admission: a worktree whose
   containers remain, a worktree whose checkpoint ref is symbolic or not a
-  deletion candidate, a never-registered `creating` worktree with a
-  checkpoint ref, a locked/ambiguous/inconsistent
+  deletion candidate, a locked/ambiguous/inconsistent
   registration, an `absent` record with a leftover directory, an
   unregistered directory left by a partial Git removal, and general
   orphaned-worktree removal
@@ -927,7 +938,8 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   worktrees at deterministic paths under the CodeAgent state root,
   removed only after exact attribution and confirmed container absence,
   by fail-closed pre-run reconciliation or `codeagent reconcile`.
-  Implemented only for the narrow rows above (Amendments 12, 13 and 17)
+  Implemented only for the narrow rows above (Amendments 12, 13, 17 and
+  20 §9)
 - Evidence/future test: the S5 spike's macOS/arm64 evidence covers the
   worktree side of this too, in spike scaffolding only — it demonstrates
   a fresh-process reconciler correctly identifying and removing an
@@ -948,26 +960,38 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   `absent`, after ref `removing`), and T37 in
   `tests/integration/test_lifecycle_run.py` (a real owner SIGKILL, then
   real-Docker admission reconciling it) — automated-test evidence, not a
+  security review. For the Amendment 20 §9 row: owner SIGKILL tests in
+  `tests/integration/test_reconciliation_s9.py` and unit tests in
+  `tests/unit/test_reconciliation.py`, committed as `c25d8d6` with the
+  test-only fix-forward `40badb1`; Linux CI run 42338832309 (evidence and
+  limits in ADR 0004 Amendment 20 §14; the earlier run 42130282872 for
+  `c25d8d6` failed and does not Linux-confirm it). Automated-test evidence, not a
   security review
 - Residual risk: between the crash and the next sweep, content sits on disk
   — acceptable for a local single-user tool, not acceptable if this were
   ever multi-tenant (explicitly out of scope, A5). Accepting ADR 0004 does
   not mitigate or resolve this threat or T-F1 in production. T-F2 remains
-  open: the Amendment 12, 13 and 17 rows are implemented but unwired (no
-  CLI or controller path calls `prepare_lifecycle()`); worktrees whose
-  containers remain, an `absent` record's leftover
+  open, not because the reconciler is unwired (the Amendment 12, 13, 17
+  and 20 §9 rows are reached through internal admission reconciliation and
+  the maintenance-only `codeagent reconcile`, though no operator `solve`
+  path exists until D6), but because coverage is limited to those accepted
+  shapes: the residual shapes listed above still block admission;
+  worktrees whose containers remain, an `absent` record's leftover
   directory, a partial-removal leftover, and general orphaned-worktree
   cleanup remain unimplemented; and a reconciler killed by SIGKILL while
   `git worktree remove` runs leaves an orphaned Git process whose
-  lifetime nothing bounds. End-to-end mitigation still requires production wiring
-  plus production acceptance tests on both platforms. T-F1 remains open
+  lifetime nothing bounds. End-to-end mitigation still requires an
+  operator task path (D6) plus production acceptance tests on both
+  platforms. T-F1 remains open
   as stated in its own entry. ADR 0004 Amendment 18 (**Accepted** 2026-10-05;
   confirmed on GitHub-hosted Linux CI, run 37333036614) adds the operator exit for refused
   worktree shapes (`codeagent reconcile --abandon`): it records a
   disposition and never removes, adopts, or changes a worktree,
   registration, or leaf directory, so it is not a mitigation of T-F2
 - Owning milestone/spike: ADR 0004 (accepted) — Milestone 3 lifecycle
-  work; in progress (Amendments 12, 13 and 17 rows only; unwired)
+  work; in progress (Amendments 12, 13, 17 and 20 §9 rows only; reached
+  through admission reconciliation and `codeagent reconcile`, not through
+  any operator task path)
 
 **T-F3 — Corrupt/partial JSONL event log after crash mid-write.**
 - Asset/objective: O5, O7

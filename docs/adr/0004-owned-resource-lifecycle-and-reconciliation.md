@@ -6985,4 +6985,157 @@ SHA-256-verified.
 **Revision 3 accepted at joint review (2026-11-02):** the §2 ordering, §6.1,
 the §8a wording, §4's object-format authority and the §11 recount. Nothing in
 this amendment remains open. Implementation status is recorded here when D5
-lands.
+lands; the Steps 1–8 checkpoint, which is not D5, is recorded in §14.
+
+### 14. Steps 1–8 checkpoint: implementation status and Linux CI evidence (2026-11-06)
+
+**Status: a committed, Linux-CI-confirmed checkpoint. D5 is not complete.**
+Steps 1–8 of the companion D5/C-1 readiness plan are implemented. Step 9 (the
+D5 documentation, including the two docstrings it names) is not done. This
+section is the single authoritative record of the checkpoint's CI evidence.
+
+**What is committed.** Commit `c25d8d6530691fd53bbe215d32a7d9063d115617`
+("feat: add worktree recreation substrate") added this amendment's text and:
+
+- **Step 1:** the read-only `LifecycleLease.identity` and `.context`.
+- **Step 2:** the admin scan moved into `state_root.py`. The reservation
+  carries `canonical_common_dir`, publisher-mode `absent` requires zero admin
+  matches, and `worktree_absence.py` holds the shared read-only absence
+  confirmation.
+- **Step 3:** the §4 evidence series in `evidence.py`: kind, sequence, base
+  commit, the version-2 header, per-member names, the 1–99 bound and a strict
+  version-2 reader.
+- **Step 4:** `WorkspaceRecreationStarted`, `WorkspaceRecreationFinished`,
+  `RecreationOutcome` and `ErrorCode.WORKSPACE_RECREATION_FAILED`.
+- **Step 5:** `GitWorktree(materialize_commit=)`.
+- **Step 6:** the controller's `WorkspaceRecreator` seam, Q1, the events,
+  `H0`, and the §5.4 fallback.
+- **Step 7:** `_lifecycle_run._CompositionRecreator`: Q2–Q6, Phases E, D, R
+  and C, and R1/R2 tracking of the current objects.
+- **Step 8:** the §9 row in `reconciliation.py`. It is reached through
+  automatic admission reconciliation (`prepare_lifecycle()`) and through the
+  explicit maintenance `codeagent reconcile`.
+
+**Live recreation is unreachable.**
+`RunController._recreation_can_continue()` returns `False` until D5 integration
+adds the repair transition after a patch failure (N4). No run therefore calls
+the recreator; a patch failure ends the run exactly as before. §11's complete
+verification list remains D5's obligation and is not claimed by this
+checkpoint.
+
+**Failed run (historical evidence; it does not Linux-confirm `c25d8d6`).**
+Run
+[42130282872](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42130282872),
+push-triggered on `main` for exact head `c25d8d6`, attempt 1, ended
+`completed` / `failure`.
+
+- Workflow steps 1–8 and the leftover-container check (workflow step 10)
+  succeeded. The complete suite (workflow step 9) failed, and the Python
+  post-step was skipped. There was one `##[error]` line and one failure
+  annotation (exit code 1).
+- The mandatory Docker preflight succeeded. The dedicated Docker step gave
+  `14 passed in 13.61s`, all named `PASSED`.
+- The complete suite (`python -m pytest -q`, `CODEAGENT_REQUIRE_DOCKER: 1`)
+  gave `1 failed, 6937 passed, 4 skipped in 193.69s`.
+- **The one failure:**
+  `tests/integration/test_worktree_recreation.py::test_full_recreation_at_c`.
+  Its assertion `os.stat(h.leaf).st_ino != old_inode` compared raw inode
+  numbers, and failed as `9189797 != 9189797`.
+  - **Cause:** the old directory had been removed and nothing held it, so the
+    runner's filesystem gave its freed inode number to the recreated
+    directory.
+  - The assertion was not portable. The failure did not indicate a production
+    defect.
+- The leftover-container check printed nothing.
+
+**Fix forward.** Commit `40badb1d178a1cf6719e5f03c881619cb0221ee8` ("test:
+make worktree recreation identity check portable") is a separate child of
+`c25d8d6`: an ordinary push of `c25d8d6..40badb1`, not an amend.
+
+- It changes only `tests/integration/test_worktree_recreation.py`.
+- **The new identity check:**
+  - `test_full_recreation_at_c` duplicates the old reservation's leaf
+    descriptor before recreation and holds it throughout;
+  - it keeps the same-path assertion;
+  - it then asserts
+    `not os.path.samestat(os.fstat(dup), os.stat(h.leaf, follow_symlinks=False))`.
+
+  Holding the descriptor keeps the old directory's inode allocated, so the new
+  directory cannot receive the same number. The requirement that recreation
+  produces a distinct directory is unchanged.
+- A new regression test pins three things: the duplicate identifies the leaf;
+  it is closed when a later assertion fails; the reservation's own descriptor
+  is untouched.
+- There is no production, scope or design change.
+- **Local verification before the push** (macOS, `CODEAGENT_REQUIRE_DOCKER=1`):
+  - full suite: 6,941 passed, 2 skipped (the two non-UTF-8-filename tests,
+    which macOS refuses);
+  - the 21-file affected set: 3,346 passed, forward and reverse;
+  - the two mutation sets that include the changed file were rerun: 33/33 and
+    24/24 caught, by explicit assertions only, with every source restored and
+    SHA-256-verified.
+- A disposable container from the pinned image reproduced the failure on
+  `c25d8d6`, and both corrected tests passed. That is Docker Desktop's Linux
+  VM, not CI evidence.
+
+**Confirmed on GitHub-hosted Linux CI.** Run
+[42338832309](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42338832309)
+was independently re-verified from the Actions API and a freshly fetched raw
+job log.
+
+- **Run:** push-triggered on `main` for exact head
+  `40badb1d178a1cf6719e5f03c881619cb0221ee8`; attempt 1; `completed` /
+  `success`.
+- **Job:** exactly one, "Test (ubuntu-24.04, Python 3.12)". All 13 reported
+  steps `success`; zero error annotations and zero `##[error]` lines.
+- **Environment:**
+  - runner image `ubuntu-24.04`, version 20261101.360.1 (Ubuntu 24.04.5 LTS);
+  - kernel 7.0.0-1017-azure;
+  - CPython 3.12.16 and pytest 9.1.1;
+  - Git 2.56.0;
+  - Docker Engine - Community 28.0.4, client and server.
+- **Docker:** the mandatory preflight succeeded. Both test steps ran with
+  `CODEAGENT_REQUIRE_DOCKER: 1`.
+- **Image:** the pinned
+  `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`,
+  which reported platform `linux/amd64`.
+- **Dedicated Docker step:**
+  `python -m pytest tests/integration/test_slice_c.py tests/integration/test_cancellation_e2e.py -v`
+  gave `14 passed in 15.37s`, all named `PASSED`: the four `test_slice_c.py`
+  tests and E1–E10. Neither file contains a recreation test.
+- **Complete suite:** `python -m pytest -q` gave
+  `6939 passed, 4 skipped in 238.09s`, 0 failed. 6,939 + 4 = 6,943, matching
+  the local collected total. That is the failed run's 6,942 plus the new
+  regression test.
+- **Leftover-container check:** a full `docker ps -a --format '{{.Names}}'`
+  listing filtered through the anchored
+  `grep -E '^codeagent-(verify-|baseline-|verification-)'`, covering all three
+  families (detection only). It printed nothing, and the step succeeded.
+
+**Limits.**
+
+- `pytest -q` names no tests. The log therefore gives no named evidence for
+  `test_full_recreation_at_c`, the new descriptor regression, or any other
+  recreation or §9 test. That they ran and passed is an inference from three
+  things: the complete-suite command, the matching 6,943-test total, and zero
+  failures.
+- The four skipped tests are not identified, and are not guessed here. They are
+  not attributable to Docker, which was required and available in that step.
+- This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence. It is
+  not a security review and not ARM64 evidence.
+- Both raw logs are preserved outside the repository with their SHA-256s:
+  - 42130282872: `cb1be3209c810e83e2e64a8478a5b8ef354ff35fc91eb8137c60003999e80184`;
+  - 42338832309: `b9a35fbc5538241cf397473dc52fbdec622e3e89c4460c17c11aecb026d3bcf8`.
+
+**Boundaries unchanged by this evidence.**
+
+- **Not complete:** D5 itself. Live recreation remains unreachable (N4).
+- **Not implemented:** the four-operation patch protocol, whole-proposal
+  validation, the syntax guard, test-file rules, N1/N2's re-derivations, model
+  integration, and D6.
+- **Blocking residuals:** B5 and B7 still block, and their only exit is
+  `ABANDONED_UNRESOLVED` (§8a). A4 is unchanged.
+- **Threats:** T-E1 and T-F1 are unchanged. T-F2 gains reconciler-level
+  coverage for the §9 shape only.
+- **No claim:** of operator readiness, Gate α, `COMPLETE_FOR_V1` or v1
+  completion.

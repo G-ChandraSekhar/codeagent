@@ -220,7 +220,9 @@ Stage 2 (of the four-stage planning process in
   or resuming a worktree. True crash-consistent filesystem mutation is
   explicitly not guaranteed in v1 — the claim is recovery plus
   interruption detection/rejection at the controller boundary. No
-  implementation exists yet; the ADR records required Milestone 2
+  implementation existed then (historical: the recreation substrate is
+  now committed but unreachable; see the D5 Steps 1–8 checkpoint bullet
+  below); the ADR records required Milestone 2
   failure-path testing obligations (disposal/recreation failure,
   additions, deletions, renames, unexpected dirty/index states) that
   S3's evidence does not cover. **Amendment 1 (Accepted 2026-09-15)**
@@ -3240,13 +3242,48 @@ Stage 2 (of the four-stage planning process in
     feedback can carry repository content into the (fake) model context, so
     D7 must add redaction before a live model; the wall-clock deadline is
     soft; bidi format characters are a D6 residual; T-A4 is unmitigated.
-- **Next:** D5 (the transactional patch protocol) is the next
-  release-blocking dependency. Its substrate requires the C-1 ADR 0004
-  amendment to be accepted before any recreation implementation; its integration depends
-  on D4, now complete. D6 follows D5; Gate O stays satisfied. Remaining
-  planning range D5–D10: 198–405 h (cumulative D1–D10 363–677 h; D1–D4
-  165–272 h) — component planning estimates, not hours spent or commitments
-  (`docs/V1_COMPLETION_LEDGER.md`).
+- **Ledger D5, C-1 recreation substrate: Steps 1–8 checkpoint** (ADR 0004
+  Amendment 20, Accepted 2026-11-02; readiness-plan Steps 1–8) is
+  **committed and Linux-CI-confirmed as a checkpoint. D5 is not complete.**
+  - **Commits and runs:**
+    - Substrate commit `c25d8d6`. Its run
+      [42130282872](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42130282872)
+      **failed** in one test, `test_full_recreation_at_c`, whose raw
+      inode-number assertion was not portable. That run does not
+      Linux-confirm `c25d8d6` and is kept as historical evidence.
+    - Test-only fix-forward commit `40badb1`, a separate child commit
+      (held-descriptor `os.path.samestat` identity check plus a
+      descriptor-cleanup regression). Its run
+      [42338832309](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42338832309)
+      succeeded.
+    - Exact evidence and limits are only in Amendment 20 §14.
+  - **What exists:**
+    - the recreation substrate: the lease fields, the moved admin scan, the
+      evidence series, the recreation events, `materialize_commit`, the
+      controller seam and the composition recreator;
+    - the §9 dead-entry reconciliation row, wired through admission
+      reconciliation and the explicit maintenance `codeagent reconcile`.
+  - **Limits:** the quiet suite names neither the corrected test nor its
+    regression, so their CI execution is inferred, not named. The skipped
+    tests are unidentified. This is GitHub-hosted `ubuntu-24.04` x86_64
+    automated-test evidence, not a security review or ARM64 evidence.
+  - **Boundary:**
+    - live-run recreation is unreachable (`_recreation_can_continue()` is
+      `False` until N4);
+    - N4, the four-operation patch protocol, model integration and D6 are
+      not implemented;
+    - B5/B7 still block (exit: `ABANDONED_UNRESOLVED`);
+    - no operator-readiness, Gate α or v1 claim follows.
+- **Next:** the rest of D5 (N4's repair transition, the four-operation
+  patch protocol and its validation, N1/N2's re-derivations, model
+  integration and the Step 9 documentation), then D6; Gate O stays
+  satisfied. Remaining planning range D5–D10: 258–495 h (cumulative D1–D10
+  423–767 h; D1–D4 165–272 h; D5 re-estimated to 95–155 h on 2026-11-02
+  through the accepted Amendment 20 / companion D5 plan) — component
+  planning ranges, not measured hours spent or delivery commitments
+  (`docs/V1_COMPLETION_LEDGER.md`). (Historical: before
+  this checkpoint, this bullet said D5's substrate waited on the C-1
+  amendment's acceptance.)
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

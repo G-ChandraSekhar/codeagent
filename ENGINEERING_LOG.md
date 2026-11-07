@@ -7334,3 +7334,53 @@ transactional patching, and neither Gate α nor v1 completion. T-A4 remains
 unmitigated, D7 redaction and disclosure work is still required before any live
 model, and D5 validation is still absent. The earlier D4b entries' "Linux CI
 pending" wording is historical. `uv.lock` was not touched.
+
+## 2026-11-06 — D5/C-1 Steps 1–8: checkpoint commit, failed Linux CI, test-only fix-forward
+
+**What.** A documentation-only pass recording the D5/C-1 recreation-substrate
+checkpoint (ADR 0004 Amendment 20, readiness-plan Steps 1–8) and its CI history.
+Substrate commit `c25d8d6` was pushed as an ordinary fast-forward. Its Linux CI
+run 42130282872 failed in one test, `test_full_recreation_at_c`. That run is
+kept as historical evidence and does not Linux-confirm `c25d8d6`.
+Commit `40badb1`, a separate test-only child (not an amend), fixed it forward.
+Its run 42338832309 succeeded for that exact commit. Both runs were verified
+independently through the Actions API and freshly fetched raw logs, which are
+preserved outside the repository with their hashes. The exact counts,
+environment and failure/fix detail are only in Amendment 20 §14.
+
+**Trade-off / lesson.** The failing assertion compared raw inode numbers
+(`st_ino != old_inode`) after the old directory had been removed. A filesystem
+may give a freed inode number to the next directory, so the check was not
+portable. The Linux CI runner did so; local macOS runs did not.
+- **The fix:** hold a duplicate of the old leaf descriptor across recreation
+  (keeping the old inode allocated) and compare with `os.path.samestat`. This
+  is the same descriptor-versus-path identity production code uses. The
+  distinct-incarnation requirement is unchanged.
+- **Rejected alternatives:** rerunning the unchanged commit, and weakening the
+  check to a path-only assertion.
+- **Lesson:** identity checks across a removal must hold the old object, never
+  compare remembered numbers.
+
+**Limits.** The quiet suite names neither the corrected test nor its regression,
+so their CI execution is inferred from the complete-suite command, the matching
+collection total and zero failures. The skipped tests are unidentified. This is
+GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence, not a security
+review or ARM64 evidence.
+
+**Status.** Steps 1–8 are committed and Linux-CI-confirmed as a checkpoint.
+The §9 dead-entry row is wired through admission and the explicit
+`codeagent reconcile`.
+- **D5 is not complete.** Live-run recreation is unreachable until N4.
+- **Not implemented:** the four-operation patch protocol, N1/N2, model
+  integration, Step 9's documentation and D6.
+- **No claim:** of operator readiness, Gate α or v1.
+
+**Estimate.** The ledger's D5 value of 35–65 h was stale. It now carries the
+95–155 h retained by the accepted Amendment 20 revision-3 review and its
+companion D5 plan (2026-11-02; C-1 portion 57–94 h). Cumulative ranges move
+by +60/+90: first operator run 294–493 h, Gate α 361–628 h, public v1 423–767
+h, remaining D5–D10 258–495 h. These are component planning ranges, not
+measured hours spent or delivery commitments. Earlier entries' figures are
+historical.
+
+`uv.lock` was not touched.
