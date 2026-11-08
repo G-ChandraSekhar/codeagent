@@ -23,6 +23,7 @@ from codeagent import domain, events
 from codeagent.checkpoint_ref import CheckpointRef, new_lifecycle_id
 from codeagent.checkpoint_session import CheckpointSession
 from codeagent.controller import RunConfig, RunController
+from codeagent.errors import ErrorCode
 from codeagent.evidence import FilesystemEvidenceSink, parse_artifact
 from codeagent.patch import GitPatchApplier
 from codeagent.workspace import GitWorktree
@@ -150,8 +151,11 @@ def test_real_repo_to_worktree_to_patch_to_checkpoint_to_cleanup() -> None:
 
 
 def test_patch_validation_failure_leaves_worktree_and_original_unchanged_via_controller() -> None:
-    """The controller-level error path (UNRECOVERABLE_ERROR) exercised
-    with a real, failing GitPatchApplier instead of the fake one."""
+    """The controller-level patch-failure path exercised with a real,
+    failing GitPatchApplier instead of the fake one. Ledger D5-A (ADR 0007
+    Amendment 1, disclosed migration): each pre-write refusal now continues
+    the run, and the identical failing plan exhausts the repair budget
+    (BUDGET_EXCEEDED) instead of ending the run at the first failure."""
     with real_fixture_repo() as repo, tempfile.TemporaryDirectory(prefix="codeagent-evidence-") as evidence_root:
         before_content = (repo / "jobs" / "worker.py").read_text()
         before_status = _status(repo)
@@ -184,8 +188,11 @@ def test_patch_validation_failure_leaves_worktree_and_original_unchanged_via_con
 
             finished = controller.run()
 
-            assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
-            assert finished.error is not None
+            assert finished.terminal_reason is domain.TerminalReason.BUDGET_EXCEEDED
+            assert finished.error is None
+            failed = [e for e in controller.log.events if isinstance(e, events.ToolCompleted) and not e.success]
+            assert len(failed) == config.max_repair_iterations + 1
+            assert all(e.error.code is ErrorCode.PATCH_VALIDATION_FAILED for e in failed)
             assert not any(isinstance(e, events.PatchApplied) for e in controller.log.events)
             assert not any(isinstance(e, events.CheckpointCreated) for e in controller.log.events)
             # _terminate has already disposed the worktree by the time

@@ -89,7 +89,9 @@ def _read_completed(controller):
 
 
 def _assert_terminal_route(controller, finished):
-    (completed,) = _read_completed(controller)
+    reads = _read_completed(controller)
+    assert len(reads) == 1, f"expected one completed read, got {len(reads)}"
+    completed = reads[0]
     assert not completed.success and completed.error.code is ErrorCode.TOOL_EXECUTION_FAILED
     assert completed.error.message == MESSAGE
     assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
@@ -107,7 +109,11 @@ def test_close_fault_takes_the_single_terminal_route(worktree, monkeypatch):
     real = RunController._terminate
 
     def spy(self, *a, **k):
-        calls.append(sys._getframe(1).f_code.co_name)
+        caller = sys._getframe(1).f_code.co_name
+        calls.append(caller)
+        # Termination is owned by the turn loop, never the dispatcher; checked
+        # at the call itself, so a misplaced call is an assertion failure.
+        assert caller == "_explore_pass", f"_terminate called from {caller}"
         return real(self, *a, **k)
 
     monkeypatch.setattr(RunController, "_terminate", spy)
@@ -128,10 +134,12 @@ def test_body_interrupt_is_deferred_not_raised(worktree, monkeypatch):
 
     monkeypatch.setattr(repo_tools, "_read", read)
     controller = _controller(RepoTools(worktree))
+    escaped = None
     try:
         finished = controller.run()
-    except BaseException as exc:  # noqa: BLE001 - an escape must fail, not abort, the session
-        pytest.fail(f"the deferred interrupt escaped run(): {type(exc).__name__}")
+    except KeyboardInterrupt as exc:  # only the injected interrupt; anything else propagates
+        escaped = exc
+    assert escaped is None, "the deferred interrupt escaped run()"
     _assert_terminal_route(controller, finished)
     assert controller.deferred_interrupt is interrupt
     assert controller.tool_cleanup_failures[0].body_failure is interrupt
@@ -156,10 +164,12 @@ def test_an_earlier_deferred_interrupt_keeps_priority(worktree, monkeypatch):
     controller = _controller(RepoTools(worktree))
     earlier = SystemExit()
     controller._deferred_interrupt = earlier
+    escaped = None
     try:
         controller.run()
-    except BaseException as exc:  # noqa: BLE001
-        pytest.fail(f"an interrupt escaped run(): {type(exc).__name__}")
+    except (KeyboardInterrupt, SystemExit) as exc:  # only the injected or earlier interrupt
+        escaped = exc
+    assert escaped is None, "an interrupt escaped run()"
     assert controller.deferred_interrupt is earlier
 
 
@@ -183,7 +193,9 @@ def test_duration_of_the_failed_read_is_accounted(worktree, monkeypatch):
     monkeypatch.setattr(repo_tools, "_close", _CloseFault())
     controller = _controller(RepoTools(worktree))
     finished = controller.run()
-    (completed,) = _read_completed(controller)
+    reads = _read_completed(controller)
+    assert len(reads) == 1, f"expected one completed read, got {len(reads)}"
+    completed = reads[0]
     baseline = next(e for e in controller.log.events if isinstance(e, events.BaselineRecorded))
     assert completed.duration_seconds > 0
     # Ledger D4b (U3): the total also includes each model request's latency.

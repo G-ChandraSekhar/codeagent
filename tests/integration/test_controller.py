@@ -413,13 +413,19 @@ def test_two_independent_runs_with_stepping_clock_produce_identical_timestamps()
 
 
 def test_patch_failure_reuses_the_same_error_id_across_events() -> None:
-    controller = _build("r-patch-fail", patch_should_fail=True)
+    # Ledger D5-A (ADR 0007 Amendment 1, disclosed migration): a
+    # PATCH_VALIDATION_FAILED now continues the run (see
+    # test_patch_failure_continuation.py), so this identity guarantee is
+    # proven on PATCH_APPLICATION_FAILED, which still ends the run.
+    controller = _build(
+        "r-patch-fail", patch_should_fail=True, patch_failure_code=ErrorCode.PATCH_APPLICATION_FAILED
+    )
     finished = controller.run()
 
     _assert_monotonic_sequence(controller)
     assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
     assert finished.error is not None
-    assert finished.error.code is ErrorCode.PATCH_VALIDATION_FAILED
+    assert finished.error.code is ErrorCode.PATCH_APPLICATION_FAILED
 
     failed_tool_completions = [
         e for e in controller.log.events if isinstance(e, events.ToolCompleted) and not e.success
@@ -448,7 +454,7 @@ def test_patch_failure_propagates_the_identical_error_object_for_new_adr0006_cod
 ) -> None:
     """ADR 0006's patch.py-hardening slice adds two new ErrorCodes. This
     proves the same object-identity/error_id-reuse guarantee already
-    established for PATCH_VALIDATION_FAILED above also holds for both
+    established for a terminating patch failure above also holds for both
     new codes: _dispatch_apply_patch's returned OperationalError is the
     exact same object forwarded into both ToolCompleted.error and (via
     _finish) RunFinished.error -- not merely an equal-by-value copy."""
@@ -2138,8 +2144,11 @@ def test_precedence_returned_failure_outranks_a_pending_cancellation(which):
                 source.request("t")
                 return super().apply(run_id, iteration, approved_paths, operations)
 
-        kwargs["patch_applier"] = Applier(should_fail=True)
-        expected = ErrorCode.PATCH_VALIDATION_FAILED
+        # Ledger D5-A (disclosed migration): a terminating patch code; a
+        # continuable PATCH_VALIDATION_FAILED is observed at C28 instead
+        # (test_pending_cancellation_during_a_t1_patch_is_observed_at_c28).
+        kwargs["patch_applier"] = Applier(should_fail=True, failure_code=ErrorCode.PATCH_APPLICATION_FAILED)
+        expected = ErrorCode.PATCH_APPLICATION_FAILED
     else:
         env = _vr(events.VerificationOutcome.ENVIRONMENT_FAILURE, code=ErrorCode.EXECUTOR_ENVIRONMENT_FAILURE)
         calls = {"n": 0}
@@ -2156,6 +2165,28 @@ def test_precedence_returned_failure_outranks_a_pending_cancellation(which):
     finished = controller.run()
     assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
     assert finished.error.code is expected
+
+
+def test_pending_cancellation_during_a_t1_patch_is_observed_at_c28():
+    """Ledger D5-A (ADR 0007 Amendment 1 §A1.5): a pre-write
+    PATCH_VALIDATION_FAILED is a returned, continuable failure, like a
+    failed read at C27, so a cancellation requested during it is observed
+    at C28: CANCELLED, with no transition and no feedback."""
+    source = _source()
+
+    class Applier(FakePatchApplier):
+        def apply(self, run_id, iteration, approved_paths, operations):
+            source.request("t")
+            return super().apply(run_id, iteration, approved_paths, operations)
+
+    controller = _build("r-p4-t1", patch_applier=Applier(should_fail=True))
+    controller._cancellation = source.token
+    finished = controller.run()
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED and finished.error is None
+    assert controller._cancellation_sites[-1][0] == "C28"
+    assert not [e for e in controller.log.events if isinstance(e, events.StateTransitioned) and e.trigger is domain.Trigger.PATCH_FAILED]
+    (done,) = [e for e in controller.log.events if isinstance(e, events.ToolCompleted) and e.tool is domain.ToolName.APPLY_PATCH]
+    assert not done.success and done.error.code is ErrorCode.PATCH_VALIDATION_FAILED
 
 
 def test_pending_cancellation_during_the_patch_is_observed_at_c19():

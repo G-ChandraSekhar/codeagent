@@ -7384,3 +7384,112 @@ measured hours spent or delivery commitments. Earlier entries' figures are
 historical.
 
 `uv.lock` was not touched.
+
+## 2026-11-07 — D5-A: continuation after a pre-write patch validation failure (uncommitted)
+
+**What.** Ledger D5, slice D5-A, per ADR 0007 Amendment 1 (Accepted
+2026-11-07) and the accepted D5 continuation plan, revision 3 (outside the
+repository, sha256 `9b7a7dd1…c32880b32fc305`). A pre-write
+`PATCH_VALIDATION_FAILED` (a stale `expected_text`) on a `PRESENT` session now
+returns the run to EXPLORE with never-dropped `PATCH_FAILED` feedback instead
+of ending it. Implemented and locally verified on macOS; **unstaged,
+uncommitted and not Linux-CI-confirmed.** D5 stays In Progress, not Done.
+
+**Changes.**
+- `domain.py`: `Trigger.PATCH_FAILED`, legal only as EXECUTE → EXPLORE; no
+  terminal reason.
+- `model_protocol.py`: `FeedbackKind.PATCH_FAILED` (not droppable),
+  `PATCH_FAILED_MESSAGE_MAX_BYTES = 512`, `PATCH_FAILED_ITEM_MAX_BYTES`
+  (≤ `VERIFICATION_ITEM_MAX_BYTES`, so the existing fit proof is unchanged),
+  `utf8_prefix()`.
+- `controller.py`: after a failed patch, Gate zero (an earlier unconfirmed
+  verifier cleanup ends the run) before classification for every mapped
+  failure T1–T7; `patch_failure_continues()` continues only T1; then C28, the
+  shared repair-budget check, and C30 as the transition's entry check;
+  feedback, the single repair charge and the pass advance only after C30. C29
+  is neither registered nor consulted. The verifier check in
+  `_route_patch_failure` became redundant and was removed (Gate zero precedes
+  it). `_recreation_can_continue()` stays `False`.
+- `.github/workflows/ci.yml`: exactly one node added to the verbose Docker
+  step, `test_patch_failure_continuation.py::test_d5a_stale_expected_text_continues_to_passing_verification_real_docker`.
+- ADR 0007: Amendment 1 marked Accepted; its Consequences line about a stale
+  `expected_text` labelled historical; A17's result wording corrected (both
+  variants fail all eight cases because the classifier spy requires zero
+  calls; the discriminating subsets are T2–T7 and T6–T7).
+
+**Disclosed test migrations (corrected, not deleted).** Five tests pinned
+"a stale `expected_text` ends the run": `test_controller.py`'s error-id
+identity test and the returned-failure precedence `[patch]` case now use
+`PATCH_APPLICATION_FAILED` (still terminal), with a new companion test that a
+cancellation during a T1 patch is observed at C28;
+`test_d4b_model_loop.py`'s mapped-shape test likewise; A21 in
+`test_d4b_e2e.py` is renamed and asserts continuation until the repair budget
+(real Docker); `test_slice_b.py`'s real-Git validation test expects
+`BUDGET_EXCEEDED` after `max+1` failures. Domain trigger pins updated. ADR
+§A1.9 listed four of these; `test_slice_b.py` was a fifth.
+
+**Mutation evidence and harness recovery.**
+- The Step 6 harness (`mut6b.py`) had been lost with its scratchpad. It was
+  reconstructed by replaying its recorded write and one patch from the session
+  transcript; its 27 mutation names match the preserved run record exactly,
+  and it caught 27/27 on unmodified `086dc62` before any production edit. D5-A
+  removed M06's original anchor, so M06 was re-pointed to Gate zero.
+- The D4b harness was recovered the same way from the D4b session transcript
+  (82 entries). The strict rule (explicit assertion failures only; no other
+  failure, error, interruption or timeout) was applied to it for the first
+  time: 15 of its 77 D5-A-invalidated mutations were detected only through
+  incidental exceptions or `pytest.raises`/`pytest.fail`, identically on a
+  pristine `086dc62` clone, so the gap predates D5-A. Each test was narrowed so
+  the defect boundary is an explicit `assert` and unrelated exceptions still
+  propagate: `assert finished.error is not None` (MR5, MR37, MR74); `assert
+  denied` (MR16); a `_raised(exc_type, fn)` helper catching only the expected
+  type, then an identity assertion (MR53, MR106, MRJ1a, MRJ1b); explicit length
+  assertions in place of single-element unpacking (MR52, MR63, MR67, MR103);
+  `getattr(..., None)` inside the assert (MR52); a caller assertion inside the
+  `_terminate` spy (MR84, whose mutation raises its own `RuntimeError` after
+  the dispatcher terminates); narrowed `except KeyboardInterrupt`/`SystemExit`
+  in place of `except BaseException` plus `pytest.fail` (MR66/MR87); and a
+  helper converting only the `RunFinished` schema `ValueError` into an
+  assertion (MR94, which production validation itself blocks). No test was
+  weakened, deleted or skipped.
+- D5-A's own harness was tightened before counting: A3 needed a
+  validation-failure case on an `ADVANCING` session (the original T6 case
+  could not catch a dropped session check), A14 is behaviourally equivalent
+  except for the reset invariant, now asserted directly, and three tests used
+  unpacking/`.index()` and were converted to explicit assertions.
+
+**Final local results (macOS, `CODEAGENT_REQUIRE_DOCKER=1`,
+`PYTHONDONTWRITEBYTECODE=1`).** Every harness ran clean baseline → every
+mutation → clean baseline, exact anchors, every source restored and
+SHA-256-verified, tree unchanged:
+- D5-A: 17 categories / 18 runs, 18/18 strict (baselines 282 passed).
+- D4b: 77/77 strict (baselines 167 passed); 5 of 82 not invalidated.
+- Step 6: 27/27 (1,153 passed); Step 7: 33/33 (1,101 passed); Step 8: 24/24
+  (735 passed). Steps 7 and 8 were not invalidated and ran as supplementary
+  evidence.
+- Directly affected set (15 files): 3,215 passed, forward and reverse.
+- Exact CI verbose command: 15 passed.
+- Complete suite: 7,007 passed, 2 skipped (the two non-UTF-8-filename tests macOS refuses) on the final run; an earlier run had 1 failed, 7,006 passed, the one failure being the pre-existing intermittent test below.
+- `git diff --check` clean; no leftover containers, worktrees,
+  `refs/codeagent` refs, processes, default state root or temp evidence.
+
+**Residual found, not fixed here.**
+`test_executor.py::test_l2_timeout_kills_the_whole_process_group` (D3) is
+intermittent: it failed in one complete-suite run and in 3 of 10 isolated
+runs, and in 1 of 20 runs on a pristine `086dc62` clone. It predates D5-A; its
+shim records nothing before the short abort timeout under load.
+
+**Estimate.** D5 is re-estimated from 95–155 h to **174–289 h** (C-1 Steps
+1–8 56–92, remaining Step 9 1–2, D5-A 22.5–36, D5-B 49.5–79, D5-C 45–80; Step
+9 counted once; low confidence). Remaining D5–D10 337–629 h; first operator
+run 373–627 h; Gate α 440–762 h; public v1 502–901 h; Gate O 86–140 h and
+completed D1–D4 165–272 h unchanged. D5-C is re-estimated from its own
+detailed plan before implementation. These are component planning ranges,
+not measured hours or commitments.
+
+**Not done / no claim.** D5-B (N4 recreation continuation, C29), D5-C (the
+four-operation protocol, N1/N2, model integration) and D6 are not
+implemented; live recreation stays unreachable; post-write failures still end
+the run. No live model or operator path; no Gate α, operator-ready,
+`COMPLETE_FOR_V1` or v1-complete claim; no threat-model conclusion changes.
+`uv.lock` was not touched.

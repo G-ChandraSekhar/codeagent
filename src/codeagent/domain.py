@@ -64,6 +64,11 @@ class Trigger(str, Enum):
     # trigger: model requests happen only in EXPLORE, so it is legal there
     # alone.
     MODEL_RESPONSE_INCOMPLETE = "model_response_incomplete"
+    # Ledger D5-A (ADR 0007 Amendment 1): a returned patch failure the
+    # controller continues from (today only a pre-write
+    # PATCH_VALIDATION_FAILED). Not an abort trigger and no terminal reason:
+    # the repair loop returns to EXPLORE.
+    PATCH_FAILED = "patch_failed"
 
 
 @unique
@@ -204,6 +209,7 @@ _TRANSITIONS: dict[tuple[RunState, Trigger], RunState] = {
     (RunState.VERIFY, Trigger.VERIFICATION_PASSED): RunState.DONE,
     (RunState.VERIFY, Trigger.VERIFICATION_FAILED): RunState.EXPLORE,
     (RunState.EXPLORE, Trigger.MODEL_RESPONSE_INCOMPLETE): RunState.DONE,
+    (RunState.EXECUTE, Trigger.PATCH_FAILED): RunState.EXPLORE,
 }
 
 # Terminal reason recorded for each trigger that ends a run. Every

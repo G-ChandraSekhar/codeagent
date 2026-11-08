@@ -71,7 +71,7 @@ jobs:
       - name: Run real Docker verification tests (must execute, not skip)
         env:
           CODEAGENT_REQUIRE_DOCKER: "1"
-        run: python -m pytest tests/integration/test_slice_c.py tests/integration/test_cancellation_e2e.py -v
+        run: python -m pytest tests/integration/test_slice_c.py tests/integration/test_cancellation_e2e.py tests/integration/test_patch_failure_continuation.py::test_d5a_stale_expected_text_continues_to_passing_verification_real_docker -v
 
       - name: Run complete test suite
         env:

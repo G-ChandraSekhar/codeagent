@@ -48,6 +48,9 @@ LEGAL_TRANSITIONS: dict[tuple[RunState, Trigger], RunState] = {
     (RunState.VERIFY, Trigger.VERIFICATION_FAILED): RunState.EXPLORE,
     # Ledger D4b (U13): a valid INCOMPLETE model response, from EXPLORE only.
     (RunState.EXPLORE, Trigger.MODEL_RESPONSE_INCOMPLETE): RunState.DONE,
+    # Ledger D5-A (ADR 0007 Amendment 1): a continued patch failure, from
+    # EXECUTE only, back to EXPLORE. Not terminal.
+    (RunState.EXECUTE, Trigger.PATCH_FAILED): RunState.EXPLORE,
 }
 
 TERMINAL_REASONS_BY_TRIGGER: dict[Trigger, TerminalReason] = {
@@ -418,6 +421,7 @@ def test_trigger_values_are_pinned() -> None:
         "cancelled",
         "unrecoverable_error",
         "model_response_incomplete",
+        "patch_failed",
     }
 
 
@@ -499,3 +503,14 @@ def test_approval_decision_maps_to_a_trigger_legal_in_approval_state(
     assert trigger is expected_trigger
     result = transition(RunState.APPROVAL, trigger)
     assert result.next_state is expected_state
+
+
+def test_patch_failed_is_legal_only_from_execute_and_is_not_terminal() -> None:
+    """Ledger D5-A (ADR 0007 Amendment 1 §A1.2)."""
+    result = transition(RunState.EXECUTE, Trigger.PATCH_FAILED)
+    assert result.next_state is RunState.EXPLORE and result.terminal_reason is None
+    assert Trigger.PATCH_FAILED not in ABORT_TRIGGERS
+    for state in RunState:
+        if state is not RunState.EXECUTE:
+            with pytest.raises(IllegalTransitionError):
+                transition(state, Trigger.PATCH_FAILED)

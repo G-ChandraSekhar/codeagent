@@ -49,6 +49,10 @@ TOOL_RESULT_ITEM_MAX_BYTES = 80 * 1024 + 3 * 1024
 VERIFICATION_ITEM_MAX_BYTES = 2 * VERIFICATION_TAIL_BYTES + 1024
 REVISION_ITEM_MAX_BYTES = 2 * MAX_NOTE_BYTES + 512
 BASELINE_MAX_BYTES = 2 * BASELINE_TAIL_BYTES + 512
+# Ledger D5-A (ADR 0007 Amendment 1 §A1.6): the patch-failure message is at
+# most 512 UTF-8 bytes; canonical JSON escaping at most doubles it.
+PATCH_FAILED_MESSAGE_MAX_BYTES = 512
+PATCH_FAILED_ITEM_MAX_BYTES = 2 * PATCH_FAILED_MESSAGE_MAX_BYTES + 512
 CONTEXT_ENVELOPE_MAX_BYTES = 512
 
 _METADATA_RE = re.compile(rb"[A-Za-z0-9._:-]{1,128}")
@@ -100,6 +104,7 @@ class FeedbackKind(str, Enum):
     MALFORMED_RESPONSE = "malformed_response"
     VERIFICATION_FAILED = "verification_failed"
     REVISION_REQUESTED = "revision_requested"
+    PATCH_FAILED = "patch_failed"
 
 
 DROPPABLE_KINDS = frozenset({FeedbackKind.TOOL_RESULT, FeedbackKind.TOOL_DENIED, FeedbackKind.MALFORMED_RESPONSE})
@@ -171,6 +176,14 @@ def encoded_tail(text: str, limit: int) -> str:
         else:
             lo = mid + 1
     return clean[lo:]
+
+
+def utf8_prefix(text: str, limit: int) -> str:
+    """The longest prefix of `sanitize_recorded_text(text)` whose UTF-8
+    encoding is at most `limit` bytes, cut on a character boundary. A lone
+    surrogate becomes '?'."""
+    encoded = sanitize_recorded_text(text).encode("utf-8", "replace")
+    return encoded[:limit].decode("utf-8", "ignore")
 
 
 # --- envelope classification ------------------------------------------------

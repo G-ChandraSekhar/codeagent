@@ -3274,16 +3274,42 @@ Stage 2 (of the four-stage planning process in
       not implemented;
     - B5/B7 still block (exit: `ABANDONED_UNRESOLVED`);
     - no operator-readiness, Gate α or v1 claim follows.
-- **Next:** the rest of D5 (N4's repair transition, the four-operation
-  patch protocol and its validation, N1/N2's re-derivations, model
-  integration and the Step 9 documentation), then D6; Gate O stays
-  satisfied. Remaining planning range D5–D10: 258–495 h (cumulative D1–D10
-  423–767 h; D1–D4 165–272 h; D5 re-estimated to 95–155 h on 2026-11-02
-  through the accepted Amendment 20 / companion D5 plan) — component
-  planning ranges, not measured hours spent or delivery commitments
-  (`docs/V1_COMPLETION_LEDGER.md`). (Historical: before
-  this checkpoint, this bullet said D5's substrate waited on the C-1
-  amendment's acceptance.)
+- **Ledger D5, slice D5-A: continuation after a pre-write patch validation
+  failure** (ADR 0007 Amendment 1, Accepted 2026-11-07; the accepted D5
+  continuation plan, revision 3) is **implemented and locally verified on
+  macOS (2026-11-07), but unstaged, uncommitted and not Linux-CI-confirmed.**
+  D5 stays In Progress, not Done.
+  - **What it adds:** `Trigger.PATCH_FAILED` (EXECUTE → EXPLORE only, no
+    terminal reason); Gate zero before classification for every mapped
+    patch failure (T1–T7); only an `APPLY` / `PATCH_VALIDATION_FAILED` on a
+    `PRESENT` session continues; C28, the shared repair budget, then C30 as
+    the transition's check; never-dropped `PATCH_FAILED` feedback (512-byte
+    UTF-8-bounded message) appended only after C30; mandatory reapproval and
+    current-pass citations unchanged. C29 is neither registered nor
+    consulted.
+  - **Not implemented:** D5-B (N4 recreation continuation, C29), D5-C (the
+    four-operation protocol, N1/N2, model integration of the operations) and
+    D6. Live recreation stays unreachable (`_recreation_can_continue()` is
+    `False`). Post-write failures still end the run.
+  - **Verification:** see `ENGINEERING_LOG.md`'s 2026-11-07 D5-A entries
+    for the exact test and mutation totals.
+  - **Boundaries:** no live model or operator path; no Gate α,
+    operator-ready, `COMPLETE_FOR_V1` or v1-complete claim; no threat-model
+    conclusion changes.
+- **Next:** commit D5-A and its exact-commit Linux CI, then D5-B (N4's
+  recreation continuation and C29) and D5-C (the four-operation patch
+  protocol and its validation, N1/N2's re-derivations, model integration
+  and the remaining Step 9 documentation), then D6; Gate O stays satisfied.
+  Remaining planning range D5–D10: 337–629 h (D5 174–289 h; first operator
+  run 373–627 h; Gate α 440–762 h; public v1 / cumulative D1–D10 502–901 h;
+  Gate O 86–140 h and D1–D4 165–272 h unchanged; D5 re-estimated from
+  95–155 h on 2026-11-07 through ADR 0007 Amendment 1 and the D5
+  continuation plan, revision 3; D5-C is re-estimated from its own plan
+  before implementation) — component planning ranges, not measured hours
+  spent or delivery commitments (`docs/V1_COMPLETION_LEDGER.md`).
+  (Historical: before this checkpoint, this bullet said D5's substrate
+  waited on the C-1 amendment's acceptance; before D5-A it listed
+  258–495 h with D5 at 95–155 h.)
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

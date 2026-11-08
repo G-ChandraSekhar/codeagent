@@ -185,12 +185,22 @@ def test_a20_r16_real_fail_then_repair_then_pass(env):
     _assert_clean(env, trace)
 
 
-def test_a21_a_stale_expected_text_is_terminal(env):
+def test_a21_a_repeated_stale_expected_text_continues_until_the_repair_budget(env):
+    """Ledger D5-A (ADR 0007 Amendment 1; disclosed migration of
+    `test_a21_a_stale_expected_text_is_terminal`): a stale `expected_text`
+    no longer ends the run. The model re-proposes the same stale change, so
+    each pre-write refusal charges one repair iteration until the shared
+    budget (3: one verification repair, then two patch continuations) ends
+    the run."""
     model = FixtureRepairModel(second=STALE_R2)
     result, trace = _invoke(env, model)
     finished = result.finished
-    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
-    assert finished.error.code is ErrorCode.PATCH_VALIDATION_FAILED
+    assert finished.terminal_reason is domain.TerminalReason.BUDGET_EXCEEDED and finished.error is None
+    (budget,) = [e for e in trace if isinstance(e, events.BudgetExceeded)]
+    assert (budget.kind, budget.limit_value, budget.observed_value) == (domain.BudgetKind.REPAIR_ITERATIONS, 3, 3)
+    failed = [e for e in trace if isinstance(e, events.ToolCompleted) and e.tool is domain.ToolName.APPLY_PATCH and not e.success]
+    assert [e.error.code for e in failed] == [ErrorCode.PATCH_VALIDATION_FAILED] * 3
+    assert len([e for e in trace if isinstance(e, events.StateTransitioned) and e.trigger is domain.Trigger.PATCH_FAILED]) == 2
     assert len([e for e in trace if isinstance(e, events.PatchApplied)]) == 1
     _assert_clean(env, trace)
 

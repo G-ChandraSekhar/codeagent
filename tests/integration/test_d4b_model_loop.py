@@ -135,6 +135,30 @@ def _run(controller: RunController, allow_unpaired=()) -> events.RunFinished:
     return finished
 
 
+def _raised(exc_type, fn):
+    """The `exc_type` instance `fn()` raised, or `None`; any other exception
+    propagates. Callers assert on the result, so a missing raise is an
+    explicit assertion failure."""
+    try:
+        fn()
+    except exc_type as exc:
+        return exc
+    return None
+
+
+def _run_valid_finish(controller: RunController) -> events.RunFinished:
+    """`_run`, except that a RunFinished the controller tried to build in
+    violation of the event schema (an error on a non-error terminal reason)
+    is reported as the assertion failure it is. Every other exception,
+    including any other ValueError, propagates."""
+    try:
+        return _run(controller)
+    except ValueError as exc:
+        if not str(exc).startswith("error must be None when terminal_reason"):
+            raise
+        raise AssertionError("the controller built a RunFinished that violates the event schema") from None
+
+
 def _of(controller, cls):
     return [e for e in controller.log.events if isinstance(e, cls)]
 
@@ -249,7 +273,9 @@ def test_r38_a_returned_non_turn_is_rejected_and_shares_its_error(returned):
 def test_r38_an_unrecognized_status_is_rejected(status):
     controller = _build(ScriptedModel([dataclasses.replace(turn(read_file_call("a.py")), status=status)]))
     finished = _run(controller)
-    (rejected,) = _of(controller, events.ModelResponseRejected)
+    rejections = _of(controller, events.ModelResponseRejected)
+    assert len(rejections) == 1
+    rejected = rejections[0]
     assert rejected.rejection_reason is events.ResponseRejectionReason.STATUS_UNRECOGNIZED
     assert rejected.error.message == "model client returned a turn with an unrecognized status"
     assert finished.error is rejected.error
@@ -282,9 +308,7 @@ def test_r38_respond_raising_an_exception_is_failed_then_unclassified():
 def test_r38_respond_raising_an_interrupt_propagates_the_exact_instance():
     interrupt = KeyboardInterrupt()
     controller = _build(ScriptedModel([interrupt]))
-    with pytest.raises(KeyboardInterrupt) as info:
-        controller.run()
-    assert info.value is interrupt
+    assert _raised(KeyboardInterrupt, controller.run) is interrupt
     assert len(_of(controller, events.ModelRequestFailed)) == 1
     assert_model_pairing(controller.log.events)
     assert controller._post_return_decisions == []
@@ -303,10 +327,8 @@ def test_r38_an_emission_failure_during_an_interrupt_is_attached():
         real(event)
 
     controller._emit = emit
-    with pytest.raises(KeyboardInterrupt) as info:
-        controller.run()
-    assert info.value is interrupt
-    assert getattr(interrupt, CLEANUP_FAILURES_ATTRIBUTE) == (boom,)
+    assert _raised(KeyboardInterrupt, controller.run) is interrupt
+    assert getattr(interrupt, CLEANUP_FAILURES_ATTRIBUTE, None) == (boom,)
 
 
 # --------------------------------------------------------------------------
@@ -331,8 +353,7 @@ def test_j1_strict_pairing_rejects_an_unexplained_missing_pair_even_when_unclass
     finished = controller.run()
     assert finished.error.code is ErrorCode.UNCLASSIFIED_FAILURE
     trace = [e for e in controller.log.events if not isinstance(e, events.ModelRequestFailed)]
-    with pytest.raises(AssertionError):
-        assert_model_pairing(trace)
+    assert _raised(AssertionError, lambda: assert_model_pairing(trace)) is not None
 
 
 def _fault_once(controller, cls):
@@ -357,10 +378,11 @@ def test_j1_one_shot_emission_fault_is_unclassified_and_names_its_request():
     assert seen == ["r-d4b-req-0-1"]  # the fault hit this request's outcome event
     assert finished.error.code is ErrorCode.UNCLASSIFIED_FAILURE
     assert_model_pairing(controller.log.events, allow_unpaired={"r-d4b-req-0-1"})
-    with pytest.raises(AssertionError):
-        assert_model_pairing(controller.log.events)
-    with pytest.raises(AssertionError):
-        assert_model_pairing(controller.log.events, allow_unpaired={"r-d4b-req-0-2"})
+    assert _raised(AssertionError, lambda: assert_model_pairing(controller.log.events)) is not None
+    assert (
+        _raised(AssertionError, lambda: assert_model_pairing(controller.log.events, allow_unpaired={"r-d4b-req-0-2"}))
+        is not None
+    )
 
 
 def test_j1_a_failure_inside_terminate_propagates_without_run_finished():
@@ -421,7 +443,7 @@ def test_r39_run_ending_rows_with_and_without_a_pending_cancellation(row, pendin
         return first
 
     controller = _build(ScriptedModel([step]), cancellation=source.token)
-    finished = _run(controller)
+    finished = _run_valid_finish(controller)
     (received,) = _of(controller, events.ModelResponseReceived)
     assert received.status is first.status  # recorded exactly as received
     assert not _of(controller, events.ToolRequested)
@@ -559,10 +581,10 @@ def test_r25_a_raising_tool_completes_then_is_unclassified_without_a_c27_record(
 def test_r25_an_interrupting_tool_completes_then_propagates_the_exact_instance():
     interrupt = KeyboardInterrupt()
     controller = _build(ScriptedModel([turn(read_file_call("a.py"))]), tools=_RaisingTools(interrupt))
-    with pytest.raises(KeyboardInterrupt) as info:
-        controller.run()
-    assert info.value is interrupt
-    (completed,) = _of(controller, events.ToolCompleted)
+    assert _raised(KeyboardInterrupt, controller.run) is interrupt
+    completions = _of(controller, events.ToolCompleted)
+    assert len(completions) == 1
+    completed = completions[0]
     assert completed.error.message == "tool interrupted"
     assert_tool_pairing(controller.log.events)
     assert [s for s, _, _ in controller._post_return_decisions] == ["C25"]
@@ -580,9 +602,8 @@ def test_r25_tool_completed_emission_failure_during_an_interrupt_is_attached():
         real(event)
 
     controller._emit = emit
-    with pytest.raises(KeyboardInterrupt) as info:
-        controller.run()
-    assert info.value is interrupt and getattr(interrupt, CLEANUP_FAILURES_ATTRIBUTE) == (boom,)
+    assert _raised(KeyboardInterrupt, controller.run) is interrupt
+    assert getattr(interrupt, CLEANUP_FAILURES_ATTRIBUTE, None) == (boom,)
 
 
 # --------------------------------------------------------------------------
@@ -802,6 +823,7 @@ def test_r6_an_id_dropped_from_the_transcript_is_rejected():
     assert model.contexts[5].dropped_count >= 1
     assert all(i.body.get("tool_call_id") != "tc-0-1" for i in model.contexts[5].transcript)
     denied = [p for p in _of(controller, events.PolicyDecisionRecorded) if not p.allowed]
+    assert denied, "the citation of a dropped result was not denied"
     assert denied[0].reason == "arguments_invalid:evidence_ref_invalid"
     assert all(ctx.size <= CONTEXT_CAP_BYTES for ctx in model.contexts)
 
@@ -1029,6 +1051,7 @@ def test_r19_a_mutated_approved_plan_fails_closed_before_dispatch(field):
     applier = FakePatchApplier()
     controller = _build(ScriptedModel(_read_then_plan()), approval=Tamper((domain.ApprovalDecision.APPROVED,)), applier=applier)
     finished = _run(controller)
+    assert finished.error is not None, "the tampered plan was not refused"
     assert finished.error.code is ErrorCode.UNCLASSIFIED_FAILURE
     assert applier.operations == []
     assert not any(e.tool is domain.ToolName.APPLY_PATCH for e in _of(controller, events.ToolRequested))
@@ -1208,7 +1231,7 @@ def test_r36_incomplete_is_explore_only_non_abort_and_rendered():
             with pytest.raises(domain.IllegalTransitionError):
                 domain.transition(state, domain.Trigger.MODEL_RESPONSE_INCOMPLETE)
     controller = _build(ScriptedModel([turn(status=S.INCOMPLETE, incomplete_reason=b"max_output_tokens")]))
-    _run(controller)
+    _run_valid_finish(controller)
     report = build_report(controller.log.events)
     assert report.terminal_reason == "model_response_incomplete"
     assert "model_response_incomplete" in render_text(report)
@@ -1524,10 +1547,15 @@ def test_a_failing_patch_failure_emission_is_attempted_once(case):
 
 def test_mapped_patch_failures_and_success_keep_their_exact_shape():
     # A returned patch failure keeps its own error object; success keeps its events.
-    failing = _build(ScriptedModel(_read_then_plan()), applier=FakePatchApplier(True))
+    # Ledger D5-A (disclosed migration): PATCH_APPLICATION_FAILED, which still
+    # ends the run; a PATCH_VALIDATION_FAILED continues (test_patch_failure_continuation.py).
+    failing = _build(
+        ScriptedModel(_read_then_plan()),
+        applier=FakePatchApplier(True, failure_code=ErrorCode.PATCH_APPLICATION_FAILED),
+    )
     finished = _run(failing)
     (completed,) = [e for e in _of(failing, events.ToolCompleted) if e.tool is domain.ToolName.APPLY_PATCH]
-    assert finished.error is completed.error and completed.error.code is ErrorCode.PATCH_VALIDATION_FAILED
+    assert finished.error is completed.error and completed.error.code is ErrorCode.PATCH_APPLICATION_FAILED
     session = FakeCheckpointSession()
     session.advance_error = CheckpointRefError(
         CheckpointRefFailure.COMPARE_AND_SWAP_REJECTED, "forced", outcome=MutationOutcome.UNCHANGED

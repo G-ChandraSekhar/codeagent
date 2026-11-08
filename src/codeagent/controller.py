@@ -62,6 +62,7 @@ from codeagent.model_protocol import (
     CONTEXT_ENVELOPE_MAX_BYTES,
     DROPPABLE_KINDS,
     MALFORMED_CHARGE_CAP,
+    PATCH_FAILED_MESSAGE_MAX_BYTES,
     REVISION_ITEM_MAX_BYTES,
     TOOL_RESULT_ITEM_MAX_BYTES,
     VERIFICATION_ITEM_MAX_BYTES,
@@ -74,6 +75,7 @@ from codeagent.model_protocol import (
     ParsedCall,
     classify_turn,
     encoded_tail,
+    utf8_prefix,
     valid_model_name,
 )
 from codeagent.tool_schema import (
@@ -473,6 +475,22 @@ def classify_recreation_trigger(
     return None
 
 
+def patch_failure_continues(
+    stage: PatchFailureStage | None, code: ErrorCode | None, session_intent: CheckpointIntent
+) -> bool:
+    """ADR 0007 Amendment 1 §A1.4 (ledger D5-A): whether a returned,
+    mapped patch failure returns the run to EXPLORE. Only T1, a pre-write
+    `PATCH_VALIDATION_FAILED` from the apply step while the checkpoint
+    session is `PRESENT`: nothing was written, so the worktree is not
+    contaminated. Every other failure ends the run (a post-write failure
+    only through recreation, which is D5-B)."""
+    return (
+        session_intent is CheckpointIntent.PRESENT
+        and stage is PatchFailureStage.APPLY
+        and code is ErrorCode.PATCH_VALIDATION_FAILED
+    )
+
+
 class PatchApplier(Protocol):
     """Applies exactly the given operations and reports what actually
     happened. In a run, `operations` is built only from the approved,
@@ -561,6 +579,9 @@ class RunConfig:
         _require_nonnegative_int("max_plan_revisions", self.max_plan_revisions)
         # Static context-fit proof (D4 plan revision 5 §10): everything that
         # is never dropped, plus one maximal tool result, fits the cap.
+        # VERIFICATION_FAILED and PATCH_FAILED items share the repair term:
+        # together at most max_repair_iterations + 1 of them, each at most
+        # VERIFICATION_ITEM_MAX_BYTES (ADR 0007 Amendment 1 §A1.6).
         never_dropped = (
             len(canonical_json_bytes(self.task_statement))
             + BASELINE_MAX_BYTES
@@ -594,6 +615,10 @@ _TRANSITION_CHECK_SITES: dict[domain.Trigger, str] = {
     domain.Trigger.PLAN_APPROVED: "C17",
     domain.Trigger.PATCH_APPLIED: "C20",
     domain.Trigger.VERIFICATION_FAILED: "C23",
+    # Ledger D5-A (ADR 0007 Amendment 1): C28 is the safe point before the
+    # repair-budget check; C30 is this transition's own entry check. C29 is
+    # reserved for D5-B (after a successful recreation begin()).
+    domain.Trigger.PATCH_FAILED: "C30",
 }
 _DISPATCH_CHECK_SITES: dict[domain.ToolName, str] = {
     domain.ToolName.APPLY_PATCH: "C18",
@@ -1148,7 +1173,55 @@ class RunController:
             self._transition(pass_index, domain.Trigger.PLAN_APPROVED)
             patch_ok, patch_error = self._dispatch_apply_patch(pass_index, approved)
             if not patch_ok:
-                return self._route_patch_failure(pass_index, patch_error)
+                # ADR 0007 Amendment 1 §A1.5. Gate zero comes before any
+                # classification: an earlier unconfirmed verifier cleanup
+                # ends the run for every mapped failure (T1-T7), and
+                # _terminate() then preserves the workspace.
+                if self._any_verifier_cleanup_unconfirmed:
+                    return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error)
+                if not patch_failure_continues(
+                    self._patch_failure_stage,
+                    patch_error.code if patch_error is not None else None,
+                    self._session.intent,
+                ):
+                    return self._route_patch_failure(pass_index, patch_error)
+                self._cancellation_check("C28")
+                if repair_iterations_used >= c.max_repair_iterations:
+                    self._emit(
+                        events.BudgetExceeded(
+                            run_id=c.run_id,
+                            sequence=self.log.next_sequence(),
+                            timestamp=self._now(),
+                            state=self.state,
+                            iteration=pass_index,
+                            kind=domain.BudgetKind.REPAIR_ITERATIONS,
+                            limit_value=c.max_repair_iterations,
+                            observed_value=repair_iterations_used,
+                        )
+                    )
+                    return self._terminate(pass_index, domain.Trigger.BUDGET_EXCEEDED)
+                # C30 runs inside the transition. Only once it has passed and
+                # the transition is recorded do the feedback and counters
+                # change, so a cancellation there leaves both untouched.
+                self._transition(pass_index, domain.Trigger.PATCH_FAILED)
+                self._transcript.append(
+                    FeedbackItem(
+                        FeedbackKind.PATCH_FAILED,
+                        pass_index,
+                        {
+                            "change_digest": digests.change_digest,
+                            "error_code": patch_error.code.value,
+                            "message": utf8_prefix(patch_error.message, PATCH_FAILED_MESSAGE_MAX_BYTES),
+                            "plan_revision": revision,
+                            "previous_attempt_failed": True,
+                            "untrusted": True,
+                            "worktree_recreated": False,
+                        },
+                    )
+                )
+                repair_iterations_used += 1
+                pass_index += 1
+                continue
             self._cancellation_check("C19")
 
             self._transition(pass_index, domain.Trigger.PATCH_APPLIED)
@@ -2052,16 +2125,18 @@ class RunController:
 
     def _recreation_can_continue(self) -> bool:
         """Q1's "the run will continue" (ADR 0004 Amendment 20 section 2).
-        Always False until D5 integration adds the domain transition that
-        returns a recreated patch failure to the repair loop (N4): with no
-        such transition the run cannot continue, so no recreation is
+        Always False until D5-B (N4) returns a recreated patch failure to the
+        repair loop. D5-A's `PATCH_FAILED` transition continues only a
+        pre-write refusal, never a recreation, so until then no recreation is
         attempted and `run()` never calls the recreator."""
         return False
 
     def _route_patch_failure(self, pass_index: int, patch_error: OperationalError | None) -> events.RunFinished:
-        """A failed `apply_patch`: recreate when Q1 and the verifier part of
-        Q3 hold and a recreator exists; otherwise end the run exactly as
-        before, through the triggering error."""
+        """A failed `apply_patch` that does not continue: recreate when Q1
+        holds and a recreator exists; otherwise end the run exactly as
+        before, through the triggering error. The verifier part of Q3 is
+        Gate zero, which the caller has already applied (ADR 0007
+        Amendment 1 §A1.3)."""
         trigger = classify_recreation_trigger(
             self._patch_failure_stage,
             patch_error.code if patch_error is not None else None,
@@ -2070,7 +2145,6 @@ class RunController:
         if (
             self._recreator is None
             or trigger is None
-            or self._any_verifier_cleanup_unconfirmed
             or not self._recreation_can_continue()
         ):
             return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error)
