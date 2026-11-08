@@ -7493,3 +7493,37 @@ implemented; live recreation stays unreachable; post-write failures still end
 the run. No live model or operator path; no Gate α, operator-ready,
 `COMPLETE_FOR_V1` or v1-complete claim; no threat-model conclusion changes.
 `uv.lock` was not touched.
+
+## 2026-11-08 — D5-A: Linux CI evidence reconciliation
+
+**Commit and run.** D5-A commit `79895f8842425c0589576547de80aa2deda6e098`
+("feat: continue after pre-write patch failure"), an ordinary fast-forward over
+`086dc62`. Its push-triggered run
+[42454095719](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42454095719)
+has a head SHA that exactly matches the commit and concluded `success`,
+verified through the Actions API and an independently fetched raw job log.
+Full evidence is in ADR 0007's "Amendment 1: Linux CI evidence" section and is
+not repeated here.
+
+**Named evidence.** The verbose Docker step names
+`test_patch_failure_continuation.py::test_d5a_stale_expected_text_continues_to_passing_verification_real_docker`
+as `PASSED`, alongside the earlier real-Docker tests.
+
+**Limits.** The other D5-A tests ran only in the quiet complete-suite step;
+their execution is inferred from that command, its success and the matching
+collected total, not named. The quiet-suite skips are unnamed and not guessed,
+and are not attributable to Docker being unavailable, because Docker was
+required and available. The
+pre-existing intermittent D3 executor test passed in this run and remains a
+disclosed residual. This is GitHub-hosted `ubuntu-24.04` x86_64
+automated-test evidence, not a security review.
+
+**Status.** D5-A's pre-write continuation criterion is complete for D5-A. D5
+stays In Progress, not Done: D5-B (N4 recreation continuation, C29), D5-C (the
+four-operation protocol, N1/N2, model integration) and D6 are not implemented,
+and live recreation stays unreachable. No live model or operator path; no
+Gate α, operator-ready, `COMPLETE_FOR_V1` or v1-complete claim; no
+threat-model conclusion changes. Planning estimates are unchanged. The
+2026-11-07 entry's "uncommitted" wording was true when written.
+
+`uv.lock` was not touched.

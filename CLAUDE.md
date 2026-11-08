@@ -3276,9 +3276,19 @@ Stage 2 (of the four-stage planning process in
     - no operator-readiness, Gate α or v1 claim follows.
 - **Ledger D5, slice D5-A: continuation after a pre-write patch validation
   failure** (ADR 0007 Amendment 1, Accepted 2026-11-07; the accepted D5
-  continuation plan, revision 3) is **implemented and locally verified on
-  macOS (2026-11-07), but unstaged, uncommitted and not Linux-CI-confirmed.**
-  D5 stays In Progress, not Done.
+  continuation plan, revision 3) is **implemented, locally verified on macOS
+  (2026-11-07), committed (`79895f8`) as an ordinary fast-forward over
+  `086dc62`, and confirmed on GitHub-hosted Linux CI** (run
+  [42454095719](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42454095719)).
+  The authoritative CI evidence is in ADR 0007's "Amendment 1: Linux CI
+  evidence" section. D5 stays In Progress, not Done. (Historical: before the
+  commit this bullet said "unstaged, uncommitted and not
+  Linux-CI-confirmed", which was true then.)
+  - **CI evidence limits:** the D5-A real-Docker acceptance node is named in
+    the verbose step; the other D5-A tests ran only in the quiet suite, so
+    their execution is inferred; the quiet-suite skips are unnamed and not
+    attributable to Docker being unavailable. GitHub-hosted `ubuntu-24.04` x86_64
+    automated-test evidence, not a security review.
   - **What it adds:** `Trigger.PATCH_FAILED` (EXECUTE → EXPLORE only, no
     terminal reason); Gate zero before classification for every mapped
     patch failure (T1–T7); only an `APPLY` / `PATCH_VALIDATION_FAILED` on a
@@ -3292,14 +3302,17 @@ Stage 2 (of the four-stage planning process in
     D6. Live recreation stays unreachable (`_recreation_can_continue()` is
     `False`). Post-write failures still end the run.
   - **Verification:** see `ENGINEERING_LOG.md`'s 2026-11-07 D5-A entries
-    for the exact test and mutation totals.
+    for the exact local test and mutation totals.
+  - **Residual:** `test_executor.py::test_l2_timeout_kills_the_whole_process_group`
+    (D3) is a pre-existing intermittent test, also failing on `086dc62`; it
+    passed in this CI run and is not a D5-A failure.
   - **Boundaries:** no live model or operator path; no Gate α,
     operator-ready, `COMPLETE_FOR_V1` or v1-complete claim; no threat-model
     conclusion changes.
-- **Next:** commit D5-A and its exact-commit Linux CI, then D5-B (N4's
-  recreation continuation and C29) and D5-C (the four-operation patch
-  protocol and its validation, N1/N2's re-derivations, model integration
-  and the remaining Step 9 documentation), then D6; Gate O stays satisfied.
+- **Next:** D5-B (N4's recreation continuation and C29) and D5-C (the
+  four-operation patch protocol and its validation, N1/N2's re-derivations,
+  model integration and the remaining Step 9 documentation), then D6; Gate O
+  stays satisfied.
   Remaining planning range D5–D10: 337–629 h (D5 174–289 h; first operator
   run 373–627 h; Gate α 440–762 h; public v1 / cumulative D1–D10 502–901 h;
   Gate O 86–140 h and D1–D4 165–272 h unchanged; D5 re-estimated from
@@ -3309,7 +3322,8 @@ Stage 2 (of the four-stage planning process in
   spent or delivery commitments (`docs/V1_COMPLETION_LEDGER.md`).
   (Historical: before this checkpoint, this bullet said D5's substrate
   waited on the C-1 amendment's acceptance; before D5-A it listed
-  258–495 h with D5 at 95–155 h.)
+  258–495 h with D5 at 95–155 h; before D5-A's commit it began "commit D5-A
+  and its exact-commit Linux CI".)
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

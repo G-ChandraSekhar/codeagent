@@ -18,9 +18,15 @@ pending", which was true then.)
 
 Amendment 1 (ledger D5, slice D5-A: continuation after a pre-write patch
 validation failure): **Accepted (2026-11-07)**, at joint review;
-implemented and locally verified on macOS (2026-11-07), but
-currently unstaged, uncommitted and not Linux-CI-confirmed. See "Amendment 1" at the end of this
-ADR, which refines the decisions above for that case.
+**implemented, locally verified on macOS (2026-11-07), committed as `79895f8`
+(an ordinary fast-forward over `086dc62`), and confirmed on GitHub-hosted
+Linux CI (run
+[42454095719](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42454095719)).**
+The authoritative CI evidence is in "Amendment 1: Linux CI evidence" at the end
+of this ADR. See "Amendment 1" for the decisions, which refine those above for
+that case. (Historical: before the commit, this marker read "implemented and
+locally verified on macOS (2026-11-07), but currently unstaged, uncommitted and
+not Linux-CI-confirmed", which was true then.)
 
 ## Context
 
@@ -261,8 +267,13 @@ adapter, no D5 transactional patching, and neither Gate α nor v1 completion.
 
 ## Amendment 1 (Accepted 2026-11-07): continue after a pre-write patch validation failure (D5-A)
 
-Status: **Accepted (2026-11-07)**, after joint review. D5-A is implemented and locally verified on macOS (2026-11-07), but
-currently unstaged, uncommitted and not Linux-CI-confirmed.
+Status: **Accepted (2026-11-07)**, after joint review. D5-A is implemented,
+locally verified on macOS (2026-11-07), committed as `79895f8` (an ordinary
+fast-forward over `086dc62`), and Linux-CI-confirmed in run
+[42454095719](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42454095719);
+see "Amendment 1: Linux CI evidence" below. (Historical: before the commit,
+this line said D5-A was "currently unstaged, uncommitted and not
+Linux-CI-confirmed", which was true then.)
 The final review accepted: Gate zero before classification for every mapped
 T1–T7 failure; T8 and T9 keeping their existing exception and raise paths;
 the behavioural C29 absence contract for D5-A (§A1.2, §A1.9); and A17, for a
@@ -640,3 +651,58 @@ is fixed mechanically from each harness's file lists at implementation:
 - Continuing after a pre-write refusal does not prove the four-operation
   protocol, whole-proposal validation, the syntax guard, test-file rules, N1
   or N2.
+
+## Amendment 1: Linux CI evidence (2026-11-08)
+
+Commit `79895f8842425c0589576547de80aa2deda6e098` ("feat: continue after
+pre-write patch failure"), pushed to `main` as an ordinary fast-forward over
+`086dc62`. Run
+[42454095719](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42454095719)
+was verified through the Actions API and an independently fetched raw job log.
+
+- **Run:** push-triggered; head SHA exactly `79895f8…e098`; attempt 1;
+  `completed` / `success`; created 2026-11-08T06:16:56Z, updated
+  2026-11-08T06:20:21Z.
+- **Job:** exactly one job, "Test (ubuntu-24.04, Python 3.12)", 06:17:00Z to
+  06:20:21Z. All 13 API-reported steps succeeded. There are zero API
+  annotations and zero `##[error]` lines in the raw log.
+- **Environment:** runner version 2.338.2; runner image `ubuntu-24.04`, version
+  20261101.360.1 (Ubuntu 24.04.5); CPython 3.12.16; Git 2.56.0; Docker client
+  and server 28.0.4.
+- **Docker:** the mandatory preflight succeeded. The pinned
+  `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`
+  reported `linux/amd64`.
+- **Dedicated verbose step** (06:17:10Z to 06:17:22Z): `python -m pytest
+  tests/integration/test_slice_c.py tests/integration/test_cancellation_e2e.py
+  tests/integration/test_patch_failure_continuation.py::test_d5a_stale_expected_text_continues_to_passing_verification_real_docker
+  -v`, with `CODEAGENT_REQUIRE_DOCKER: 1`, gave `15 passed in 11.87s`. All 15
+  are named `PASSED`: the four `test_slice_c.py` tests, E1–E10 as ten test
+  cases, and the D5-A real-Docker acceptance node.
+- **Complete suite** (06:17:22Z to 06:20:18Z): `python -m pytest -q`, with
+  `CODEAGENT_REQUIRE_DOCKER: 1` in that step's own environment, gave
+  `7005 passed, 4 skipped in 174.93s`, with zero failed. 7,005 + 4 = 7,009,
+  which matches the local collected total (7,007 passed + 2 skipped).
+- **Leftover-container check:** the anchored
+  `^codeagent-(verify-|baseline-|verification-)` filter over a full
+  `docker ps -a` name listing printed nothing after its header, and the step
+  succeeded.
+
+**Evidence limits:**
+- The D5-A real-Docker acceptance node is named evidence. The other D5-A
+  tests ran only in the `pytest -q` step; their execution is inferred from the
+  complete-suite command, its successful result and the matching collected
+  total, not named in the log.
+- The four quiet-mode skips are unnamed; `pytest -q` does not name them, and
+  they are not guessed here. Docker was required and available in that step,
+  so they are not attributable to unavailable Docker.
+- `test_executor.py::test_l2_timeout_kills_the_whole_process_group` (D3)
+  passed here but remains a disclosed pre-existing intermittent test
+  (`ENGINEERING_LOG.md`, 2026-11-07 D5-A entry).
+- This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence, not a
+  security review.
+
+**Unchanged non-claims:** D5 is not complete; D5-B (N4 recreation
+continuation, C29), D5-C and D6 are not implemented, and live recreation stays
+unreachable. No live model, provider adapter or operator path; no Gate α,
+operator-ready, `COMPLETE_FOR_V1` or v1-complete claim; no threat-model
+conclusion changes.
