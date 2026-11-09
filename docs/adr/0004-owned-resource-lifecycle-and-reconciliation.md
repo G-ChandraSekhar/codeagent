@@ -7144,9 +7144,12 @@ job log.
 
 ## Amendment 21 (Accepted 2026-11-08): live recreation continues the repair loop (D5-B, N4)
 
-Status: **Accepted (2026-11-08)**, after joint review. **Implemented and
-locally verified on macOS (2026-11-08); unstaged, uncommitted and not
-Linux-CI-confirmed** (§21.17). (Historical: at acceptance this line said "Not
+Status: **Accepted (2026-11-08)**, after joint review. **Implemented, locally
+verified on macOS (2026-11-08), committed as `ba653b7` (pushed as an ordinary
+fast-forward over `3ee839a`), and confirmed on GitHub-hosted Linux CI (run
+[42592929825](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42592929825)).** The authoritative CI evidence is in §21.17. (Historical: before the
+commit this line said "Implemented and locally verified on macOS (2026-11-08);
+unstaged, uncommitted and not Linux-CI-confirmed"; at acceptance it said "Not
 implemented.") It was accepted together with ADR 0007 Amendment 2 (Accepted 2026-11-08,
 recreation feedback), which governs the feedback schema. Milestone 2, ledger D5, slice D5-B only. It completes Amendment 20's N4 and the
 D5 row's "post-write handled failure → … → new incarnation at the last
@@ -7741,11 +7744,15 @@ documentation reconciliation is written.
 | 5 | **Real-Docker scenario:** out-of-band contamination during the pass-1 approval, after a pass-0 T1 has established the session, so T3 occurs on a `PRESENT` session; the contamination is an uncommitted modification to a tracked file (post-acceptance precision correction, 2026-11-08: an untracked file cannot reach `RECREATED` under ADR 0003 Amendment 2's unchanged evidence rule); any *n+1* sentinel is carried by the approved change; T4 covered in real Git by an in-process contaminating applier; no production injection seam; node `test_d5b_contaminated_worktree_recreates_and_passes_real_docker` | §21.11, §21.13 |
 | 6 | **Anchor re-pointing** approved under the stated conditions; Step 6 M05, M10, M11, M12, M16 and D5-A A16 expected; any other discovered and disclosed | §21.12 |
 
-### 21.17 Implementation record (2026-11-08, local; not Linux-CI-confirmed)
+### 21.17 Implementation record and Linux CI evidence (2026-11-08 local; 2026-11-09 Linux CI)
 
-Implemented on top of `3ee839a`; **unstaged, uncommitted and not
-Linux-CI-confirmed.** This section records implementation facts and local
-evidence only; it changes no accepted decision above.
+Implemented on top of `3ee839a`; **committed as `ba653b7`, pushed as an
+ordinary fast-forward, and confirmed on GitHub-hosted Linux CI (run
+[42592929825](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42592929825)).** This section records the implementation facts, the local evidence
+and, at its end, the authoritative Linux CI evidence; it changes no accepted
+decision above. (Historical: before the commit, the heading read "(2026-11-08,
+local; not Linux-CI-confirmed)" and this paragraph said "unstaged, uncommitted
+and not Linux-CI-confirmed", which was true then.)
 
 **Production changes.**
 - `controller.py`:
@@ -7904,7 +7911,7 @@ case; each new anchor matches exactly once:
 - **Predicted but not needed:** M12 and A16 still matched unchanged.
 - **Not predicted:** M07, M18, A9, A10, A17 and S7-M22.
 
-**Verification.**
+**Local verification (before the commit).**
 - Directly affected files: 1,284 passed forward, 1,284 passed reverse.
 - The exact CI verbose Docker command: 18 passed, each named `PASSED` (the four `test_slice_c.py` tests, E1–E10 and E13/E14 in `test_cancellation_e2e.py`, and the D5-A and D5-B real-Docker nodes).
 - Complete suite: 7,078 passed, 2 skipped (`CODEAGENT_REQUIRE_DOCKER=1`); the two skips are `test_repo_tools.py`'s non-UTF-8-filename tests, which macOS APFS refuses.
@@ -7929,3 +7936,59 @@ not test evidence and are left in place, not deleted.
 - The §21.15 non-claims stand: D5-C, the four-operation protocol, D6,
   operator reachability, Gate α and v1 remain unimplemented, and D5 stays In
   Progress.
+
+**Linux CI evidence (2026-11-09).** Commit
+`ba653b76aa0513db5a63c01e80aef4161bcd7552` ("feat: continue the repair loop
+after live worktree recreation") holds this amendment, ADR 0007 Amendment 2's
+implementation and the 16 reviewed paths. It was pushed to `main` as an
+ordinary fast-forward (`3ee839a..ba653b7`). Run
+[42592929825](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42592929825), verified through the Actions API and a freshly fetched raw job log:
+
+- **Run:** workflow "CI", push-triggered on `main`, head SHA
+  `ba653b76aa0513db5a63c01e80aef4161bcd7552` (exactly the pushed commit),
+  attempt 1, `completed` / `success`.
+- **Job:** "Test (ubuntu-24.04, Python 3.12)", `success`; all 13 API-reported
+  steps `success`; zero `##[error]` lines in the raw log.
+- **Environment:** runner image `ubuntu-24.04` (Ubuntu 24.04.5 LTS), CPython
+  3.12.16, pytest 9.1.1, Git 2.56.0.
+- **Docker:** the mandatory preflight succeeded; Docker Engine - Community,
+  client and server `28.0.4`.
+- **Image:** the pinned
+  `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`
+  was pulled and reported `linux/amd64`.
+- **Dedicated Docker step:** the verbose command, with
+  `CODEAGENT_REQUIRE_DOCKER: 1` in that step's own environment, gave
+  `18 passed in 20.84s`. All 18 are named `PASSED`: the four
+  `test_slice_c.py` tests; E1–E10 and the D5-B
+  `test_e13_e14_signal_during_recreation_is_observed_at_c30[E13-group-SIGINT]`
+  and `[E14-pid-SIGTERM]` in `test_cancellation_e2e.py`; the D5-A real-Docker
+  node; and the D5-B node
+  `test_patch_failure_continuation.py::test_d5b_contaminated_worktree_recreates_and_passes_real_docker`.
+- **Complete suite:** `python -m pytest -q`, with
+  `CODEAGENT_REQUIRE_DOCKER: 1` in that step's own environment, gave
+  `7076 passed, 4 skipped in 237.18s (0:03:57)`, with 0 failed. 7,076 + 4 =
+  7,080, matching the local collected total (7,078 passed, 2 skipped).
+- **Leftover check:** a full `docker ps -a --format '{{.Names}}'` listing
+  through the anchored
+  `grep -E '^codeagent-(verify-|baseline-|verification-)'` (all three
+  families) produced empty output, and the step succeeded.
+
+**Evidence limits.**
+- Named: the D5-B real-Docker node and E13/E14 are named `PASSED` in the
+  verbose step.
+- Inferred: every other D5-B test (controller, real-Git, factory, C29,
+  latency pin and the post-continuation SIGKILL test) ran only in the quiet
+  suite, which names no tests; their execution is inferred from the
+  whole-suite command, the matching collection total and the successful run.
+- The four quiet-mode skips are not identified, and CI skipped two more than
+  the local run did; which tests account for the difference is not visible.
+  They are not attributable to Docker being unavailable: Docker was required
+  and available in that step.
+- This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence, not a
+  security review and not ARM64 evidence.
+
+**Unchanged boundaries.** D5 stays In Progress, not Done. D5-C (the
+four-operation protocol, N1/N2, model integration), D6 and operator
+reachability remain unimplemented. There is no live model or operator path,
+no Gate α, operator-ready, `COMPLETE_FOR_V1` or v1 claim, and no threat-model
+conclusion changes.

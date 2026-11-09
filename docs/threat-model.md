@@ -921,9 +921,9 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   `absent`, re-lists containers and re-observes the ref, then deletes the
   ref. Its B5/B7 neighbours still block, with `ABANDONED_UNRESOLVED` as
   the only exit. Live-run recreation (N4) was unreachable before D5-B; with
-  D5-B (ADR 0004 Amendment 21, locally verified and uncommitted) it is
-  reachable only through the internal continuation path, with no operator
-  path. No threat conclusion changes.
+  D5-B (ADR 0004 Amendment 21, commit `ba653b7`, Linux-CI-confirmed in run
+  42592929825) it is reachable only through the internal continuation path,
+  with no operator path. No threat conclusion changes.
   **Reachability:** the Amendment 12, 13, 17 and 20 §9 rows are narrow
   accepted rows in the shared reconciler. They are reached through
   internal automatic admission reconciliation (`prepare_lifecycle()`) and

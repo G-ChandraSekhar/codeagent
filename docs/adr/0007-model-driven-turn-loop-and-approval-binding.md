@@ -29,9 +29,12 @@ locally verified on macOS (2026-11-07), but currently unstaged, uncommitted and
 not Linux-CI-confirmed", which was true then.)
 
 Amendment 2 (ledger D5, slice D5-B: recreation feedback): **Accepted
-(2026-11-08)**, at joint review; implemented and locally verified on macOS;
-unstaged, uncommitted and not Linux-CI-confirmed. See "Amendment 2" at the end
-of this ADR. (Historical: at acceptance this line said "not implemented".)
+(2026-11-08)**, at joint review; **implemented, locally verified on macOS,
+committed as `ba653b7`, and confirmed on GitHub-hosted Linux CI (run
+[42592929825](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42592929825)).** The authoritative CI evidence is in ADR 0004 §21.17. See
+"Amendment 2" at the end of this ADR. (Historical: before the commit this line
+said "implemented and locally verified on macOS; unstaged, uncommitted and not
+Linux-CI-confirmed"; at acceptance it said "not implemented".)
 
 ## Context
 
@@ -710,18 +713,19 @@ was verified through the Actions API and an independently fetched raw job log.
 
 **Unchanged non-claims:** D5 is not complete. (Historical: when this evidence
 was recorded, D5-B (N4 recreation continuation, C29) was not implemented and
-live recreation stayed unreachable. D5-B is now implemented and locally
-verified, unstaged, uncommitted and not Linux-CI-confirmed (ADR 0004
-§21.17).) D5-C and D6 remain unimplemented. No live model, provider adapter or operator path; no Gate α,
+live recreation stayed unreachable. D5-B is now implemented, committed as
+`ba653b7` and Linux-CI-confirmed in run 42592929825 (ADR 0004 §21.17).) D5-C and D6 remain unimplemented. No live model, provider adapter or operator path; no Gate α,
 operator-ready, `COMPLETE_FOR_V1` or v1-complete claim; no threat-model
 conclusion changes.
 
 ## Amendment 2 (Accepted 2026-11-08): recreation feedback after D5-B
 
-Status: **Accepted (2026-11-08)**, after joint review. **Implemented and
-locally verified on macOS (2026-11-08); unstaged, uncommitted and not
-Linux-CI-confirmed** (ADR 0004 §21.17). (Historical: at acceptance this line
-said "Not implemented.") The controller appends `"worktree_recreated": true`
+Status: **Accepted (2026-11-08)**, after joint review. **Implemented, locally
+verified on macOS (2026-11-08), committed as `ba653b7`, and confirmed on
+GitHub-hosted Linux CI (run [42592929825](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42592929825)); evidence in ADR 0004 §21.17.**
+(Historical: before the commit this line said "Implemented and locally verified
+on macOS (2026-11-08); unstaged, uncommitted and not Linux-CI-confirmed"; at
+acceptance it said "Not implemented.") The controller appends `"worktree_recreated": true`
 and `"recreation_outcome": "recreated"` only after `RECREATED` and C30.
 `test_recreated_feedback_body` pins the exact body.
 `test_patch_failed_bound_fits_the_shared_repair_allowance` uses the

@@ -7603,3 +7603,39 @@ mutation table and full disclosures are in ADR 0004 §21.17.
   threat-model conclusion changes.
 - Planning estimates are unchanged.
 - `uv.lock` was not touched.
+
+## 2026-11-09 — D5-B: Linux CI evidence reconciliation
+
+**What.** Documentation-only reconciliation for ledger D5, slice D5-B (ADR
+0004 Amendment 21, ADR 0007 Amendment 2). Commit
+`ba653b76aa0513db5a63c01e80aef4161bcd7552` was pushed to `main` as an ordinary
+fast-forward over `3ee839a`. Its push-triggered run
+[42592929825](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42592929825)
+concluded `success`, and its head SHA is exactly the pushed commit. Both were
+verified through the Actions API and a freshly fetched raw job log; no tests
+or Docker were run for this pass. The authoritative evidence (environment,
+image, counts and timings) is in ADR 0004 §21.17 only.
+
+**Named evidence.** The verbose Docker step names the D5-B real-Docker node
+`test_d5b_contaminated_worktree_recreates_and_passes_real_docker` and E13/E14
+(`test_e13_e14_signal_during_recreation_is_observed_at_c30`) as `PASSED`. The
+leftover-container check produced empty output.
+
+**Evidence limits.** Every other D5-B test ran only in the quiet suite, so its
+execution is inferred from the whole-suite command, the matching collection
+total and the successful run. The quiet-mode skips are unidentified; Docker
+was required and available in that step, so they are not attributable to
+Docker being unavailable. This is GitHub-hosted `ubuntu-24.04` x86_64
+automated-test evidence, not a security review or ARM64 evidence.
+
+**Status edits.** ADR 0004 (Amendment 21's status and §21.17), ADR 0007
+(Amendment 2's markers), the ledger, `CLAUDE.md` and the threat model now
+record the commit and run; the earlier "unstaged, uncommitted and not
+Linux-CI-confirmed" wording is kept as explicitly historical. `CLAUDE.md`'s
+"Next" is now D5-C, then D6.
+
+**Unchanged boundaries.** D5 stays In Progress, not Done. D5-C (the
+four-operation protocol, N1/N2, model integration), D6 and operator
+reachability remain unimplemented. No live model or operator path; no Gate α,
+operator-ready, `COMPLETE_FOR_V1` or v1 claim; no threat-model conclusion
+changes. Planning totals are unchanged. `uv.lock` was not touched.

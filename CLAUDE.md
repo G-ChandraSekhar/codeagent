@@ -3311,9 +3311,20 @@ Stage 2 (of the four-stage planning process in
     conclusion changes.
 - **Ledger D5, slice D5-B: live recreation continues the repair loop (N4,
   C29)** (ADR 0004 Amendment 21 and ADR 0007 Amendment 2, both Accepted
-  2026-11-08) is **implemented and locally verified on macOS (2026-11-08);
-  unstaged, uncommitted and not Linux-CI-confirmed.** Evidence:
-  ADR 0004 §21.17. D5 stays In Progress, not Done.
+  2026-11-08) is **implemented, locally verified on macOS (2026-11-08),
+  committed (`ba653b7`) as an ordinary fast-forward over `3ee839a`, and
+  confirmed on GitHub-hosted Linux CI** (run
+  [42592929825](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42592929825));
+  the authoritative evidence is in ADR 0004 §21.17. D5 stays In Progress, not
+  Done. (Historical: before the commit this said "unstaged, uncommitted and
+  not Linux-CI-confirmed", which was true then.)
+  - **Linux CI evidence limits:** the D5-B real-Docker node and E13/E14 are
+    named in the verbose step; every other D5-B test ran only in the quiet
+    suite, so its execution is inferred. The four quiet-mode skips are
+    unidentified; Docker was required and available in that step, so they are
+    not attributable to Docker being unavailable. GitHub-hosted
+    `ubuntu-24.04` x86_64 automated-test evidence, not a security review or
+    ARM64 evidence.
   - **What it adds:** a T3–T5 post-write handled failure, with a recreator,
     goes through Gate zero → classification → C28 → the single repair-budget
     check → `begin()` → C29 → Started → `recreate()` (duration in
@@ -3340,10 +3351,9 @@ Stage 2 (of the four-stage planning process in
   - **Not implemented:** D5-C (four-operation protocol, N1/N2, model
     integration), D6, operator reachability; no Gate α, operator-ready,
     `COMPLETE_FOR_V1` or v1 claim; no threat-model conclusion changes.
-- **Next:** commit D5-B and its exact-commit Linux CI, then D5-C (the
-  four-operation patch protocol and its validation, N1/N2's re-derivations,
-  model integration and the remaining Step 9 documentation), then D6; Gate O
-  stays satisfied.
+- **Next:** D5-C (the four-operation patch protocol and its validation,
+  N1/N2's re-derivations, model integration and the remaining Step 9
+  documentation), then D6; Gate O stays satisfied.
   Remaining planning range D5–D10: 337–629 h (D5 174–289 h; first operator
   run 373–627 h; Gate α 440–762 h; public v1 / cumulative D1–D10 502–901 h;
   Gate O 86–140 h and D1–D4 165–272 h unchanged; D5 re-estimated from
@@ -3355,7 +3365,8 @@ Stage 2 (of the four-stage planning process in
   waited on the C-1 amendment's acceptance; before D5-A it listed
   258–495 h with D5 at 95–155 h; before D5-A's commit it began "commit D5-A
   and its exact-commit Linux CI"; before D5-B it began "D5-B (N4's
-  recreation continuation and C29) and D5-C".)
+  recreation continuation and C29) and D5-C"; before D5-B's commit it began
+  "commit D5-B and its exact-commit Linux CI, then D5-C".)
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)
