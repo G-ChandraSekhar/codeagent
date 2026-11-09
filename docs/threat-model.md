@@ -920,7 +920,10 @@ Each entry: **asset/objective**, **source**, **attack path**, **impact**,
   directory or absent), one pass removes the leaf, records the worktree
   `absent`, re-lists containers and re-observes the ref, then deletes the
   ref. Its B5/B7 neighbours still block, with `ABANDONED_UNRESOLVED` as
-  the only exit, and live-run recreation itself is unreachable (N4).
+  the only exit. Live-run recreation (N4) was unreachable before D5-B; with
+  D5-B (ADR 0004 Amendment 21, locally verified and uncommitted) it is
+  reachable only through the internal continuation path, with no operator
+  path. No threat conclusion changes.
   **Reachability:** the Amendment 12, 13, 17 and 20 §9 rows are narrow
   accepted rows in the shared reconciler. They are reached through
   internal automatic admission reconciliation (`prepare_lifecycle()`) and

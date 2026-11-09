@@ -409,7 +409,13 @@ class RecreationResult:
     hold afterwards: the new one for `RECREATED` and `ADOPTED_THEN_FAILED`,
     `None` (keep the current object) for every other outcome. The receipt
     fields and `error` become `WorkspaceRecreationFinished`'s, which
-    validates their shape."""
+    validates their shape.
+
+    ADR 0004 Amendment 21 §21.4: `tools` is the new incarnation's toolkit,
+    present exactly for `RECREATED`; `tool_cleanup_failure` is a private
+    evidence channel for a toolkit factory's `ToolCleanupUnconfirmedError`,
+    present only with `ADOPTED_THEN_FAILED`, never serialized, emitted or
+    printed, and excluded from equality."""
 
     outcome: events.RecreationOutcome
     workspace: "Workspace | None" = None
@@ -418,6 +424,47 @@ class RecreationResult:
     bytes_written: int | None = None
     evidence_complete: bool | None = None
     error: OperationalError | None = None
+    tools: "RepositoryTools | None" = None
+    tool_cleanup_failure: ToolCleanupUnconfirmedError | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        _check_recreation_result(self)
+
+
+_ADOPTING_OUTCOMES = frozenset(
+    {events.RecreationOutcome.RECREATED, events.RecreationOutcome.ADOPTED_THEN_FAILED}
+)
+
+
+def _check_recreation_result(result: RecreationResult) -> None:
+    """Amendment 21 §21.4 rules 1-4, with fixed messages that never include
+    a field value. `error` and the receipt are validated by
+    `WorkspaceRecreationFinished`, unchanged."""
+    if not isinstance(result.outcome, events.RecreationOutcome):
+        raise ValueError("a recreation result needs a RecreationOutcome")
+    if (result.workspace is not None) != (result.outcome in _ADOPTING_OUTCOMES):
+        raise ValueError("a recreation result carries a workspace exactly when its incarnation is adopted")
+    if (result.tools is not None) != (result.outcome is events.RecreationOutcome.RECREATED):
+        raise ValueError("a recreation result carries tools exactly for RECREATED")
+    cleanup = result.tool_cleanup_failure
+    if cleanup is not None and (
+        not isinstance(cleanup, ToolCleanupUnconfirmedError)
+        or result.outcome is not events.RecreationOutcome.ADOPTED_THEN_FAILED
+    ):
+        raise ValueError("a toolkit cleanup failure is carried only by ADOPTED_THEN_FAILED")
+
+
+class _RetiredTools:
+    """Stands in for a toolkit that may never be used again: the one held
+    after `ADOPTED_THEN_FAILED` (Amendment 21 §21.5). Every method raises."""
+
+    def _refuse(self, *args, **kwargs):
+        raise RuntimeError("a retired repository toolkit was used")
+
+    read_file = list_directory = search_text = check_search_cursor = _refuse
+
+
+_RETIRED_TOOLS = _RetiredTools()
 
 
 class WorkspaceRecreator(Protocol):
@@ -1179,12 +1226,15 @@ class RunController:
                 # _terminate() then preserves the workspace.
                 if self._any_verifier_cleanup_unconfirmed:
                     return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error)
-                if not patch_failure_continues(
-                    self._patch_failure_stage,
-                    patch_error.code if patch_error is not None else None,
-                    self._session.intent,
-                ):
-                    return self._route_patch_failure(pass_index, patch_error)
+                stage, code = self._patch_failure_stage, patch_error.code if patch_error is not None else None
+                trigger = None
+                if not patch_failure_continues(stage, code, self._session.intent):
+                    # ADR 0004 Amendment 21: only a T3-T5 candidate with a
+                    # recreator goes on; everything else, including T3-T5
+                    # with no recreator, ends here, before C28.
+                    trigger = classify_recreation_trigger(stage, code, self._session.intent)
+                    if self._recreator is None or trigger is None:
+                        return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error)
                 self._cancellation_check("C28")
                 if repair_iterations_used >= c.max_repair_iterations:
                     self._emit(
@@ -1200,25 +1250,31 @@ class RunController:
                         )
                     )
                     return self._terminate(pass_index, domain.Trigger.BUDGET_EXCEEDED)
-                # C30 runs inside the transition. Only once it has passed and
-                # the transition is recorded do the feedback and counters
-                # change, so a cancellation there leaves both untouched.
+                recreated = trigger is not None
+                if recreated:
+                    if not self._recreation_can_continue():
+                        return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error)
+                    finished = self._attempt_recreation(pass_index, trigger, patch_error)
+                    if finished is not None:
+                        return finished
+                # C30 runs inside the transition, the very next action after a
+                # RECREATED Finished. Only once it has passed and the
+                # transition is recorded do the feedback and counters change,
+                # so a cancellation there leaves both untouched.
                 self._transition(pass_index, domain.Trigger.PATCH_FAILED)
-                self._transcript.append(
-                    FeedbackItem(
-                        FeedbackKind.PATCH_FAILED,
-                        pass_index,
-                        {
-                            "change_digest": digests.change_digest,
-                            "error_code": patch_error.code.value,
-                            "message": utf8_prefix(patch_error.message, PATCH_FAILED_MESSAGE_MAX_BYTES),
-                            "plan_revision": revision,
-                            "previous_attempt_failed": True,
-                            "untrusted": True,
-                            "worktree_recreated": False,
-                        },
-                    )
-                )
+                body = {
+                    "change_digest": digests.change_digest,
+                    "error_code": patch_error.code.value,
+                    "message": utf8_prefix(patch_error.message, PATCH_FAILED_MESSAGE_MAX_BYTES),
+                    "plan_revision": revision,
+                    "previous_attempt_failed": True,
+                    "untrusted": True,
+                    "worktree_recreated": recreated,
+                }
+                if recreated:
+                    # ADR 0007 Amendment 2's recreation form.
+                    body["recreation_outcome"] = "recreated"
+                self._transcript.append(FeedbackItem(FeedbackKind.PATCH_FAILED, pass_index, body))
                 repair_iterations_used += 1
                 pass_index += 1
                 continue
@@ -1798,14 +1854,12 @@ class RunController:
         and returns the fixed error. It never calls `_terminate`; the
         caller's existing terminal owner does, and the returned failure
         outranks a pending cancellation (ADR 0005 Amendment 1 §3)."""
-        self._tool_cleanup_failures.append(cleanup)
+        interrupt = self._retain_tool_cleanup(cleanup)
         error = OperationalError(
             code=ErrorCode.TOOL_EXECUTION_FAILED,
             error_id=f"{self._c.run_id}-tool-cleanup-{len(self._tool_cleanup_failures)}",
             message=ToolCleanupUnconfirmedError.MESSAGE,
         )
-        body = cleanup.body_failure
-        interrupt = body if body is not None and not isinstance(body, Exception) else None
         try:
             self._emit(
                 events.ToolCompleted(
@@ -1826,9 +1880,21 @@ class RunController:
             if interrupt is not None:
                 attach_cleanup_failures(emit_exc, (interrupt,))
             raise
+        self._defer_interrupt(interrupt)
+        return error
+
+    def _retain_tool_cleanup(self, cleanup: ToolCleanupUnconfirmedError) -> BaseException | None:
+        """Retain a descriptor-cleanup failure by identity and return its
+        body interrupt, if any, for deferral. Emits nothing (Amendment 21
+        §21.5): shared by the tool path and the recreation path."""
+        self._tool_cleanup_failures.append(cleanup)
+        body = cleanup.body_failure
+        return body if body is not None and not isinstance(body, Exception) else None
+
+    def _defer_interrupt(self, interrupt: BaseException | None) -> None:
+        """D3's first-wins rule: an earlier deferred interrupt is kept."""
         if interrupt is not None and self._deferred_interrupt is None:
             self._deferred_interrupt = interrupt
-        return error
 
     def _map_checkpoint_error(self, exc: Exception, iteration: int) -> OperationalError:
         """ADR 0003 Amendment 2's exact reason+MutationOutcome mapping.
@@ -2124,41 +2190,19 @@ class RunController:
         return None, result
 
     def _recreation_can_continue(self) -> bool:
-        """Q1's "the run will continue" (ADR 0004 Amendment 20 section 2).
-        Always False until D5-B (N4) returns a recreated patch failure to the
-        repair loop. D5-A's `PATCH_FAILED` transition continues only a
-        pre-write refusal, never a recreation, so until then no recreation is
-        attempted and `run()` never calls the recreator."""
-        return False
-
-    def _route_patch_failure(self, pass_index: int, patch_error: OperationalError | None) -> events.RunFinished:
-        """A failed `apply_patch` that does not continue: recreate when Q1
-        holds and a recreator exists; otherwise end the run exactly as
-        before, through the triggering error. The verifier part of Q3 is
-        Gate zero, which the caller has already applied (ADR 0007
-        Amendment 1 §A1.3)."""
-        trigger = classify_recreation_trigger(
-            self._patch_failure_stage,
-            patch_error.code if patch_error is not None else None,
-            self._session.intent,
-        )
-        if (
-            self._recreator is None
-            or trigger is None
-            or not self._recreation_can_continue()
-        ):
-            return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=patch_error)
-        finished = self._attempt_recreation(pass_index, trigger, patch_error)
-        if finished is None:
-            raise RuntimeError("continuing after RECREATED requires the D5 integration repair transition")
-        return finished
+        """Q1's "the run will continue" (ADR 0004 Amendment 20 section 2), a
+        capability result since D5-B (Amendment 21 §21.1): reached only on
+        the accepted path (a T3-T5 candidate, a recreator, C28 passed and the
+        repair budget checked once), where a `RECREATED` outcome returns the
+        run to EXPLORE. It never re-checks the repair budget."""
+        return True
 
     def _attempt_recreation(
         self, pass_index: int, trigger: ErrorCode, triggering_error: OperationalError | None
     ) -> events.RunFinished | None:
         """One recreation attempt (ADR 0004 Amendment 20 sections 2, 3, 6,
-        6.1). Returns `None` only for `RECREATED`; every other path ends the
-        run. Neither event emission is retried or suppressed: a failure
+        6.1; Amendment 21). Returns `None` only for `RECREATED`, which the
+        caller continues through C30; every other path ends the run. Neither event emission is retried or suppressed: a failure
         propagates to `run()`'s Amendment 9 boundary, and nothing here is
         repeated. All bookkeeping is final before the Finished emission, so
         teardown acts on the actual current incarnation."""
@@ -2167,8 +2211,13 @@ class RunController:
         sequence = self._recreator.begin(trigger_code=trigger, checkpoint_id=checkpoint_id)
         if sequence is None:
             # A Q2-Q6 refusal is not an attempt: no event, no sequence, no
-            # artifact; the run ends through the triggering error.
+            # artifact, and no safe point, so a pending cancellation never
+            # replaces it; the run ends through the triggering error.
             return self._terminate(pass_index, domain.Trigger.UNRECOVERABLE_ERROR, error=triggering_error)
+        # C29 (Amendment 21 §21.3a): the first action after begin() returns.
+        # An observation here consumes `sequence` with no event, artifact or
+        # mutation; teardown acts on the current incarnation.
+        self._cancellation_check("C29")
         self._recreation_attempted = True
         self._emit(
             events.WorkspaceRecreationStarted(
@@ -2182,15 +2231,28 @@ class RunController:
                 checkpoint_id=checkpoint_id,
             )
         )
-        result = self._recreator.recreate(sequence)
+        # Recreation time is counted once, on every path (Amendment 21 §21.9).
+        start = self._clock.monotonic()
+        try:
+            result = self._recreator.recreate(sequence)
+        finally:
+            self._total_duration += max(0.0, self._clock.monotonic() - start)
         if not isinstance(result, RecreationResult) or not isinstance(result.outcome, events.RecreationOutcome):
             raise TypeError("the workspace recreator did not return a RecreationResult")
-        adopts = result.outcome in (events.RecreationOutcome.RECREATED, events.RecreationOutcome.ADOPTED_THEN_FAILED)
-        if adopts != (result.workspace is not None):
-            raise ValueError("a recreation result carries a workspace exactly when its incarnation is adopted")
-        # Bookkeeping, final before the Finished emission (section 6.1).
+        # Re-checked here: a frozen result can still be mutated around
+        # __post_init__.
+        _check_recreation_result(result)
+        adopts = result.outcome in _ADOPTING_OUTCOMES
+        # Bookkeeping, final before the Finished emission (section 6.1):
+        # workspace and toolkit change together (Amendment 21 §21.5).
         if adopts:
             self._workspace = result.workspace
+        if result.outcome is events.RecreationOutcome.RECREATED:
+            self._tools = result.tools
+        elif result.outcome is events.RecreationOutcome.ADOPTED_THEN_FAILED:
+            self._tools = _RETIRED_TOOLS
+            if result.tool_cleanup_failure is not None:
+                self._defer_interrupt(self._retain_tool_cleanup(result.tool_cleanup_failure))
         if result.outcome is events.RecreationOutcome.UNCONFIRMED:
             self._recreation_cleanup_unconfirmed = True
         self._emit(

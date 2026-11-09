@@ -99,6 +99,17 @@ def _owner_and_sigkill(repo, state_dir, evidence, point):
         return real_run(cwd, *args, **kwargs)
 
     ws_c._run = run
+    if point == "after_c30":
+        # D5-B: the recreation completes (RECREATED), C30 passes and the run
+        # returns to EXPLORE; die at the next pass's first model request.
+        real_respond = MarkerGatedFakeModel.respond
+
+        def respond(self, context):
+            if context.pass_index >= 1:
+                die()
+            return real_respond(self, context)
+
+        MarkerGatedFakeModel.respond = respond
     if point == "b9":
         # The enter-time cleanup has run and the reservation closed (the leaf
         # is gone); die before the confirmed `creating -> absent`.
@@ -290,3 +301,19 @@ def test_s9_owner_sigkill_b5_b7_stays_blocked_until_forced_acknowledgement(owner
     finally:
         lease.close()
     assert _snapshot(o)[1:] == left[1:]  # nothing was repaired
+
+
+def test_s9_owner_sigkill_after_a_recreated_continuation_is_reconciled(owner):
+    """ADR 0004 Amendment 21 §21.10: an owner SIGKILLed after a RECREATED
+    continuation (C30 passed, the next pass begun) leaves n+1 `present(C)`
+    beside the ref `present(C)`; the next admission reconciles it through
+    Amendment 17's row. The recreation artifact stays in the evidence root."""
+    o = owner
+    proj = _crash(o, "after_c30")
+    _assert_crashed_shape(proj, "present")
+    assert proj["worktree"]["expected_head"] == proj["checkpoint_ref"]["accepted_sha"]
+    assert o.leaf.is_dir() and os.path.realpath(o.leaf) in _git(o.repo, "worktree", "list", "--porcelain")
+    assert (o.evidence / f"{o.lifecycle_id}.recreation-01.evidence").exists()
+    evidence_before = _tree(o.evidence)
+    _assert_admitted(o.repo, "r-after-c30")
+    _assert_fully_clean(o, evidence_before)

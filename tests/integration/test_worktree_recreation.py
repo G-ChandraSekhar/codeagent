@@ -3,8 +3,9 @@ recreator, against real Git, a real lease, the real shared publishers and
 evidence sink, and real `GitWorktree` incarnations. No Docker: the composed
 runs below replace only the verifier.
 
-`RunController._recreation_can_continue()` is still False in production
-(N4); the composed-run tests enable it through the Step 6 test seam.
+Since D5-B (ADR 0004 Amendment 21), `RunController._recreation_can_continue()`
+is the production capability result, so the composed runs below recreate and
+continue without any test seam.
 """
 
 from __future__ import annotations
@@ -38,6 +39,12 @@ from codeagent.workspace import GitWorktree, GitWorktreeCleanupError
 from codeagent.worktree_lifecycle import WorktreeIntent, WorktreePublicationError, WorktreePublicationFailure
 from tests.support.fakes import FakeApprovalProvider, FakeVerifier, MarkerGatedFakeModel, make_plan
 from tests.support.fixture_repo import real_fixture_repo
+
+
+def _code(finished):
+    """The terminal error code; a missing error is an explicit assertion failure."""
+    assert finished.error is not None, f"no error on {finished.terminal_reason}"
+    return finished.error.code
 
 O = events.RecreationOutcome
 _IDENTITY = ["-c", "user.name=CodeAgent Test", "-c", "user.email=codeagent-test@example.invalid"]
@@ -321,6 +328,16 @@ def _raised(fn) -> BaseException | None:
     except Exception as exc:  # noqa: BLE001 - the type is asserted by the caller
         return exc
     return None
+
+
+def _admit(repo, run_id) -> None:
+    """The next admission must succeed; a store refusal (for example a blocked
+    reconciliation) is an explicit assertion failure, anything else propagates."""
+    try:
+        lease = ls.prepare_lifecycle(str(repo), run_id=run_id)
+    except ls.LifecycleStoreError as exc:
+        raise AssertionError(f"the next admission was refused: {exc.reason}") from exc
+    lease.close()
 
 
 def test_begin_refuses_a_second_mint_while_one_is_pending(h) -> None:
@@ -769,10 +786,23 @@ class _ContaminatingApplier:
         )
 
 
+class _ContaminateOnceApplier(lr.GitPatchApplier):
+    """The real applier, except that the first call in a test writes into the
+    worktree and reports a post-write failure (T4); later calls apply for
+    real. `calls` records each call's worktree path."""
+
+    calls: list = []
+
+    def apply(self, run_id, iteration, approved_paths, operations):
+        _ContaminateOnceApplier.calls.append(self._worktree_path)
+        if len(_ContaminateOnceApplier.calls) == 1:
+            return _ContaminatingApplier(self._worktree_path).apply(run_id, iteration, approved_paths, operations)
+        return super().apply(run_id, iteration, approved_paths, operations)
+
+
 @pytest.fixture
 def composed(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEAGENT_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setattr(RunController, "_recreation_can_continue", lambda self: True)
     monkeypatch.setattr(lr, "DockerVerifier", lambda *a, **k: FakeVerifier((events.VerificationOutcome.PASSED,)))
     monkeypatch.setattr(lr, "GitPatchApplier", _ContaminatingApplier)
     counts = {"dispose": {}, "exit": {}}
@@ -827,18 +857,24 @@ def test_composed_recreation_tears_down_only_the_current_objects(composed) -> No
     result, caught = _compose_catching(composed, log)
     assert caught is None, f"unexpected {type(caught).__name__}"
     (rec,) = composed.created
-    assert [type(e).__name__ for e in _recreation(log)] == ["WorkspaceRecreationStarted", "WorkspaceRecreationFinished"]
-    assert _recreation(log)[-1].outcome is O.RECREATED
-    assert result.finished.error.code is ErrorCode.UNCLASSIFIED_FAILURE  # N4 guard: no continuation yet
+    # D5-B (ADR 0004 Amendment 21; migrated from the pre-N4 "no continuation
+    # yet" form): the applier contaminates every attempt, so each RECREATED
+    # continues through C30 until the repair budget (3) ends the run.
+    finished_events = [e for e in _recreation(log) if isinstance(e, events.WorkspaceRecreationFinished)]
+    assert [e.outcome for e in finished_events] == [O.RECREATED] * 3
+    assert [e.recreation_sequence for e in finished_events] == [1, 2, 3]
+    assert result.finished.terminal_reason is domain.TerminalReason.BUDGET_EXCEEDED
     assert result.release_confirmed
     projection, lid = _state(composed)
     assert projection["state"] == "COMPLETE" and projection["worktree"]["intent"] == "absent"
-    # Each incarnation disposed exactly once; each reservation closed exactly once.
-    assert sorted(composed.counts["dispose"].values()) == [1, 1]
-    assert sorted(composed.counts["exit"].values()) == [1, 1]
+    # Each of the four incarnations disposed exactly once; each reservation closed exactly once.
+    assert sorted(composed.counts["dispose"].values()) == [1, 1, 1, 1]
+    assert sorted(composed.counts["exit"].values()) == [1, 1, 1, 1]
     assert _registered(composed.repo) == set() and _git(composed.repo, "for-each-ref", "refs/codeagent") == ""
-    assert (composed.tmp / "evidence" / f"{lid}.recreation-01.evidence").exists()
+    for k in (1, 2, 3):
+        assert (composed.tmp / "evidence" / f"{lid}.recreation-{k:02d}.evidence").exists()
     assert (composed.tmp / "evidence" / f"{lid}.evidence").exists()
+    events.validate_recreation_trace(log.events)
 
 
 class _FailingLog(EventLog):
@@ -968,7 +1004,8 @@ def test_composed_old_reservation_close_failure_is_reported_once_under_reservati
     result, caught = _compose_catching(composed, log)
     assert caught is None, f"unexpected {type(caught).__name__}"
     (rec,) = composed.created
-    assert _recreation(log)[-1].outcome is O.FAILED_NOTHING_OWNED
+    recreation = _recreation(log)
+    assert recreation and recreation[-1].outcome is O.FAILED_NOTHING_OWNED
     assert rec.earlier_reservation_failures == [failure] and rec.reservation is None
     assert result.unconfirmed_stages == (lr.CleanupStage.RESERVATION,)
     assert result.reservation_release_error is failure
@@ -1154,9 +1191,11 @@ def test_the_recreation_budget_bounds_are_accepted(composed, value) -> None:
     assert rec._budget == value
     outcomes = [e.outcome for e in _recreation(log) if isinstance(e, events.WorkspaceRecreationFinished)]
     if value == 0:
-        assert outcomes == [] and result.finished.error.code is ErrorCode.PATCH_APPLICATION_FAILED  # Q6 refused
+        assert outcomes == [] and _code(result.finished) is ErrorCode.PATCH_APPLICATION_FAILED  # Q6 refused
     else:
-        assert outcomes == [O.RECREATED]
+        # D5-B: each RECREATED continues; the repair budget (3) ends the run.
+        assert outcomes == [O.RECREATED] * 3
+        assert result.finished.terminal_reason is domain.TerminalReason.BUDGET_EXCEEDED
     assert result.release_confirmed
 
 
@@ -1182,3 +1221,217 @@ def test_q6_applies_both_the_budget_and_the_format_bound(h) -> None:
     last = h.recreator(max_recreations=99)
     last._minted = 98
     assert _begin(last, h) == 99
+
+
+# ===========================================================================
+# D5-B (ADR 0004 Amendment 21): factory, ordering, C29 and latency, real Git
+# ===========================================================================
+
+
+def _one(items):
+    """Exactly one element, by explicit assertion (strict mutation rule)."""
+    items = list(items)
+    assert len(items) == 1, f"expected exactly one, got {len(items)}"
+    return items[0]
+
+from codeagent.cancellation import CancellationSource  # noqa: E402
+from codeagent.repo_tools import RepoTools  # noqa: E402
+from codeagent.tool_schema import ToolCleanupUnconfirmedError  # noqa: E402
+
+
+def _capture_controller(monkeypatch):
+    box: list = []
+
+    class Recording(RunController):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.initial_workspace = self._workspace
+            box.append(self)
+
+    monkeypatch.setattr(lr, "RunController", Recording)
+    return box
+
+
+def _failing_factory(monkeypatch, exc):
+    """RepoTools whose second construction (the C3a factory call) raises."""
+    made: list = []
+
+    class Factory(RepoTools):
+        def __init__(self, path):
+            made.append(Path(path))
+            if len(made) == 2:
+                raise exc
+            super().__init__(path)
+
+    monkeypatch.setattr(lr, "RepoTools", Factory)
+    return made
+
+
+def test_factory_failure_is_adopted_then_failed(composed, monkeypatch) -> None:
+    """B17, B18: an ordinary factory failure adopts n+1, terminates through
+    WORKSPACE_RECREATION_FAILED, and n+1 is torn down exactly once."""
+    box = _capture_controller(monkeypatch)
+    made = _failing_factory(monkeypatch, ValueError("factory failed"))
+    log = EventLog()
+    result, caught = _compose_catching(composed, log)
+    assert caught is None, f"unexpected {type(caught).__name__}"
+    done = _one([e for e in _recreation(log) if isinstance(e, events.WorkspaceRecreationFinished)])
+    assert done.outcome is O.ADOPTED_THEN_FAILED
+    assert _code(result.finished) is ErrorCode.WORKSPACE_RECREATION_FAILED
+    assert len(box) == 1
+    controller = box[0]
+    assert len(made) == 2 and controller._workspace is not controller.initial_workspace
+    assert controller._tools is __import__("codeagent").controller._RETIRED_TOOLS
+    assert sorted(composed.counts["dispose"].values()) == [1, 1]
+    assert sorted(composed.counts["exit"].values()) == [1, 1]
+    assert _registered(composed.repo) == set()
+
+
+def test_factory_cleanup_unconfirmed_retained_composed(composed, monkeypatch) -> None:
+    """B35 (with the real recreator): a factory cleanup failure travels by
+    identity into the controller's retained list; no tool event; no text."""
+    box = _capture_controller(monkeypatch)
+    injected = ToolCleanupUnconfirmedError((OSError("SENTINEL-FACTORY-91"),), None)
+    _failing_factory(monkeypatch, injected)
+    log = EventLog()
+    result, caught = _compose_catching(composed, log)
+    assert caught is None, f"unexpected {type(caught).__name__}"
+    assert len(box) == 1
+    controller = box[0]
+    assert len(controller.tool_cleanup_failures) == 1 and controller.tool_cleanup_failures[-1] is injected
+    assert _code(result.finished) is ErrorCode.WORKSPACE_RECREATION_FAILED
+    requested = [e for e in log.events if isinstance(e, events.ToolRequested)]
+    completed = [e for e in log.events if isinstance(e, events.ToolCompleted)]
+    assert len(completed) == len(requested)
+    assert all("SENTINEL-FACTORY-91" not in repr(e) for e in log.events)
+    assert sorted(composed.counts["dispose"].values()) == [1, 1]
+
+
+def test_factory_interrupt_takes_raise_path(composed, monkeypatch) -> None:
+    """B19: an interrupt from the factory propagates as the exact instance;
+    the trace ends with an unmatched Started; R2 acts on n+1."""
+    interrupt = KeyboardInterrupt()
+    _failing_factory(monkeypatch, interrupt)
+    log = EventLog()
+    result, caught = _compose_catching(composed, log)
+    assert caught is interrupt and result is None
+    assert [type(e).__name__ for e in _recreation(log)] == ["WorkspaceRecreationStarted"]
+    assert not [e for e in log.events if isinstance(e, events.RunFinished)]
+    assert sorted(composed.counts["exit"].values()) == [1, 1]
+    assert _registered(composed.repo) == set()
+    # The raise path (Amendment 14) never runs _terminate(), so the checkpoint
+    # ref is a durable leftover; the next admission reconciles it.
+    assert _git(composed.repo, "for-each-ref", "refs/codeagent") != ""
+    _admit(composed.repo, "r-after-interrupt")
+    assert _git(composed.repo, "for-each-ref", "refs/codeagent") == ""
+
+
+def test_factory_runs_after_present_and_entry_gate(composed, monkeypatch) -> None:
+    """B21: C3a's factory call follows n+1's durable `present` and C3's entry
+    gate."""
+    order: list = []
+    real_publish = ls.LifecycleWorktreePublisher.publish
+    real_gate = GitWorktree.entry_gate
+
+    def publish(self, transition):
+        real_publish(self, transition)
+        order.append(("publish", transition.intent))
+
+    def gate(self, expected):
+        order.append(("entry_gate", None))
+        return real_gate(self, expected)
+
+    class Factory(RepoTools):
+        def __init__(self, path):
+            order.append(("factory", None))
+            super().__init__(path)
+
+    monkeypatch.setattr(ls.LifecycleWorktreePublisher, "publish", publish)
+    monkeypatch.setattr(GitWorktree, "entry_gate", gate)
+    monkeypatch.setattr(lr, "RepoTools", Factory)
+    _compose_catching(composed, max_recreations=1)
+    factories = [i for i, (kind, _) in enumerate(order) if kind == "factory"]
+    assert len(factories) == 2
+    second = factories[1]
+    assert order[second - 2:second] == [("publish", WorktreeIntent.PRESENT), ("entry_gate", None)]
+
+
+def test_unused_minted_sequence_is_never_reissued(h) -> None:
+    """B31: a minted sequence that was never passed to recreate() is never
+    handed out again."""
+    rec = h.recreator()
+    assert _begin(rec, h) == 1
+    assert isinstance(_raised(lambda: rec.begin(trigger_code=ErrorCode.PATCH_APPLICATION_FAILED, checkpoint_id=h.c)), RuntimeError)
+    assert rec._minted == 1
+
+
+def test_composed_c29_cancellation_real_git(composed, monkeypatch) -> None:
+    """C29 with the real recreator: cancellation requested during Q5's ref
+    observation is observed right after begin(); k is consumed with no event,
+    artifact or mutation, and teardown acts on n."""
+    source = CancellationSource()
+    armed = {"on": False}
+
+    class Applier(_ContaminatingApplier):
+        def apply(self, *a):
+            armed["on"] = True
+            return super().apply(*a)
+
+    real_observe = lr.CheckpointRef.observe
+
+    def observe(self):
+        if armed["on"]:
+            armed["on"] = False
+            source.request("test")
+        return real_observe(self)
+
+    monkeypatch.setattr(lr, "GitPatchApplier", Applier)
+    monkeypatch.setattr(lr.CheckpointRef, "observe", observe)
+    log = EventLog()
+    result, caught = _compose_catching(composed, log, cancellation=source.token)
+    assert caught is None, f"unexpected {type(caught).__name__}"
+    assert result.finished.terminal_reason is domain.TerminalReason.CANCELLED
+    assert _recreation(log) == []
+    rec = _one(composed.created)
+    assert rec._minted == 1
+    lid = _state(composed)[1]
+    assert not (composed.tmp / "evidence" / f"{lid}.recreation-01.evidence").exists()
+    assert (composed.tmp / "evidence" / f"{lid}.evidence").exists()
+    assert sorted(composed.counts["dispose"].values()) == [1]
+    assert sorted(composed.counts["exit"].values()) == [1]
+    assert _registered(composed.repo) == set() and _git(composed.repo, "for-each-ref", "refs/codeagent") == ""
+    _admit(composed.repo, "r-after-c29")
+
+
+# The exact number of Git subprocesses one successful recreation launches
+# (Phases E, D, R and C plus the C3 entry gate), pinned so the documented
+# cancellation-latency bound (Amendment 21 §21.3a) cannot drift silently.
+RECREATION_GIT_LAUNCHES = 21
+
+
+def test_recreation_git_invocation_count_is_pinned(composed, monkeypatch) -> None:
+    launches: list = []
+    active = {"on": False}
+    real_popen = subprocess.Popen
+
+    class Counting(real_popen):
+        def __init__(self, args, *a, **k):
+            if active["on"] and Path(str(args[0])).name == "git":
+                launches.append(tuple(args[:4]))
+            super().__init__(args, *a, **k)
+
+    real_recreate = lr._CompositionRecreator.recreate
+
+    def recreate(self, k):
+        active["on"] = True
+        try:
+            return real_recreate(self, k)
+        finally:
+            active["on"] = False
+
+    monkeypatch.setattr(subprocess, "Popen", Counting)
+    monkeypatch.setattr(lr._CompositionRecreator, "recreate", recreate)
+    log = EventLog()
+    _compose_catching(composed, log, max_recreations=1)
+    assert [e.outcome for e in _recreation(log) if isinstance(e, events.WorkspaceRecreationFinished)] == [O.RECREATED]
+    assert len(launches) == RECREATION_GIT_LAUNCHES, launches

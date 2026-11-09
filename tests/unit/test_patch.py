@@ -194,18 +194,26 @@ def test_rejects_more_than_one_operation() -> None:
     against the same file would each start from the original content
     and silently overwrite one another — deferred to Milestone 2's
     atomic multi-file patch engine, not partially built here."""
+    # ADR 0004 Amendment 21 mutation B14 (the N1/N2 pin): refused before the
+    # worktree is touched, checked by explicit assertion.
     with real_fixture_repo() as repo:
         with GitWorktree(repo, run_id="r-multi-ops") as worktree:
-            with pytest.raises(ValueError):
+            before = (Path(worktree) / "jobs" / "worker.py").read_text()
+            refused = None
+            try:
                 GitPatchApplier(worktree).apply(
                     "r-multi-ops",
                     0,
                     frozenset({"jobs/worker.py"}),
                     (
-                        PatchOperation("jobs/worker.py", "a", "b"),
-                        PatchOperation("jobs/worker.py", "c", "d"),
+                        PatchOperation("jobs/worker.py", "    job.retry_count += 1\n", "    pass\n"),
+                        PatchOperation("jobs/worker.py", "already_processed", "seen"),
                     ),
                 )
+            except ValueError as exc:
+                refused = exc
+            assert refused is not None, "two operations were accepted"
+            assert (Path(worktree) / "jobs" / "worker.py").read_text() == before
 
 
 def test_rejects_empty_expected_text() -> None:

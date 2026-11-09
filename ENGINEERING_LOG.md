@@ -7527,3 +7527,79 @@ threat-model conclusion changes. Planning estimates are unchanged. The
 2026-11-07 entry's "uncommitted" wording was true when written.
 
 `uv.lock` was not touched.
+
+## 2026-11-08 — D5-B: live recreation continues the repair loop (uncommitted)
+
+**What.** Ledger D5, slice D5-B, implemented per ADR 0004 Amendment 21 and
+ADR 0007 Amendment 2 (both Accepted 2026-11-08). A post-write handled failure
+(T3–T5) with a recreator now recreates the worktree at the last accepted
+checkpoint, and the repair loop continues on the new incarnation. Implemented
+and locally verified on macOS; **unstaged, uncommitted and not
+Linux-CI-confirmed.** D5 stays In Progress, not Done. The ordering map,
+mutation table and full disclosures are in ADR 0004 §21.17.
+
+**Trade-offs and decisions made during implementation.**
+- **Real-Docker contamination.** The scenario uses a modification to a
+  tracked file, not a new untracked file. An untracked path makes Phase E's
+  evidence incomplete under ADR 0003 Amendment 2's unchanged rule, so the run
+  could never reach `RECREATED`. This was reproduced, then accepted as a
+  post-acceptance precision correction (§21.11, decision 5).
+- **M05 retired, not re-pointed.** Its only possible inverse is B1. Counting
+  both would count one defect twice.
+- **Strict-rule hardening.** Several new and pre-existing tests failed
+  through incidental `AttributeError`, `IndexError`, `KeyError`,
+  `DID NOT RAISE` or `LifecycleStoreError` rather than an explicit
+  assertion. They were narrowed so the defect boundary is an `assert` while
+  unrelated exceptions still propagate. Nothing was weakened, deleted or
+  skipped.
+
+**Corrections found by verification (each rerun in full).**
+1. S8-M02 also raised one incidental `LifecycleStoreError` at a
+   next-admission check in `test_worktree_recreation.py`. Fixed with
+   `_admit()`. This invalidated the D5-B, Step 7 and Step 8 harnesses.
+2. ADR 0007 Amendment 2 required the worst-case feedback-bound test to use
+   the recreation form, but it still had the D5-A form. Separately, the
+   two-recreations test did not assert the terminal artifact. Both are
+   fixed. This invalidated the D5-B and D5-A harnesses.
+
+   A rerun was in progress when this was found. It was stopped with SIGINT,
+   so the harness's `finally` restored the source, and the tree was confirmed
+   identical to its pre-run hashes.
+3. The Step 8 harness script had disappeared from the scratch directory
+   (no command in the session removed it). It was restored byte for byte from
+   the transcript of its only write and rerun.
+
+**Final local results** (macOS, `CODEAGENT_REQUIRE_DOCKER=1`,
+`PYTHONDONTWRITEBYTECODE=1`).
+- Mutations, each a clean baseline → every mutation → clean baseline, with
+  sources restored and SHA-256-verified:
+  - D5-B: 44/44
+  - D5-A: 18/18
+  - Step 6: 26/26 (M05 retired)
+  - Step 7: 33/33
+  - Step 8: 24/24
+  - D4b: 60/60 (60 of 82 invalidated; `tests/support/fakes.py` is unchanged)
+- Directly affected files: 1,284 passed forward, 1,284 passed reverse.
+- The exact CI verbose command: 18 passed, each named `PASSED` (the four `test_slice_c.py` tests, E1–E10 and E13/E14 in `test_cancellation_e2e.py`, and the D5-A and D5-B real-Docker nodes).
+- Complete suite: 7,078 passed, 2 skipped (`CODEAGENT_REQUIRE_DOCKER=1`); the two skips are `test_repo_tools.py`'s non-UTF-8-filename tests, which macOS APFS refuses.
+- `git diff --check` is clean. Residue checks: no `codeagent-verify-`/`codeagent-baseline-`/`codeagent-verification-` containers, no extra worktrees, no `refs/codeagent` refs, no leftover processes, no default state root, and no temporary CodeAgent roots other than the two explicitly retained non-authoritative `d5bdbg*` evidence roots; nothing staged, `uv.lock` untouched.
+- Two non-authoritative debug evidence roots from diagnosing the Docker
+  scenario are left in place under `/var/folders/.../T/` (`d5bdbg-*`,
+  `d5bdbg2-*`). Their full paths are in §21.17.
+
+**Residuals.**
+- `test_executor.py::test_l2_timeout_kills_the_whole_process_group` (D3) is
+  still intermittent.
+- The Step 8 harness takes about 1.5 hours per run.
+- The mutation harnesses live outside the repository. One of them (Step 8's)
+  disappeared from the scratch directory for an unexplained reason and had to
+  be restored from the session transcript.
+
+**Not done / no claim.**
+- D5-C (the four-operation protocol, N1/N2, model integration), D6 and
+  operator reachability are not implemented.
+- No live model.
+- No Gate α, operator-ready, `COMPLETE_FOR_V1` or v1 claim, and no
+  threat-model conclusion changes.
+- Planning estimates are unchanged.
+- `uv.lock` was not touched.

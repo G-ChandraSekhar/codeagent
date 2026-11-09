@@ -496,3 +496,39 @@ def test_e10_signal_during_admission_reconciliation(e):
     assert result["sites"] == ["C1"]
     assert result["iterations_used"] == 0
     _assert_set_a(e, result, seeded=(seeded,))
+
+
+# ---------------------------------------------------------------------------
+# E13/E14 (ADR 0004 Amendment 21): a signal during recreate()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("how", ["SIGINT", "SIGTERM"], ids=["E13-group-SIGINT", "E14-pid-SIGTERM"])
+def test_e13_e14_signal_during_recreation_is_observed_at_c30(e, how):
+    """Pass 0's stale replacement (T1) establishes the session; the pass-1
+    approval modifies a tracked file in n, so the entry gate fails as T3.
+    Phase E then blocks on a file gate while the test signals twice: the
+    recreation completes (RECREATED) and C30, the very next safe point,
+    observes the cancellation before any further work."""
+    _launch(e, scenario="recreation")
+    assert _gate(e, "ready-recreation") == "0"
+    _signal(e, how)
+    _gate(e, "count-1")
+    _signal(e, how)
+    _gate(e, "count-2")
+    (e.gates / "release-recreation").write_text("")
+    result = _finish(e)
+    assert result["requests_received"] == 2  # repeated signals are idempotent
+    sites = result["sites"]
+    assert {"C28", "C29"} <= set(sites) and sites.index("C28") < sites.index("C29") and sites[-1] == "C30"
+    names = [ev["type"] for ev in result["events"]]
+    assert "WorkspaceRecreationFinished" in names
+    finished = names.index("WorkspaceRecreationFinished")
+    assert names.index("WorkspaceRecreationStarted") == finished - 1
+    assert result["events"][finished]["outcome"] == "recreated"
+    after = result["events"][finished + 1:]
+    assert not [ev for ev in after if ev["type"] == "ModelRequestStarted"]
+    assert not [ev for ev in after if ev.get("trigger") == "patch_failed"]
+    worktree = [intent for kind, intent in result["published"] if kind == "worktree"]
+    assert worktree.count("present") == 2  # n and n+1
+    _assert_set_a(e, result)

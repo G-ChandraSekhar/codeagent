@@ -1,9 +1,9 @@
-"""ADR 0004 Amendment 20, D5/C-1 Step 6: the controller's recreation seam.
+"""ADR 0004 Amendments 20 and 21: the controller's recreation seam.
 
-`_recreation_can_continue()` is hard False until D5 integration adds the
-repair transition (N4), so `run()` never calls the recreator. Tests that
-exercise the seam enable that predicate explicitly and drive a fake
-recreator; nothing here creates a reservation, artifact or real worktree.
+Since D5-B (Amendment 21), `_recreation_can_continue()` is a capability
+result and a `RECREATED` outcome returns the run to EXPLORE through C30.
+These tests drive a fake recreator; nothing here creates a reservation,
+artifact or real worktree.
 """
 
 from __future__ import annotations
@@ -42,6 +42,22 @@ from tests.support.fakes import (
     make_plan,
 )
 
+
+def _code(finished):
+    """The terminal error code; a missing error is an explicit assertion failure."""
+    assert finished.error is not None, f"no error on {finished.terminal_reason}"
+    return finished.error.code
+
+
+def _raised(exc_type, fn):
+    """The `exc_type` instance `fn()` raised, or `None`; any other exception
+    propagates, so a missing raise is an explicit assertion failure."""
+    try:
+        fn()
+    except exc_type as exc:
+        return exc
+    return None
+
 _LID = "a" * 32
 _H0 = "a" * 40
 _NEXT = "c" * 40
@@ -61,9 +77,11 @@ def _error(code: ErrorCode) -> OperationalError:
     return OperationalError(code=code, error_id=f"rec-{code.value}", message="fixed recreation failure")
 
 
-def _result(outcome: events.RecreationOutcome, workspace=None) -> RecreationResult:
+def _result(outcome: events.RecreationOutcome, workspace=None, tools=None) -> RecreationResult:
     if outcome is O.RECREATED:
-        return RecreationResult(outcome=outcome, workspace=workspace, **_receipt())
+        return RecreationResult(
+            outcome=outcome, workspace=workspace, tools=tools if tools is not None else FakeRepositoryTools(), **_receipt()
+        )
     if outcome is O.EVIDENCE_NOT_CONFIRMED:
         return RecreationResult(outcome=outcome, error=_error(ErrorCode.EVIDENCE_ARTIFACT_COLLISION))
     return RecreationResult(
@@ -157,10 +175,10 @@ def _run(controller):
 
 
 @pytest.fixture
-def seam_enabled(monkeypatch):
-    """Stand-in for D5 integration's repair transition (N4): lets `run()`
-    reach the recreation seam. Production keeps the predicate False."""
-    monkeypatch.setattr(RunController, "_recreation_can_continue", lambda self: True)
+def seam_enabled():
+    """Historical name. Before D5-B this fixture forced
+    `_recreation_can_continue()` True; since ADR 0004 Amendment 21 the
+    production predicate is the capability result, so it changes nothing."""
 
 
 def _types(controller) -> list[str]:
@@ -195,6 +213,7 @@ def test_protocol_result_and_seam_are_structurally_pinned() -> None:
     assert {n for n in vars(WorkspaceRecreator) if not n.startswith("_")} == {"begin", "recreate"}
     assert [f.name for f in dataclasses.fields(RecreationResult)] == [
         "outcome", "workspace", "artifact_id", "sha256_payload", "bytes_written", "evidence_complete", "error",
+        "tools", "tool_cleanup_failure",
     ]
     params = inspect.signature(RunController.__init__).parameters
     assert list(params)[-1] == "workspace_recreator" and params["workspace_recreator"].default is None
@@ -204,8 +223,17 @@ def test_protocol_result_and_seam_are_structurally_pinned() -> None:
     }
 
 
-def test_recreation_can_continue_is_false_until_d5_integration() -> None:
-    assert _build()._recreation_can_continue() is False
+def test_recreation_can_continue_is_a_capability() -> None:
+    """ADR 0004 Amendment 21 decision 2 (migrated from
+    `test_recreation_can_continue_is_false_until_d5_integration`): the
+    predicate takes no budget input and is True even when no repair budget
+    exists; the single budget check is ordering step 5."""
+    import inspect as _inspect
+
+    controller = _build()
+    controller._c = dataclasses.replace(controller._c, max_repair_iterations=0)
+    assert controller._recreation_can_continue() is True
+    assert list(_inspect.signature(RunController._recreation_can_continue).parameters) == ["self"]
 
 
 # --- Q1 classification: every stage x code x intent -------------------------
@@ -237,20 +265,22 @@ def test_q1_never_recreates_an_establish_failure_even_with_the_advance_codes() -
 # --- With the predicate False (production): nothing changes ------------------
 
 
-@pytest.mark.parametrize("with_recreator", [False, True])
-def test_production_path_never_calls_the_recreator(with_recreator) -> None:
-    recreator = FakeRecreator(result=_result(O.UNCONFIRMED))
-    controller = _build(recreator=recreator if with_recreator else None)
+def test_without_a_recreator_a_candidate_never_reaches_recreation() -> None:
+    """Migrated from `test_production_path_never_calls_the_recreator`, whose
+    with-recreator case no longer holds after D5-B (Amendment 21)."""
+    controller = _build(recreator=None)
     finished = _run(controller)
-    assert recreator.begin_calls == [] and recreator.recreate_calls == []
     assert _recreation_events(controller) == []
+    assert "C28" not in [s for s, _ in controller._cancellation_sites]
     assert finished.error.code is ErrorCode.PATCH_APPLICATION_FAILED
 
 
 @pytest.mark.parametrize(
     "applier",
-    [lambda: FakePatchApplier(), lambda: FakePatchApplier(True), _apply_failure],
-    ids=["success", "validation-failure", "application-failure"],
+    # D5-B: an application failure is now a recreation candidate, so the
+    # recreator is used there; only the unused cases remain (disclosed).
+    [lambda: FakePatchApplier(), lambda: FakePatchApplier(True)],
+    ids=["success", "validation-failure"],
 )
 def test_runs_are_identical_with_and_without_an_unused_recreator(applier) -> None:
     without = _build(patch_applier=applier())
@@ -500,13 +530,19 @@ def test_adopted_then_failed_tears_down_the_new_incarnation_with_h0_evidence(sea
     assert finished.error.code is ErrorCode.WORKSPACE_RECREATION_FAILED
 
 
-def test_recreated_cannot_continue_before_d5_integration(seam_enabled) -> None:
-    controller, finished, _, old, new, session, sink, owner = _run_outcome(O.RECREATED)
-    assert controller._workspace is new and new.disposed
-    assert _last_recreation_event(controller).outcome is O.RECREATED
-    assert finished.error.code is ErrorCode.UNCLASSIFIED_FAILURE
+def test_recreated_continues_and_tears_down_the_new_incarnation(seam_enabled) -> None:
+    """Migrated from `test_recreated_cannot_continue_before_d5_integration`:
+    since D5-B a `RECREATED` outcome continues through C30. The fake
+    recreator keeps returning `RECREATED` while the applier keeps failing, so
+    the run ends through the repair budget, with teardown on the current
+    (latest) incarnation and terminal evidence based on `H0`."""
+    controller, finished, recreator, old, new, session, sink, owner = _run_outcome(O.RECREATED)
+    assert controller._workspace is new and new.disposed and not old.disposed
+    assert {type(e).__name__ for e in _recreation_events(controller)} == {
+        "WorkspaceRecreationStarted", "WorkspaceRecreationFinished",
+    }
+    assert finished.terminal_reason is domain.TerminalReason.BUDGET_EXCEEDED
     assert sink.last_call_kwargs["initial_commit"] == _H0
-    events.validate_recreation_trace(controller.log.events)
 
 
 def test_h0_is_the_run_origin_not_the_current_incarnation(seam_enabled) -> None:
@@ -521,7 +557,11 @@ def test_h0_is_the_run_origin_not_the_current_incarnation(seam_enabled) -> None:
 def test_a_malformed_result_is_refused_before_bookkeeping_or_finished(seam_enabled, outcome, workspace) -> None:
     old = FakeWorkspace(initial_commit=_H0)
     new = FakeWorkspace(initial_commit=_NEXT)
-    result = dataclasses.replace(_result(outcome), workspace=new if workspace == "new" else None)
+    # The contract is enforced at construction, so the malformed shape is made
+    # by mutating a valid result around __post_init__: the controller's
+    # re-check must still refuse it (Amendment 21 §21.4).
+    result = _result(outcome, new if outcome in (O.RECREATED, O.ADOPTED_THEN_FAILED) else None)
+    object.__setattr__(result, "workspace", new if workspace == "new" else None)
     recreator = FakeRecreator(result=result)
     controller = _build(recreator=recreator, workspace=old)
     finished = _run(controller)
@@ -715,3 +755,524 @@ def test_the_controller_module_creates_no_reservation_artifact_or_worktree() -> 
         assert forbidden not in source
     capture = source[source.index("self._evidence_sink.capture("):]
     assert "recreation_sequence" not in capture[: capture.index(")")]
+
+
+# ===========================================================================
+# D5-B (ADR 0004 Amendment 21; ADR 0007 Amendment 2): recreation continues
+# ===========================================================================
+
+
+def _one(items):
+    """Exactly one element, by explicit assertion (strict mutation rule)."""
+    items = list(items)
+    assert len(items) == 1, f"expected exactly one, got {len(items)}"
+    return items[0]
+
+from codeagent.cancellation import CancellationSource  # noqa: E402
+from codeagent.controller import PatchResult  # noqa: E402
+from codeagent.model_protocol import FeedbackKind  # noqa: E402
+from codeagent.tool_schema import ToolCleanupUnconfirmedError  # noqa: E402
+
+
+class _FailOnce(FakePatchApplier):
+    """A post-write failure (T4) on the first `times` calls, then success."""
+
+    def __init__(self, times: int = 1, code: ErrorCode = ErrorCode.PATCH_APPLICATION_FAILED) -> None:
+        super().__init__()
+        self._left, self._code = times, code
+
+    def apply(self, run_id, iteration, approved_paths, operations):
+        if self._left:
+            self._left -= 1
+            self.operations.append(operations)
+            return PatchResult(
+                success=False, operation_count=0, changed_paths=(), diff_bytes=0,
+                error=OperationalError(code=self._code, error_id=f"{run_id}-fail-{self._left}", message="fixture post-write failure"),
+            )
+        return super().apply(run_id, iteration, approved_paths, operations)
+
+
+class _Recreator(FakeRecreator):
+    """FakeRecreator that records its calls into a shared order list."""
+
+    def __init__(self, *, order, on_begin=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.order, self.on_begin = order, on_begin
+
+    def begin(self, *, trigger_code, checkpoint_id):
+        self.order.append("begin")
+        if self.on_begin is not None:
+            self.on_begin()
+        return super().begin(trigger_code=trigger_code, checkpoint_id=checkpoint_id)
+
+    def recreate(self, sequence):
+        self.order.append("recreate")
+        return super().recreate(sequence)
+
+
+def _d5b(
+    *, outcome=O.RECREATED, result=None, applier=None, sequence=1, on_begin=None, on_recreate=None,
+    owner=None, sink=None, session=None, max_repair=3,
+):
+    old = FakeWorkspace(initial_commit=_H0, path=Path("/fake/n"))
+    new = FakeWorkspace(initial_commit=_NEXT, path=Path("/fake/n1"))
+    new_tools = FakeRepositoryTools()
+    if result is None:
+        adopts = outcome in (O.RECREATED, O.ADOPTED_THEN_FAILED)
+        result = _result(outcome, new if adopts else None, tools=new_tools if outcome is O.RECREATED else None)
+    order: list = []
+    source = CancellationSource()
+    rec = _Recreator(order=order, on_begin=on_begin, sequence=sequence, result=result, on_recreate=on_recreate)
+    controller = _build(
+        recreator=rec, patch_applier=applier if applier is not None else _FailOnce(), workspace=old,
+        session=session, sink=sink, owner=owner, cancellation=source.token,
+    )
+    if max_repair != 3:
+        controller._c = dataclasses.replace(controller._c, max_repair_iterations=max_repair)
+    real_check = controller._cancellation_check
+
+    def check(site):
+        order.append(("site", site, controller.log.next_sequence()))
+        real_check(site)
+
+    controller._cancellation_check = check
+    real_append = controller.log.append
+
+    def append(event):
+        order.append(("event", type(event).__name__, event.sequence))
+        real_append(event)
+
+    controller.log.append = append
+    return SimpleNamespace(c=controller, rec=rec, old=old, new=new, new_tools=new_tools, order=order, source=source,
+                           old_tools=controller._tools)
+
+
+def _sites_of(ns):
+    return [site for site, _ in ns.c._cancellation_sites]
+
+
+def _trans(ns, trigger=domain.Trigger.PATCH_FAILED):
+    return [e for e in ns.c.log.events if isinstance(e, events.StateTransitioned) and e.trigger is trigger]
+
+
+def _feedback(ns):
+    return [i for i in ns.c._transcript if i.kind is FeedbackKind.PATCH_FAILED]
+
+
+def _of_type(ns, cls):
+    return [e for e in ns.c.log.events if isinstance(e, cls)]
+
+
+def _after(ns, cls):
+    """Events after the last WorkspaceRecreationFinished."""
+    finished = _of_type(ns, events.WorkspaceRecreationFinished)
+    assert finished, "expected a WorkspaceRecreationFinished"
+    return [e for e in ns.c.log.events if e.sequence > finished[-1].sequence and isinstance(e, cls)]
+
+
+from types import SimpleNamespace  # noqa: E402
+
+
+# --- Continuation and outcomes ------------------------------------------------
+
+
+def test_recreated_continues_through_c30_to_a_pass() -> None:
+    ns = _d5b()
+    finished = _run(ns.c)
+    assert finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED and finished.error is None
+    assert len(_trans(ns)) == 1 and len(_feedback(ns)) == 1
+    assert ns.c._workspace is ns.new and ns.c._tools is ns.new_tools
+    assert ns.new_tools.calls, "the new toolkit served the next pass"
+    events.validate_recreation_trace(ns.c.log.events)
+
+
+def test_d5b_site_inventory() -> None:
+    ns = _d5b()
+    _run(ns.c)
+    failed = _one([e for e in _of_type(ns, events.ToolCompleted) if e.tool is domain.ToolName.APPLY_PATCH and not e.success])
+    transition = _one(_trans(ns))
+    window = [s for s, seq in ns.c._cancellation_sites if failed.sequence < seq <= transition.sequence]
+    assert window == ["C28", "C29", "C30"]
+
+
+def test_repair_budget_exhausted_never_begins() -> None:
+    ns = _d5b(max_repair=0)
+    finished = _run(ns.c)
+    assert ns.rec.begin_calls == [] and not _of_type(ns, events.WorkspaceRecreationStarted)
+    assert finished.terminal_reason is domain.TerminalReason.BUDGET_EXCEEDED
+    budget = _one(_of_type(ns, events.BudgetExceeded))
+    assert budget.kind is domain.BudgetKind.REPAIR_ITERATIONS and budget.state is domain.RunState.EXECUTE
+
+
+def test_q6_refusal_terminates_with_triggering_error() -> None:
+    ns = _d5b(sequence=None)
+    finished = _run(ns.c)
+    assert len(ns.rec.begin_calls) == 1 and ns.rec.recreate_calls == []
+    assert _code(finished) is ErrorCode.PATCH_APPLICATION_FAILED
+    assert not _trans(ns) and not _of_type(ns, events.BudgetExceeded)
+    assert not _of_type(ns, events.WorkspaceRecreationStarted)
+
+
+def test_adopted_then_failed_terminates_and_disposes_n1() -> None:
+    ns = _d5b(outcome=O.ADOPTED_THEN_FAILED)
+    finished = _run(ns.c)
+    assert _code(finished) is ErrorCode.WORKSPACE_RECREATION_FAILED and not _trans(ns)
+    assert ns.c._workspace is ns.new and ns.new.disposed and not ns.old.disposed
+    assert ns.c._tools is ctl._RETIRED_TOOLS
+
+
+def test_retired_toolkit_refuses_every_call() -> None:
+    for method in ("read_file", "list_directory", "search_text", "check_search_cursor"):
+        assert isinstance(_raised(RuntimeError, lambda: getattr(ctl._RETIRED_TOOLS, method)(None)), RuntimeError)
+
+
+@pytest.mark.parametrize("outcome", [o for o in O if o is not O.RECREATED], ids=lambda o: o.value)
+def test_no_other_outcome_continues(outcome) -> None:
+    ns = _d5b(outcome=outcome)
+    finished = _run(ns.c)
+    assert not _trans(ns) and not _feedback(ns)
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert "C30" not in _sites_of(ns)
+
+
+def test_finished_emission_failure_never_continues() -> None:
+    ns = _d5b()
+    attempts = _fail_emission(ns.c, events.WorkspaceRecreationFinished)
+    finished = _run(ns.c)
+    assert attempts["n"] == 1 and _code(finished) is ErrorCode.UNCLASSIFIED_FAILURE
+    assert not _trans(ns) and not _feedback(ns)
+
+
+def test_recreation_events_in_execute_state() -> None:
+    ns = _d5b()
+    _run(ns.c)
+    started, done = _one(_of_type(ns, events.WorkspaceRecreationStarted)), _one(_of_type(ns, events.WorkspaceRecreationFinished))
+    assert started.state is done.state is domain.RunState.EXECUTE
+    assert done.sequence < _one(_trans(ns)).sequence
+
+
+def test_bookkeeping_precedes_finished() -> None:
+    ns = _d5b()
+    _fail_emission(ns.c, events.WorkspaceRecreationFinished)
+    _run(ns.c)
+    assert ns.c._workspace is ns.new and ns.c._tools is ns.new_tools
+    assert ns.new.disposed and not ns.old.disposed
+
+
+def test_continued_run_teardown_disposes_current_incarnation() -> None:
+    ns = _d5b()
+    _run(ns.c)
+    assert ns.new.disposed and not ns.old.disposed and not ns.old.preserved
+
+
+def test_recreation_candidate_after_verifier_unconfirmed_terminates() -> None:
+    ns = _d5b()
+    ns.c._any_verifier_cleanup_unconfirmed = True
+    calls = []
+    real = ctl.classify_recreation_trigger
+    ctl_spy = lambda *a: calls.append(a) or real(*a)  # noqa: E731
+    original = ctl.classify_recreation_trigger
+    ctl.classify_recreation_trigger = ctl_spy
+    try:
+        finished = _run(ns.c)
+    finally:
+        ctl.classify_recreation_trigger = original
+    assert ns.rec.begin_calls == [] and not _of_type(ns, events.WorkspaceRecreationStarted) and calls == []
+    assert _code(finished) is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+
+
+def test_recreated_charges_one_repair_iteration() -> None:
+    ns = _d5b(applier=_FailOnce(times=5), max_repair=1)
+    finished = _run(ns.c)
+    assert finished.terminal_reason is domain.TerminalReason.BUDGET_EXCEEDED
+    budget = _one(_of_type(ns, events.BudgetExceeded))
+    assert budget.observed_value == 1 and len(_trans(ns)) == 1
+
+
+def test_recreated_feedback_body() -> None:
+    ns = _d5b()
+    _run(ns.c)
+    item = _one(_feedback(ns))
+    proposed = _of_type(ns, events.PlanProposed)
+    assert proposed
+    proposed = proposed[0]
+    assert item.body == {
+        "change_digest": proposed.change_digest,
+        "error_code": "patch_application_failed",
+        "message": "fixture post-write failure",
+        "plan_revision": proposed.plan_revision,
+        "previous_attempt_failed": True,
+        "recreation_outcome": "recreated",
+        "untrusted": True,
+        "worktree_recreated": True,
+    }
+
+
+def test_cancellation_during_recreation_observed_at_c30_first() -> None:
+    holder = {}
+    ns = _d5b(on_recreate=lambda: holder["ns"].source.request("test"))
+    holder["ns"] = ns
+    lengths = []
+    real = ns.c._cancellation_check
+
+    def check(site):
+        if site == "C30":
+            lengths.append(len(ns.c._transcript))
+        real(site)
+
+    ns.c._cancellation_check = check
+    finished = _run(ns.c)
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED
+    assert _sites_of(ns)[-1] == "C30" and lengths and len(ns.c._transcript) == lengths[0]
+    assert not _after(ns, events.ModelRequestStarted) and not _after(ns, events.ToolRequested)
+    assert not _feedback(ns) and not _trans(ns)
+    assert ns.new.disposed
+
+
+def test_cancellation_does_not_replace_unconfirmed() -> None:
+    holder = {}
+    ns = _d5b(outcome=O.UNCONFIRMED, on_recreate=lambda: holder["ns"].source.request("test"))
+    holder["ns"] = ns
+    finished = _run(ns.c)
+    assert _code(finished) is ErrorCode.LIFECYCLE_CLEANUP_UNCONFIRMED
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+
+
+# --- C29 ------------------------------------------------------------------------
+
+
+def test_cancellation_during_begin_observed_at_c29() -> None:
+    holder = {}
+    ns = _d5b(on_begin=lambda: holder["ns"].source.request("test"))
+    holder["ns"] = ns
+    finished = _run(ns.c)
+    sites = _sites_of(ns)
+    assert "C28" in sites and sites[sites.index("C28") + 1 :] == ["C29"]
+    assert not _recreation_events(ns.c)
+    assert finished.terminal_reason is domain.TerminalReason.CANCELLED
+    assert ns.old.disposed and not ns.new.disposed
+
+
+def test_deadline_during_begin_observed_at_c29() -> None:
+    holder = {}
+
+    def jump():
+        c = holder["ns"].c
+        c._clock._next_monotonic += c._c.wall_clock_budget_seconds + 1
+
+    ns = _d5b(on_begin=jump)
+    holder["ns"] = ns
+    finished = _run(ns.c)
+    budget = _one(_of_type(ns, events.BudgetExceeded))
+    assert budget.kind is domain.BudgetKind.WALL_CLOCK
+    assert finished.terminal_reason is domain.TerminalReason.BUDGET_EXCEEDED
+    assert _sites_of(ns)[-1] == "C29" and not _recreation_events(ns.c)
+
+
+def test_c29_precedes_started() -> None:
+    ns = _d5b()
+    _run(ns.c)
+    marks = [m if isinstance(m, str) else m[1] for m in ns.order]
+    assert "begin" in marks
+    i = marks.index("begin")
+    assert marks[i:i + 4] == ["begin", "C29", "WorkspaceRecreationStarted", "recreate"]
+    c29 = _one([seq for kind, site, seq in [m for m in ns.order if isinstance(m, tuple) and m[0] == "site"] if site == "C29"])
+    started = _one(_of_type(ns, events.WorkspaceRecreationStarted))
+    assert c29 == started.sequence
+
+
+def test_c29_cancellation_never_calls_recreate() -> None:
+    holder = {}
+    ns = _d5b(on_begin=lambda: holder["ns"].source.request("test"))
+    holder["ns"] = ns
+    _run(ns.c)
+    assert ns.rec.recreate_calls == [] and len(ns.rec.begin_calls) == 1
+
+
+def test_c29_cancellation_consumes_sequence() -> None:
+    holder = {}
+    ns = _d5b(sequence=1, on_begin=lambda: holder["ns"].source.request("test"))
+    holder["ns"] = ns
+    _run(ns.c)
+    assert ns.rec.recreate_calls == []
+    assert not any(getattr(e, "recreation_sequence", None) == 1 for e in ns.c.log.events)
+    events.validate_recreation_trace(ns.c.log.events)
+    assert ns.c._recreation_attempted is False
+
+
+def test_begin_refusal_outranks_pending_cancellation() -> None:
+    holder = {}
+    ns = _d5b(sequence=None, on_begin=lambda: holder["ns"].source.request("test"))
+    holder["ns"] = ns
+    finished = _run(ns.c)
+    patch = _one([e for e in _of_type(ns, events.ToolCompleted) if e.tool is domain.ToolName.APPLY_PATCH])
+    assert finished.error is patch.error and finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert "C29" not in _sites_of(ns)
+
+
+# --- Result contract --------------------------------------------------------------
+
+
+def _cleanup_error(text="SENTINEL-CLOSE-TEXT-77", body=None):
+    return ToolCleanupUnconfirmedError((OSError(text),), body)
+
+
+@pytest.mark.parametrize("outcome", list(O), ids=lambda o: o.value)
+def test_recreation_result_tools_only_with_recreated(outcome) -> None:
+    adopts = outcome in (O.RECREATED, O.ADOPTED_THEN_FAILED)
+    workspace = FakeWorkspace() if adopts else None
+    kwargs = dict(outcome=outcome, workspace=workspace)
+    if outcome is O.RECREATED:
+        RecreationResult(**kwargs, tools=FakeRepositoryTools())
+        assert _raised(ValueError, lambda: RecreationResult(**kwargs)) is not None
+    else:
+        assert _raised(ValueError, lambda: RecreationResult(**kwargs, tools=FakeRepositoryTools())) is not None
+
+
+@pytest.mark.parametrize("outcome", [o for o in O if o is not O.ADOPTED_THEN_FAILED], ids=lambda o: o.value)
+def test_recreation_result_refuses_cleanup_evidence_on_other_outcomes(outcome) -> None:
+    workspace = FakeWorkspace() if outcome is O.RECREATED else None
+    tools = FakeRepositoryTools() if outcome is O.RECREATED else None
+    assert _raised(ValueError, lambda: RecreationResult(
+        outcome=outcome, workspace=workspace, tools=tools, tool_cleanup_failure=_cleanup_error())) is not None
+
+
+def test_recreation_result_refuses_wrong_evidence_type() -> None:
+    assert _raised(ValueError, lambda: RecreationResult(
+        outcome=O.ADOPTED_THEN_FAILED, workspace=FakeWorkspace(), tool_cleanup_failure=RuntimeError("x"))) is not None
+
+
+def test_recreation_result_evidence_hidden_from_repr_and_equality() -> None:
+    injected = _cleanup_error()
+    with_evidence = RecreationResult(outcome=O.ADOPTED_THEN_FAILED, workspace=None or FakeWorkspace(), tool_cleanup_failure=injected)
+    without = dataclasses.replace(with_evidence, tool_cleanup_failure=None)
+    assert "SENTINEL-CLOSE-TEXT-77" not in repr(with_evidence) and "ToolCleanupUnconfirmed" not in repr(with_evidence)
+    assert with_evidence == without
+
+
+def test_recreation_result_preserves_evidence_identity() -> None:
+    injected = _cleanup_error()
+    result = RecreationResult(outcome=O.ADOPTED_THEN_FAILED, workspace=FakeWorkspace(), tool_cleanup_failure=injected)
+    assert result.tool_cleanup_failure is injected
+
+
+@pytest.mark.parametrize("field_name", ["workspace", "tools", "tool_cleanup_failure"])
+def test_result_bypass_is_refused_by_the_controller_recheck(field_name) -> None:
+    ns = _d5b()
+    result = ns.rec.result
+    bad = {"workspace": None, "tools": None, "tool_cleanup_failure": _cleanup_error()}[field_name]
+    object.__setattr__(result, field_name, bad)
+    finished = _run(ns.c)
+    assert _code(finished) is ErrorCode.UNCLASSIFIED_FAILURE and not _trans(ns)
+    assert [type(e).__name__ for e in _recreation_events(ns.c)] == ["WorkspaceRecreationStarted"]
+
+
+def test_recreated_without_tools_fails_closed() -> None:
+    ns = _d5b()
+    object.__setattr__(ns.rec.result, "tools", None)
+    finished = _run(ns.c)
+    assert _code(finished) is ErrorCode.UNCLASSIFIED_FAILURE and not _trans(ns)
+
+
+# --- Toolkit cleanup retention --------------------------------------------------------
+
+
+def _adopted_with_cleanup(cleanup):
+    new = FakeWorkspace(initial_commit=_NEXT, path=Path("/fake/n1"))
+    return _d5b(result=RecreationResult(
+        outcome=O.ADOPTED_THEN_FAILED, workspace=new, tool_cleanup_failure=cleanup,
+        error=_error(ErrorCode.WORKSPACE_RECREATION_FAILED), **_receipt(),
+    ))
+
+
+def test_factory_cleanup_unconfirmed_retained() -> None:
+    injected = _cleanup_error()
+    ns = _adopted_with_cleanup(injected)
+    before = len(ns.c.tool_cleanup_failures)
+    finished = _run(ns.c)
+    assert len(ns.c.tool_cleanup_failures) == before + 1 and ns.c.tool_cleanup_failures[-1] is injected
+    assert _code(finished) is ErrorCode.WORKSPACE_RECREATION_FAILED
+
+
+def test_factory_cleanup_unconfirmed_emits_no_tool_event() -> None:
+    ns = _adopted_with_cleanup(_cleanup_error())
+    _run(ns.c)
+    assert len(_of_type(ns, events.ToolCompleted)) == len(_of_type(ns, events.ToolRequested))
+    started = _one(_of_type(ns, events.WorkspaceRecreationStarted))
+    done = _one(_of_type(ns, events.WorkspaceRecreationFinished))
+    assert not [e for e in _of_type(ns, events.ToolCompleted) if started.sequence < e.sequence < done.sequence]
+
+
+def test_factory_cleanup_deferred_interrupt_retained() -> None:
+    interrupt = KeyboardInterrupt()
+    ns = _adopted_with_cleanup(_cleanup_error(body=interrupt))
+    finished = _run(ns.c)
+    assert ns.c.deferred_interrupt is interrupt
+    assert _code(finished) is ErrorCode.WORKSPACE_RECREATION_FAILED
+
+
+def test_factory_cleanup_deferred_interrupt_first_wins() -> None:
+    earlier = SystemExit()
+    ns = _adopted_with_cleanup(_cleanup_error(body=KeyboardInterrupt()))
+    ns.c._deferred_interrupt = earlier
+    _run(ns.c)
+    assert ns.c.deferred_interrupt is earlier
+
+
+def test_factory_cleanup_no_text_leak() -> None:
+    ns = _adopted_with_cleanup(_cleanup_error(text="SENTINEL-LEAK-5c1e"))
+    finished = _run(ns.c)
+    for event in ns.c.log.events:
+        assert "SENTINEL-LEAK-5c1e" not in repr(event)
+    assert "SENTINEL-LEAK-5c1e" not in repr(finished)
+
+
+def test_record_tool_cleanup_unchanged_after_split() -> None:
+    controller = _build()
+    controller.state = domain.RunState.EXPLORE
+    interrupt = KeyboardInterrupt()
+    cleanup = _cleanup_error(body=interrupt)
+    error = controller._record_tool_cleanup(0, domain.ToolName.READ_FILE, "tc-0-1", cleanup, 0.5)
+    done = _one([e for e in controller.log.events if isinstance(e, events.ToolCompleted)])
+    assert not done.success and done.error is error and error.message == ToolCleanupUnconfirmedError.MESSAGE
+    assert error.error_id.endswith("-tool-cleanup-1")
+    assert controller.tool_cleanup_failures == (cleanup,) and controller.deferred_interrupt is interrupt
+
+
+# --- Duration ---------------------------------------------------------------------------
+
+
+def _duration_run(seconds, *, outcome=O.RECREATED, raise_exc=None, fail_finished=False):
+    holder = {}
+
+    def advance():
+        holder["ns"].c._clock._next_monotonic += seconds
+        if raise_exc is not None:
+            raise raise_exc
+
+    ns = _d5b(outcome=outcome, on_recreate=advance)
+    holder["ns"] = ns
+    if fail_finished:
+        _fail_emission(ns.c, events.WorkspaceRecreationFinished)
+    if isinstance(raise_exc, BaseException) and not isinstance(raise_exc, Exception):
+        assert _raised(type(raise_exc), ns.c.run) is not None, "the interrupt did not propagate"
+        return ns.c._total_duration
+    return _run(ns.c).total_duration_seconds
+
+
+@pytest.mark.parametrize("outcome", [O.DISPOSAL_FAILED, O.UNCONFIRMED], ids=lambda o: o.value)
+def test_duration_counted_on_failed_outcome(outcome) -> None:
+    assert _duration_run(7.0, outcome=outcome) - _duration_run(0.0, outcome=outcome) == pytest.approx(7.0)
+
+
+@pytest.mark.parametrize("make", [lambda: RuntimeError("boom"), lambda: KeyboardInterrupt()], ids=["exception", "interrupt"])
+def test_duration_counted_on_exception_and_interrupt(make) -> None:
+    assert _duration_run(7.0, raise_exc=make()) - _duration_run(0.0, raise_exc=make()) == pytest.approx(7.0)
+
+
+def test_duration_counted_once_when_finished_emission_fails() -> None:
+    assert _duration_run(7.0, fail_finished=True) - _duration_run(0.0, fail_finished=True) == pytest.approx(7.0)
+
+
+def test_duration_counted_once_on_recreated() -> None:
+    assert _duration_run(7.0) - _duration_run(0.0) == pytest.approx(7.0)

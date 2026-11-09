@@ -7016,7 +7016,9 @@ section is the single authoritative record of the checkpoint's CI evidence.
   automatic admission reconciliation (`prepare_lifecycle()`) and through the
   explicit maintenance `codeagent reconcile`.
 
-**Live recreation is unreachable.**
+**Live recreation is unreachable** (historical: true at this checkpoint;
+Amendment 21, D5-B, makes `_recreation_can_continue()` a `True` capability
+result and live recreation reachable on the internal continue path, §21.17).
 `RunController._recreation_can_continue()` returns `False` until D5 integration
 adds the repair transition after a patch failure (N4). No run therefore calls
 the recreator; a patch failure ends the run exactly as before. §11's complete
@@ -7139,3 +7141,791 @@ job log.
   coverage for the §9 shape only.
 - **No claim:** of operator readiness, Gate α, `COMPLETE_FOR_V1` or v1
   completion.
+
+## Amendment 21 (Accepted 2026-11-08): live recreation continues the repair loop (D5-B, N4)
+
+Status: **Accepted (2026-11-08)**, after joint review. **Implemented and
+locally verified on macOS (2026-11-08); unstaged, uncommitted and not
+Linux-CI-confirmed** (§21.17). (Historical: at acceptance this line said "Not
+implemented.") It was accepted together with ADR 0007 Amendment 2 (Accepted 2026-11-08,
+recreation feedback), which governs the feedback schema. Milestone 2, ledger D5, slice D5-B only. It completes Amendment 20's N4 and the
+D5 row's "post-write handled failure → … → new incarnation at the last
+checkpoint → repair continues (real Git)" criterion. D5 stays "In progress, not
+Done" afterwards: D5-C remains required.
+
+**Sources.** The jointly accepted D5 continuation plan, revision 3
+(`D5_N4_patch_failure_continuation_plan_rev3.md`, outside the repository,
+sha256 `9b7a7dd1246cae68fdd2aeba1bfab1a866d1d107cf6542ffb9c32880b32fc305`);
+Amendment 20 above; ADR 0007 Amendment 1 (D5-A, Accepted 2026-11-07, committed
+`79895f8`, Linux-CI-confirmed in run 42454095719). Where this amendment and the
+plan differ, this amendment governs once accepted; ADR 0007 Amendment 1 governs
+its own accepted corrections (Gate zero before classification for every mapped
+T1–T7 failure; T8 and T9 on their own paths; D5-A's behavioural C29 absence;
+17/18 D5-A mutations). Line references are to `3ee839a`.
+
+### 21.1 Scope
+
+- **D5-A stays authoritative** for T1 (a pre-write `PATCH_VALIDATION_FAILED`
+  on a `PRESENT` session): continue without recreation, unchanged.
+- **D5-B adds recreation continuation** for Amendment 20 §2's Q1 candidates
+  only: T3 (`ENTRY_GATE` / `WORKSPACE_ENTRY_GATE_FAILED`), T4 (`APPLY` /
+  `PATCH_APPLICATION_FAILED`) and T5 (`ADVANCE` / a confirmed-`UNCHANGED`
+  code), each on a `PRESENT` session, and only when a `WorkspaceRecreator` is
+  supplied. With no recreator, T3–T5 terminate exactly as today (Amendment 20
+  §2).
+- **Still terminal:** T2, T6, T7 and every unknown failure. T8 and T9 keep
+  their exception and raise paths.
+- **Gate zero** stays before any classification for T1–T7 (ADR 0007
+  Amendment 1 §A1.3); it is also Amendment 20 Q3's verifier part.
+- **`_recreation_can_continue()`** (`controller.py:2126-2132`, constant
+  `False` today) becomes a capability result: once reached on the accepted
+  D5-B candidate path (a T3–T5 candidate, a recreator present, C28 passed,
+  the repair budget checked), it returns `True`, meaning "a `RECREATED`
+  outcome returns the run to EXPLORE". It does **not** re-evaluate the repair
+  budget; that is checked exactly once, in ordering step 5 (§21.3), and no
+  second budget check or competing precedence rule exists (decision 2).
+- **Out of scope:** D5-C (the four-operation protocol, whole-proposal
+  validation, N1/N2, the syntax guard, test-file policy, model integration of
+  the operations), D6 and any operator path.
+
+### 21.2 Classification (D5-B)
+
+| # | Stage / code | Session | D5-B disposition |
+|---|---|---|---|
+| T1 | `APPLY` / `PATCH_VALIDATION_FAILED` | `PRESENT` | continue without recreation (D5-A, unchanged) |
+| T2 | `APPLY` / substrate or objects-unavailable | any | terminate with `E` |
+| T3 | `ENTRY_GATE` / `WORKSPACE_ENTRY_GATE_FAILED` | `PRESENT` | recreation candidate (with a recreator); otherwise terminate |
+| T4 | `APPLY` / `PATCH_APPLICATION_FAILED` | `PRESENT` | recreation candidate (with a recreator); otherwise terminate |
+| T5 | `ADVANCE` / confirmed-`UNCHANGED` code | `PRESENT` | recreation candidate (with a recreator); otherwise terminate |
+| T6 | `ESTABLISH` / any; other `ADVANCE` codes | not `PRESENT` | terminate |
+| T7 | `POSTCONDITION` / `INTERNAL_INVARIANT_VIOLATION` | `PRESENT` | terminate |
+| T8 | unexpected `Exception` in the transaction | — | unchanged exception path (`UNCLASSIFIED_FAILURE`) |
+| T9 | non-`Exception` `BaseException` | — | unchanged raise path (Amendment 14) |
+| T10 | Gate zero holds (any of T1–T7) | — | terminate at Gate zero, before any classification |
+
+Classification is `patch_failure_continues()` (T1, `controller.py:478`) then
+`classify_recreation_trigger()` (T3–T5, `controller.py:455`); Gate zero runs
+before both.
+
+### 21.3 Ordering and safe points
+
+After a failed `apply_patch`, in EXECUTE:
+
+1. `ToolCompleted(apply_patch, success=False, error=E)` (unchanged).
+2. **Gate zero:** `_any_verifier_cleanup_unconfirmed` true → terminate with
+   `E`; `_terminate()`'s precedence preserves the workspace and reports
+   `LIFECYCLE_CLEANUP_UNCONFIRMED`.
+3. **Classification:** T1 → D5-A's path (C28, budget, C30, feedback);
+   T3–T5 with a recreator → step 4; **T3–T5 with no recreator → terminate
+   immediately with `E`** (decision 1): no C28, no wall-clock or budget
+   check, no `begin()`, no recreation event, no feedback, counter change or
+   transition, and a pending cancellation does not replace the returned
+   failure; everything else → terminate with `E`.
+4. **C28:** cancellation, then the wall clock. Observed: `CANCELLED` or
+   `BudgetExceeded(WALL_CLOCK)`, on incarnation *n*.
+5. **Shared repair budget, checked exactly once:** exhausted →
+   `BudgetExceeded(REPAIR_ITERATIONS)` in EXECUTE, then `BUDGET_EXCEEDED`. No
+   `begin()`. `_recreation_can_continue()` (then `True`) does not repeat this
+   check.
+6. **`k = recreator.begin(...)`** (Q2–Q6; Q5's ref observation blocks).
+   - Returns `None` → terminate with `E`. **No safe point runs:** a returned
+     operational refusal outranks a pending cancellation (ADR 0005
+     Amendment 1 §3), so the run never ends `CANCELLED` here.
+   - Raises → an interrupt propagates (the recreator's `_call` re-raises it
+     outside any handler; nothing was minted); an ordinary exception reaches
+     Amendment 9's boundary. Both unchanged.
+7. **C29**, the very next action after a non-`None` return (§21.3a).
+8. `_recreation_attempted = True`, then **`WorkspaceRecreationStarted(k)`**.
+9. **`recreate(k)`**, inside the duration wrapper (§21.9).
+10. **Result validation and all bookkeeping** (§21.4, §21.5): workspace,
+    tools, cleanup-error retention, deferred interrupt, `UNCONFIRMED` flag.
+11. **`WorkspaceRecreationFinished(k)`.** Any outcome but `RECREATED`
+    terminates now with `result.error`; no safe point runs first.
+12. **C30** (`RECREATED` only): `_transition(pass_index, PATCH_FAILED)` runs
+    C30, cancellation then the wall clock, as the very next action after
+    Finished returns.
+13. `StateTransitioned(EXECUTE → EXPLORE, patch_failed)`.
+14. Only then: append one `PATCH_FAILED` feedback item (§21.8), charge one
+    repair iteration, advance the pass; the next pass begins at the existing
+    C5.
+
+Nothing changes the transcript or a counter before C30.
+
+**Amendment 20 §3 S0, narrowly revised.** S0 said the controller updates its
+bookkeeping and emits Started immediately after the recreator mints *k*. C29
+now sits between the mint and that bookkeeping and emission. Q1–Q6, the mint
+itself and Phases E, D, R and C are otherwise unchanged.
+
+#### 21.3a C29
+
+- **Definition.** A direct `self._cancellation_check("C29")` in
+  `_attempt_recreation`, the first action after `begin()` returns a
+  non-`None` *k*, before `_recreation_attempted`, Started, `recreate()` or any
+  lifecycle mutation. It is neither a transition site nor a dispatch site.
+- **Sequence identity.** The C29 entry in `_cancellation_sites` records
+  `self.log.next_sequence()`; nothing is emitted between C29 and Started, so
+  that value equals the sequence Started then receives. An order spy proves
+  the call order `begin → C29 → Started → recreate`.
+- **Observed at C29** (cancellation, or the wall-clock deadline):
+  - *k* is minted and consumed. `_CompositionRecreator._minted` stays
+    incremented and `_pending` stays set; nothing releases or re-issues *k*
+    (a later `begin()` would raise `RuntimeError`, `_lifecycle_run.py:446-447`,
+    but the run terminates so none follows).
+  - No Started, no Finished, no artifact, and no recreation mutation (no
+    Phase E/D/R/C step, projection publication, reservation, or Git command
+    beyond Q5's read-only observation).
+  - `_recreation_attempted` stays `False`. `validate_recreation_trace`
+    passes: there is no Started, so no sequence gap is visible.
+  - Teardown acts on incarnation *n*, still current, active and with its
+    reservation consumed and open: terminal evidence from *n*, disposal of
+    *n* once, ref deletion, the reservation closed once.
+  - Analogous to, but distinct from, a failed Started emission (Amendment 20
+    §6.1): both consume *k* with nothing mutated, but a failed emission is
+    `UNRECOVERABLE_ERROR` (`UNCLASSIFIED_FAILURE`) and may leave an unmatched
+    Started, while a C29 observation is an ordinary `CANCELLED` or
+    `BUDGET_EXCEEDED` with no recreation event at all.
+- **Accepted residual.** No safe point runs inside `recreate()`. A
+  cancellation arriving after C29 passes waits through the remainder of
+  `recreate()` and is observed at C30 (`RECREATED`) or by the immediate
+  terminal path (any other outcome). The configured bound on that wait is
+  computed from the Git invocation count pinned by
+  `test_recreation_git_invocation_count_is_pinned` (plan revision 3 §7.1
+  estimated about 16–20 `subprocess.run` Git calls at 30 s each plus 3–4
+  bounded readers at 32 s each, about 576–728 s); filesystem and `fsync`
+  time, and the direct-child-only Git timeout residual, have no configured
+  bound. A cancellation during `begin()` waits at most Q5's two 30 s
+  observations and is observed at C29, never after recreation.
+
+### 21.4 `RecreationResult` contract
+
+Today's dataclass (`controller.py:405-420`) has `outcome`, `workspace`, four
+receipt fields and `error`. D5-B appends two fields at the end, so existing
+keyword construction is unaffected:
+
+```python
+tools: "RepositoryTools | None" = None
+tool_cleanup_failure: ToolCleanupUnconfirmedError | None = field(
+    default=None, repr=False, compare=False
+)
+```
+
+`__post_init__` raises `ValueError` with a fixed message (never a field value)
+when:
+1. `outcome` is not a `RecreationOutcome`;
+2. `workspace is not None` differs from `outcome in {RECREATED,
+   ADOPTED_THEN_FAILED}`;
+3. `tools is not None` differs from `outcome is RECREATED`;
+4. `tool_cleanup_failure` is neither `None` nor a `ToolCleanupUnconfirmedError`,
+   or is non-`None` with any outcome other than `ADOPTED_THEN_FAILED`.
+
+`error` and the receipt fields stay validated at the Finished-event boundary
+(`events.py:1150-1168`), unchanged. The cleanup field is never serialized or
+emitted; the controller copies only `outcome`, `error` and the receipt into
+`WorkspaceRecreationFinished`. The controller re-checks rules 2–4 after
+`recreate()` returns, as defence against an `object.__setattr__`-mutated or
+duck-typed result; a violation goes to Amendment 9's boundary.
+
+| Outcome | `workspace` | `tools` | `tool_cleanup_failure` | `error` |
+|---|---|---|---|---|
+| `RECREATED` | *n+1* | the factory's toolkit | `None` | `None` |
+| `ADOPTED_THEN_FAILED` (C3 entry gate) | *n+1* | `None` | `None` | `WORKSPACE_RECREATION_FAILED` |
+| `ADOPTED_THEN_FAILED` (C3a factory, ordinary `Exception`) | *n+1* | `None` | `None` (instance discarded) | `WORKSPACE_RECREATION_FAILED` |
+| `ADOPTED_THEN_FAILED` (C3a factory, `ToolCleanupUnconfirmedError`) | *n+1* | `None` | the exact instance | `WORKSPACE_RECREATION_FAILED` |
+| `EVIDENCE_NOT_CONFIRMED` | `None` | `None` | `None` | the §5.2 evidence code |
+| `DISPOSAL_FAILED`, `FAILED_NOTHING_OWNED`, `UNCONFIRMED` | `None` | `None` | `None` | `WORKSPACE_RECREATION_FAILED` |
+| C3a factory non-`Exception` `BaseException` | no result: `recreate()` propagates it | | | |
+
+### 21.5 Tool ownership and rebinding
+
+`RepoTools` pins the worktree root's `(st_dev, st_ino)` (`repo_tools.py:339`), and
+*n+1* is a new directory at the same path, so *n*'s toolkit cannot serve *n+1*.
+The composition today constructs one `RepoTools(path)` (`_lifecycle_run.py:742`).
+
+- **Factory.** `_CompositionRecreator` gains `tools_factory: Callable[[Path],
+  RepositoryTools]`; the composition passes `RepoTools`.
+- **Amendment 20 §3 Phase C, narrowly revised: new step C3a.** After C2
+  (durable `present(C)` and `consume()`) and C3 (`entry_gate(C)` on *n+1*),
+  the recreator calls the factory with *n+1*'s path. Only then is `RECREATED`
+  returned. No factory call happens before `present(C)` or on any path where
+  *n+1* is not adopted.
+- **Factory failures:**
+  - an ordinary `Exception` (including `RepoTools.__init__`'s `ValueError`):
+    `ADOPTED_THEN_FAILED`, the existing fixed `WORKSPACE_RECREATION_FAILED`
+    message, the instance not retained;
+  - `ToolCleanupUnconfirmedError` (injected factories only; the production
+    `RepoTools.__init__` opens no descriptor): `ADOPTED_THEN_FAILED`, with the
+    exact instance in `tool_cleanup_failure`. **Never `UNCONFIRMED`**: a tool
+    descriptor is not lifecycle-owned. *n+1* is the current owned workspace
+    and is torn down exactly once;
+  - a non-`Exception` `BaseException`: `_call` re-raises it; `recreate()`
+    propagates it; no Finished (an unmatched Started, legal with no
+    `RunFinished`); the recreator's current objects are *n+1* and its
+    consumed reservation, so R2 disposes *n+1* once through
+    `GitWorktree.__exit__` and closes the reservation once.
+- **When the old toolkit is retired and the new one becomes authoritative.**
+  Both happen in step 10, before Finished: `RECREATED` sets `self._tools =
+  result.tools`; `ADOPTED_THEN_FAILED` sets `self._tools = _RETIRED_TOOLS`, a
+  private sentinel whose every `RepositoryTools` method raises. Every other
+  outcome leaves *n* and its toolkit current, and the run terminates, so they
+  are never used again. *n*'s `RepoTools` holds no persistent descriptor, so
+  retiring it closes nothing and cannot fail.
+- **Cleanup retention without a tool event.** `_record_tool_cleanup`
+  (`controller.py:1786`) is split so its retention is shared:
+  - `_retain_tool_cleanup(cleanup)` appends the exact instance to
+    `_tool_cleanup_failures` and returns its `body_failure` if that is a
+    non-`Exception`; it emits nothing;
+  - `_defer_interrupt(interrupt)` sets `_deferred_interrupt` only if none is
+    set (first deferred interrupt wins);
+  - `_record_tool_cleanup` keeps its single failed `ToolCompleted`, its
+    emission-failure attachment and its order (defer only after the emission);
+  - the recreation path calls only
+    `_defer_interrupt(_retain_tool_cleanup(result.tool_cleanup_failure))` in
+    step 10, before Finished. It emits no `ToolCompleted` and no new event, and
+    never reads the exception's text.
+- **Moving together or failing closed.** Workspace, toolkit and reservation
+  change only through one `recreate()` result: the recreator updates its
+  current incarnation and reservation inside `recreate()`; the controller
+  updates workspace and toolkit together in step 10. No path adopts *n+1*
+  without either its toolkit (`RECREATED`) or `_RETIRED_TOOLS`
+  (`ADOPTED_THEN_FAILED`). `RECREATED` without tools fails `__post_init__`, and
+  the controller's re-check catches a bypass.
+
+### 21.6 Retained collaborators across incarnations
+
+`GitPatchApplier(path)` and `DockerVerifier(path)` are kept (plan revision 3,
+J3). Both are path-based, and *n+1* is materialized at the same deterministic
+path. Real tests must prove they act on *n+1*: the revised patch's commit is
+observed in *n+1* (`HEAD == PatchApplied.checkpoint_id`, parent `C`) while
+*n*'s inode no longer exists (samestat against a descriptor held across
+recreation); in real Docker, a sentinel written into *n+1* after recreation is
+visible inside the verification container and one written into *n* before
+disposal is not, and the verification passes only with the revised content.
+
+### 21.7 Outcomes and precedence
+
+| Outcome | Run | Current workspace / reservation / toolkit | Cleanup-unconfirmed | Errors retained | C30 | Feedback / budget |
+|---|---|---|---|---|---|---|
+| `RECREATED` | continues | *n+1* / *n+1*'s / new toolkit | no | `E` stays on its `ToolCompleted` | yes | appended once / charged once, both after C30 |
+| `ADOPTED_THEN_FAILED` | terminates (`result.error`) | *n+1* / *n+1*'s / `_RETIRED_TOOLS` | no | `E` on `ToolCompleted`; a factory cleanup error retained by identity | no | none |
+| `EVIDENCE_NOT_CONFIRMED` | terminates (evidence code) | *n* / *n*'s / *n*'s | no | as above | no | none |
+| `DISPOSAL_FAILED` | terminates | *n* (possibly partly removed) / *n*'s / *n*'s | per the existing disposal latch | as above | no | none |
+| `FAILED_NOTHING_OWNED` | terminates | no worktree / none current / *n*'s (unused) | no | as above | no | none |
+| `UNCONFIRMED` | terminates; `LIFECYCLE_CLEANUP_UNCONFIRMED` dominates | per Amendment 20 §7 | **yes** | as above | no | none |
+
+- **Only `RECREATED` continues.** Every other outcome terminates in step 11,
+  with Amendment 20 §5.3/§7 teardown unchanged.
+- **Cancellation never replaces** an unconfirmed cleanup or a recreation
+  failure: a non-`RECREATED` outcome terminates before any safe point, and
+  `_terminate()`'s precedence is unchanged.
+- **Deferred interrupts:** a factory cleanup error's body interrupt is
+  deferred in step 10 (first wins) and reaches the composition through the
+  existing `deferred_interrupt` channels even if Finished then fails.
+- **Evidence and events:** Amendment 20 §4–§6 unchanged; a continued run's
+  terminal artifact is captured from the incarnation current at
+  termination.
+
+### 21.8 Feedback after `RECREATED`
+
+- **Schema authority: ADR 0007 Amendment 2** (Accepted 2026-11-08,
+  recreation feedback), which defines the two recreation fields
+  (`"worktree_recreated": true`, `"recreation_outcome": "recreated"`), the
+  unchanged D5-A schema without recreation, and the extended worst-case bound.
+  This amendment does not change that schema itself.
+- **What this amendment governs:** when the item is produced in the lifecycle
+  sequence. It is appended only in step 14, after a `RECREATED` Finished and a
+  passed C30, once per continuation; never after a `begin()` refusal, a C29
+  or C30 observation, or any terminal outcome.
+
+### 21.9 Accounting
+
+- **Repair budget:** exactly one charge, in step 14, after C30 passes. None on
+  a `begin()` refusal, a C29 observation, a C30 observation, any terminal
+  outcome, or a T3–T5 failure with no recreator. Exhaustion is checked exactly
+  once, in step 5, before `begin()`; `_recreation_can_continue()` never
+  re-checks it.
+- **Recreation budget (Q6):** unchanged; a refusal terminates through `E`
+  (J2), with no `BudgetKind` and no `BudgetExceeded`.
+- **Duration:** measured once by the only `recreate()` call site:
+  ```python
+  start = self._clock.monotonic()
+  try:
+      result = self._recreator.recreate(k)
+  finally:
+      self._total_duration += max(0.0, self._clock.monotonic() - start)
+  ```
+  It covers `RECREATED`, every other outcome, an ordinary exception and an
+  interrupt, and adds nothing more when Finished fails. `begin()` and C29 add
+  no duration; the wall clock (elapsed since `RunStarted`) is independent.
+- **Verification attempts:** unchanged until VERIFY.
+- **Passes:** `pass_index` advances once per continuation; `iterations_used`
+  keeps ADR 0005 Amendment 1's definition.
+- **Sequences and evidence numbering:** *k* increases by one per minted
+  sequence, including one consumed at C29; recreation artifacts are numbered
+  by the *k* whose Phase E ran, so a C29-consumed *k* has no artifact, and no
+  later recreation occurs in that run.
+- **No repetition:** Started, Finished, each recreation step and each cleanup
+  action happen at most once per *k*; `recreate(k)` is called at most once.
+
+### 21.10 Crash and reconciliation
+
+No durable write is added beyond Amendment 20.
+
+| Crash window | Durable state | Next admission |
+|---|---|---|
+| during `begin()`, at C29, or between C29 and Started | `ACTIVE`, `present(H)`, ref `present(C)`; *k* only in memory | A17: `RECONCILED` |
+| Started emitted, Phase E through C (Amendment 20 §8 E0–B11) | per Amendment 20 §8 | per Amendment 20 §8; B5 and B7 still `BLOCKED` with `ABANDONED_UNRESOLVED` as the only exit (§8a) |
+| after `RECREATED` bookkeeping, before or during Finished, at C30, or later in the continued run | `ACTIVE`, `present(C)`, ref `present(C)` | A17 (and Amendment 19's verification family once a later verification container exists): `RECONCILED` |
+
+- An unmatched Started is legal only as the last recreation event in a trace
+  with no `RunFinished` (death) or an `UNRECOVERABLE_ERROR` one (emission
+  failure); `validate_recreation_trace` is unchanged.
+- Amendment 20 §9's dead-entry row and the explicit `codeagent reconcile`
+  are unchanged.
+- Refused and unconfirmed states keep their existing abandonment boundary.
+- No cross-resource atomicity, filesystem atomicity or crash-consistency
+  claim is made.
+
+### 21.11 Tests
+
+- **`test_controller_recreation.py` (fakes):** every outcome × continuation;
+  result invariants; bookkeeping before Finished for workspace and toolkit;
+  Gate zero with a recreator; budget exhausted → no `begin()`; a Q6 refusal →
+  `E`, not `BudgetExceeded`; both emission failures never continue; C30
+  ordering; cancellation plus `UNCONFIRMED`; duration on every path; the C29
+  tests (`test_cancellation_during_begin_observed_at_c29`,
+  `test_deadline_during_begin_observed_at_c29`, `test_c29_precedes_started`,
+  `test_c29_cancellation_never_calls_recreate`,
+  `test_c29_cancellation_consumes_sequence`,
+  `test_begin_refusal_outranks_pending_cancellation`); the `RecreationResult`
+  contract tests; the retention tests (no fabricated `ToolCompleted`, exact
+  identity, deferred interrupt retained and first-wins, no text leak,
+  `_record_tool_cleanup` unchanged after the split); a D5-B site-inventory
+  test (a `RECREATED` continuation consults C28, C29 and C30 once each per
+  failed patch, in that order); D5-A's
+  `test_gate_zero_precedes_classification_for_every_mapped_failure` extended
+  so its spy also requires zero calls to `classify_recreation_trigger`, with a
+  recreator supplied; `test_recreation_can_continue_is_a_capability`
+  (`_recreation_can_continue()` returns `True` with the repair counter at its
+  maximum, proving it does not re-check the budget, and `begin()` is reached
+  only through step 5's single check); and a result-bypass test for each of
+  rules 2–4 (a valid result mutated with `object.__setattr__` before the
+  controller's re-check).
+- **No-recreator regression (decision 1), preserved:** D5-A's
+  `test_t3_to_t5_terminate_in_slice_a` (`test_patch_failure_continuation.py`)
+  stays, parametrized over T3, T4 and T5 with no recreator: terminal error
+  exactly `E`; no `C28` site; no `BudgetExceeded`; no `patch_failed`
+  transition or `PATCH_FAILED` feedback; no recreator call. It is kept,
+  possibly renamed `test_t3_to_t5_without_a_recreator_terminate_before_c28`,
+  and is separate from the migrated T4-with-recreator test below.
+- **`test_worktree_recreation.py` (real Git, the real recreator):**
+  `test_unused_minted_sequence_is_never_reissued`; factory failures (ordinary,
+  `ToolCleanupUnconfirmedError`, `KeyboardInterrupt`) with ownership and
+  per-identity disposal counts; the factory runs after `present(C)` and the
+  entry gate (order spy); `test_composed_c29_cancellation_real_git`;
+  `test_recreation_git_invocation_count_is_pinned`.
+- **`test_patch_failure_continuation.py`, real Git (T4):** an in-process
+  contaminating patch applier (a test-only subclass that writes, then reports
+  `PATCH_APPLICATION_FAILED`), substituted for the composition's
+  `GitPatchApplier` inside the test process only, with no production
+  injection seam. Covered: n → n+1 continuation to a pass; two recreations
+  then success; recreation budget exhausted → `E`; repair budget exhausted →
+  no recreation; artifacts `recreation-01`, `recreation-02` and the terminal
+  one; the trace validator; the §21.6 applier proof.
+- **Real Docker, the CI node
+  `test_patch_failure_continuation.py::test_d5b_contaminated_worktree_recreates_and_passes_real_docker`
+  (decision 5).** T3 must occur on a `PRESENT` checkpoint session. A fresh
+  run's first entry gate runs while the session is `ABSENT` (the gate precedes
+  the lazy `establish()`), so contaminating during the first approval wait
+  would not produce a D5-B candidate. The production-path sequence:
+  1. pass 0: the scripted model proposes a stale exact replacement;
+  2. the real transaction lazily establishes the checkpoint session, then
+     fails pre-write with T1 `PATCH_VALIDATION_FAILED`;
+  3. D5-A returns the run to EXPLORE;
+  4. pass 1: the model proposes the corrected change; during that approval
+     the fake approval provider makes an uncommitted modification to a
+     tracked file in incarnation *n*, appending a distinctive contamination
+     marker to `jobs/worker.py` (located by its deterministic path under the
+     test's state root);
+  5. the next entry gate fails naturally as T3 on a `PRESENT` session;
+  6. D5-B recreates at the accepted checkpoint into *n+1*;
+  7. C29 precedes Started; Finished reports `RECREATED`; C30 runs;
+  8. pass 2: the model rereads through the new toolkit and re-proposes the
+     corrected change (identical, `material_change=False`, approval still
+     requested); the retained patch applier commits it in *n+1*;
+  9. real Docker verification passes on *n+1*;
+  10. assertions: *n*'s toolkit is never called after recreation and the new
+      toolkit is authoritative; the applier and verifier act on *n+1*; *n*'s
+      held identity is gone (samestat); *n+1*'s `HEAD` has parent `C` and
+      equals the resulting checkpoint; Phase E captured a complete artifact;
+      the contamination marker from *n* is absent from `jobs/worker.py` in
+      the verification container, while the approved change, carrying its
+      own distinct sentinel line committed by the retained applier into
+      *n+1*, is present there; no separate untracked sentinel is created; no
+      container, worktree, ref, process, reservation or state residue
+      remains.
+  - **Post-acceptance precision correction (2026-11-08, found during
+    implementation).** The accepted text said the approval provider writes an
+    *untracked* file. ADR 0003 Amendment 2's evidence rule, unchanged, makes
+    any untracked path an incomplete capture, so Phase E (Amendment 20 §3
+    E2) yields `EVIDENCE_NOT_CONFIRMED` and the run cannot reach
+    `RECREATED`; that outcome was reproduced. The contamination is therefore
+    an uncommitted modification to a tracked file. Phase E's rule is not
+    changed.
+- **`test_cancellation_e2e.py`:** E13 (group SIGINT) and E14 (PID SIGTERM)
+  during `recreate()`, through a test-only sink hook in Phase E and
+  `cancellation_driver.py` file gates. The driver reaches recreation by the
+  same production-path sequence as the real-Docker node (a pass-0 T1, then
+  out-of-band contamination during the pass-1 approval, so T3 occurs on a
+  `PRESENT` session); no production injection seam is added. Assertions: C29 precedes Started; Finished is
+  `RECREATED`; the run ends `CANCELLED` with no `ModelRequestStarted` or
+  transition to EXPLORE after Finished; *n+1* disposed, ref deleted, no
+  containers, clean next admission; repeated signals idempotent.
+- **SIGKILL:** post-continuation shapes reconcile through A17 and Amendment
+  19; Amendment 20's B1–B11 stay green.
+- **`test_patch.py`:** `test_apply_rejects_multiple_operations` (new; the N1/N2
+  pin for B14), asserting `GitPatchApplier.apply` refuses two operations.
+- **Feedback (ADR 0007 Amendment 2):** `test_recreated_feedback_body` (exact
+  body with both recreation fields) and the worst-case bound test extended to
+  include them; D5-A's body stays exact without recreation.
+- **Disclosed migrations:** `test_recreation_can_continue_is_false_until_d5_integration`
+  and `test_recreated_cannot_continue_before_d5_integration`
+  (`test_controller_recreation.py:207`, `:503`) are replaced by continuation
+  tests; the `seam_enabled` fixture (`:160`) is removed or reduced to the
+  production behaviour; D5-A's
+  `test_slice_a_contaminating_failure_still_terminates`
+  (`test_patch_failure_continuation.py:545`), which asserts a recreator is
+  never called on T4, becomes a test that a T4 with a recreator never
+  continues without `RECREATED`.
+
+### 21.12 Mutation plan
+
+**43 categories, 44 concrete runs**, each caught by a named test's explicit
+assertion:
+
+| # | Mutation | Caught by |
+|---|---|---|
+| B1 | `_recreation_can_continue()` left constant `False` (the enabling change reverted) | `test_composed_recreation_continues_to_pass`: `terminal_reason is VERIFICATION_PASSED` |
+| B2 | *n*'s toolkit kept | the same test: the reread succeeds; a spy shows *n*'s instance has zero calls after `RECREATED` |
+| B3 | old search chains reused | `test_old_search_cursor_refused_after_recreation`: `cursor_invalid:chain_unknown` |
+| B4 | recreation when the repair budget is exhausted | `test_repair_budget_exhausted_never_begins`: `begin()` count 0, no Started |
+| B5 | continue after a Q2–Q6 refusal | `test_q6_refusal_terminates_with_triggering_error`: `finished.error.code is PATCH_APPLICATION_FAILED`, no transition |
+| B6 | continue after `ADOPTED_THEN_FAILED` | `test_adopted_then_failed_terminates_and_disposes_n1`: terminal, *n+1* disposed once |
+| B7 | continue after a Finished emission failure | `test_finished_emission_failure_never_continues`: `UNCLASSIFIED_FAILURE`, no `patch_failed` transition |
+| B8 | transition before the recreation events | `test_recreation_events_in_execute_state`: both events in EXECUTE and before the transition |
+| B9 | workspace and toolkit adopted after Finished | `test_bookkeeping_precedes_finished`: a Finished-emission failure still tears down *n+1* |
+| B10 | teardown disposes *n* after a continued run | `test_continued_run_teardown_disposes_current_incarnation`: per-identity counts |
+| B11 | recreation after an unconfirmed verifier cleanup (Gate zero bypassed) | `test_recreation_candidate_after_verifier_unconfirmed_terminates`: no `begin()`, no Started |
+| B12 | the repair budget charged twice on `RECREATED` | `test_recreated_charges_one_repair_iteration`: counter +1 |
+| B13 | `worktree_recreated` omitted | `test_recreated_feedback_body`: exact body match |
+| B14 | `GitPatchApplier.apply` accepts two operations | `test_patch.py::test_apply_rejects_multiple_operations`: refused |
+| B15 | feedback appended before C30 after Finished | `test_cancellation_during_recreation_observed_at_c30_first`: transcript unchanged, next site C30 |
+| B16 | any action between Finished and C30 | the same test: no `ModelRequestStarted` or `ToolRequested` after Finished; last site `C30` |
+| B17 | an ordinary factory failure mapped to `RECREATED` | `test_factory_failure_is_adopted_then_failed`: outcome and terminal |
+| B18 | a factory failure mapped to a non-adopting outcome | the same test: `controller._workspace is new`, `new.disposed` once |
+| B19 | a factory interrupt swallowed into an outcome | `test_factory_interrupt_takes_raise_path`: the exact instance raised, an unmatched Started |
+| B20 | continue with `tools=None` (controller re-check removed) | `test_recreated_without_tools_fails_closed`: `UNCLASSIFIED_FAILURE`, no transition (result mutated via `object.__setattr__`) |
+| B21 | the factory runs before `present`/the entry gate | `test_factory_runs_after_present_and_entry_gate`: order spy |
+| B22 | the controller ignores `tool_cleanup_failure` | `test_factory_cleanup_unconfirmed_retained`: last retained `is injected`, list grew by one |
+| B23 | duration not added on a non-`RECREATED` outcome | `test_duration_counted_on_failed_outcome`: exact delta |
+| B24 | duration not added on an exception or interrupt (no `finally`) | `test_duration_counted_on_exception_and_interrupt`: exact delta on both (one run) |
+| B25 | duration added twice | `test_duration_counted_once_when_finished_emission_fails`: exact single delta |
+| B26 | cancellation replaces `UNCONFIRMED` | `test_cancellation_does_not_replace_unconfirmed`: `LIFECYCLE_CLEANUP_UNCONFIRMED` |
+| B27 | `DockerVerifier` mounts *n* | the real-Docker node: *n+1*'s sentinel visible, *n*'s not; passes only with the revised content |
+| B28 | C29 skipped | `test_cancellation_during_begin_observed_at_c29`: site after C28 is `C29`; no Started; `CANCELLED` |
+| B29 | Started emitted before C29 | `test_c29_precedes_started`: order spy `["begin", "C29", "Started", "recreate"]` |
+| B30 | `recreate()` called after C29 observes cancellation | `test_c29_cancellation_never_calls_recreate`: `recreate_calls == 0`, `begin_calls == 1` |
+| B31 | the consumed sequence re-issued by `begin()` | `test_unused_minted_sequence_is_never_reissued`: second `begin()` raises `RuntimeError`; `_minted == 1` |
+| B32 | a safe point on the `begin() → None` path | `test_begin_refusal_outranks_pending_cancellation`: `error is E`, `UNRECOVERABLE_ERROR`, no `C29` site |
+| B33 | C29 checks cancellation only | `test_deadline_during_begin_observed_at_c29`: `BudgetExceeded(WALL_CLOCK)`, `BUDGET_EXCEEDED`, no Started |
+| B34 | the recreation path calls `_record_tool_cleanup` | `test_factory_cleanup_unconfirmed_emits_no_tool_event`: `ToolCompleted` count equals `ToolRequested` count |
+| B35 | the recreator omits `tool_cleanup_failure` | `test_factory_cleanup_unconfirmed_retained` (composed): list grew by one, last `is injected` |
+| B36 | identity not preserved | `test_recreation_result_preserves_evidence_identity` and B22's test: `is` |
+| B37 | `_retain_tool_cleanup` drops the body interrupt | `test_factory_cleanup_deferred_interrupt_retained`: `deferred_interrupt is that_instance` |
+| B38 | `_defer_interrupt` overwrites an earlier one | `test_factory_cleanup_deferred_interrupt_first_wins`: `deferred_interrupt is earlier` |
+| B39 | the evidence field visible: (i) `repr=True`; (ii) `compare=True` (**two concrete runs**) | `test_recreation_result_evidence_hidden_from_repr_and_equality`: (i) sentinel absent from `repr`; (ii) results equal |
+| B40 | exception text leaks into an event | `test_factory_cleanup_no_text_leak`: sentinel in no event and not in `RunFinished` |
+| B41 | rule 4's outcome check removed | `test_recreation_result_refuses_cleanup_evidence_on_other_outcomes`: `ValueError` × 6 |
+| B42 | rule 4's type check removed | `test_recreation_result_refuses_wrong_evidence_type`: `ValueError` |
+| B43 | rule 3 weakened (tools with another outcome) | `test_recreation_result_tools_only_with_recreated`: `ValueError` × 6 |
+
+Moving `_recreation_attempted = True` before C29 is an equivalent mutant today
+(it is read only with `self._workspace.path is None`), reported as such, not
+counted.
+
+**Strict rule.** Clean baseline → every mutation → clean baseline; a catch is
+pytest exit 1 with at least one explicit assertion failure and no other
+failure, error, collection or import failure, fixture failure, timeout or
+interruption; every anchor matches exactly once; every mutated source is
+restored and SHA-256-verified; `PYTHONDONTWRITEBYTECODE=1`.
+
+**Harness invalidation.** A harness is invalidated when D5-B changes a
+production source it mutates or a test file it runs, **or** (decision 3) a
+shared test-support module that any of its selected tests imports directly or
+transitively, even when a
+changed helper appears unused by some tests. Membership is determined
+mechanically from actual imports and harness file lists at implementation
+time. Implementation constraint: keep D5-B-only fakes in the new or directly
+affected D5-B test files and avoid editing `tests/support/fakes.py`; the same
+rule applies to `cancellation_driver.py` and every other shared support
+module. Computed at `3ee839a` against D5-B's expected changes
+(`controller.py`, `_lifecycle_run.py`; `test_controller_recreation.py`,
+`test_worktree_recreation.py`, `test_patch_failure_continuation.py`,
+`test_cancellation_e2e.py`, `test_patch.py`; support:
+`cancellation_driver.py` for E13/E14):
+
+| Harness | Mutates | Runs | By source/test file | Conservative support-import rule |
+|---|---|---|---|---|
+| Step 6 (27; `mut6b`, M06 re-pointed to Gate zero by D5-A) | `controller.py` | `test_controller.py`, `test_controller_recreation.py` | **invalidated** | invalidated (unchanged) |
+| Step 7 (33) | `_lifecycle_run.py` | `test_controller_recreation.py`, `test_worktree_recreation.py` | **invalidated** | invalidated (unchanged) |
+| Step 8 (24) | `_lifecycle_run.py`, `reconciliation.py`, `worktree_absence.py` | `test_reconciliation.py`, `test_worktree_absence.py`, `test_reconciliation_s9.py`, `test_worktree_recreation.py` | **invalidated** | invalidated (unchanged) |
+| D5-A (17 / 18) | `controller.py`, `model_protocol.py` | `test_patch_failure_continuation.py`, `test_model_protocol.py`, `test_domain.py` | **invalidated** | invalidated (unchanged) |
+| D4b (82) | mostly `controller.py`; also `model_protocol.py`, `tool_schema.py`, `_lifecycle_run.py`, `domain.py`, `cli.py`, `trace_assertions.py` | `test_d4b_model_loop.py`, `test_d4a_read_path.py`, `test_d4b_e2e.py`, `test_tool_schema.py`, `test_lifecycle_run.py` | **60 of 82** | **all 82** if `tests/support/fakes.py` changes (every D4b test file imports it); 60 otherwise. No D4b test imports `cancellation_driver.py` |
+
+`cancellation_driver.py` is imported only by `test_cancellation_e2e.py`, which
+no Step 6–8, D5-A or D4b harness runs, so editing it invalidates none of them.
+
+**Anchor re-pointing (decision 6, approved conditionally).** Expected:
+Step 6's M05 (the predicate body), M10 (the `recreate()` call moves into the
+duration wrapper), M11 and M12 (the bookkeeping block gains toolkit lines) and
+M16 (the `RuntimeError` that `RECREATED` raises today); D5-A's A16 (its
+catching test changes, §21.11). Conditions: each old and new anchor is
+recorded; every edit pattern matches exactly once; the mutation's original
+behavioural defect is unchanged; no mutation is deleted because its anchor
+moved; every affected harness runs clean baseline → every mutation → clean
+baseline with assertion-only catches, sources restored and SHA-256-verified,
+`PYTHONDONTWRITEBYTECODE=1`. Implementation discovers and discloses any
+further re-pointing mechanically.
+
+### 21.13 CI
+
+The verbose "Run real Docker verification tests" step gains exactly one node:
+`tests/integration/test_patch_failure_continuation.py::test_d5b_contaminated_worktree_recreates_and_passes_real_docker`
+(plan revision 3's `test_d5b_contaminated_patch_recreates_and_passes_real_docker`
+is superseded: the node contaminates the worktree, not the patch).
+E13/E14 join `test_cancellation_e2e.py`, which that step already runs in
+full; no other file or node is added. Expected added runtime: a few seconds,
+an estimate until measured. Exact-commit Linux CI must succeed before D5-B's
+documentation reconciliation is written.
+
+### 21.14 Estimate and status
+
+- D5-B, excluding Step 9: **49.5–79 h** (plan revision 3 §10.4), low
+  confidence.
+- D5 stays **174–289 h**; every derived total is unchanged (remaining
+  D5–D10 337–629 h; first operator run 373–627 h; Gate α 440–762 h; public v1
+  502–901 h; Gate O 86–140 h; completed D1–D4 165–272 h).
+- D5-C's 45–80 h stays provisional and is re-estimated from its own detailed
+  plan before implementation.
+- The ledger and status documents are not changed by this proposed
+  amendment; D5-B's implementation and status diff carries any update, and
+  labels §14's "Live recreation is unreachable" historical.
+
+### 21.15 Non-claims
+
+- D5 is not complete after D5-B; D5-C is required.
+- No four-operation protocol, whole-proposal validation, syntax guard,
+  test-file policy or N1/N2 completion.
+- No live model, provider adapter, operator path or D6.
+- No Gate α, operator-ready, `COMPLETE_FOR_V1` or v1 claim.
+- No new threat-model conclusion unless separately reviewed.
+- No filesystem, cross-resource or crash atomicity claim.
+
+### 21.16 Final joint-review decisions (2026-11-08)
+
+| # | Decision | Recorded in |
+|---|---|---|
+| 1 | **No recreator:** T3–T5 with no supplied recreator terminate immediately with `E`, after Gate zero and classification and before C28: no wall-clock or budget check, no `begin()`, no recreation event, feedback, counter change or transition; a pending cancellation does not replace the returned failure. The existing D5-A regression is preserved; no new mutation category, since D5-A's coverage already observes this boundary | §21.3 step 3, §21.9, §21.11 |
+| 2 | **`_recreation_can_continue()`** is a capability result: `True` once reached on the accepted candidate path; it never re-evaluates the repair budget, which is checked exactly once in step 5 | §21.1, §21.3 step 5, §21.9, §21.11 |
+| 3 | **Support files:** a change to a shared test-support module invalidates every harness whose selected tests import it directly or transitively, determined mechanically; D5-B avoids editing `tests/support/fakes.py`; if it changes, all 82 D4b mutations are invalidated | §21.12 |
+| 4 | **Feedback schema:** governed by ADR 0007 Amendment 2, accepted together with this amendment; this amendment governs only when the item is produced | header, §21.8 |
+| 5 | **Real-Docker scenario:** out-of-band contamination during the pass-1 approval, after a pass-0 T1 has established the session, so T3 occurs on a `PRESENT` session; the contamination is an uncommitted modification to a tracked file (post-acceptance precision correction, 2026-11-08: an untracked file cannot reach `RECREATED` under ADR 0003 Amendment 2's unchanged evidence rule); any *n+1* sentinel is carried by the approved change; T4 covered in real Git by an in-process contaminating applier; no production injection seam; node `test_d5b_contaminated_worktree_recreates_and_passes_real_docker` | §21.11, §21.13 |
+| 6 | **Anchor re-pointing** approved under the stated conditions; Step 6 M05, M10, M11, M12, M16 and D5-A A16 expected; any other discovered and disclosed | §21.12 |
+
+### 21.17 Implementation record (2026-11-08, local; not Linux-CI-confirmed)
+
+Implemented on top of `3ee839a`; **unstaged, uncommitted and not
+Linux-CI-confirmed.** This section records implementation facts and local
+evidence only; it changes no accepted decision above.
+
+**Production changes.**
+- `controller.py`:
+  - `RecreationResult` gains `tools` and `tool_cleanup_failure`
+    (`repr=False, compare=False`). Rules 2–4 are re-checked by
+    `_check_recreation_result()` after `recreate()` returns.
+  - `_RETIRED_TOOLS` (`_RetiredTools`) refuses every call after
+    `ADOPTED_THEN_FAILED`.
+  - `_retain_tool_cleanup()` and `_defer_interrupt()` are split out of
+    `_record_tool_cleanup()`, whose own behaviour is unchanged.
+  - `_recreation_can_continue()` returns `True`.
+  - The D5-A routing block admits T3–T5 candidates.
+  - `_attempt_recreation()` gains C29 and the `try`/`finally` duration
+    accounting.
+- `_lifecycle_run.py`: `_CompositionRecreator(..., tools_factory=RepoTools)`.
+  The factory runs after *n+1*'s durable `present` and the entry gate. A
+  factory failure returns `ADOPTED_THEN_FAILED`, carrying
+  `tool_cleanup_failure` when it is a `ToolCleanupUnconfirmedError`; a factory
+  interrupt propagates on the raise path.
+
+**Ordering (§21.3) as implemented** (`controller.py`, run loop and
+`_attempt_recreation()`):
+
+| Step | Implementation |
+|---|---|
+| 1 Gate zero | `if self._any_verifier_cleanup_unconfirmed` before any classification |
+| 2 Classification | `patch_failure_continues()` (T1), else `classify_recreation_trigger()` (T3–T5) |
+| 3 No recreator / not a candidate | `_terminate(..., error=patch_error)` before C28 |
+| 4 C28 | `self._cancellation_check("C28")` |
+| 5 Single repair-budget check | `repair_iterations_used >= max_repair_iterations` → `BudgetExceeded` |
+| 6 Capability | `_recreation_can_continue()` (`True`) |
+| 7 `begin()` | `None` → `_terminate(..., error=triggering_error)` with no safe point |
+| 8 C29 | `self._cancellation_check("C29")`, the first action after `begin()` |
+| 9 Started | `_recreation_attempted = True`, then `WorkspaceRecreationStarted` |
+| 10 `recreate()` | inside `try`/`finally`, the duration counted once on every path |
+| 11 Result check | type check, then `_check_recreation_result()` |
+| 12 Bookkeeping | workspace for adopting outcomes; toolkit `result.tools` (`RECREATED`) or `_RETIRED_TOOLS` (`ADOPTED_THEN_FAILED`, with cleanup retention); `UNCONFIRMED` flag |
+| 13 Finished | `WorkspaceRecreationFinished`; any outcome but `RECREATED` → `_terminate(..., error=result.error)` |
+| 14 Continue | `_transition(PATCH_FAILED)` (C30), then the feedback item (`worktree_recreated: True`, `recreation_outcome: "recreated"`), one repair charge, the pass advance |
+
+The outcome table (§21.7) is implemented as written: only `RECREATED`
+continues, and an emission failure propagates to the Amendment 9 boundary.
+
+**Test files.**
+- New and migrated tests: `test_controller_recreation.py`,
+  `test_worktree_recreation.py` and `test_patch_failure_continuation.py`,
+  including the real-Docker node.
+- E13/E14: `test_cancellation_e2e.py::test_e13_e14_signal_during_recreation_is_observed_at_c30`
+  (parametrized `E13-group-SIGINT` and `E14-pid-SIGTERM`), driven through
+  `cancellation_driver.py`.
+- SIGKILL after a continuation:
+  `test_reconciliation_s9.py::test_s9_owner_sigkill_after_a_recreated_continuation_is_reconciled`.
+- Latency pin: `test_recreation_git_invocation_count_is_pinned`, 21 Git
+  launches per successful recreation.
+- `tests/support/fakes.py` is unchanged, so 60 of D4b's 82 mutations are
+  invalidated, not all 82.
+
+**Name deviations from §21.11–§21.12 (disclosed).**
+- B14 is caught by the pre-existing `test_patch.py::test_rejects_more_than_one_operation`,
+  narrowed to an explicit assertion (it catches only `ValueError`, then asserts
+  a refusal and an unchanged worktree file). The planned duplicate
+  `test_apply_rejects_multiple_operations` was added and then removed.
+- `test_t3_to_t5_terminate_in_slice_a` became
+  `test_t3_to_t5_without_a_recreator_terminate_before_c28`, as §21.11
+  anticipated.
+- `test_slice_a_contaminating_failure_still_terminates` became
+  `test_contaminating_failure_never_continues_without_recreated`.
+
+**Strict-rule test hardening (disclosed; nothing weakened, deleted or
+skipped).** These assertions previously failed through an incidental exception
+(`AttributeError`, `IndexError`, `KeyError`, `DID NOT RAISE` or
+`LifecycleStoreError`) rather than an explicit assertion, so the
+corresponding mutation catches were not strict:
+- `_code(finished)` asserts that an error is present before reading its
+  code.
+- The local `_raised(...)` helpers catch only the expected type, followed by
+  an assertion.
+- Explicit membership assertions replace `.index()` and `[-1]`, and
+  `.get(...)` replaces subscripts.
+- `_admit(repo, run_id)` turns only a `LifecycleStoreError` from the next
+  admission into an assertion.
+
+Two pre-existing tests were narrowed: Step 7's
+`test_composed_old_reservation_close_failure_is_reported_once_under_reservation`
+and `test_patch.py::test_rejects_more_than_one_operation`.
+
+**Correction found by verification.** In the first authoritative Step 8 run,
+S8-M02 was caught by 76 explicit assertions, but it also raised one
+incidental `LifecycleStoreError` in
+`test_worktree_recreation.py::test_factory_interrupt_takes_raise_path`. Under
+the strict rule it was therefore not clean. The fix was `_admit()` at that
+test's next-admission check and at the identical check in the C29 test. That
+test file is run by the D5-B, Step 7 and Step 8 harnesses, so all three were
+rerun in full.
+
+A second correction followed. ADR 0007 Amendment 2 requires the worst-case
+`PATCH_FAILED` bound test to use the recreation form; it still used the D5-A
+form, and now includes `worktree_recreated` and `recreation_outcome`.
+Separately, `test_composed_two_recreations_then_success` did not assert the
+terminal evidence artifact named in §21.11; it now does. Both are in
+`test_patch_failure_continuation.py`, run by the D5-B and D5-A harnesses, so
+both were rerun in full. A rerun already in progress when this was found was
+stopped with SIGINT; the harness's `finally` restored the mutated source, and
+the tree matched its pre-run hashes.
+
+The Step 8 harness script was found missing from the scratch directory before
+its final rerun; it was restored byte for byte from the session transcript of
+its only write (24 mutations, unchanged) and rerun.
+
+**Mutation evidence** (macOS, `CODEAGENT_REQUIRE_DOCKER=1`,
+`PYTHONDONTWRITEBYTECODE=1`). Every harness ran a clean baseline, then every
+mutation, then a clean baseline. Each mutation was caught by explicit
+assertions only, with exact anchors; every source was restored and
+SHA-256-verified, and the tree was unchanged:
+
+| Harness | Result | Baselines |
+|---|---|---|
+| D5-B (43 categories, 44 runs) | 44/44 | 1,264 passed |
+| Step 6 (26 active; M05 retired) | 26/26 | 1,207 passed |
+| Step 7 | 33/33 | 1,162 passed |
+| Step 8 | 24/24 | 743 passed |
+| D5-A (17 categories, 18 runs) | 18/18 | 289 passed |
+| D4b (60 of 82 invalidated) | 60/60 | 360 passed |
+
+The D5-B, D5-A, Step 7 and Step 8 rows come from the reruns after both
+corrections above. The Step 6 and D4b rows come from the authoritative batch
+before them; those harnesses run neither corrected file.
+
+**Equivalent mutant (§21.12).** Moving `_recreation_attempted = True` before
+C29 is equivalent and is not counted.
+
+**M05 retirement.** M05 ("production predicate True") is retired, not
+re-pointed. D5-B makes `True` the accepted predicate, and the only possible
+inverse is identical to B1. B1 is caught by assertion (87 assertion failures
+in its first authoritative run), and the defect is counted once, as B1.
+
+**Anchor re-pointing (decision 6).** The original defect is unchanged in every
+case; each new anchor matches exactly once:
+- **Step 6:**
+  - M07: the multi-line `self._recreator is None or trigger is None` condition
+    became the single-line guard in the D5-B routing block.
+  - M10: `recreate()` now sits inside the duration wrapper.
+  - M11: the following line is now the `RECREATED` toolkit branch instead of
+    the `UNCONFIRMED` check.
+  - M16: the old `RuntimeError` is gone; the anchor is now
+    `if finished is not None: return finished`.
+  - M18: the adoption and workspace consistency check moved into
+    `_check_recreation_result()`.
+- **D5-A:**
+  - A9 is now an exact one-line feedback append.
+  - A10's indentation changed.
+  - A17(i) and A17(ii): C28 is shared by T1 and the T3–T5 candidates, so (i)
+    is a gate guarded by `trigger is None`, and (ii) moves the unconditional
+    gate after classification.
+- **Step 7:** S7-M22's `return RecreationResult(...)` gained `tools=tools`.
+- **Predicted but not needed:** M12 and A16 still matched unchanged.
+- **Not predicted:** M07, M18, A9, A10, A17 and S7-M22.
+
+**Verification.**
+- Directly affected files: 1,284 passed forward, 1,284 passed reverse.
+- The exact CI verbose Docker command: 18 passed, each named `PASSED` (the four `test_slice_c.py` tests, E1–E10 and E13/E14 in `test_cancellation_e2e.py`, and the D5-A and D5-B real-Docker nodes).
+- Complete suite: 7,078 passed, 2 skipped (`CODEAGENT_REQUIRE_DOCKER=1`); the two skips are `test_repo_tools.py`'s non-UTF-8-filename tests, which macOS APFS refuses.
+- `git diff --check` is clean.
+- Residue checks: no `codeagent-verify-`/`codeagent-baseline-`/`codeagent-verification-` containers, no extra worktrees, no `refs/codeagent` refs, no leftover processes, no default state root, and no temporary CodeAgent roots other than the two explicitly retained non-authoritative `d5bdbg*` evidence roots; nothing staged, `uv.lock` untouched.
+
+**Non-authoritative debug evidence roots.** Two evidence roots were created
+while diagnosing the real-Docker scenario:
+`/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/d5bdbg-3e3c0tef` and
+`/var/folders/l7/x1hh4mbn57x3y8jbfj30d7300000gn/T/d5bdbg2-7yr2fce4`. They are
+not test evidence and are left in place, not deleted.
+
+**Remaining risks.**
+- `test_executor.py::test_l2_timeout_kills_the_whole_process_group` (D3) is
+  still intermittent and predates D5-B.
+- The Step 8 harness takes about 1.5 hours per run.
+- The mutation harnesses live outside the repository. One of them (Step 8's)
+  disappeared from the scratch directory for an unexplained reason and had to
+  be restored from the session transcript.
+- The latency pin fixes today's count of 21 Git launches; any legitimate
+  change to that count must update it.
+- The §21.15 non-claims stand: D5-C, the four-operation protocol, D6,
+  operator reachability, Gate α and v1 remain unimplemented, and D5 stays In
+  Progress.

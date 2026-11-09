@@ -30,6 +30,7 @@ import traceback
 from pathlib import Path
 
 from codeagent import _lifecycle_run, cli, domain, events, executor
+from codeagent import evidence as evidence_module
 from codeagent import lifecycle_store as ls
 from codeagent import reconciliation
 from codeagent.controller import EventLog, RunController, SystemClock
@@ -50,6 +51,10 @@ FIXED = (
 )
 # Ledger D4b (U6): the patch content comes from the approved proposal.
 PLAN = make_plan(expected_text=BUGGY, new_text=FIXED)
+# E13/E14 (ADR 0004 Amendment 21): a stale replacement for pass 0 (T1), and a
+# marker appended to the tracked file during the pass-1 approval (T3).
+STALE_PLAN = make_plan(expected_text="    job.retry_count += 2\n", new_text="    pass\n")
+CONTAMINATION_MARKER = "# CONTAMINATION_FROM_N"
 _DEADLINE_SECONDS = 300.0
 
 
@@ -189,6 +194,28 @@ def main(config_path: str) -> None:
             return real_apply(self, run_id, iteration, approved_paths, operations)
 
         GitPatchApplier.apply = apply
+    elif scenario == "recreation":  # E13/E14
+        real_capture = evidence_module.FilesystemEvidenceSink.capture
+
+        def capture_gate(self, **kwargs):
+            # Only Phase E of a recreation blocks; terminal capture is real.
+            if kwargs.get("recreation_sequence") is not None:
+                gates.write("ready-recreation", str(requests_received()))
+                seen = [requests_received()]
+
+                def released():
+                    # Serialized repeats: report each received request so the
+                    # parent sends the next signal only after this one landed.
+                    count = requests_received()
+                    if count != seen[0]:
+                        seen[0] = count
+                        gates.write(f"count-{count}")
+                    return gates.exists("release-recreation")
+
+                gates.wait(released, "release-recreation")
+            return real_capture(self, **kwargs)
+
+        evidence_module.FilesystemEvidenceSink.capture = capture_gate
     elif scenario == "admission":  # E10
         real_reconcile = reconciliation.reconcile_repository
 
@@ -210,15 +237,21 @@ def main(config_path: str) -> None:
                 approval = BlockingCancellableApprovalProvider(
                     source.token, on_wait=lambda: gates.write("ready-approval"), deadline_seconds=_DEADLINE_SECONDS
                 )
+            elif scenario == "recreation":
+                approval = _ContaminatingApproval(controller_box)
             else:
                 approval = FakeApprovalProvider((domain.ApprovalDecision.APPROVED,))
+            if scenario == "recreation":
+                model = _StaleThenPlan(read_path="jobs/worker.py", marker="# BUG:", plan=PLAN)
+            else:
+                model = MarkerGatedFakeModel(read_path="jobs/worker.py", marker="# BUG:", plan=PLAN)
             result = _lifecycle_run.run_lifecycle_aware(
                 config["repo"],
                 run_id=config["run_id"],
                 task_statement="fix retry bug",
                 approval_mode=domain.ApprovalMode.INTERACTIVE,
                 evidence_root=config["evidence"],
-                model=MarkerGatedFakeModel(read_path="jobs/worker.py", marker="# BUG:", plan=PLAN),
+                model=model,
                 approval=approval,
                 verify_command=tuple(config["verify_command"]),
                 clock=SystemClock(),
@@ -247,6 +280,29 @@ def main(config_path: str) -> None:
     record["published"] = published
     record["events"] = [_summarize(e) for e in log.events]
     gates.write("result.json", json.dumps(record))
+
+
+class _StaleThenPlan(MarkerGatedFakeModel):
+    """Proposes STALE_PLAN in pass 0 and PLAN afterwards."""
+
+    def respond(self, context):
+        self._plan = STALE_PLAN if context.pass_index == 0 else PLAN
+        return super().respond(context)
+
+
+class _ContaminatingApproval(FakeApprovalProvider):
+    """Approves everything; during the second approval it appends a marker
+    to the tracked `jobs/worker.py` of the controller's current incarnation."""
+
+    def __init__(self, controller_box) -> None:
+        super().__init__((domain.ApprovalDecision.APPROVED,))
+        self._box = controller_box
+
+    def decide(self, request):
+        if len(self.requests) == 1:
+            target = Path(self._box[0]._workspace.path) / "jobs" / "worker.py"
+            target.write_text(target.read_text() + CONTAMINATION_MARKER + "\n")
+        return super().decide(request)
 
 
 def _summarize(event: events.Event) -> dict:

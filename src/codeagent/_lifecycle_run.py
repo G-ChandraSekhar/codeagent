@@ -76,6 +76,7 @@ from .lifecycle_store import LifecycleState, LifecycleStoreError, create_shared_
 from .patch import GitPatchApplier
 from .worktree_absence import Absence, observe_worktree_absent
 from .repo_tools import RepoTools
+from .tool_schema import ToolCleanupUnconfirmedError
 from .state_root import MaterializedLeafObservation
 from .workspace import GitWorktree
 from .worktree_lifecycle import ABSENT_WORKTREE_TRANSITION, WorktreeIntent, WorktreePublicationFailure
@@ -372,8 +373,9 @@ def _returned_path(finished, reservation, lease, deferred_interrupt=None, earlie
 # Step 7). The controller decides and records; this object performs the
 # attempt and tracks which incarnation and reservation are current, so the
 # Amendment 14 R1/R2 cleanup always acts on the objects current when
-# `run()` returns or raises. `RunController._recreation_can_continue()` is
-# still False in production (N4), so a real run never reaches it yet.
+# `run()` returns or raises. Since D5-B (ADR 0004 Amendment 21) a real run
+# reaches it on a post-write patch failure, and a RECREATED outcome continues
+# the repair loop with the toolkit built at step C3a.
 # ---------------------------------------------------------------------------
 
 RECREATION_FORMAT_BOUND = 99
@@ -421,6 +423,7 @@ class _CompositionRecreator:
         worktree: GitWorktree,
         reservation,
         max_recreations: int,
+        tools_factory=RepoTools,
     ) -> None:
         self._lease = lease
         self._publisher = publishers.worktree_publisher
@@ -430,6 +433,9 @@ class _CompositionRecreator:
         self._source = source
         self._run_id = run_id
         self._budget = max_recreations
+        # Builds the new incarnation's toolkit at step C3a (ADR 0004
+        # Amendment 21 §21.5): the old toolkit pins the old root's inode.
+        self._tools_factory = tools_factory
         # The current objects (Amendment 14 R2, revised by Amendment 20).
         self.worktree: GitWorktree | None = worktree
         self.worktree_entered = True
@@ -536,10 +542,11 @@ class _CompositionRecreator:
         if not (receipt.success and receipt.complete and receipt.error is None):
             return RecreationResult(outcome=_O.EVIDENCE_NOT_CONFIRMED, error=receipt.error, **artifact)
 
-        def failed(outcome, workspace=None) -> RecreationResult:
+        def failed(outcome, workspace=None, tool_cleanup_failure=None) -> RecreationResult:
             return RecreationResult(
                 outcome=outcome,
                 workspace=workspace,
+                tool_cleanup_failure=tool_cleanup_failure,
                 error=OperationalError(
                     code=ErrorCode.WORKSPACE_RECREATION_FAILED,
                     error_id=f"{self._run_id}-recreation-{sequence}",
@@ -587,7 +594,15 @@ class _CompositionRecreator:
         _, exc = _call(lambda: candidate.entry_gate(commit))
         if exc is not None:
             return failed(_O.ADOPTED_THEN_FAILED, candidate)  # fully owned; teardown disposes it
-        return RecreationResult(outcome=_O.RECREATED, workspace=candidate, **artifact)
+        # C3a (Amendment 21 §21.5): only now, with n+1 durably present, owned
+        # and through its entry gate, build its toolkit. A failure adopts n+1
+        # (teardown disposes it); a cleanup failure travels by identity; an
+        # interrupt propagates through `_call`.
+        tools, exc = _call(lambda: self._tools_factory(candidate.path))
+        if exc is not None:
+            cleanup = exc if isinstance(exc, ToolCleanupUnconfirmedError) else None
+            return failed(_O.ADOPTED_THEN_FAILED, candidate, tool_cleanup_failure=cleanup)
+        return RecreationResult(outcome=_O.RECREATED, workspace=candidate, tools=tools, **artifact)
 
     def _unwind_unentered(self, candidate: GitWorktree | None, failed) -> RecreationResult:
         """A Phase C failure before n+1 was entered (section 7)."""
@@ -716,6 +731,7 @@ def run_lifecycle_aware(
             worktree=worktree,
             reservation=reservation,
             max_recreations=max_recreations,
+            tools_factory=RepoTools,
         )
         controller = RunController(
             RunConfig(

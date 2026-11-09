@@ -28,6 +28,11 @@ that case. (Historical: before the commit, this marker read "implemented and
 locally verified on macOS (2026-11-07), but currently unstaged, uncommitted and
 not Linux-CI-confirmed", which was true then.)
 
+Amendment 2 (ledger D5, slice D5-B: recreation feedback): **Accepted
+(2026-11-08)**, at joint review; implemented and locally verified on macOS;
+unstaged, uncommitted and not Linux-CI-confirmed. See "Amendment 2" at the end
+of this ADR. (Historical: at acceptance this line said "not implemented".)
+
 ## Context
 
 Before D4b, `RunController` asked a two-method fake model for one read path,
@@ -525,10 +530,12 @@ StateTransitioned(EXECUTE→EXPLORE, patch_failed)    ← entry check C30
 - **Reapproval:** an identical re-proposal gives `material_change=False`,
   `decide()` is called, and the feedback holds `previous_attempt_failed` and
   the failed digest.
-- **Recreation unreachable:**
-  `test_slice_a_contaminating_failure_still_terminates`: with a recreator
-  supplied, T4 gives no `begin()` call, no recreation event, and terminates
-  with `E`.
+- **Recreation unreachable** (historical, D5-A only; D5-B makes recreation
+  reachable on the internal continuation path and renames this test
+  `test_contaminating_failure_never_continues_without_recreated`, ADR 0004
+  §21.17): `test_slice_a_contaminating_failure_still_terminates`: with a
+  recreator supplied, T4 gives no `begin()` call, no recreation event, and
+  terminates with `E`.
 - **Accounting:** budget boundaries at 0, 1 and the maximum; the
   `BudgetExceeded` fields; one charge per continuation; `iterations_used`;
   `_verification_attempt` unchanged; durations counted once; unique
@@ -701,8 +708,71 @@ was verified through the Actions API and an independently fetched raw job log.
 - This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence, not a
   security review.
 
-**Unchanged non-claims:** D5 is not complete; D5-B (N4 recreation
-continuation, C29), D5-C and D6 are not implemented, and live recreation stays
-unreachable. No live model, provider adapter or operator path; no Gate α,
+**Unchanged non-claims:** D5 is not complete. (Historical: when this evidence
+was recorded, D5-B (N4 recreation continuation, C29) was not implemented and
+live recreation stayed unreachable. D5-B is now implemented and locally
+verified, unstaged, uncommitted and not Linux-CI-confirmed (ADR 0004
+§21.17).) D5-C and D6 remain unimplemented. No live model, provider adapter or operator path; no Gate α,
 operator-ready, `COMPLETE_FOR_V1` or v1-complete claim; no threat-model
 conclusion changes.
+
+## Amendment 2 (Accepted 2026-11-08): recreation feedback after D5-B
+
+Status: **Accepted (2026-11-08)**, after joint review. **Implemented and
+locally verified on macOS (2026-11-08); unstaged, uncommitted and not
+Linux-CI-confirmed** (ADR 0004 §21.17). (Historical: at acceptance this line
+said "Not implemented.") The controller appends `"worktree_recreated": true`
+and `"recreation_outcome": "recreated"` only after `RECREATED` and C30.
+`test_recreated_feedback_body` pins the exact body.
+`test_patch_failed_bound_fits_the_shared_repair_allowance` uses the
+recreation form (corrected during verification: it first still had the D5-A
+form), and `PATCH_FAILED_ITEM_MAX_BYTES` is unchanged. D5-A's
+`test_t1_feedback_body_exact` is unchanged. It was accepted together with ADR 0004 Amendment 21 (Accepted 2026-11-08, D5-B:
+live recreation continues the repair loop). ADR 0004 Amendment 21 governs when the item below is
+produced in the lifecycle sequence; this amendment governs only its schema.
+
+### A2.1 Schema
+
+The `PATCH_FAILED` feedback item of Amendment 1 §A1.6 gains a recreation form:
+
+- **After a D5-B `RECREATED` result and a passed C30** (ADR 0004 Amendment 21
+  §21.3 steps 11–14): the body is Amendment 1's body with
+  `"worktree_recreated": true` and one added field,
+  `"recreation_outcome": "recreated"`.
+- **D5-A without recreation** (T1): unchanged. `"worktree_recreated": false`
+  and no `recreation_outcome` field; Amendment 1's exact schema stands.
+- **Unchanged in both forms:** `previous_attempt_failed: true`, the plan
+  revision and failed `change_digest`, the triggering error's fixed code as
+  `error_code`, and the engine's sanitized message truncated to 512 UTF-8
+  bytes on a character boundary as `message`, `untrusted: true`.
+
+### A2.2 Invariants
+
+- The item stays never-droppable (`FeedbackKind.PATCH_FAILED` is not in
+  `DROPPABLE_KINDS`).
+- Nothing else is added: no repository content, patch content (`expected_text`,
+  `new_text`), raw exception text, Git output, evidence-artifact data or
+  identifiers, lifecycle identifier, or unsanitized path.
+- **Bound:** `PATCH_FAILED_ITEM_MAX_BYTES` covers the new field, and its
+  worst-case test is extended to include `"worktree_recreated": true` and
+  `"recreation_outcome": "recreated"`. The constant must stay at most
+  `VERIFICATION_ITEM_MAX_BYTES`; the existing value (twice the 512-byte message
+  plus 512) is expected to suffice, and the extended test decides.
+- **Static context-fit proof:** unchanged and still valid. Patch and
+  verification feedback share the single repair counter, so the two kinds
+  together number at most `max_repair_iterations + 1`.
+- No event schema changes. No other decision of this ADR or of Amendment 1
+  changes.
+
+### A2.3 Tests
+
+`test_recreated_feedback_body` (exact body with both recreation fields, after
+`RECREATED` and C30); the extended worst-case bound test; D5-A's exact-body test
+unchanged. These are part of ADR 0004 Amendment 21's test plan and its
+mutation B13; this amendment adds no mutation category.
+
+### A2.4 Non-claims
+
+No D5 completion, four-operation protocol, live model, provider adapter,
+operator path, Gate α, operator-ready, `COMPLETE_FOR_V1` or v1 claim, and no
+threat-model change.

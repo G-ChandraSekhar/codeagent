@@ -3309,7 +3309,38 @@ Stage 2 (of the four-stage planning process in
   - **Boundaries:** no live model or operator path; no Gate α,
     operator-ready, `COMPLETE_FOR_V1` or v1-complete claim; no threat-model
     conclusion changes.
-- **Next:** D5-B (N4's recreation continuation and C29) and D5-C (the
+- **Ledger D5, slice D5-B: live recreation continues the repair loop (N4,
+  C29)** (ADR 0004 Amendment 21 and ADR 0007 Amendment 2, both Accepted
+  2026-11-08) is **implemented and locally verified on macOS (2026-11-08);
+  unstaged, uncommitted and not Linux-CI-confirmed.** Evidence:
+  ADR 0004 §21.17. D5 stays In Progress, not Done.
+  - **What it adds:** a T3–T5 post-write handled failure, with a recreator,
+    goes through Gate zero → classification → C28 → the single repair-budget
+    check → `begin()` → C29 → Started → `recreate()` (duration in
+    `try`/`finally`) → result re-check → bookkeeping (workspace plus the new
+    `RecreationResult.tools`; `_RETIRED_TOOLS` after `ADOPTED_THEN_FAILED`)
+    → Finished. On `RECREATED` alone it then runs C30, appends the
+    recreation-form `PATCH_FAILED` feedback, makes one repair charge, and
+    starts a new pass. `_recreation_can_continue()` is now a `True`
+    capability. `_CompositionRecreator` builds the new incarnation's
+    `RepoTools` after `present` and the entry gate. With no recreator, T3–T5
+    still end before C28.
+  - **Tests:** controller fakes; real Git (T4 contaminating applier; two
+    recreations; both budgets; factory failures; C29; a pinned 21 Git
+    launches per recreation); the real-Docker node
+    `test_d5b_contaminated_worktree_recreates_and_passes_real_docker` (a
+    tracked-file contamination, since an untracked file cannot reach
+    `RECREATED` under ADR 0003 Amendment 2), added to CI's verbose step;
+    E13/E14; a SIGKILL after a continuation.
+  - **Mutation evidence:** D5-B 43 categories / 44 runs, plus the
+    invalidated Step 6 (M05 retired as B1), Step 7, Step 8, D5-A and 60/82
+    D4b, all under the strict assertion-only rule. Test hardening, name
+    deviations, anchor re-pointing and two verification corrections are
+    disclosed in §21.17.
+  - **Not implemented:** D5-C (four-operation protocol, N1/N2, model
+    integration), D6, operator reachability; no Gate α, operator-ready,
+    `COMPLETE_FOR_V1` or v1 claim; no threat-model conclusion changes.
+- **Next:** commit D5-B and its exact-commit Linux CI, then D5-C (the
   four-operation patch protocol and its validation, N1/N2's re-derivations,
   model integration and the remaining Step 9 documentation), then D6; Gate O
   stays satisfied.
@@ -3323,7 +3354,8 @@ Stage 2 (of the four-stage planning process in
   (Historical: before this checkpoint, this bullet said D5's substrate
   waited on the C-1 amendment's acceptance; before D5-A it listed
   258–495 h with D5 at 95–155 h; before D5-A's commit it began "commit D5-A
-  and its exact-commit Linux CI".)
+  and its exact-commit Linux CI"; before D5-B it began "D5-B (N4's
+  recreation continuation and C29) and D5-C".)
 - One Stage-2 spike is unstarted: Responses API strict function tools
   and multiple tool calls. (A sixth spike, JSONL replay into the first
   frontend view, is also listed in the handoff and unstarted.)

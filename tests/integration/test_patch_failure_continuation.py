@@ -58,6 +58,12 @@ from tests.support.fixture_repo import real_fixture_repo
 from tests.support.scripted_model import propose_plan_call, read_file_call, turn
 from tests.support.trace_assertions import assert_model_pairing, assert_tool_pairing
 
+
+def _code(finished):
+    """The terminal error code; a missing error is an explicit assertion failure."""
+    assert finished.error is not None, f"no error on {finished.terminal_reason}"
+    return finished.error.code
+
 _LID = "a" * 32
 _H0 = "a" * 40
 STALE = make_plan(expected_text="    job.retry_count += 2\n", new_text="    pass\n")
@@ -106,17 +112,23 @@ class PlanPerPass(FakeModel):
 
 
 class FakeRecreator:
-    def __init__(self) -> None:
+    """`begin()` returns `sequence`; `recreate()` returns `result`, or fails
+    the test when no result is configured (a path that must never recreate)."""
+
+    def __init__(self, sequence=1, result=None) -> None:
         self.begin_calls = 0
         self.recreate_calls = 0
+        self._sequence, self._result = sequence, result
 
     def begin(self, *, trigger_code, checkpoint_id):
         self.begin_calls += 1
-        return 1
+        return self._sequence
 
     def recreate(self, sequence):
         self.recreate_calls += 1
-        raise AssertionError("D5-A never recreates")
+        if self._result is None:
+            raise AssertionError("this path must never recreate")
+        return self._result
 
 
 def _build(
@@ -401,7 +413,9 @@ def test_patch_failed_bound_fits_the_shared_repair_allowance() -> None:
             "plan_revision": 10**9,
             "previous_attempt_failed": True,
             "untrusted": True,
-            "worktree_recreated": False,
+            # ADR 0007 Amendment 2: the recreation form is the larger one.
+            "worktree_recreated": True,
+            "recreation_outcome": "recreated",
         },
     )
     assert worst.size <= PATCH_FAILED_ITEM_MAX_BYTES
@@ -476,10 +490,16 @@ def test_t2_objects_unavailable_terminates() -> None:
 
 
 @pytest.mark.parametrize("case", ["t3", "t4", "t5"])
-def test_t3_to_t5_terminate_in_slice_a(case) -> None:
+def test_t3_to_t5_without_a_recreator_terminate_before_c28(case) -> None:
+    """ADR 0004 Amendment 21 decision 1 (renamed from
+    `test_t3_to_t5_terminate_in_slice_a`, behaviour unchanged): with no
+    recreator, a T3-T5 failure ends the run with `E` before C28, with no
+    budget check, recreation event, transition or feedback."""
     setup, code = MAPPED[case]
     controller = _build(**setup())
     _assert_terminated_by(controller, controller.run(), code)
+    assert not _of(controller, events.BudgetExceeded)
+    assert not _of(controller, events.WorkspaceRecreationStarted)
 
 
 def _validation_on_advancing_session() -> dict:
@@ -542,14 +562,30 @@ def test_t9_interrupt_keeps_its_raise_path() -> None:
     assert not _patch_failed_transitions(controller) and "C28" not in _sites(controller)
 
 
-def test_slice_a_contaminating_failure_still_terminates() -> None:
-    """With a recreator supplied, a post-write failure (T4) never reaches it."""
-    recreator = FakeRecreator()
+def _disposal_failed_result():
+    from codeagent.controller import RecreationResult
+
+    return RecreationResult(
+        outcome=events.RecreationOutcome.DISPOSAL_FAILED,
+        error=OperationalError(code=ErrorCode.WORKSPACE_RECREATION_FAILED, error_id="rec-1", message="fixed"),
+        artifact_id=f"{_LID}.recreation-01", sha256_payload="d" * 64, bytes_written=10, evidence_complete=True,
+    )
+
+
+@pytest.mark.parametrize("refuse", [True, False], ids=["begin-refuses", "recreation-fails"])
+def test_contaminating_failure_never_continues_without_recreated(refuse) -> None:
+    """ADR 0004 Amendment 21 (migrated from D5-A's
+    `test_slice_a_contaminating_failure_still_terminates`, which asserted the
+    recreator is never called): a post-write failure (T4) with a recreator now
+    reaches `begin()`, and never continues unless the outcome is `RECREATED`."""
+    recreator = FakeRecreator(sequence=None) if refuse else FakeRecreator(result=_disposal_failed_result())
     controller = _build(applier=SequencedApplier((ErrorCode.PATCH_APPLICATION_FAILED,)), recreator=recreator)
     finished = controller.run()
-    _assert_terminated_by(controller, finished, ErrorCode.PATCH_APPLICATION_FAILED)
-    assert (recreator.begin_calls, recreator.recreate_calls) == (0, 0)
-    assert not _of(controller, events.WorkspaceRecreationStarted)
+    assert recreator.begin_calls == 1
+    assert finished.terminal_reason is domain.TerminalReason.UNRECOVERABLE_ERROR
+    assert not _patch_failed_transitions(controller) and not _feedback(controller)
+    expected = ErrorCode.PATCH_APPLICATION_FAILED if refuse else ErrorCode.WORKSPACE_RECREATION_FAILED
+    assert _code(finished) is expected
 
 
 def test_t1_with_a_recreator_never_recreates() -> None:
@@ -604,6 +640,9 @@ def test_gate_zero_precedes_classification_for_every_mapped_failure(case, monkey
     calls = []
     real = ctl.patch_failure_continues
     monkeypatch.setattr(ctl, "patch_failure_continues", lambda *a: calls.append(a) or real(*a))
+    # ADR 0004 Amendment 21: Gate zero also precedes the recreation classifier.
+    real_recreation = ctl.classify_recreation_trigger
+    monkeypatch.setattr(ctl, "classify_recreation_trigger", lambda *a: calls.append(a) or real_recreation(*a))
     setup, code = MAPPED[case]
     kwargs = setup()
     kwargs.setdefault("workspace", FakeWorkspace())
@@ -962,6 +1001,378 @@ def test_d5a_stale_expected_text_continues_to_passing_verification_real_docker(t
         assert git("status", "--porcelain").strip() == ""
         assert git("for-each-ref", "refs/codeagent").strip() == ""
         (run_dir,) = state.glob("repos/*/runs/*")
+        assert json.loads((run_dir / "lifecycle.json").read_text())["state"] == "COMPLETE"
+        names = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"], capture_output=True, text=True, check=True).stdout
+        assert run_dir.name not in names
+        assert not list(state.glob(f"worktrees/*/{run_dir.name}"))
+
+
+# ===========================================================================
+# D5-B (ADR 0004 Amendment 21): recreation continues the repair loop, real Git
+# ===========================================================================
+
+from types import SimpleNamespace  # noqa: E402
+
+from codeagent.controller import VerificationResult  # noqa: E402
+from tests.support.scripted_model import search_text_call  # noqa: E402
+
+_CURRENT_PASS = [0]
+
+
+class _RecordingTools(RepoTools):
+    """The real toolkit, recording each instance and the pass of each call."""
+
+    instances: list = []
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.calls: list[int] = []
+        _RecordingTools.instances.append(self)
+
+    def read_file(self, args, should_stop=lambda: False):
+        self.calls.append(_CURRENT_PASS[0])
+        return super().read_file(args, should_stop)
+
+    def search_text(self, args, should_stop=lambda: False):
+        self.calls.append(_CURRENT_PASS[0])
+        return super().search_text(args, should_stop)
+
+
+class _ContaminatingApplier(GitPatchApplier):
+    """The real applier, except that its first `contaminate` calls write into
+    the worktree and report a post-write failure (T4). It holds a descriptor
+    to the first incarnation and records, after each real commit, the commit,
+    its parent and whether the path still names that first incarnation."""
+
+    contaminate = 1
+    records: list = []
+    first_fd: list = []
+
+    def apply(self, run_id, iteration, approved_paths, operations):
+        path = self._worktree_path
+        if _ContaminatingApplier.contaminate:
+            _ContaminatingApplier.contaminate -= 1
+            if not _ContaminatingApplier.first_fd:
+                _ContaminatingApplier.first_fd.append(os.open(path, os.O_RDONLY))
+            target = path / "jobs" / "worker.py"
+            target.write_text(target.read_text() + "# contaminated\n")
+            return PatchResult(
+                success=False, operation_count=0, changed_paths=(), diff_bytes=0,
+                error=OperationalError(code=ErrorCode.PATCH_APPLICATION_FAILED, error_id=f"{run_id}-c", message="post-write"),
+            )
+        result = super().apply(run_id, iteration, approved_paths, operations)
+        if result.success:
+            git = lambda *a: subprocess.run(["git", "-C", str(path), *a], capture_output=True, text=True, check=True).stdout.strip()  # noqa: E731
+            first = _ContaminatingApplier.first_fd[0]
+            _ContaminatingApplier.records.append(SimpleNamespace(
+                head=git("rev-parse", "HEAD"), parent=git("rev-parse", "HEAD^"), commit=result.commit_hash,
+                same_as_first=os.path.samestat(os.fstat(first), os.stat(path)),
+            ))
+        return result
+
+
+class _PathVerifier:
+    """Stands in for DockerVerifier on the composition's path: passes only if
+    the corrected content is present at that path (so it proves which
+    incarnation the retained verifier reads)."""
+
+    seen: list = []
+
+    def __init__(self, path, **kwargs):
+        self._path = Path(path)
+
+    @property
+    def command(self):
+        return FIXTURE_VERIFY_COMMAND
+
+    def _result(self, ok: bool) -> VerificationResult:
+        return VerificationResult(
+            outcome=events.VerificationOutcome.PASSED if ok else events.VerificationOutcome.TEST_FAILURE,
+            exit_code=0 if ok else 1, duration_seconds=0.01, stdout="", stderr="",
+            cleanup_status=events.ContainerCleanupStatus.CONFIRMED_ABSENT,
+        )
+
+    def run_baseline(self):
+        return self._result(False)
+
+    def run(self, attempt_index):
+        content = (self._path / "jobs" / "worker.py").read_text()
+        _PathVerifier.seen.append(content)
+        return self._result(REAL_FIX.new_text in content and "# contaminated" not in content)
+
+
+class _FixEveryPass:
+    """Reads in every pass and proposes REAL_FIX citing that pass's read; after
+    a recreation it requires the ADR 0007 Amendment 2 feedback. `search` adds
+    a pass-0 paginated search and a pass-1 replay of its stale cursor."""
+
+    model_name = "fake-model-v1"
+
+    def __init__(self, *, search: bool = False) -> None:
+        self.search = search
+        self.cursor: list[str] = []
+        self.feedback: list[dict] = []
+
+    def respond(self, context):
+        _CURRENT_PASS[0] = context.pass_index
+        current = [i for i in context.transcript if i.kind is FeedbackKind.TOOL_RESULT and i.pass_index == context.pass_index]
+        denied = [i for i in context.transcript if i.kind is FeedbackKind.TOOL_DENIED and i.pass_index == context.pass_index]
+        if self.search and context.pass_index == 0 and not current:
+            return turn(search_text_call("job", ".", limit=1))
+        if self.search and context.pass_index == 0 and len(current) == 1:
+            self.cursor.append(current[0].body["payload"]["next_cursor"])
+            return turn(read_file_call("jobs/worker.py"))
+        if self.search and context.pass_index == 1 and not denied and not current:
+            return turn(search_text_call("job", ".", cursor=self.cursor[0], limit=1))
+        reads = [i for i in current if i.body["tool"] == "read_file" and i.body["ok"]]
+        if not reads:
+            return turn(read_file_call("jobs/worker.py"))
+        if context.pass_index >= 1:
+            self.feedback.append([i.body for i in context.transcript if i.kind is FeedbackKind.PATCH_FAILED][-1])
+        return turn(propose_plan_call(_real_plan(REAL_FIX, reads[-1].body["tool_call_id"])))
+
+
+@pytest.fixture
+def composed_t4(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEAGENT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(lr, "GitPatchApplier", _ContaminatingApplier)
+    monkeypatch.setattr(lr, "DockerVerifier", _PathVerifier)
+    monkeypatch.setattr(lr, "RepoTools", _RecordingTools)
+    _ContaminatingApplier.contaminate, _ContaminatingApplier.records = 1, []
+    _ContaminatingApplier.first_fd = []
+    _RecordingTools.instances, _PathVerifier.seen = [], []
+    with real_fixture_repo() as repo:
+        yield SimpleNamespace(repo=repo, tmp=tmp_path)
+    for fd in _ContaminatingApplier.first_fd:
+        os.close(fd)
+
+
+def _run_t4(c, model=None, **kwargs):
+    log = EventLog()
+    result = lr.run_lifecycle_aware(
+        c.repo, run_id="r-d5b-git", task_statement="fix the retry counter", approval_mode=domain.ApprovalMode.INTERACTIVE,
+        evidence_root=c.tmp / "evidence", model=model or _FixEveryPass(),
+        approval=FakeApprovalProvider((domain.ApprovalDecision.APPROVED,)), event_log=log, **kwargs,
+    )
+    return result, log.events
+
+
+def _lid(c) -> str:
+    run_dir = _one((c.tmp / "state" / "repos").glob("*/runs/*"))
+    return run_dir.name
+
+
+def _assert_composed_clean(c) -> None:
+    git = lambda *a: subprocess.run(["git", "-C", str(c.repo), *a], capture_output=True, text=True, check=True).stdout  # noqa: E731
+    assert git("for-each-ref", "refs/codeagent").strip() == ""
+    assert len([l for l in git("worktree", "list", "--porcelain").splitlines() if l.startswith("worktree ")]) == 1
+    run_dir = _one((c.tmp / "state" / "repos").glob("*/runs/*"))
+    assert json.loads((run_dir / "lifecycle.json").read_text())["state"] == "COMPLETE"
+    assert not list((c.tmp / "state").glob(f"worktrees/*/{run_dir.name}"))
+
+
+def test_composed_recreation_continues_to_pass(composed_t4) -> None:
+    """B1, B2 and the §21.6 applier proof: T4 → recreation → C30 → reread
+    through the new toolkit → the retained applier commits in n+1 → pass."""
+    origin = subprocess.run(["git", "-C", str(composed_t4.repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    model = _FixEveryPass()
+    result, trace = _run_t4(composed_t4, model)
+    finished = result.finished
+    assert finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED and finished.error is None
+    done = [e for e in trace if isinstance(e, events.WorkspaceRecreationFinished)]
+    assert [e.outcome for e in done] == [events.RecreationOutcome.RECREATED]
+    assert len(_RecordingTools.instances) == 2
+    n_tools, n1_tools = _RecordingTools.instances
+    assert n_tools.calls and set(n_tools.calls) == {0}, "n's toolkit is never used after recreation"
+    assert n1_tools.calls and set(n1_tools.calls) == {1}
+    record = _one(_ContaminatingApplier.records)
+    assert record.head == record.commit and record.parent == origin and record.same_as_first is False
+    applied = [e for e in trace if isinstance(e, events.PatchApplied)]
+    assert [e.checkpoint_id for e in applied] == [record.commit]
+    assert model.feedback and model.feedback[0].get("worktree_recreated") is True
+    assert model.feedback[0].get("recreation_outcome") == "recreated"
+    assert "# contaminated" not in _PathVerifier.seen[-1]
+    events.validate_recreation_trace(trace)
+    assert_model_pairing(trace)
+    assert_tool_pairing(trace)
+    lid = _lid(composed_t4)
+    assert (composed_t4.tmp / "evidence" / f"{lid}.recreation-01.evidence").exists()
+    assert (composed_t4.tmp / "evidence" / f"{lid}.evidence").exists()
+    _assert_composed_clean(composed_t4)
+
+
+def test_composed_two_recreations_then_success(composed_t4) -> None:
+    _ContaminatingApplier.contaminate = 2
+    result, trace = _run_t4(composed_t4)
+    assert result.finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED
+    done = [e for e in trace if isinstance(e, events.WorkspaceRecreationFinished)]
+    assert [(e.recreation_sequence, e.outcome) for e in done] == [(1, events.RecreationOutcome.RECREATED), (2, events.RecreationOutcome.RECREATED)]
+    assert len(_RecordingTools.instances) == 3
+    lid = _lid(composed_t4)
+    for k in (1, 2):
+        assert (composed_t4.tmp / "evidence" / f"{lid}.recreation-{k:02d}.evidence").exists()
+    assert (composed_t4.tmp / "evidence" / f"{lid}.evidence").exists()
+    events.validate_recreation_trace(trace)
+    _assert_composed_clean(composed_t4)
+
+
+def test_composed_recreation_budget_exhausted_ends_with_the_triggering_error(composed_t4) -> None:
+    _ContaminatingApplier.contaminate = 2
+    result, trace = _run_t4(composed_t4, max_recreations=1)
+    assert _code(result.finished) is ErrorCode.PATCH_APPLICATION_FAILED
+    assert len([e for e in trace if isinstance(e, events.WorkspaceRecreationStarted)]) == 1
+    _assert_composed_clean(composed_t4)
+
+
+def test_composed_repair_budget_exhausted_never_recreates(composed_t4) -> None:
+    result, trace = _run_t4(composed_t4, max_repair_iterations=0)
+    assert result.finished.terminal_reason is domain.TerminalReason.BUDGET_EXCEEDED
+    assert not [e for e in trace if isinstance(e, events.WorkspaceRecreationStarted)]
+    _assert_composed_clean(composed_t4)
+
+
+def test_old_search_cursor_refused_after_recreation(composed_t4) -> None:
+    """B3: a search cursor issued by n's toolkit is unknown to n+1's."""
+    model = _FixEveryPass(search=True)
+    result, trace = _run_t4(composed_t4, model)
+    assert result.finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED
+    assert model.cursor and model.cursor[0]
+    denials = [e for e in trace if isinstance(e, events.PolicyDecisionRecorded) and not e.allowed]
+    assert [d.reason for d in denials] == ["cursor_invalid:chain_unknown"]
+    assert denials[0].iteration == 1
+
+
+# --- Real Docker (CI verbose node) ------------------------------------------
+
+D5B_SENTINEL = "    # D5B_SENTINEL_N1\n"
+REAL_FIX_MARKED = ProposedChange("jobs/worker.py", INCREMENT + CHECK, CHECK + INCREMENT + D5B_SENTINEL)
+# Appended to the tracked `jobs/worker.py` in incarnation n (ADR 0004
+# Amendment 21's post-acceptance correction: an untracked contaminant would
+# make Phase E's evidence incomplete, so it could never reach RECREATED).
+CONTAMINATION_MARKER = "# CONTAMINATION_FROM_N"
+
+
+class _StaleThenFixTwice:
+    """Pass 0: a stale replacement (T1). Passes 1 and 2: the marked fix,
+    each citing that pass's read; records reads and feedback."""
+
+    model_name = "fake-model-v1"
+
+    def __init__(self) -> None:
+        self.reads: dict[int, str] = {}
+        self.feedback: list[dict] = []
+
+    def respond(self, context):
+        _CURRENT_PASS[0] = context.pass_index
+        reads = [i for i in context.transcript
+                 if i.kind is FeedbackKind.TOOL_RESULT and i.pass_index == context.pass_index and i.body["ok"]]
+        if not reads:
+            return turn(read_file_call("jobs/worker.py"))
+        self.reads[context.pass_index] = "".join(text for _, text in reads[-1].body["payload"]["lines"])
+        read_id = reads[-1].body["tool_call_id"]
+        if context.pass_index == 0:
+            return turn(propose_plan_call(_real_plan(REAL_STALE, read_id)))
+        self.feedback.append([i.body for i in context.transcript if i.kind is FeedbackKind.PATCH_FAILED][-1])
+        return turn(propose_plan_call(_real_plan(REAL_FIX_MARKED, read_id)))
+
+
+class _ContaminatingApproval(FakeApprovalProvider):
+    """Approves everything. During the second approval (pass 1) it appends a
+    contamination marker to the tracked `jobs/worker.py` in incarnation n
+    (an uncommitted modification) and holds a descriptor to n; during the
+    third (pass 2) it records what the path now names."""
+
+    def __init__(self, state: Path) -> None:
+        super().__init__((domain.ApprovalDecision.APPROVED,))
+        self.state, self.held, self.pass2 = state, [], {}
+
+    def _leaf(self) -> Path:
+        leaf = _one(self.state.glob("worktrees/*/*"))
+        return leaf
+
+    def decide(self, request):
+        n = len(self.requests) + 1
+        if n == 2:
+            leaf = self._leaf()
+            target = leaf / "jobs" / "worker.py"
+            target.write_text(target.read_text() + CONTAMINATION_MARKER + "\n")
+            self.held.append(os.open(leaf, os.O_RDONLY))
+        elif n == 3:
+            leaf = self._leaf()
+            git = lambda *a: subprocess.run(["git", "-C", str(leaf), *a], capture_output=True, text=True, check=True).stdout.strip()  # noqa: E731
+            self.pass2 = {
+                "same_as_n": os.path.samestat(os.fstat(self.held[0]), os.stat(leaf)),
+                "head": git("rev-parse", "HEAD"),
+                "contamination_visible": CONTAMINATION_MARKER in (leaf / "jobs" / "worker.py").read_text(),
+            }
+        return super().decide(request)
+
+
+@requires_docker
+def test_d5b_contaminated_worktree_recreates_and_passes_real_docker(tmp_path, monkeypatch) -> None:
+    """ADR 0004 Amendment 21 decision 5: pass 0 establishes a PRESENT session
+    through T1; pass-1 approval contaminates n, so the entry gate fails as T3;
+    recreation builds n+1 at the checkpoint; pass 2 re-proposes the identical
+    fix, and the retained applier and real Docker verifier act on n+1."""
+    if not _docker_available():
+        pytest.fail("CODEAGENT_REQUIRE_DOCKER=1 but no Docker daemon is available", pytrace=False)
+    state = tmp_path / "state"
+    monkeypatch.setenv("CODEAGENT_STATE_DIR", str(state))
+    monkeypatch.setattr(lr, "RepoTools", _RecordingTools)
+    _RecordingTools.instances = []
+    # Inside the container: the fixture tests pass, the approved change's own
+    # sentinel line is present, and n's contamination marker is absent.
+    verify = ("sh", "-c", "python3 -B -m unittest tests.test_worker && grep -q D5B_SENTINEL_N1 jobs/worker.py "
+              f"&& ! grep -q '{CONTAMINATION_MARKER}' jobs/worker.py")
+    with real_fixture_repo() as repo:
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, check=True).stdout.strip()  # noqa: E731
+        origin = git("rev-parse", "HEAD")
+        original = (repo / "jobs" / "worker.py").read_text()
+        log = EventLog()
+        model = _StaleThenFixTwice()
+        approval = _ContaminatingApproval(state)
+        try:
+            result = lr.run_lifecycle_aware(
+                repo, run_id="r-d5b-docker", task_statement="fix the retry counter for duplicate deliveries",
+                approval_mode=domain.ApprovalMode.INTERACTIVE, evidence_root=tmp_path / "evidence",
+                model=model, approval=approval, verify_command=verify, clock=SystemClock(), event_log=log,
+            )
+        finally:
+            for fd in approval.held:
+                os.close(fd)
+            for lifecycle_dir in state.glob("repos/*/runs/*"):
+                for role in ("baseline", "verification"):
+                    subprocess.run(["docker", "rm", "-f", f"codeagent-{role}-{lifecycle_dir.name}"], capture_output=True)
+        trace, finished = log.events, result.finished
+        assert finished.terminal_reason is domain.TerminalReason.VERIFICATION_PASSED and finished.error is None
+        failed = [_code(e) for e in trace if isinstance(e, events.ToolCompleted) and e.tool is domain.ToolName.APPLY_PATCH and not e.success]
+        assert failed == [V, ErrorCode.WORKSPACE_ENTRY_GATE_FAILED]
+        started = [e for e in trace if isinstance(e, events.WorkspaceRecreationStarted)]
+        done = [e for e in trace if isinstance(e, events.WorkspaceRecreationFinished)]
+        assert [(e.trigger_code, e.checkpoint_id) for e in started] == [(ErrorCode.WORKSPACE_ENTRY_GATE_FAILED, origin)]
+        assert [e.outcome for e in done] == [events.RecreationOutcome.RECREATED]
+        assert done[0].evidence_complete is True  # Phase E captured a complete artifact
+        assert len([e for e in trace if isinstance(e, events.StateTransitioned) and e.trigger is domain.Trigger.PATCH_FAILED]) == 2
+        assert len(model.feedback) == 2
+        assert model.feedback[0].get("worktree_recreated") is False and "recreation_outcome" not in model.feedback[0]
+        assert model.feedback[1].get("worktree_recreated") is True and model.feedback[1].get("recreation_outcome") == "recreated"
+        assert len(approval.requests) == 3 and approval.requests[2].material_change is False
+        assert approval.pass2 == {"same_as_n": False, "head": origin, "contamination_visible": False}
+        assert len(_RecordingTools.instances) == 2
+        n_tools, n1_tools = _RecordingTools.instances
+        assert set(n_tools.calls) == {0, 1} and set(n1_tools.calls) == {2}
+        applied = _one([e for e in trace if isinstance(e, events.PatchApplied)])
+        assert git("rev-parse", f"{applied.checkpoint_id}^") == origin
+        committed = git("show", f"{applied.checkpoint_id}:jobs/worker.py") + "\n"
+        assert D5B_SENTINEL in committed and CONTAMINATION_MARKER not in committed
+        outcomes = [e.outcome for e in trace if isinstance(e, events.VerificationCompleted)]
+        assert outcomes == [events.VerificationOutcome.PASSED]
+        events.validate_recreation_trace(trace)
+        assert_model_pairing(trace)
+        assert_tool_pairing(trace)
+        assert (repo / "jobs" / "worker.py").read_text() == original
+        assert git("status", "--porcelain") == "" and git("for-each-ref", "refs/codeagent") == ""
+        run_dir = _one(state.glob("repos/*/runs/*"))
         assert json.loads((run_dir / "lifecycle.json").read_text())["state"] == "COMPLETE"
         names = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"], capture_output=True, text=True, check=True).stdout
         assert run_dir.name not in names
