@@ -220,9 +220,10 @@ Stage 2 (of the four-stage planning process in
   or resuming a worktree. True crash-consistent filesystem mutation is
   explicitly not guaranteed in v1 — the claim is recovery plus
   interruption detection/rejection at the controller boundary. No
-  implementation existed then (historical: the recreation substrate is
-  now committed but unreachable; see the D5 Steps 1–8 checkpoint bullet
-  below); the ADR records required Milestone 2
+  implementation existed then (historical: the recreation substrate was
+  later committed, and was unreachable until D5-B made it reachable on the
+  internal continuation path; see the D5 Steps 1–8 checkpoint and D5-B
+  bullets below); the ADR records required Milestone 2
   failure-path testing obligations (disposal/recreation failure,
   additions, deletions, renames, unexpected dirty/index states) that
   S3's evidence does not cover. **Amendment 1 (Accepted 2026-09-15)**
@@ -3267,11 +3268,12 @@ Stage 2 (of the four-stage planning process in
     regression, so their CI execution is inferred, not named. The skipped
     tests are unidentified. This is GitHub-hosted `ubuntu-24.04` x86_64
     automated-test evidence, not a security review or ARM64 evidence.
-  - **Boundary:**
-    - live-run recreation is unreachable (`_recreation_can_continue()` is
-      `False` until N4);
-    - N4, the four-operation patch protocol, model integration and D6 are
-      not implemented;
+  - **Boundary (historical, at this checkpoint):**
+    - live-run recreation was unreachable (`_recreation_can_continue()` was
+      `False` until N4; D5-B, commit `ba653b7`, now makes it reachable on the
+      internal continuation path);
+    - N4, the four-operation patch protocol, model integration and D6 were
+      not implemented (N4 is now implemented by D5-B; the rest remain);
     - B5/B7 still block (exit: `ABANDONED_UNRESOLVED`);
     - no operator-readiness, Gate α or v1 claim follows.
 - **Ledger D5, slice D5-A: continuation after a pre-write patch validation
@@ -3297,10 +3299,13 @@ Stage 2 (of the four-stage planning process in
     UTF-8-bounded message) appended only after C30; mandatory reapproval and
     current-pass citations unchanged. C29 is neither registered nor
     consulted.
-  - **Not implemented:** D5-B (N4 recreation continuation, C29), D5-C (the
-    four-operation protocol, N1/N2, model integration of the operations) and
-    D6. Live recreation stays unreachable (`_recreation_can_continue()` is
-    `False`). Post-write failures still end the run.
+  - **Historical D5-A boundary:** at D5-A landing, D5-B (N4 recreation
+    continuation, C29), D5-C (the four-operation protocol, N1/N2, model
+    integration of the operations) and D6 were not implemented, live
+    recreation remained unreachable (`_recreation_can_continue()` was
+    `False`), and post-write failures still ended the run. D5-B is now
+    committed as `ba653b7` and Linux-CI-confirmed in run 42592929825; D5-C
+    and D6 remain unimplemented.
   - **Verification:** see `ENGINEERING_LOG.md`'s 2026-11-07 D5-A entries
     for the exact local test and mutation totals.
   - **Residual:** `test_executor.py::test_l2_timeout_kills_the_whole_process_group`
