@@ -1406,7 +1406,7 @@ def test_composed_c29_cancellation_real_git(composed, monkeypatch) -> None:
 # The exact number of Git subprocesses one successful recreation launches
 # (Phases E, D, R and C plus the C3 entry gate), pinned so the documented
 # cancellation-latency bound (Amendment 21 §21.3a) cannot drift silently.
-RECREATION_GIT_LAUNCHES = 21
+RECREATION_GIT_LAUNCHES = 22
 
 
 def test_recreation_git_invocation_count_is_pinned(composed, monkeypatch) -> None:
@@ -1417,7 +1417,7 @@ def test_recreation_git_invocation_count_is_pinned(composed, monkeypatch) -> Non
     class Counting(real_popen):
         def __init__(self, args, *a, **k):
             if active["on"] and Path(str(args[0])).name == "git":
-                launches.append(tuple(args[:4]))
+                launches.append(tuple(args))
             super().__init__(args, *a, **k)
 
     real_recreate = lr._CompositionRecreator.recreate
@@ -1435,3 +1435,10 @@ def test_recreation_git_invocation_count_is_pinned(composed, monkeypatch) -> Non
     _compose_catching(composed, log, max_recreations=1)
     assert [e.outcome for e in _recreation(log) if isinstance(e, events.WorkspaceRecreationFinished)] == [O.RECREATED]
     assert len(launches) == RECREATION_GIT_LAUNCHES, launches
+    # ADR 0006 Amendment 5: the 22nd launch is the entry gate's one
+    # filter-configuration enumeration, between its cached and tree diffs.
+    from tests.support.hostile_filter import describe
+
+    commands = [describe(argv)[0] for argv in launches]
+    gate = commands.index(("diff", "--cached"))
+    assert commands[gate : gate + 4] == [("diff", "--cached"), ("config",), ("diff", "--quiet"), ("status",)]

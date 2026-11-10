@@ -3356,9 +3356,48 @@ Stage 2 (of the four-stage planning process in
   - **Not implemented:** D5-C (four-operation protocol, N1/N2, model
     integration), D6, operator reachability; no Gate α, operator-ready,
     `COMPLETE_FOR_V1` or v1 claim; no threat-model conclusion changes.
-- **Next:** D5-C (the four-operation patch protocol and its validation,
-  N1/N2's re-derivations, model integration and the remaining Step 9
-  documentation), then D6; Gate O stays satisfied.
+- **Mandatory pre-D5-C hotfix: refuse unrenderable filter-driver names and
+  neutralize the entry gate**, per ADR 0006 Amendment 5 (Accepted
+  2026-11-09). **Implemented and locally verified on macOS (2026-11-09);
+  unstaged, uncommitted and not Linux-CI-confirmed.**
+  - **Finding:** `git -c` splits at the first `=`, so the neutralization
+    override for a driver named, for example, `a=b` was silently ineffective,
+    and its helper ran during governed `status`/`diff`. The entry gate's
+    `diff --quiet HEAD --` and `status` ran with no neutralization at all.
+  - **Fix:**
+    - `_git_safety` refuses any `=`-containing driver name with
+      `FILTER_DRIVER_NAME_UNRENDERABLE`, using a fixed message raised
+      directly with no cause or context;
+    - `entry_gate` enumerates once and neutralizes both commands, translating
+      only `GitSafetyError` (`from exc`);
+    - recreation launches go from 21 to 22, and the ADR 0004 §21.3a range
+      from 576–728 s to 606–758 s.
+  - **Verified:**
+    - affected set 3,437, forward and reverse;
+    - full suite 7,116 passed, 2 skipped (the known non-UTF-8-filename
+      tests);
+    - H-1–H-6 all killed by assertion only;
+    - no leftovers.
+  - **Prior-harness invalidation audit** (computed mechanically, including
+    the import closure of `hostile_filter.py`):
+    - D5-B, Step 7 and Step 8 were invalidated and rerun: 44/44, 33/33 and
+      24/24 caught by assertion, with baselines 1,266, 1,162 and 743 on both
+      sides and the tree unchanged.
+    - Three Step 8 mutations that overlapped system sleep were rerun in a
+      sleep-free window.
+    - Step 6, D5-A and D4b (0 of 82 mutations) are not invalidated, and no
+      Steps 1–5 harness is recorded.
+    - The authoritative matrix is in ADR 0006 Amendment 5 §A5.9.
+  - **ADR drafts:** the four Proposed D5-C drafts renumbered ADR 0006's D5-C
+    amendment to **Amendment 6**, a mechanical change of 34 lines, and stay
+    unstaged.
+  - **Boundaries:** no D5-C capabilities, registry, snapshot, private index
+    or protocol; no workflow change; D5 stays In Progress.
+- **Next:** commit the hotfix with the partial-index safeguards (hotfix plan
+  revision 3 §9.2) and obtain exact-commit Linux CI. Only then D5-C (the
+  four-operation patch protocol and its validation, N1/N2's re-derivations,
+  model integration and the remaining Step 9 documentation), then D6. Gate O
+  stays satisfied.
   Remaining planning range D5–D10: 337–629 h (D5 174–289 h; first operator
   run 373–627 h; Gate α 440–762 h; public v1 / cumulative D1–D10 502–901 h;
   Gate O 86–140 h and D1–D4 165–272 h unchanged; D5 re-estimated from

@@ -3296,3 +3296,201 @@ def test_lifecycle_store_legitimately_declares_and_constructs_worktree_publisher
     keyword_uses = {kw.arg for node in ast.walk(tree) if isinstance(node, ast.Call) for kw in node.keywords}
     assert "worktree_publisher" in annotated
     assert "worktree_publisher" in keyword_uses
+
+
+# ---------------------------------------------------------------------------
+# ADR 0006 Amendment 5 (mandatory pre-D5-C hotfix): the entry gate's
+# `diff --quiet HEAD --` and `status` are filter execution points and carry
+# one shared enumerate-and-neutralize backstop; an unrenderable driver name
+# is refused by every workspace consumer. Real Git and a real hostile helper.
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid  # noqa: E402
+
+from tests.support import hostile_filter as hf  # noqa: E402
+
+_GATE_NEUTRALIZE_MESSAGE = "the worktree's filter configuration could not be neutralized"
+_GATE_SEQUENCE = [("rev-parse",), ("diff", "--cached"), ("config",), ("diff", "--quiet"), ("status",)]
+
+
+def _arm_hostile_gate(path: Path, tmp_path: Path, name: str):
+    sentinel = tmp_path / f"sentinel-{_uuid.uuid4().hex}"
+    hf.configure_hostile_driver(path, name, "clean", sentinel, pattern="*.py")
+    tracked = next(path.rglob("*.py"))
+    hf.make_stat_dirty(tracked)
+    return sentinel
+
+
+def _registered_worktrees(repo: Path) -> list[str]:
+    out = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"], capture_output=True, text=True, check=True
+    ).stdout
+    return [line for line in out.splitlines() if line.startswith("worktree ")]
+
+
+def _gate_state(path: Path) -> tuple:
+    index = (Path(subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-path", "index"],
+        capture_output=True, text=True, check=True).stdout.strip())).read_bytes()
+    return (_head(path), _refs(path), index, _file_digest_manifest(path), _worktree_list(path))
+
+
+def test_entry_gate_neutralizes_tree_diff_and_status(tmp_path, monkeypatch) -> None:
+    """H-2/H-3's designated catch: with a hostile clean filter on a
+    stat-dirty tracked file, the gate passes and the helper never runs."""
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-gate-neutralized")
+        with wt as path:
+            sentinel = _arm_hostile_gate(path, tmp_path, "f")
+            with hf.spy_git_launches(monkeypatch) as spy:
+                outcome = hf.capture(lambda: wt.entry_gate(wt.initial_commit))
+            assert outcome is hf.NOTHING_RAISED
+            assert not sentinel.exists(), "a configured clean filter ran during the entry gate"
+            assert spy.commands == _GATE_SEQUENCE
+            tree_overrides, status_overrides = spy.launches[3][1], spy.launches[4][1]
+            assert tree_overrides == status_overrides
+            assert f"filter.f.clean={_git_safety.FIXED_CAT_PATH}" in tree_overrides
+
+
+def test_entry_gate_refuses_unrenderable_driver(tmp_path, monkeypatch) -> None:
+    token = f"SENTINEL-{_uuid.uuid4().hex}"
+    name = f"a={token}"
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-gate-unrenderable")
+        with wt as path:
+            sentinel = _arm_hostile_gate(path, tmp_path, name)
+            before = _gate_state(path)
+            with hf.spy_git_launches(monkeypatch) as spy:
+                exc = hf.capture(lambda: wt.entry_gate(wt.initial_commit))
+            assert type(exc) is GitWorktreeError and str(exc) == _GATE_NEUTRALIZE_MESSAGE
+            inner = exc.__cause__
+            assert type(inner) is _git_safety.GitSafetyError
+            assert inner.reason is _git_safety.GitSafetyFailure.FILTER_DRIVER_NAME_UNRENDERABLE
+            assert inner.message == _git_safety._UNRENDERABLE_MESSAGE
+            assert inner.__cause__ is None and inner.__context__ is None
+            assert exc.__context__ is inner
+            reached = hf.assert_no_hostile_value(exc, (token, name, str(sentinel), str(path), str(repo)))
+            assert {id(e) for e in reached} == {id(exc), id(inner)}
+            assert spy.commands == _GATE_SEQUENCE[:3]
+            assert not sentinel.exists()
+            assert _gate_state(path) == before
+
+
+def test_entry_gate_enumeration_failure_fails_closed(tmp_path, monkeypatch) -> None:
+    token = f"SENTINEL-{_uuid.uuid4().hex}"
+    real_run_git = _git_safety.run_git
+    launched = []
+
+    def failing_config(repo_path, *args, **kwargs):
+        launched.append(args[:2])
+        if args and args[0] == "config":
+            return subprocess.CompletedProcess(["git"], 2, "", f"fatal: {token}")
+        return real_run_git(repo_path, *args, **kwargs)
+
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-gate-enum-fail")
+        with wt as path:
+            monkeypatch.setattr(_git_safety, "run_git", failing_config)
+            exc = hf.capture(lambda: wt.entry_gate(wt.initial_commit))
+            monkeypatch.undo()
+    assert type(exc) is GitWorktreeError and str(exc) == _GATE_NEUTRALIZE_MESSAGE
+    assert exc.__cause__.reason is _git_safety.GitSafetyFailure.FILTER_ENUMERATION_UNAVAILABLE
+    hf.assert_no_hostile_value(exc, (token,))
+    assert [a[0] for a in launched] == ["rev-parse", "diff", "config"]
+
+
+class _DirectBase(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "make", [KeyboardInterrupt, lambda: SystemExit(3), lambda: _DirectBase("gate")],
+    ids=["KeyboardInterrupt", "SystemExit", "_DirectBase"],
+)
+def test_entry_gate_interrupt_propagates(tmp_path, monkeypatch, make) -> None:
+    """H-4's designated catch: an interrupt raised by the enumeration
+    surfaces as the identical instance, never as a `GitWorktreeError`."""
+    inst = make()
+
+    def raiser(*args, **kwargs):
+        raise inst
+
+    with real_fixture_repo() as repo:
+        wt = GitWorktree(repo, run_id="r-gate-interrupt")
+        with wt as path:
+            before = _gate_state(path)
+            with hf.spy_git_launches(monkeypatch) as spy, monkeypatch.context() as patch:
+                patch.setattr(_git_safety, "enumerate_filter_neutralization", raiser)
+                got = hf.capture(lambda: wt.entry_gate(wt.initial_commit))
+            assert got is inst
+            assert not isinstance(got, GitWorktreeError)
+            assert spy.count("diff", "--quiet") == 0 and spy.count("status") == 0
+            assert _gate_state(path) == before
+
+
+def test_snapshot_source_refuses_unrenderable_driver(tmp_path, monkeypatch) -> None:
+    token = f"SENTINEL-{_uuid.uuid4().hex}"
+    with real_fixture_repo() as repo:
+        sentinel = tmp_path / "sentinel"
+        hf.configure_hostile_driver(repo, f"a={token}", "clean", sentinel, pattern="*.py")
+        hf.make_stat_dirty(next(repo.rglob("*.py")))
+        wt = GitWorktree(repo, run_id="r-snapshot-unrenderable")
+        with hf.spy_git_launches(monkeypatch) as spy:
+            exc = hf.capture(wt.snapshot_source)
+        assert type(exc) is GitWorktreeError
+        assert type(exc.__cause__) is _git_safety.GitSafetyError
+        assert exc.__cause__.reason is _git_safety.GitSafetyFailure.FILTER_DRIVER_NAME_UNRENDERABLE
+        hf.assert_no_hostile_value(exc, (token, str(sentinel), str(repo)))
+        assert spy.commands == [("config",)]
+        assert not sentinel.exists()
+
+
+def _creation_launches(repo, monkeypatch, **kwargs):
+    wt = GitWorktree(repo, run_id="r-creation-launches", **kwargs)
+    with hf.spy_git_launches(monkeypatch) as spy:
+        exc = hf.capture(lambda: wt.__enter__())
+    return wt, exc, spy.commands
+
+
+@pytest.mark.parametrize("variant", ["tempdir", "reservation"])
+def test_creation_refuses_unrenderable_driver_before_checkout(tmp_path, monkeypatch, variant) -> None:
+    token = f"SENTINEL-{_uuid.uuid4().hex}"
+    with real_fixture_repo() as clean_repo:
+        # Baseline: the same creation on a repository with no unrenderable
+        # driver, to pin the launch prefix up to the enumeration.
+        wt_ok, ok_exc, ok_commands = _creation_launches(clean_repo, monkeypatch)
+        assert ok_exc is hf.NOTHING_RAISED
+        wt_ok.__exit__(None, None, None)
+    with real_fixture_repo() as repo:
+        sentinel = tmp_path / "sentinel"
+        hf.configure_hostile_driver(repo, f"a={token}", "smudge", sentinel, pattern="*.py")
+        registered_before = _registered_worktrees(repo)
+        state_root = _real_state_root(tmp_path) if variant == "reservation" else None
+        try:
+            if state_root is None:
+                _, exc, commands = _creation_launches(repo, monkeypatch)
+            else:
+                with state_root.reserve_worktree_leaf(_WT_REPO_KEY, _WT_LIFECYCLE_ID) as reservation:
+                    _, exc, commands = _creation_launches(repo, monkeypatch, reservation=reservation)
+                leaf = Path(state_root.path) / "worktrees" / _WT_REPO_KEY / _WT_LIFECYCLE_ID
+                assert not os.path.lexists(leaf)
+        finally:
+            if state_root is not None:
+                state_root.close()
+        assert type(exc) is GitWorktreeError
+        assert str(exc) == "the source commit's filter-attribute safety could not be verified"
+        reached = hf.assert_no_hostile_value(exc, (token, str(sentinel), str(repo)))
+        assert all(type(e) in (GitWorktreeError, _git_safety.GitSafetyError) for e in reached)
+        assert any(getattr(e, "reason", None) is _git_safety.GitSafetyFailure.FILTER_DRIVER_NAME_UNRENDERABLE
+                   for e in reached)
+        cut = commands.index(("config",)) + 1
+        assert commands[:cut] == ok_commands[: ok_commands.index(("config",)) + 1]
+        assert commands.count(("config",)) == 1
+        assert ("checkout",) not in commands
+        # Measured pin (both variants): HEAD, `worktree add`, `read-tree`, the
+        # refused enumeration, then the existing exact cleanup (`worktree
+        # remove`, then the confirming `worktree list`).
+        assert commands == [("rev-parse",), ("worktree",), ("read-tree",), ("config",),
+                            ("worktree",), ("worktree",)]
+        assert _registered_worktrees(repo) == registered_before
+        assert not sentinel.exists()

@@ -7298,6 +7298,16 @@ itself and Phases E, D, R and C are otherwise unchanged.
   time, and the direct-child-only Git timeout residual, have no configured
   bound. A cancellation during `begin()` waits at most Q5's two 30 s
   observations and is observed at C29, never after recreation.
+  - **Updated by ADR 0006 Amendment 5 (2026-11-09).** The entry gate now runs
+    one filter-configuration enumeration (`git config`, through `run_git`,
+    with a 30 s timeout).
+    - The pinned count moves from 21 to **22** Git launches per successful
+      recreation.
+    - The configured subprocess component grows by at most one 30 s
+      `subprocess.run` timeout: 17–21 calls at 30 s plus 3–4 bounded readers
+      at 32 s, about **606–758 s** (previously 576–728 s).
+    - Filesystem and `fsync` time, and the direct-child-only Git timeout
+      residual, still have no configured bound.
 
 ### 21.4 `RecreationResult` contract
 
@@ -7933,6 +7943,14 @@ not test evidence and are left in place, not deleted.
   be restored from the session transcript.
 - The latency pin fixes today's count of 21 Git launches; any legitimate
   change to that count must update it.
+  - **Updated by ADR 0006 Amendment 5 (2026-11-09).** The pin is now **22**:
+    the entry gate's filter-configuration enumeration adds one `git config`
+    launch.
+  - The §21.3a configured range is now about 606–758 s (previously
+    576–728 s).
+  - Filesystem and `fsync` time, and the direct-child timeout residual,
+    remain unbounded.
+  - The 21 above is this record's historical D5-B count.
 - The §21.15 non-claims stand: D5-C, the four-operation protocol, D6,
   operator reachability, Gate α and v1 remain unimplemented, and D5 stays In
   Progress.

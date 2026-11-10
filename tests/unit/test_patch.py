@@ -1231,3 +1231,57 @@ def test_apply_sanitizes_a_real_symlink_loop_runtime_error() -> None:
     assert not result.success
     assert result.error.code is ErrorCode.PATCH_VALIDATION_FAILED
     assert str(worktree) not in result.error.message
+
+
+# ---------------------------------------------------------------------------
+# ADR 0006 Amendment 5 (mandatory pre-D5-C hotfix): an unrenderable filter
+# driver name is refused before any attribute inspection.
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid  # noqa: E402
+
+from codeagent import _git_safety  # noqa: E402
+from codeagent.patch import _ApplicationFailure  # noqa: E402
+from tests.support import hostile_filter as hf  # noqa: E402
+
+
+def test_target_attribute_check_refuses_unrenderable_driver(tmp_path, monkeypatch) -> None:
+    """C4: the pre-write attribute check fails closed. The message keeps
+    only its sanitized repository-relative approved target fragment."""
+    token = f"SENTINEL-{_uuid.uuid4().hex}"
+    with real_fixture_repo() as repo:
+        with GitWorktree(repo, run_id="r-unrenderable-target") as worktree:
+            sentinel = tmp_path / "sentinel"
+            hf.configure_hostile_driver(worktree, f"a={token}", "clean", sentinel, pattern="*.py")
+            target = worktree / "jobs" / "worker.py"
+            before = target.read_bytes()
+            applier = _Bound(
+                worktree, (PatchOperation("jobs/worker.py", ORIGINAL_SNIPPET, REPLACEMENT_SNIPPET),)
+            )
+            with hf.spy_git_launches(monkeypatch) as spy:
+                result = applier.apply("r-unrenderable-target", 0, frozenset({"jobs/worker.py"}))
+            assert not result.success
+            assert result.error.code is ErrorCode.PATCH_VALIDATION_FAILED
+            assert "could not be verified" in result.error.message
+            assert "jobs/worker.py" in result.error.message
+            hf.assert_no_hostile_value(result.error, (token, str(sentinel), str(worktree), str(repo)))
+            assert spy.count("check-attr") == 0
+            assert target.read_bytes() == before
+            assert not sentinel.exists()
+
+
+def test_repository_wide_revalidation_refuses_unrenderable_driver(tmp_path, monkeypatch) -> None:
+    """C5: driven directly (it is not reached from `apply()`; `.gitattributes`
+    targets are refused upstream, ADR 0006 Amendment 3)."""
+    token = f"SENTINEL-{_uuid.uuid4().hex}"
+    with real_fixture_repo() as repo:
+        with GitWorktree(repo, run_id="r-unrenderable-revalidate") as worktree:
+            hf.configure_hostile_driver(worktree, f"a={token}", "clean", tmp_path / "s", pattern="*.py")
+            applier = GitPatchApplier(worktree)
+            with hf.spy_git_launches(monkeypatch) as spy:
+                exc = hf.capture(applier._check_repository_wide_attribute_safety)
+            assert type(exc) is _ApplicationFailure
+            assert type(exc.__cause__) is _git_safety.GitSafetyError
+            assert exc.__cause__.reason is _git_safety.GitSafetyFailure.FILTER_DRIVER_NAME_UNRENDERABLE
+            hf.assert_no_hostile_value(exc, (token, str(worktree), str(repo)))
+            assert spy.count("check-attr") == 0

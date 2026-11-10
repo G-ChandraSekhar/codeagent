@@ -7639,3 +7639,79 @@ four-operation protocol, N1/N2, model integration), D6 and operator
 reachability remain unimplemented. No live model or operator path; no Gate α,
 operator-ready, `COMPLETE_FOR_V1` or v1 claim; no threat-model conclusion
 changes. Planning totals are unchanged. `uv.lock` was not touched.
+
+## 2026-11-09 — Mandatory pre-D5-C hotfix (ADR 0006 Amendment 5): implementation, local verification
+
+**What.** The accepted hotfix (plan revision 3, accepted content
+`42da33bc…3417fb`; external Amendment 5 draft revision 3, accepted content
+`ab57fbf9…583722`) is implemented, unstaged and uncommitted.
+- `git -c` splits at the first `=`. The neutralization override for a
+  driver named, for example, `a=b` was silently ineffective, and its helper
+  ran. This was reproduced in scratch against the repository's own module.
+- `enumerate_filter_neutralization` now refuses every `=`-containing name
+  directly, with a fixed message and no cause or context, before any
+  passthrough check or rendering.
+- `entry_gate` now enumerates once, immediately before `diff --quiet HEAD
+  --`, and applies the same overrides to `status`. It translates only
+  `GitSafetyError`, `from exc`.
+
+**Decisions taken in planning** (recorded in the plan; summarized here):
+- **D-H8:** a simple predicate rather than an internal validator exception.
+  H-5 is a pure mutation that adds a synthetic `ValueError(name)` cause.
+  Revision 2 had added production complexity only to make a mutation
+  testable, and that was removed.
+- **D-H9:** the gate keeps the sanitized `GitSafetyError` as its cause, and
+  the exact chain is asserted.
+- **D-H4:** ADR 0004 owns the wait-bound statement. §21.3a and §21.17 now
+  record pin 22 and about 606–758 s.
+- **D-H7:** no ledger hours for the hotfix.
+
+**Documentation.** ADR 0006's Proposed D5-C amendment was renumbered from 5
+to 6 across the four unstaged drafts:
+- 34 lines (0003: 8, 0004: 4, 0006: 20, 0007: 2);
+- each line differs only by `Amendment 5`→`6` or `A5.`→`A6.`;
+- ADR 0004's own Amendment 5 references (20 lines) are untouched.
+
+**Deviation.** A shared test-support module,
+`tests/support/hostile_filter.py`, was added. The plan listed only test
+files.
+
+**Evidence** (macOS, `CODEAGENT_REQUIRE_DOCKER=1`):
+- affected set 3,437, forward and reverse;
+- full suite 7,116 passed, 2 skipped (known non-UTF-8-filename);
+- H-1–H-6 killed, assertion-only, with sources SHA-256-restored;
+- `git diff --check` clean;
+- no leftover containers, worktrees, refs, processes or default state root.
+
+**Limits.**
+- There is no commit and no Linux CI run yet.
+- H-2 and H-3 share one sentinel assertion.
+- Two pre-existing 2026-11-08 fixture temp directories were left untouched.
+- `uv.lock` was not touched.
+- D5 stays In Progress.
+
+**Prior-harness invalidation audit (2026-11-09/10, same entry; appended).**
+- **Method.** Membership was read mechanically from each preserved harness
+  script and from the transitive `tests.*` import closure of its selected
+  tests, including `hostile_filter.py`.
+- **Invalidated, and rerun** as clean baseline → every mutation → clean
+  baseline, with `CODEAGENT_REQUIRE_DOCKER=1`, `PYTHONDONTWRITEBYTECODE=1`,
+  assertion-only kills and SHA-256 restoration, the whole tree unchanged:
+
+  | Harness | Mutations | Baselines |
+  |---|---|---|
+  | D5-B | 44/44 | 1,266/1,266 |
+  | Step 7 | 33/33 | 1,162/1,162 |
+  | Step 8 | 24/24 | 743/743 |
+
+- **Not invalidated:** Step 6, D5-A, and D4b (0 of 82 mutations).
+- **Steps 1–5:** no separate harness is recorded anywhere.
+- **Anchors:** none missing, re-anchored, retired or superseded.
+- **Sleep lesson.** The Mac slept (clamshell, on battery) during the Step 8
+  run. `caffeinate -i` alone did not prevent it. S8-M16, S8-M20 and S8-M21
+  overlapped sleep twice, and were rerun under `caffeinate -s -i` in a
+  window the pmset log shows free of sleep and wake events. The results
+  were identical. Long harness runs need AC power and `caffeinate -s`, plus
+  a pmset-log check of the run window.
+- **No repository change** during the audit, so the affected-set and
+  full-suite results remain valid. Matrix: ADR 0006 Amendment 5 §A5.9.

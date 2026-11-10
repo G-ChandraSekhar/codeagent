@@ -2,6 +2,11 @@
 
 Status: Accepted (2026-09-16)
 
+Amendment 5 (mandatory pre-D5-C hotfix: refuse unrenderable filter-driver
+names; neutralize the workspace entry gate): **Accepted (2026-11-09)**;
+implemented and locally verified, uncommitted and not Linux-CI-confirmed. See
+"Amendment 5" after Amendment 4.
+
 Implementation status: **partially implemented.** The shared
 foundation (`src/codeagent/_git_safety.py`) and `workspace.py`'s
 `worktree add` inspect-then-refuse-or-checkout mechanism are
@@ -1309,3 +1314,388 @@ overrides; and untracked-file blindness under every flag combination
 tested. No implementation or test exists yet in this repository for any
 of the above; `run_git_bounded_preview` and its callers are the
 implementation obligation this amendment creates.
+
+## Amendment 5 (Accepted 2026-11-09): refuse unrenderable filter-driver names; neutralize the workspace entry gate (mandatory pre-D5-C hotfix)
+
+**Status.** Accepted 2026-11-09, after joint review. **Implemented and
+locally verified on macOS (2026-11-09); unstaged, uncommitted and not
+Linux-CI-confirmed** (see A5.9). The acceptance decision is unchanged.
+(Historical: at insertion this read "Accepted 2026-11-09, after joint review;
+not implemented.") The
+accepted-content SHA-256 of the external draft (revision 3) is
+`ab57fbf9f54fc8a06e23d448e418c8d621eddc07b6fcaae2c09e165c2e583722`.
+(Historical: the heading read "Proposed 2026-11-09", and this status read
+"Proposed. Not accepted and not implemented.") This is the mandatory
+pre-D5-C hotfix (D-23, D-25; D5-C plan revision 9 §5). D5-C plan revision 12
+governs D5-C and excludes this hotfix's effort, estimated separately at
+10–18 h (low–medium confidence). That estimate is not entered in the ledger.
+
+### A5.1 Finding
+
+**Override parsing.** Section 1's secondary control renders one override per
+configured `clean`, `smudge` and `process` subkey, as
+`-c filter.<name>.<subkey>=<value>`. Git splits a `-c` argument at its
+**first** `=`. For a driver named `a=b`, the override sets key `filter.a`,
+and the configured helper still runs. This was reproduced against this
+module on Git 2.54.0, with a positive control. Nothing refuses the name, so
+the control fails open.
+
+**Entry gate.** `GitWorktree.entry_gate()` runs `diff --quiet HEAD --` and
+`status --porcelain=v1 --untracked-files=all` without neutralization.
+- Each one ran a configured clean filter on a stat-dirty tracked file,
+  independently of the other.
+- `diff --cached --quiet HEAD --` did not.
+
+### A5.2 Threat and security boundary
+
+**Threat.** A filter helper in repository, global or system configuration,
+or one attributed through `info/attributes`, executes on the host with the
+invoking user's privileges during an observation this ADR promises is
+filter-free. Committed `.gitattributes` alone cannot configure a driver.
+
+**Established:**
+1. No governed `status` or `diff` in `workspace.py` or `evidence.py` runs
+   while a driver name that cannot be neutralized is configured.
+2. The entry gate's two filter-capable observations are neutralized.
+
+**Not established:**
+- protection against configuration rewritten between enumeration and launch;
+- any filter-capable call site not listed in A5.4.
+
+### A5.3 Neutralization contract
+
+1. **Renderability.** A driver name is renderable if and only if it contains
+   no `=`. Renderable names (including `a.b`, `x.clean`, `é` and `A`) keep
+   today's byte-identical rendering.
+2. **Rejection.** If any configured `filter.*` driver name is unrenderable,
+   `enumerate_filter_neutralization` raises
+   `GitSafetyError(FILTER_DRIVER_NAME_UNRENDERABLE, <fixed message>)`.
+   - It does so whichever subkeys the driver configures, including none.
+   - Order: parse configuration; enforce the existing bounds; test every
+     name with the private predicate `_driver_name_renderable`; on any
+     `False`, raise the refusal directly; only then verify the passthrough
+     and render the overrides.
+   - There is no environment-variable fallback and no partial
+     neutralization.
+3. **Confidentiality.**
+   - **Where the refusal is raised.** The refusal is raised directly, in
+     straight-line code, outside every exception handler. The path has no
+     internal exception class, handler or `from`.
+   - **What the refusal carries:**
+     - its message is one constant;
+     - `args` is that message alone;
+     - `__cause__ is None` and `__context__ is None`;
+     - its attributes are only `reason` and `message`.
+   - **What is never reachable.** No driver name, configured value, helper,
+     host or repository path, Git stderr, or other exception is reachable
+     from it.
+   - **Consumers.** Consumer failures chain `from` the refusal, which
+     retains diagnostics, but they add none of those values. The entry
+     gate's fixed `GitWorktreeError` has exactly one cause, the sanitized
+     `GitSafetyError`, exposing only `reason` and its fixed message. The one exception is `patch.py`'s existing
+     sanitized repository-relative approved target fragment, which is
+     retained.
+4. **Safe execution.** When every name is renderable, each governed
+   filter-capable command runs with the rendered overrides placed before
+   its subcommand.
+5. **Interrupts.** The only new handler is the entry gate's
+   `except GitSafetyError`. `KeyboardInterrupt`, `SystemExit` and other
+   non-`Exception` `BaseException`s propagate unchanged, by identity, under
+   ADR 0005 Amendment 1.
+
+### A5.4 Call sites
+
+**Refusal propagates, with no consumer code change:**
+
+| Consumer | Location | Failure |
+|---|---|---|
+| evidence `status` and `diff` | `evidence.py` | `EvidenceCaptured`, capture-failed |
+| `snapshot_source()` `status` | `workspace.py` | `GitWorktreeError` |
+| creation-time attribute inspection, before `checkout` | `workspace.py`, via `evaluate_tracked_filter_safety` | `GitWorktreeError`, then the existing exact cleanup |
+| target-attribute checks and their re-checks | `patch.py` `_check_attribute_safety` | validation or application failure |
+| repository-wide re-validation | `patch.py` `_check_repository_wide_attribute_safety` | application failure |
+
+**Newly neutralized: the entry gate.**
+- One enumeration runs immediately before `diff --quiet HEAD --`. Its
+  immutable overrides are applied to that command and to the following
+  `status`.
+- An enumeration failure becomes a fixed `GitWorktreeError`, raised `from`
+  the sanitized `GitSafetyError`, consistent with `snapshot_source()`. It
+  maps to `WORKSPACE_ENTRY_GATE_FAILED`.
+- The `HEAD` and `diff --cached --quiet` checks are unchanged.
+
+**Consequence.**
+- One successful worktree recreation launches **22** Git processes, not 21.
+- The recreation wait-bound statement is owned by **ADR 0004**. Its §21.3a
+  and §21.17 are updated in the same change:
+  - the pin moves to 22;
+  - the configured subprocess component grows by at most one 30 s timeout;
+  - the approximate configured range moves from 576–728 s to **606–758 s**;
+  - filesystem and `fsync` time, and the direct-child timeout residual,
+    stay unbounded.
+- The launch-site inventory (L1–L7) is unchanged.
+
+### A5.5 Test obligations
+
+All tests use real Git. Outcomes are captured as values and asserted with
+plain `assert`.
+
+**Fixture.** A hostile `clean` or `process` helper that touches a sentinel,
+attributed through common-directory `info/attributes`, with a stat-dirty
+tracked file.
+
+**Names:**
+- refused: `a=b`, `=a`, `a=`, `x.y=z` and `a=SENTINEL-<uuid>`;
+- also refused: a name configuring only `required`.
+
+**Controls:**
+- renderable names `ab`, `a.b`, `x.clean`, `é`;
+- fixture sanity (the helper runs with no override);
+- a **positive control**: with `_driver_name_renderable` patched to return
+  `True`, the helper runs.
+
+**Per consumer:**
+- the fixed failure;
+- a cycle-safe walk that reaches no hostile value and no exception outside
+  the expected chain;
+- exact Git launch counts: one `config` and zero downstream filter-capable
+  launches;
+- sentinel absent;
+- unchanged `HEAD`, refs, index bytes, worktree bytes, worktree
+  registrations, configuration and admin entries.
+
+**Confidentiality tests:**
+- **No retained failure:** with a sentinel-bearing driver name, the surfaced
+  low-level refusal has `__cause__ is None` and `__context__ is None`, and
+  its cause, context, args and attributes contain neither the sentinel nor
+  any other exception.
+- **Fixed message:** an exact fixed-message assertion plus the reachability
+  walk.
+
+**Entry gate:**
+- passes with a hostile helper for a renderable name, with no sentinel,
+  the exact 5-launch sequence, and identical override tokens on both
+  commands;
+- refuses `a=b` after 3 launches, with the exact safe chain:
+  - `GitWorktreeError(fixed)`, whose cause is `GitSafetyError(reason, fixed)`;
+  - that inner error has no cause and no context;
+  - nothing else is reachable;
+- an enumeration failure fails closed;
+- `KeyboardInterrupt`, `SystemExit` and direct-`BaseException` instances
+  propagate by identity, with no later launch.
+
+**Recreation pin:** 22, differing from the previous launch list by exactly
+one `config` entry.
+
+### A5.6 Mutation obligations
+
+Six categories, six concrete runs, under the strict assertion-only rule:
+- a kill counts only when the catching test fails with an `AssertionError`
+  in a pytest session that ends normally with exit code 1;
+- sources are restored and SHA-256-verified.
+
+| ID | Mutation | Caught by |
+|---|---|---|
+| H-1 | `_driver_name_renderable` always returns `True` | refusal test: the outcome is the fixed refusal |
+| H-2 | the entry gate's `diff --quiet HEAD --` un-neutralized | entry-gate test: sentinel absent |
+| H-3 | the entry gate's `status` un-neutralized | the same test: sentinel absent |
+| H-4 | the new entry-gate handler widened to `BaseException` | interrupt test: exact identity |
+| H-5 | the direct refusal chained from a synthetic name-bearing failure (`from ValueError(name)`); production has no such failure | retention test: `__cause__ is None`, and an empty walk |
+| H-6 | the refusal message includes the driver name or another hostile value | fixed-message test: exact message, and an empty walk |
+
+### A5.7 Landing and Linux-CI gate
+
+**Before commit:**
+- the affected test files, forward and reverse;
+- the full suite with `CODEAGENT_REQUIRE_DOCKER=1`;
+- all six mutations caught;
+- `git diff --check` and `git diff --cached --check`;
+- no leftover containers, worktrees, `refs/codeagent` refs, processes or
+  state roots.
+
+**Commit contents:**
+- the hotfix code and tests;
+- this amendment;
+- the ADR 0004 bound note;
+- `CLAUDE.md`;
+- an append-only `ENGINEERING_LOG.md` entry;
+- optionally, a ledger status/dependency note with no hours.
+
+**Index discipline:**
+- Every Proposed D5-C draft stays unstaged.
+- The ADR 0004 and ADR 0006 index blobs are built from `HEAD` plus only the
+  hotfix content. Patches are generated against `HEAD`, checked with
+  `git apply --cached --check`, and applied.
+- The intended blob hashes are recorded and verified, and the worktree is
+  verified to still hold the renumbered D5-C drafts.
+- Every other path is staged explicitly. `uv.lock`, `git add -A`,
+  `git add .` and wildcards are never used.
+
+**Gate.**
+- The commit is an ordinary fast-forward, followed by a successful
+  push-triggered Linux CI run on that exact commit. Its evidence is recorded
+  here afterwards.
+- **D5-C** (ADR 0006 Amendment 6, the D5-C amendments to ADRs 0003, 0004
+  and 0007, and any D5-C implementation) **cannot begin** until this hotfix
+  is committed and Linux-CI-confirmed.
+- D5-C reuses `FILTER_DRIVER_NAME_UNRENDERABLE`.
+
+### A5.8 Non-claims
+
+This amendment does not add:
+- typed Git capabilities, a capability registry, a filter-facts snapshot,
+  a private index, a freshness guard or the four-operation protocol;
+- a change to `FilterNeutralization`, attribute classification, the hardened
+  baseline, the executor, the controller, the events, the error codes or the
+  workflows;
+- operator reachability, Gate α or v1.
+
+T-E1, T-F1 and T-F2 are unchanged. D5 stays In Progress.
+
+### A5.9 Implementation record (2026-11-09; local, macOS; uncommitted)
+
+**Production.**
+- `_git_safety.py`:
+  - `GitSafetyFailure.FILTER_DRIVER_NAME_UNRENDERABLE`;
+  - `_UNRENDERABLE_MESSAGE`;
+  - `_driver_name_renderable(name)` (`"=" not in name`);
+  - in `enumerate_filter_neutralization`, after parsing and the existing
+    bounds, a direct refusal for any unrenderable name, before
+    `_verify_fixed_cat_path()` and rendering.
+
+  No handler or internal exception was added.
+- `workspace.py`: `entry_gate` enumerates once, immediately before
+  `diff --quiet HEAD --`. Only `GitSafetyError` is translated, to the fixed
+  `GitWorktreeError` raised `from exc`. The same `neutralization.args` are
+  applied to the tree diff and to `status`. The `HEAD` and cached-diff checks
+  are unchanged.
+
+**Tests.**
+- New tests in `test_git_safety.py`, `test_workspace.py`, `test_evidence.py`
+  and `test_patch.py`, plus the shared support module
+  `tests/support/hostile_filter.py` (a hostile helper and sentinel, a
+  `Popen` launch spy, and a cycle-safe reachability walk).
+  - The support module is a disclosed deviation: the plan listed only test
+    files.
+- `test_worktree_recreation.py`: `RECREATION_GIT_LAUNCHES = 22`. The pinned
+  launch list now also asserts the gate's `diff --cached`, `config`,
+  `diff --quiet`, `status` sequence.
+- The refused-creation launch list is pinned for both the tempdir and the
+  reservation variants: `rev-parse`, `worktree add`, `read-tree`, `config`,
+  `worktree remove`, `worktree list`.
+  - This is a measured pin. Its prefix up to `config` equals that of a
+    successful creation, and `checkout` is never launched.
+
+**Local evidence** (macOS, Git 2.54.0, Python 3.12.16, real Docker,
+`CODEAGENT_REQUIRE_DOCKER=1`):
+- **Affected set** (`test_git_safety`, `test_workspace`, `test_evidence`,
+  `test_patch`, `test_worktree_recreation`, `test_controller_recreation`,
+  `test_patch_failure_continuation`, `test_subprocess_inventory`,
+  `test_errors`, `test_events`): 3,437 passed, forward and reverse.
+- **Full suite:** 7,116 passed, 2 skipped. The skips are the two known
+  non-UTF-8-filename tests in `test_repo_tools.py`, which macOS refuses.
+- **Mutations:** H-1 to H-6, one canonical run each, all **killed**. Each
+  kill was an assertion failure in a normally completed pytest session
+  (exit 1, no errors). Sources were restored and verified by SHA-256 after
+  every run.
+
+  | ID | Failing tests | Designated assertion |
+  |---|---|---|
+  | H-1 | 8 | the refusal outcome |
+  | H-2 | 1 | sentinel absent |
+  | H-3 | 1 | sentinel absent |
+  | H-4 | 3 | `got is inst` |
+  | H-5 | 1 | `__cause__ is None` |
+  | H-6 | 1 | the exact fixed message |
+- `git diff --check` is clean.
+- **Cleanup checks:**
+  - no `codeagent-(verify-|baseline-|verification-)` containers;
+  - one registered worktree, the main checkout;
+  - no `refs/codeagent` refs;
+  - no leftover test processes;
+  - no default state root.
+  - Two `codeagent-fixture-*` temporary directories dated 2026-11-08
+    predate this pass and were left untouched.
+
+**Prior mutation-harness invalidation audit (2026-11-09/10).**
+
+**Method.**
+- Membership was computed mechanically, not from memory:
+  - every string literal naming a `src/codeagent/*.py` or `tests/*.py` path
+    was read from each preserved harness script;
+  - for D4b, the per-mutation entries were read from
+    `d4b_mutations_strict.py`, which `run_d4b_inv.py` loads;
+  - the transitive `tests.*` import closure of every selected test was
+    computed, including `from tests.support import <module>` and imports
+    nested inside functions.
+- There is no `conftest.py`.
+- The changed set (checked against `git diff --name-only` plus untracked
+  files) is `_git_safety.py`, `workspace.py`, the five modified test files
+  and `tests/support/hostile_filter.py`.
+- A harness is invalidated if it mutates a changed source, selects a changed
+  test, or imports `hostile_filter.py` directly or transitively.
+
+| Harness (script) | Mutates | Selects | Intersection | Status |
+|---|---|---|---|---|
+| D5-B (`d5b/mut_d5b.py`) | `controller.py`, `_lifecycle_run.py`, `patch.py`, `executor.py` | `test_controller_recreation`, `test_worktree_recreation`, `test_patch_failure_continuation`, `test_patch` | `test_patch`, `test_worktree_recreation`, `hostile_filter` | **invalidated** |
+| Step 7 (`d5b/mut7_d5b.py`) | `_lifecycle_run.py` | `test_worktree_recreation`, `test_controller_recreation` | `test_worktree_recreation`, `hostile_filter` | **invalidated** |
+| Step 8 (`mut8.py`) | `_lifecycle_run.py`, `reconciliation.py`, `worktree_absence.py` | `test_reconciliation`, `test_worktree_absence`, `test_reconciliation_s9`, `test_worktree_recreation` | `test_worktree_recreation` (direct, and imported by `test_reconciliation_s9`), `hostile_filter` | **invalidated** |
+| Step 6 (`d5b/mut6b_d5b.py`) | `controller.py` | `test_controller`, `test_controller_recreation` | none (support: `fakes`, `scripted_model`) | not invalidated |
+| D5-A (`d5b/mut_d5a_d5b.py`) | `controller.py`, `model_protocol.py` | `test_patch_failure_continuation`, `test_model_protocol`, `test_domain` | none | not invalidated |
+| D4b (`d5a/d4b/d4b_mutations_strict.py`) | `controller.py`, `model_protocol.py`, `tool_schema.py`, `_lifecycle_run.py`, `domain.py`, `cli.py`, `_read_adapter.py`, `trace_assertions.py`, a fixture test | `test_d4b_model_loop`, `test_d4a_read_path`, `test_d4b_e2e`, `test_tool_schema`, `test_lifecycle_run` | none (0 of 82 mutations) | not invalidated |
+| Steps 1–5 | — | — | — | No separate harness is recorded in ADR 0004 Amendment 20 §14, §21.17 or `ENGINEERING_LOG.md`. The Steps 1–8 mutation evidence is the Step 6, 7 and 8 harnesses. |
+
+**Reruns of the invalidated harnesses** (macOS, `CODEAGENT_REQUIRE_DOCKER=1`,
+`PYTHONDONTWRITEBYTECODE=1`):
+- **Anchors and scripts:** every anchor applied exactly once. No harness was
+  missing or rebuilt, and no mutation was re-anchored, retired or
+  superseded.
+- **Sequence:** each harness ran clean baseline, then every mutation, then
+  clean baseline.
+- **Kill rule:** a kill counts only for exit 1 with at least one
+  `AssertionError`/`assert` failure and no other failure, error or
+  interruption.
+- **Restoration:** each harness restores the mutated source and asserts its
+  SHA-256 after every run, and a whole-tree SHA-256 over tracked and
+  untracked files was compared before and after.
+
+| Harness | Baseline 1 | Mutations | Baseline 2 | Tree before = after |
+|---|---|---|---|---|
+| D5-B | 1,266 passed | 44/44 caught by assertion (43 categories, 44 runs) | 1,266 passed | `ea5efa3f…74f0cc7`, yes |
+| Step 7 | 1,162 passed | 33/33 | 1,162 passed | yes |
+| Step 8 | 743 passed | 24/24 | 743 passed | yes |
+
+- D5-B's baseline is 1,266 rather than §21.17's 1,264 because of the hotfix's
+  two new tests in `test_patch.py`.
+- **System sleep.** The Mac entered clamshell and maintenance sleep during
+  the Step 8 run.
+  - S8-M16, S8-M20 and S8-M21 overlapped a sleep, in the harness run and
+    again in a first targeted rerun. Each time they were caught by
+    assertion only, with the tree unchanged.
+  - They were rerun a third time under `caffeinate -s -i` in a window with no
+    sleep or wake events (2026-11-10 15:37:54–15:48:24). Results: S8-M16 10
+    assertion failures, S8-M20 18, S8-M21 24; zero other failures or errors;
+    the tree unchanged.
+  - D5-B, Step 7, both Step 8 baselines and S8-M01–M15, M17–M19 and M22–M24
+    ran while awake. The pmset log shows no sleep before 20:56.
+- **Restored sources** are byte-identical to `HEAD`:
+  - `controller.py` `f90c8c7a…`;
+  - `_lifecycle_run.py` `48b73d96…`;
+  - `patch.py` `b23163c3…`;
+  - `executor.py` `d54f3622…`;
+  - `reconciliation.py` `17e13fdd…`;
+  - `worktree_absence.py` `77db7e24…`.
+- **No repository change.** No test, support, fixture, helper or production
+  file changed during the audit, so the affected-set (3,437, forward and
+  reverse) and full-suite (7,116 passed, 2 skipped) results above remain
+  valid. Only external harness drivers were added.
+
+**Limits.**
+- This is local macOS evidence only. There is no commit and no Linux CI run
+  yet.
+- H-2 and H-3 share one test and one assertion (sentinel absent). The plan
+  probe showed each command runs the helper independently, but the test does
+  not identify which command did.
+- The `process` subkey is exercised with a helper that exits at once.
+- The A4 same-user configuration race between enumeration and launch
+  remains.

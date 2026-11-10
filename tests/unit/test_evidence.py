@@ -1420,3 +1420,36 @@ def test_strict_reader_hides_the_integer_digit_limit_error():
         evidence.parse_artifact(_frame_text(text))  # the lax reader's contract is unchanged
     assert "digit" in str(lax.value).lower()
     _assert_strict_refusal(_frame_text(text), None, "not an evidence artifact: the header is not valid UTF-8 JSON")
+
+
+# ---------------------------------------------------------------------------
+# ADR 0006 Amendment 5 (mandatory pre-D5-C hotfix): an unrenderable filter
+# driver name makes capture fail closed before `status` or `diff` runs.
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid  # noqa: E402
+
+from tests.support import hostile_filter as hf  # noqa: E402
+
+
+def test_capture_fails_closed_on_unrenderable_driver(tmp_path, monkeypatch):
+    token = f"SENTINEL-{_uuid.uuid4().hex}"
+    repo = _make_repo(tmp_path / "repo")
+    initial = _initial_commit(repo)
+    sentinel = tmp_path / "sentinel"
+    hf.configure_hostile_driver(repo, f"a={token}", "clean", sentinel)
+    hf.make_stat_dirty(repo / "a.txt")
+    output_dir = tmp_path / "evidence-out"
+    with hf.spy_git_launches(monkeypatch) as spy:
+        receipt = _sink(output_dir).capture(
+            worktree_path=repo, source_repo_path=tmp_path / "no-such-source", initial_commit=initial,
+            lifecycle_id="c" * 32,
+        )
+    assert receipt.success is False and receipt.complete is False
+    assert receipt.artifact_id is None and receipt.bytes_written is None
+    assert receipt.error.code is ErrorCode.EVIDENCE_CAPTURE_FAILED
+    assert receipt.error.message == "a configured filter driver name cannot be safely neutralized"
+    hf.assert_no_hostile_value(receipt.error, (token, str(sentinel), str(repo)))
+    assert spy.commands == [("config",)]
+    assert not sentinel.exists()
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []

@@ -150,6 +150,10 @@ MAX_FILTER_DRIVERS = 128
 MAX_FILTER_DRIVER_NAME_BYTES = 256
 MAX_FILTER_ARGV_BYTES = 65_536
 
+# ADR 0006 Amendment 5: fixed, sanitized text for an unrenderable driver name.
+# It never names the driver, a configured value, a path or Git stderr.
+_UNRENDERABLE_MESSAGE = "a configured filter driver name cannot be safely neutralized"
+
 # Bounds for the shared tracked-path listing / filter-attribute
 # inspection helpers (used by workspace.py's pre-materialization
 # refusal check, ADR 0006 section 1's primary control). A repository
@@ -252,6 +256,7 @@ class GitSafetyFailure(str, Enum):
     FILTER_ENUMERATION_MALFORMED = "filter_enumeration_malformed"
     FILTER_ENUMERATION_LIMIT_EXCEEDED = "filter_enumeration_limit_exceeded"
     FILTER_PASSTHROUGH_UNAVAILABLE = "filter_passthrough_unavailable"
+    FILTER_DRIVER_NAME_UNRENDERABLE = "filter_driver_name_unrenderable"
     ATTRIBUTE_OUTPUT_MALFORMED = "attribute_output_malformed"
     TRACKED_PATH_LISTING_UNAVAILABLE = "tracked_path_listing_unavailable"
     TRACKED_PATH_LISTING_MALFORMED = "tracked_path_listing_malformed"
@@ -1283,6 +1288,12 @@ def _parse_filter_config(raw: str) -> dict[str, dict[str, str]]:
     return drivers
 
 
+def _driver_name_renderable(name: str) -> bool:
+    """`True` iff a `-c filter.<name>.<subkey>=<value>` override for `name`
+    is parsed by Git as that exact key (ADR 0006 Amendment 5)."""
+    return "=" not in name
+
+
 def enumerate_filter_neutralization(repo_path: Path | str) -> FilterNeutralization:
     """Enumerate `filter.*` configuration for `repo_path` and build the
     bounded set of `-c` overrides that neutralize every discovered
@@ -1321,6 +1332,18 @@ def enumerate_filter_neutralization(repo_path: Path | str) -> FilterNeutralizati
             raise GitSafetyError(
                 GitSafetyFailure.FILTER_ENUMERATION_LIMIT_EXCEEDED,
                 "a configured filter driver name exceeds the fixed safety length bound",
+            )
+
+    # ADR 0006 Amendment 5: `git -c` splits at the first `=`, so an override
+    # for a name containing `=` sets a different key and the driver still
+    # runs. Refuse every such name (whatever subkeys it configures) before
+    # any passthrough check or rendering. Raised directly, outside any
+    # handler, so the refusal carries no cause or context.
+    for name in sorted(drivers):
+        if not _driver_name_renderable(name):
+            raise GitSafetyError(
+                GitSafetyFailure.FILTER_DRIVER_NAME_UNRENDERABLE,
+                _UNRENDERABLE_MESSAGE,
             )
 
     needs_passthrough = any("clean" in subkeys or "smudge" in subkeys for subkeys in drivers.values())

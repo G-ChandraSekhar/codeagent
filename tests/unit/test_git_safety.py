@@ -3307,3 +3307,143 @@ def test_l4_refusing_body_still_surfaces_exactly(monkeypatch, make_refusal):
     with pytest.raises(SystemExit) as info:
         _gs_read()
     assert info.value is body and len(kills) == 1
+
+
+# ---------------------------------------------------------------------------
+# ADR 0006 Amendment 5 (mandatory pre-D5-C hotfix): `git -c` splits at the
+# first `=`, so a driver name containing `=` cannot be neutralized and is
+# refused. Real Git, a real hostile helper and a sentinel throughout.
+# ---------------------------------------------------------------------------
+
+import uuid  # noqa: E402
+
+from tests.support import hostile_filter as hf  # noqa: E402
+
+_UNRENDERABLE = _git_safety._UNRENDERABLE_MESSAGE
+
+
+def _hostile_repo(tmp_path, name, subkey):
+    repo = hf.make_repo(tmp_path / "repo")
+    sentinel = tmp_path / "sentinel"
+    hf.configure_hostile_driver(repo, name, subkey, sentinel)
+    return repo, sentinel
+
+
+def _status_through_production(repo, args=()):
+    return run_git(repo, *args, "status", "--porcelain=v1", "--untracked-files=all")
+
+
+@pytest.mark.parametrize("subkey", ["clean", "process"])
+def test_hostile_fixture_runs_its_helper_without_any_override(tmp_path, subkey):
+    repo, sentinel = _hostile_repo(tmp_path, "f", subkey)
+    hf.make_stat_dirty(repo / "a.txt")
+    _status_through_production(repo)
+    assert hf.take_sentinel(sentinel), "fixture sanity: the helper must run unneutralized"
+
+
+@pytest.mark.parametrize("subkey", ["clean", "process"])
+@pytest.mark.parametrize("name", hf.RENDERABLE_NAMES)
+def test_renderable_names_are_neutralized(tmp_path, name, subkey):
+    repo, sentinel = _hostile_repo(tmp_path, name, subkey)
+    neutralization = enumerate_filter_neutralization(repo)
+    expected = ("-c", f"filter.{name}.clean={FIXED_CAT_PATH}") if subkey == "clean" else (
+        "-c", f"filter.{name}.process=")
+    assert expected[1] in neutralization.args and name in neutralization.driver_names
+    hf.make_stat_dirty(repo / "a.txt")
+    _status_through_production(repo, neutralization.args)
+    assert not hf.take_sentinel(sentinel)
+
+
+def test_positive_control_unrenderable_name_executes_without_the_refusal(tmp_path, monkeypatch):
+    repo, sentinel = _hostile_repo(tmp_path, "a=b", "clean")
+    monkeypatch.setattr(_git_safety, "_driver_name_renderable", lambda name: True)
+    neutralization = enumerate_filter_neutralization(repo)
+    assert f"filter.a=b.clean={FIXED_CAT_PATH}" in neutralization.args
+    hf.make_stat_dirty(repo / "a.txt")
+    _status_through_production(repo, neutralization.args)
+    assert hf.take_sentinel(sentinel), "the rendered override must be ineffective for `a=b`"
+
+
+def _assert_low_level_refusal(exc, hostile):
+    assert exc is not hf.NOTHING_RAISED, "expected the fixed refusal; nothing was raised"
+    assert type(exc) is GitSafetyError
+    assert exc.reason is GitSafetyFailure.FILTER_DRIVER_NAME_UNRENDERABLE
+    assert str(exc) == _UNRENDERABLE and exc.message == _UNRENDERABLE
+    assert exc.args == (_UNRENDERABLE,)
+    assert exc.__cause__ is None and exc.__context__ is None
+    assert set(vars(exc)) == {"reason", "message"}
+    assert hf.assert_no_hostile_value(exc, hostile) == [exc]
+
+
+@pytest.mark.parametrize("subkey", ["clean", "process"])
+@pytest.mark.parametrize("name", hf.REFUSED_NAMES)
+def test_unrenderable_driver_name_refused(tmp_path, monkeypatch, name, subkey):
+    repo, sentinel = _hostile_repo(tmp_path, name, subkey)
+    with hf.spy_git_launches(monkeypatch) as spy:
+        exc = hf.capture(lambda: enumerate_filter_neutralization(repo))
+    _assert_low_level_refusal(exc, (name, str(sentinel), str(repo)))
+    assert spy.commands == [("config",)]
+    hf.make_stat_dirty(repo / "a.txt")
+    assert not hf.take_sentinel(sentinel)
+
+
+def test_unrenderable_name_without_executable_subkeys_refused(tmp_path):
+    repo = hf.make_repo(tmp_path / "repo")
+    hf.git(repo, "config", "filter.a=b.required", "true")
+    exc = hf.capture(lambda: enumerate_filter_neutralization(repo))
+    _assert_low_level_refusal(exc, ("a=b",))
+
+
+def test_refusal_retains_no_internal_failure(tmp_path):
+    """H-5's designated catch: the surfaced low-level refusal has no cause
+    or context and reaches no other exception and no sentinel text."""
+    token = f"SENTINEL-{uuid.uuid4().hex}"
+    repo, _ = _hostile_repo(tmp_path, f"a={token}", "clean")
+    exc = hf.capture(lambda: enumerate_filter_neutralization(repo))
+    assert exc is not hf.NOTHING_RAISED
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    assert set(vars(exc)) == {"reason", "message"}
+    exceptions, strings = hf.reachable(exc)
+    assert exceptions == [exc]
+    assert [s for s in strings if token in s] == []
+
+
+def test_refusal_message_is_fixed(tmp_path):
+    """H-6's designated catch: the exact fixed message, and no hostile value
+    anywhere reachable."""
+    token = f"SENTINEL-{uuid.uuid4().hex}"
+    repo, sentinel = _hostile_repo(tmp_path, f"a={token}", "clean")
+    exc = hf.capture(lambda: enumerate_filter_neutralization(repo))
+    assert exc is not hf.NOTHING_RAISED
+    assert str(exc) == _UNRENDERABLE
+    assert exc.message == _UNRENDERABLE and exc.args == (_UNRENDERABLE,)
+    hf.assert_no_hostile_value(exc, (token, f"a={token}", str(sentinel), str(repo)))
+
+
+def test_refusal_precedes_rendering_and_passthrough_checks(tmp_path, monkeypatch):
+    repo, _ = _hostile_repo(tmp_path, "a=b", "clean")
+    calls = []
+    monkeypatch.setattr(_git_safety, "_verify_fixed_cat_path", lambda: calls.append(1))
+    exc = hf.capture(lambda: enumerate_filter_neutralization(repo))
+    assert type(exc) is GitSafetyError and calls == []
+
+
+def test_a_renderable_driver_beside_an_unrenderable_one_is_still_refused(tmp_path):
+    repo, sentinel = _hostile_repo(tmp_path, "ok", "clean")
+    hf.git(repo, "config", "filter.z=z.smudge", "true")
+    exc = hf.capture(lambda: enumerate_filter_neutralization(repo))
+    _assert_low_level_refusal(exc, ("z=z",))
+
+
+def test_evaluate_tracked_filter_safety_propagates_the_refusal(tmp_path):
+    repo, _ = _hostile_repo(tmp_path, "a=b", "clean")
+    exc = hf.capture(lambda: evaluate_tracked_filter_safety(repo))
+    _assert_low_level_refusal(exc, ("a=b",))
+
+
+def test_driver_name_renderable_is_exactly_the_equals_rule():
+    assert _git_safety._driver_name_renderable("a.b") is True
+    assert _git_safety._driver_name_renderable("é") is True
+    assert _git_safety._driver_name_renderable("a=b") is False
+    assert _git_safety._driver_name_renderable("=") is False

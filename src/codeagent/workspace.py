@@ -806,13 +806,26 @@ class GitWorktree:
         if staged_diff.returncode != 0:
             raise GitWorktreeError("the worktree's staged index could not be inspected")
 
-        tree_diff = _run(self.path, "diff", "--quiet", "HEAD", "--")
+        # ADR 0006 Amendment 5: `diff --quiet HEAD --` and `status` are both
+        # filter execution points (a stat-dirty file runs a configured clean
+        # filter). One enumeration, immediately before the tree diff, is
+        # applied unchanged to both.
+        try:
+            neutralization = _git_safety.enumerate_filter_neutralization(self.path)
+        except _git_safety.GitSafetyError as exc:
+            raise GitWorktreeError(
+                "the worktree's filter configuration could not be neutralized"
+            ) from exc
+
+        tree_diff = _run(self.path, *neutralization.args, "diff", "--quiet", "HEAD", "--")
         if tree_diff.returncode == 1:
             raise GitWorktreeError("the worktree's tracked working tree is not clean")
         if tree_diff.returncode != 0:
             raise GitWorktreeError("the worktree's tracked working tree could not be inspected")
 
-        status_result = _run(self.path, "status", "--porcelain=v1", "--untracked-files=all")
+        status_result = _run(
+            self.path, *neutralization.args, "status", "--porcelain=v1", "--untracked-files=all"
+        )
         if status_result.returncode != 0:
             raise GitWorktreeError("the worktree's status could not be inspected")
         if status_result.stdout.strip() != "":
