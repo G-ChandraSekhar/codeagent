@@ -3358,8 +3358,21 @@ Stage 2 (of the four-stage planning process in
     `COMPLETE_FOR_V1` or v1 claim; no threat-model conclusion changes.
 - **Mandatory pre-D5-C hotfix: refuse unrenderable filter-driver names and
   neutralize the entry gate**, per ADR 0006 Amendment 5 (Accepted
-  2026-11-09). **Implemented and locally verified on macOS (2026-11-09);
-  unstaged, uncommitted and not Linux-CI-confirmed.**
+  2026-11-09). **Committed as `067fca0` (an ordinary fast-forward over
+  `5422046`) and Linux-CI-confirmed in run
+  [42908777385](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42908777385).**
+  The authoritative evidence is in ADR 0006 Amendment 5 §A5.10. (Historical:
+  before its commit this said "Implemented and locally verified on macOS
+  (2026-11-09); unstaged, uncommitted and not Linux-CI-confirmed", which was
+  true then.)
+  - **CI evidence limits:**
+    - no hotfix-specific test is named in the verbose Docker step;
+    - the hotfix tests and the launch-count pin are inferred from the
+      quiet suite's matching total;
+    - the quiet-suite skips are unidentified;
+    - the mutations and prior-harness reruns are local macOS evidence;
+    - this is GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence,
+      not a security review.
   - **Finding:** `git -c` splits at the first `=`, so the neutralization
     override for a driver named, for example, `a=b` was silently ineffective,
     and its helper ran during governed `status`/`diff`. The entry gate's
@@ -3393,11 +3406,18 @@ Stage 2 (of the four-stage planning process in
     unstaged.
   - **Boundaries:** no D5-C capabilities, registry, snapshot, private index
     or protocol; no workflow change; D5 stays In Progress.
-- **Next:** commit the hotfix with the partial-index safeguards (hotfix plan
-  revision 3 §9.2) and obtain exact-commit Linux CI. Only then D5-C (the
-  four-operation patch protocol and its validation, N1/N2's re-derivations,
-  model integration and the remaining Step 9 documentation), then D6. Gate O
-  stays satisfied.
+- **Next:** the mandatory pre-D5-C gate (ADR 0006 Amendment 5 §A5.7) is
+  satisfied.
+  - The next task is revising the four Proposed D5-C ADR drafts (the D5-C
+    plan revisions 8–12 queued items, with the capability amendment already
+    numbered ADR 0006 Amendment 6). It is **not** implementation yet.
+  - After that comes D5-C itself (the four-operation patch protocol and its
+    validation, N1/N2's re-derivations, model integration and the remaining
+    Step 9 documentation), then D6.
+  - Gate O stays satisfied. D5 stays In Progress. There is no Gate α,
+    operator-ready or v1 claim.
+  - (Historical: before the hotfix commit this said "commit the hotfix …
+    and obtain exact-commit Linux CI. Only then D5-C …".)
   Remaining planning range D5–D10: 337–629 h (D5 174–289 h; first operator
   run 373–627 h; Gate α 440–762 h; public v1 / cumulative D1–D10 502–901 h;
   Gate O 86–140 h and D1–D4 165–272 h unchanged; D5 re-estimated from

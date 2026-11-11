@@ -7715,3 +7715,51 @@ files.
   a pmset-log check of the run window.
 - **No repository change** during the audit, so the affected-set and
   full-suite results remain valid. Matrix: ADR 0006 Amendment 5 §A5.9.
+
+## 2026-11-10 — Mandatory pre-D5-C hotfix: Linux CI evidence reconciliation
+
+**What.** A documentation-only reconciliation for the mandatory pre-D5-C
+hotfix (ADR 0006 Amendment 5, accepted 2026-11-09).
+- Commit `067fca0767f140a0e1f4a20afbe4b3eeae0a80e8` was pushed to `main` as an
+  ordinary fast-forward over `5422046`.
+- ADRs 0004 and 0006 were staged as `HEAD` plus only the hotfix content.
+  The four Proposed D5-C drafts stayed unstaged.
+- Its push-triggered run,
+  [42908777385](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42908777385),
+  concluded `success`, and its head SHA is exactly the pushed commit.
+- Both were re-verified independently through the Actions API and a freshly
+  fetched raw job log. No tests or Docker were run for this pass.
+- The authoritative counts, timings, environment and Docker evidence are in
+  ADR 0006 Amendment 5 §A5.10 only.
+
+**Evidence limits.**
+- None of the dedicated Docker step's named tests is hotfix-specific.
+- The hotfix tests and the launch-count pin ran only in the quiet suite, so
+  their execution is inferred from the matching total.
+- The quiet-suite skips are unidentified and not attributable to Docker
+  being unavailable.
+- The six mutations and the prior-harness reruns remain local macOS
+  evidence.
+- This is GitHub-hosted `ubuntu-24.04` x86_64 automated-test evidence, not a
+  security review or ARM64 evidence.
+- **Correction:** the pre-reconciliation report of this run listed 16 named
+  dedicated-step tests. The verified count is 18, including the D5-A and
+  D5-B real-Docker nodes.
+
+**Status edits.**
+- ADR 0006 (the hotfix top marker, Amendment 5's status, A5.9's heading and
+  limits, and the new A5.10), `CLAUDE.md` and the ledger note now record the
+  commit and run.
+- The earlier "uncommitted / not Linux-CI-confirmed" wording is kept as
+  explicitly historical.
+- `CLAUDE.md`'s "Next" is now the revision of the Proposed D5-C ADR drafts,
+  not implementation.
+
+**Unchanged boundaries.**
+- The mandatory pre-D5-C gate is satisfied.
+- D5 stays In Progress, and D5-C is not implemented.
+- The Proposed D5-C draft text is unchanged.
+- No Gate α, operator-ready, `COMPLETE_FOR_V1` or v1 claim, and no
+  threat-model conclusion change.
+- Planning totals are unchanged.
+- `uv.lock` was not touched.

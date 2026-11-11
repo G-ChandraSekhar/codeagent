@@ -4,8 +4,10 @@ Status: Accepted (2026-09-16)
 
 Amendment 5 (mandatory pre-D5-C hotfix: refuse unrenderable filter-driver
 names; neutralize the workspace entry gate): **Accepted (2026-11-09)**;
-implemented and locally verified, uncommitted and not Linux-CI-confirmed. See
-"Amendment 5" after Amendment 4.
+committed as `067fca0` and Linux-CI-confirmed in run 42908777385. (Historical:
+before its commit this read "implemented and locally verified, uncommitted and
+not Linux-CI-confirmed", which was true then.) See "Amendment 5" after
+Amendment 4.
 
 Implementation status: **partially implemented.** The shared
 foundation (`src/codeagent/_git_safety.py`) and `workspace.py`'s
@@ -1317,11 +1319,15 @@ implementation obligation this amendment creates.
 
 ## Amendment 5 (Accepted 2026-11-09): refuse unrenderable filter-driver names; neutralize the workspace entry gate (mandatory pre-D5-C hotfix)
 
-**Status.** Accepted 2026-11-09, after joint review. **Implemented and
-locally verified on macOS (2026-11-09); unstaged, uncommitted and not
-Linux-CI-confirmed** (see A5.9). The acceptance decision is unchanged.
-(Historical: at insertion this read "Accepted 2026-11-09, after joint review;
-not implemented.") The
+**Status.** Accepted 2026-11-09, after joint review. **Implemented, locally
+verified on macOS (2026-11-09), committed as
+`067fca0767f140a0e1f4a20afbe4b3eeae0a80e8` (an ordinary fast-forward over
+`5422046`), and Linux-CI-confirmed in run 42908777385** (A5.9 records the
+local evidence, A5.10 the Linux CI evidence). The acceptance decision is
+unchanged. (Historical: before its commit this read "Implemented and locally
+verified on macOS (2026-11-09); unstaged, uncommitted and not
+Linux-CI-confirmed", and at insertion it read "Accepted 2026-11-09, after joint
+review; not implemented." Both were true then.) The
 accepted-content SHA-256 of the external draft (revision 3) is
 `ab57fbf9f54fc8a06e23d448e418c8d621eddc07b6fcaae2c09e165c2e583722`.
 (Historical: the heading read "Proposed 2026-11-09", and this status read
@@ -1552,7 +1558,10 @@ This amendment does not add:
 
 T-E1, T-F1 and T-F2 are unchanged. D5 stays In Progress.
 
-### A5.9 Implementation record (2026-11-09; local, macOS; uncommitted)
+### A5.9 Implementation record (2026-11-09; local, macOS)
+
+(Historical: this heading read "(2026-11-09; local, macOS; uncommitted)"
+before the commit.)
 
 **Production.**
 - `_git_safety.py`:
@@ -1691,11 +1700,92 @@ T-E1, T-F1 and T-F2 are unchanged. D5 stays In Progress.
   valid. Only external harness drivers were added.
 
 **Limits.**
-- This is local macOS evidence only. There is no commit and no Linux CI run
-  yet.
+- This section is local macOS evidence. (Historical: before the commit this
+  bullet said "There is no commit and no Linux CI run yet", which was true
+  then. The commit and Linux CI evidence are in A5.10.)
 - H-2 and H-3 share one test and one assertion (sentinel absent). The plan
   probe showed each command runs the helper independently, but the test does
   not identify which command did.
 - The `process` subkey is exercised with a helper that exits at once.
 - The A4 same-user configuration race between enumeration and launch
   remains.
+
+### A5.10 Linux CI evidence (2026-11-10)
+
+**Commit and push.**
+- Commit `067fca0767f140a0e1f4a20afbe4b3eeae0a80e8` ("fix: harden Git filter
+  neutralization"), parent `5422046df62a90876aa6a5f051ebdbc9b881fb17`.
+- Pushed to `main` as an ordinary fast-forward, `5422046..067fca0`, with no
+  force push.
+- The commit holds the hotfix code, tests, this amendment, the ADR 0004
+  bound notes, `CLAUDE.md`, `ENGINEERING_LOG.md` and the ledger note.
+- ADRs 0004 and 0006 were staged partially, as `HEAD` plus only the hotfix
+  content:
+  - ADR 0004 blob `c41137466b6557372d9f22bd38f8e692594abcba`;
+  - ADR 0006 blob `f42046a7b804208aa8a848520a861f98f72c0a88`.
+- The Proposed D5-C drafts (ADRs 0003, 0004, 0006 and 0007) stayed
+  unstaged.
+
+**Run** [42908777385](https://github.com/G-ChandraSekhar/codeagent/actions/runs/42908777385),
+re-verified independently through the Actions API and a freshly fetched raw
+job log (523 lines, SHA-256 `8f0a33447dd648443ad61700118f182db63817a2fde8226c32631219cf9b746d`):
+- **Run:** push-triggered on `main` for exact head
+  `067fca0767f140a0e1f4a20afbe4b3eeae0a80e8`, attempt 1, `completed` /
+  `success`.
+- **Job:** exactly one, "Test (ubuntu-24.04, Python 3.12)", 21:49:42Z to
+  21:54:17Z. All 13 reported steps `success`; zero annotations and zero
+  `##[error]` lines.
+- **Environment:**
+  - runner image `ubuntu-24.04`, version 20261101.360.1 (Ubuntu 24.04.5,
+    x86_64);
+  - CPython 3.12.16 and pytest 9.1.1;
+  - Git 2.56.0;
+  - Docker Engine - Community 28.0.4, client and server.
+- **Docker:**
+  - the mandatory preflight succeeded;
+  - `CODEAGENT_REQUIRE_DOCKER: 1` is present in both test steps' logged
+    environments;
+  - the pinned
+    `python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea`
+    reported platform `linux/amd64`.
+- **Dedicated Docker step** (`pytest -v` over `test_slice_c.py`,
+  `test_cancellation_e2e.py` and two named `test_patch_failure_continuation.py`
+  nodes): `18 passed in 20.44s`, all 18 named `PASSED`:
+  - the four `test_slice_c.py` tests;
+  - E1–E10, E13 and E14;
+  - `test_d5a_stale_expected_text_continues_to_passing_verification_real_docker`;
+  - `test_d5b_contaminated_worktree_recreates_and_passes_real_docker`.
+- **Complete suite** (`python -m pytest -q`): `7114 passed, 4 skipped in
+  234.92s (0:03:54)`, with zero failed and zero errors. 7,114 + 4 = 7,118,
+  which equals the local collected total (7,116 passed + 2 skipped).
+- **Leftover check:** the anchored
+  `^codeagent-(verify-|baseline-|verification-)` listing over a full
+  `docker ps -a` name list printed nothing after "currently present
+  (expected: none):", and the step succeeded.
+
+**Evidence limits.**
+- **No hotfix-specific named test.** The 18 dedicated-step tests are named
+  evidence, but none of them is a hotfix-specific test. (By source
+  inspection, not log evidence, the D5-B real-Docker node runs a recreation,
+  and therefore the changed entry gate.)
+- **Inferred, not named:** the hotfix tests, the refused-creation launch pin
+  and the recreation launch pin of 22 ran only in the quiet suite. Their
+  execution is inferred from the whole-suite command, the matching
+  collection total and zero failures; no log line names them.
+- **Skips:** the four quiet-suite skips are unidentified. They are not
+  attributable to Docker being unavailable, since Docker was required and
+  available in that step.
+- **Local only:** the six hotfix mutations (H-1–H-6) and the prior-harness
+  reruns (A5.9) remain local macOS evidence.
+- **Scope:** this is GitHub-hosted `ubuntu-24.04` x86_64 automated-test
+  evidence, not a security review and not ARM64 evidence.
+- **Correction.** The pre-reconciliation report of this run listed only 16
+  of the 18 named dedicated-step tests. It omitted the two
+  `test_patch_failure_continuation.py` real-Docker nodes. The figure above,
+  18, is the verified one.
+
+**Unchanged by this evidence:**
+- D5 stays In Progress, and D5-C is not implemented.
+- The mandatory pre-D5-C gate (A5.7) is satisfied.
+- No Gate α, operator-ready or v1 claim is made.
+- T-E1, T-F1 and T-F2 are unchanged.
