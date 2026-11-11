@@ -6,6 +6,10 @@ identity, and repository/generic-lock substrate design — see the end
 of this document. Everything above "Amendment 1" is the original
 decision, unchanged.
 
+Amendment 22 (ledger D5, slice D5-C: private Git sessions as an owned worktree
+sub-resource, and scratch cleanup precedence): **Accepted 2026-11-10, after joint review; not implemented.** (Historical:
+Proposed 2026-11-09.) See "Amendment 22" at the end of this document.
+
 Implementation status: **partially implemented.** This ADR's
 Milestone 2 prerequisites exist in production code: generated
 lifecycle IDs, `CheckpointSession`'s in-memory transition record,
@@ -8010,3 +8014,281 @@ four-operation protocol, N1/N2, model integration), D6 and operator
 reachability remain unimplemented. There is no live model or operator path,
 no Gate α, operator-ready, `COMPLETE_FOR_V1` or v1 claim, and no threat-model
 conclusion changes.
+
+## Amendment 22 (Accepted 2026-11-10): private Git sessions as an owned worktree sub-resource, and scratch cleanup precedence (D5-C)
+
+Status: **Accepted 2026-11-10, after joint review; not implemented.**
+(Historical: "Proposed (2026-11-09). Not accepted and not implemented.")
+- D5-C is not implemented.
+- D5 stays **In progress, not Done**.
+- D6, operator reachability, Gate α and v1 remain unimplemented and unclaimed.
+- **No new reconciliation row** is introduced.
+
+**Source:** the accepted D5-C plan chain. The governing plan is **revision 12**:
+`/Users/chandrasekhar/code/codeagent-plans/D5_C_transactional_patch_protocol_plan_rev12.md`.
+- Revision 12's accepted-content SHA-256 is
+  `241c11f9b2169a5dba080fbdf82cd90e2c4e115f08ab80a56513678346812566`. The file
+  now hashes `de42aaa199a1fbf200a68623c5405f9f190e2e57a7903607d6a002b55a0b38d8`,
+  because only its status line changed to Accepted.
+- **Order of governance:**
+  - revisions 8–12 govern wherever they supersede revisions 1–7, each later
+    revision governing the one before it;
+  - revision 7 governs revision 6, revision 6 governs revision 5, and revision
+    5 governs revision 4, which carries revision 3's design and revision 2's
+    protocol.
+- Revision 7's accepted-content SHA-256 is
+  `4ef87d2d4134fb8fc3fe0a1d522cbec403be4851c667b2f9c4c1c3cf31592adb`, and
+  revision 6's is
+  `0a17f54c6073e46c3d7825dcc8bf540df67d3f08cb93f82266d579963fc2c76b`.
+- **Revision 13** (accepted at joint review 2026-11-10;
+  accepted-content SHA-256 `b39295869f8ed3388acd35b24519c81823de2cb6548738cc0e958a5ef671c744`; the file now
+  hashes `4eb60305bb78a53dd423ef3eb466bca770d46af3ad28f21560f98d23478eba21` after its status-line change)
+  records the 2026-11-10 decisions on Phase V routing and on the hotfix harness
+  as a prior rerun (ADR 0003 Amendment 3 §A3.2 and §A3.9).
+- **The mandatory pre-D5-C hotfix prerequisite is satisfied.** ADR 0006
+  Amendment 5 is committed as `067fca0` and Linux-CI-confirmed in run
+  42908777385; its evidence reconciliation is commit `6091f3b`. D5-C itself
+  remains unimplemented.
+
+The scratch-ownership and cleanup-precedence design is revision 3's, carried
+unchanged through revisions 4–12. Revisions 8–12 change the capabilities that
+use a session (ADR 0006 Amendment 6 §A6.2a–§A6.2b), not the session resource
+owned here.
+
+This amendment changes nothing in this ADR's committed Amendment 5 (the
+container reconciliation row), in ADR 0006 Amendment 5 (the hotfix), or in the
+hotfix bound notes in §21.3a and §21.17.
+
+**Ownership:** ADR 0003 Amendment 3 §A3.1 holds the ownership map. This
+amendment owns the session resource and the scratch cleanup error, code, record
+and precedence. The runners that use sessions are defined in ADR 0006
+Amendment 6.
+
+### 22.1 Declaration
+
+A **private Git session** is an owned sub-resource of one **linked worktree
+incarnation**. A session serves one of:
+- the read-only private index used by `ReadOnlyGit` (ADR 0006 Amendment 6
+  §A6.2);
+- the exact preflight's private index and object directory, used by
+  `PreflightGit` (ADR 0006 Amendment 6 §A6.7).
+
+**Capability binding (owned by ADR 0006 Amendment 6 §A6.2b).** A capability
+is registered against the exact session object and its repository identity,
+and is refused once that session is closed or swapped. This amendment owns the
+session; ADR 0006 Amendment 6 owns the binding check.
+
+It is created **only** inside that incarnation's own Git admin directory, at
+`<common>/worktrees/<id>/codeagent-scratch-<16 lowercase hex>`. Its owner is the
+owner of that incarnation: the lifecycle in production, or the `GitWorktree`
+instance in non-lifecycle test compositions.
+
+| User | Admin directory used |
+|---|---|
+| Patch Phase V (read-only and preflight) | current incarnation |
+| Entry gate | current incarnation |
+| Recreation Phase E evidence | incarnation *n*, before Phase D |
+| Terminal evidence | the current incarnation, before disposal |
+
+**Refusal, never a fallback.** If the target is a main worktree, has no recorded
+admin name, or fails the `gitdir` check, the session open is refused with
+`GitScratchUnavailable`:
+- a patch → T2;
+- the entry gate → its existing code;
+- evidence → `EVIDENCE_CAPTURE_FAILED`.
+
+There is no fallback to global temporary storage.
+
+### 22.2 Derivation
+
+The admin directory is **not** derived from the worktree's `.git` file, nor
+from `rev-parse` run inside the worktree. A planning probe showed `rev-parse
+--absolute-git-dir` follows a redirected `.git` file.
+
+**Inputs:**
+- the trusted `canonical_common_dir`, from `LifecycleLease.identity` and the
+  reservation;
+- the admin name, recorded once by `GitWorktree` at materialization, while it
+  holds the reservation and before any model access.
+
+**Each session open:**
+1. opens `<common>` → `worktrees` → `<name>` by descriptor, with `O_NOFOLLOW`
+   and `O_DIRECTORY` at each step;
+2. reads the `gitdir` file with no-follow;
+3. requires its real path to equal the leaf's `.git`.
+
+### 22.3 Creation
+
+- `mkdirat(<random name>, 0o700)` relative to the admin descriptor.
+- Then an `O_NOFOLLOW|O_DIRECTORY` open, and `fstat` to verify the owner and
+  mode 0700.
+- **A pre-existing entry** at the drawn name, of any type, is foreign. It is
+  refused and **never adopted or removed**.
+
+### 22.4 State machine
+
+```
+open ──► CREATED ──► IN_USE
+  └─(EEXIST / no-follow failure / owner|mode mismatch)─► REFUSED (nothing of ours created)
+IN_USE ──close()──► CLOSING ──one bottom-up removal + lstat ENOENT──► CLOSED_CONFIRMED
+                       └─ any failure, or the entry still present ─► CLOSE_UNCONFIRMED (retained)
+CLOSED_* ──close() again──► same state, same retained result, no further filesystem call
+owner SIGKILL in CREATED/IN_USE/CLOSING ──► ORPHANED_IN_ADMIN_DIR
+  ──worktree removal (22.6)──► REMOVED_WITH_ADMIN_DIR, or BLOCKED → abandonment
+```
+
+- **Lifetime:** a session opens and closes within one owned operation: one Phase
+  V, one entry gate, or one evidence capture.
+- **Patch sessions close before the mutation boundary** (ADR 0003 Amendment 3
+  §A3.2), so a scratch cleanup failure never coexists with a contaminated
+  worktree.
+
+### 22.5 What a session may contain
+
+A private index copy, and the preflight's private index, objects (including
+proposed content not yet written to the worktree) and locks. Nothing in a
+session is visible to the real `status` or the evidence diff.
+
+### 22.6 Removal and reconciliation coverage
+
+| Route | Effect on a session |
+|---|---|
+| `GitWorktree.dispose()`, `_terminate` disposal, recreation Phase D (`git worktree remove --force <exact path>`, then the existing confirmations) | removed with the admin directory; the existing confirmations (registration absent, admin-name count zero, leaf absent) prove it gone |
+| The Amendment 13 dead `creating`/`present`/`disposing` row; the Amendments 17 and 19 chains; the Amendment 20 §9 row | the same removal action and confirmations |
+| The Amendment 12 unregistered `creating` row | not applicable: there is no admin directory before registration, so no session can exist |
+| Partial removal (for example an externally made unremovable entry) | the existing confirmations fail, so the entry **blocks** (fail closed); abandonment is the exit |
+| Abandonment (Amendment 18) | never deletes: the session stays inside the abandoned worktree's admin directory |
+
+**Planning evidence** (Git 2.54.0; SHA-1 and SHA-256; paths with spaces and
+non-ASCII; temporary repositories outside this repository; `scratch_results.json`
+SHA-256 `0bc14d00f23b1735ecbc38184ffd5337c0344670a5d25a7672a7cbe1b51e6ac7`):
+- **Uses:** entry-gate, evidence and preflight use through a session left the
+  real index, objects, files and status unchanged, including with an
+  `index.lock` present.
+- **Ordinary close:** confirmed absent.
+- **`worktree remove --force`** removed the admin directory with session files,
+  objects and locks inside. A symlink inside the session was **not** followed
+  (the outside sentinel was intact).
+- **An unremovable subdirectory** made removal partial (rc 255) and left the
+  registration: it blocks.
+- **Refused:** a foreign entry or a symlink at the session name, and an admin
+  directory replaced by a symlink.
+- **Owner SIGKILL** at five boundaries (after create, mid-copy, during Git use,
+  after preflight writes, mid-cleanup) left a session behind each time. The
+  reconciliation removal action then left **zero** sessions in the common
+  directory, with the admin directory, registration and leaf all gone.
+
+**Not exercised in planning:** the real `reconcile_repository()` and `codeagent
+reconcile` code paths, abandonment, and Git 2.56. These are required tests
+(§22.10).
+
+### 22.7 Cleanup error and record
+
+- **`GitScratchCleanupUnconfirmedError`** (in `_git_safety`; fixed `MESSAGE` "a
+  private Git scratch session could not be confirmed removed"):
+  - `cleanup_failures`: every exact failure, in order, by identity;
+  - `body_failure`;
+  - `deferred_interrupt`: the earliest non-`Exception`.
+
+  `__cause__` is the body failure, else the first cleanup failure. It never
+  embeds a path, a session name, Git output, proposal content or exception text.
+- **`ErrorCode.GIT_SCRATCH_CLEANUP_UNCONFIRMED`** (`ErrorDomain.LIFECYCLE`;
+  new). It is legal on:
+  - `ToolCompleted(APPLY_PATCH)`;
+  - `EvidenceCaptured.error`;
+  - a recreation `EVIDENCE_NOT_CONFIRMED` result's error;
+  - `RunFinished`.
+
+  `PATCH_UNSUPPORTED_GIT_SUBSTRATE` is **not** reused for a cleanup failure.
+- **`ScratchCleanupRecord`** (`repr=False`, `compare=False`): the error
+  instance, the layer (`patch`, `entry_gate`, `evidence_member` or
+  `evidence_terminal`), and `confirmed_absent_by_teardown: bool | None`. It is
+  exposed only as `RunController.scratch_cleanup_records` and
+  `LifecycleRunResult.scratch_cleanup_records`, never in events or a `repr`.
+- **One attempt per owned layer:**
+  - **L1:** a session's `close()`, one removal and one absence check. It is
+    idempotent.
+  - **L2:** worktree disposal, the existing single removal and its
+    confirmations. It never retries L1.
+  - **L3:** reconciliation at next admission, the existing single action per
+    pass.
+
+### 22.8 Outcome table
+
+| # | Body | L1 | L2 | Transaction / evidence | `RunFinished` | Interrupt | Final residue |
+|---|---|---|---|---|---|---|---|
+| 1 | success | confirmed | — | normal | normal | — | none |
+| 2 | Phase V passed | unconfirmed | confirmed | `ToolCompleted(GIT_SCRATCH_CLEANUP_UNCONFIRMED)`; no Phase M; T11 terminate | `UNRECOVERABLE_ERROR` / scratch code; record `confirmed_absent_by_teardown=True` | — | none |
+| 3 | validation refusal | unconfirmed | confirmed | cleanup dominates; refusal kept as `body_failure`; no T1 | as #2 | — | none |
+| 4 | ordinary exception | unconfirmed | confirmed | cleanup dominates (not T8); exception kept as `body_failure` and `__cause__` | as #2 | — | none |
+| 5 | `KeyboardInterrupt`/`SystemExit` | confirmed | — | the exact interrupt re-raised | the existing raise path | primary | none |
+| 6 | interrupt | unconfirmed | confirmed | the cleanup error, with the interrupt as `body_failure` and `deferred_interrupt`; controller `_defer_interrupt` (first wins) | as #2 (not `CANCELLED`) | deferred and exposed | none |
+| 7 | any | several failures | confirmed | all retained, in order | as #2 | as #6 if any | none |
+| 8 | any | unconfirmed | **unconfirmed** | as #2 | `LIFECYCLE_CLEANUP_UNCONFIRMED` (tier a dominates); record `False` | as #6 | session inside the preserved or partial admin directory; next admission blocks or reconciles (L3) |
+| 9 | owner SIGKILL | — | — | — | none | — | removed by L3, or blocked → abandonment |
+| 10 | terminal evidence | unconfirmed | confirmed | receipt carries the scratch code | tier a2 | — | none |
+| 11 | Phase E evidence | unconfirmed | (Phase D of *n*) | `EVIDENCE_NOT_CONFIRMED` carrying the code; recreation refused | T4 terminates; tier a2, or a | — | per L2 |
+
+### 22.9 Terminal precedence (amends ADR 0003 Amendment 2 §5)
+
+1. **a:** any verifier/container, worktree or checkpoint-ref cleanup
+   unconfirmed → `LIFECYCLE_CLEANUP_UNCONFIRMED`.
+2. **a2 (new):** any retained scratch cleanup failure →
+   `GIT_SCRATCH_CLEANUP_UNCONFIRMED`.
+3. **b–e:** the evidence tiers, unchanged.
+4. **f:** the original result.
+
+A successful L2 confirmation **does not downgrade** a2. It is recorded as
+`confirmed_absent_by_teardown=True`.
+
+### 22.10 Tests and mutation obligations
+
+**Required tests:**
+- **The scratch suite**, on SHA-1 and SHA-256, with spaces and non-ASCII paths:
+  - all three uses, with `index.lock`;
+  - removal with files, a symlink, and an unremovable subdirectory;
+  - the four escape cases;
+  - owner SIGKILL at each of the five boundaries, followed by the **real**
+    `prepare_lifecycle()` and the **real** `codeagent reconcile`, each asserting
+    the exact entry outcome and zero sessions;
+  - abandonment, dry run and forced, with a live session: the marker is written,
+    the session is untouched, and nothing is deleted.
+- **The fault tests** for rows #2–#11:
+  - `test_scratch_body_success_cleanup_fails`;
+  - `test_scratch_validation_refusal_cleanup_fails`;
+  - `test_scratch_body_exception_cleanup_fails`;
+  - `test_scratch_interrupt_cleanup_confirmed`;
+  - `test_scratch_interrupt_cleanup_fails`;
+  - `test_scratch_multiple_cleanup_failures`;
+  - `test_scratch_sigkill_before_cleanup_reconciled`;
+  - `test_scratch_cleanup_fails_then_disposal_confirms`;
+  - `test_scratch_cleanup_fails_and_disposal_fails`;
+  - `test_scratch_repeated_close_is_idempotent`;
+  - `test_terminal_evidence_scratch_failure_tier_a2`;
+  - `test_phase_e_scratch_failure_refuses_recreation`.
+
+  Each pins the exact identities, the fixed text, `__cause__`, the
+  `deferred_interrupt` identity, the absence of any sensitive text, and the
+  final residue.
+
+**Mutation group owned here:** G-01…G-24 (24), counted in ADR 0003 Amendment 3
+§A3.9's 228 new D5-C variants, which are distinct from the 232 prior-harness
+reruns. (Historical: 206 before revisions 8–12, and 226 before revision 13.)
+This amendment's cleanup outcome table (rows #3 and #4) and tier a2 also govern
+the Phase V routing classes when session cleanup is unconfirmed: cleanup
+dominates, and the body failure is retained (ADR 0003 Amendment 3 §A3.2).
+
+### 22.11 Non-claims and residuals
+
+**Non-claims:**
+- no new reconciliation row;
+- no language-level guarantee against an A4 same-user actor;
+- no implementation.
+
+**Residuals:**
+- an externally made unremovable session blocks the entry until abandonment;
+- an abandoned entry retains its session, which may contain proposal content in
+  preflight objects;
+- an orphaned Git child can briefly outlive a SIGKILLed owner (as in
+  Amendment 13);
+- the planning evidence is Git 2.54-only until CI.

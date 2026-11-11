@@ -3401,30 +3401,46 @@ Stage 2 (of the four-stage planning process in
     - Step 6, D5-A and D4b (0 of 82 mutations) are not invalidated, and no
       Steps 1–5 harness is recorded.
     - The authoritative matrix is in ADR 0006 Amendment 5 §A5.9.
-  - **ADR drafts:** the four Proposed D5-C drafts renumbered ADR 0006's D5-C
-    amendment to **Amendment 6**, a mechanical change of 34 lines, and stay
-    unstaged.
+  - **ADR drafts:** the four D5-C drafts (then Proposed) renumbered ADR 0006's
+    D5-C amendment to **Amendment 6**, a mechanical change of 34 lines, and
+    stayed unstaged in the hotfix commit.
   - **Boundaries:** no D5-C capabilities, registry, snapshot, private index
     or protocol; no workflow change; D5 stays In Progress.
-- **Next:** the mandatory pre-D5-C gate (ADR 0006 Amendment 5 §A5.7) is
-  satisfied.
-  - The next task is revising the four Proposed D5-C ADR drafts (the D5-C
-    plan revisions 8–12 queued items, with the capability amendment already
-    numbered ADR 0006 Amendment 6). It is **not** implementation yet.
-  - After that comes D5-C itself (the four-operation patch protocol and its
-    validation, N1/N2's re-derivations, model integration and the remaining
-    Step 9 documentation), then D6.
-  - Gate O stays satisfied. D5 stays In Progress. There is no Gate α,
-    operator-ready or v1 claim.
-  - (Historical: before the hotfix commit this said "commit the hotfix …
-    and obtain exact-commit Linux CI. Only then D5-C …".)
-  Remaining planning range D5–D10: 337–629 h (D5 174–289 h; first operator
-  run 373–627 h; Gate α 440–762 h; public v1 / cumulative D1–D10 502–901 h;
-  Gate O 86–140 h and D1–D4 165–272 h unchanged; D5 re-estimated from
-  95–155 h on 2026-11-07 through ADR 0007 Amendment 1 and the D5
-  continuation plan, revision 3; D5-C is re-estimated from its own plan
-  before implementation) — component planning ranges, not measured hours
-  spent or delivery commitments (`docs/V1_COMPLETION_LEDGER.md`).
+- **D5-C design accepted (2026-11-10); not implemented.** ADR 0003
+  Amendment 3, ADR 0004 Amendment 22, ADR 0006 Amendment 6 and ADR 0007
+  Amendment 3 were accepted jointly on 2026-11-10.
+  - The governing plan is D5-C plan revision 13: accepted-content SHA-256
+    `b39295869f8ed3388acd35b24519c81823de2cb6548738cc0e958a5ef671c744`; the
+    file hashes `4eb60305bb78a53dd423ef3eb466bca770d46af3ad28f21560f98d23478eba21`
+    after its status-line change.
+  - **Obligations:** 228 D5-C mutation variants and 232 required
+    prior-harness reruns (227 recorded − obsolete B14 + 6 hotfix reruns), at
+    about 12.5–22.5 h of machine time.
+  - This is design acceptance only. **D5-C is not implemented**, and D5 stays
+    **In Progress**.
+- **Next:** D5-C implementation, per the accepted amendments (the
+  four-operation patch protocol and its validation, N1/N2's re-derivations,
+  model integration and the remaining Step 9 documentation), then D6.
+  - The mandatory pre-D5-C gate (ADR 0006 Amendment 5 §A5.7) is satisfied.
+  - Gate O stays satisfied.
+  - There is no Gate α, operator-ready or v1 claim.
+  - (Historical: before the D5-C acceptance this said "The next task is
+    revising the four Proposed D5-C ADR drafts … It is not implementation
+    yet"; before the hotfix commit it said "commit the hotfix … and obtain
+    exact-commit Linux CI. Only then D5-C …".)
+  Remaining planning range D5–D10: 480–859 h.
+  - D5 is 317–519 h: D5-C 178–292 h, replacing the provisional 45–80 h, plus
+    the landed mandatory hotfix at 10–18 h.
+  - First operator run 516–857 h; Gate α 583–992 h; public v1 / cumulative
+    D1–D10 645–1,131 h.
+  - Gate O 86–140 h and D1–D4 165–272 h are unchanged.
+  - D5 was re-estimated from 174–289 h on 2026-11-10 through the accepted
+    D5-C amendments and plan revision 13.
+  - These are component planning ranges, not measured hours spent or delivery
+    commitments (`docs/V1_COMPLETION_LEDGER.md`).
+  - (Historical: before 2026-11-10 this read 337–629 h, with D5 at 174–289 h,
+    first operator run 373–627 h, Gate α 440–762 h, public v1 502–901 h, and
+    "D5-C is re-estimated from its own plan before implementation".)
   (Historical: before this checkpoint, this bullet said D5's substrate
   waited on the C-1 amendment's acceptance; before D5-A it listed
   258–495 h with D5 at 95–155 h; before D5-A's commit it began "commit D5-A

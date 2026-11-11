@@ -7763,3 +7763,52 @@ hotfix (ADR 0006 Amendment 5, accepted 2026-11-09).
   threat-model conclusion change.
 - Planning totals are unchanged.
 - `uv.lock` was not touched.
+
+## 2026-11-10 — D5-C design accepted (revision 13 and four ADR amendments); not implemented
+
+**What.** A documentation-only record of the D5-C design acceptance.
+- **Amendments accepted jointly on 2026-11-10:** ADR 0003 Amendment 3 (the
+  four-operation transactional protocol, N1/N2, the ownership map and the
+  aggregate obligations), ADR 0004 Amendment 22 (private Git sessions and
+  scratch cleanup precedence), ADR 0006 Amendment 6 (closed, typed Git
+  capabilities, internal filter facts, the canonical snapshot, capability
+  authority and refusal semantics) and ADR 0007 Amendment 3 (four-operation
+  proposals, v2 digests, the patch policy and `ApprovedChange`).
+- **Governing plan:** D5-C plan revision 13, outside the repository.
+  Accepted-content SHA-256
+  `b39295869f8ed3388acd35b24519c81823de2cb6548738cc0e958a5ef671c744`; the
+  post-marker file hashes
+  `4eb60305bb78a53dd423ef3eb466bca770d46af3ad28f21560f98d23478eba21`.
+- **Revision 13's two joint decisions:**
+  - Phase V routes `FILTER_DRIVER_NAME_UNRENDERABLE` and
+    `FILTER_CONFIGURATION_CHANGED` to `PATCH_UNSUPPORTED_GIT_SUBSTRATE` (T2,
+    terminate), and lets `GitCapabilityRefused` propagate to the existing
+    unexpected-exception path (T8).
+  - The mandatory-hotfix harness (H-1…H-6) becomes a required prior harness.
+
+**Obligations recorded in the accepted design.**
+- **228 D5-C mutation variants**, with C-09 and C-10 added for the routing
+  decision.
+- **232 required prior-harness reruns:** 227 recorded earlier entries − the
+  obsolete B14 + the 6 hotfix reruns.
+- **About 12.5–22.5 h** of mutation and rerun machine time.
+
+**Planning.** The ledger and `CLAUDE.md` now carry the accepted estimates:
+- D5-C 178–292 h, replacing the provisional 45–80 h;
+- combined D5 317–519 h (174 − 45 + 178 + 10; 289 − 80 + 292 + 18), including
+  the landed hotfix at 10–18 h;
+- remaining D5–D10 480–859 h;
+- first operator run 516–857 h;
+- Gate α 583–992 h;
+- public v1 645–1,131 h.
+
+Gate O (86–140 h) and the completed D1–D4 (165–272 h) are unchanged. These are
+planning estimates, not hours spent or commitments.
+
+**Boundaries.**
+- This is **design acceptance only**. D5-C implementation has not started, and
+  D5 stays In Progress.
+- The four amendments are present in the working tree, uncommitted.
+- No code, tests, workflows or `uv.lock` changed.
+- No Gate α, operator-ready, `COMPLETE_FOR_V1` or v1 claim, and no
+  threat-model conclusion change.

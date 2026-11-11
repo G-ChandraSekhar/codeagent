@@ -9,6 +9,11 @@ decision, unchanged; Amendment 1 is unchanged by Amendment 2 except
 where Amendment 2 explicitly narrows its point 4 ("establish, then
 rely") ordering.
 
+Amendment 3 (ledger D5, slice D5-C: the four-operation transactional patch
+protocol, N1 and N2): **Accepted 2026-11-10, after joint review; not implemented.** (Historical:
+Proposed 2026-11-09.) It also holds the D5-C decision ownership map. See "Amendment 3"
+at the end of this document.
+
 ## Context
 
 Stage 2 spike S3 (`spikes/s3/spike_s3.py`, full evidence and analysis
@@ -785,3 +790,495 @@ files under every flag combination tested, with `git status
 --porcelain=v1` the only read-only detector. No code exists yet; the
 file/test plan recorded in `ENGINEERING_LOG.md`'s 2B-2 planning entry is
 the implementation obligation this amendment creates.
+
+## Amendment 3 (Accepted 2026-11-10): the four-operation transactional patch protocol, N1 and N2 (D5-C)
+
+Status: **Accepted 2026-11-10, after joint review; not implemented.**
+(Historical: "Proposed (2026-11-09). Not accepted and not implemented.")
+
+What remains unimplemented:
+- **D5-C** does not exist in code: no four-operation protocol, no index-first
+  transaction, no exact evidence preflight, no read-only Git runner, no private
+  Git sessions, no `patch_contract`.
+- **D5** stays **In progress, not Done**.
+- **D6**, operator reachability, **Gate α** and **v1** remain unimplemented and
+  unclaimed.
+
+This amendment and its three companions were accepted on 2026-11-10. A separate
+documentation reconciliation, accepted at joint review on 2026-11-10, has now
+applied the accepted estimates to `docs/V1_COMPLETION_LEDGER.md`. This changes
+documentation status only. It does not mean D5-C is implemented or that D5 is
+Done. (Historical: before that reconciliation this said "The ledger's estimates
+stay unchanged until a separate documentation update is reviewed", and earlier
+"until this amendment and its three companions are accepted and a separate
+documentation update is reviewed". Both were true then.)
+
+### A3.1 Source and ownership
+
+**Source.** The D5-C plan revision chain, accepted at joint review on
+2026-11-09. The governing plan is **revision 12**:
+- the plan is
+  `/Users/chandrasekhar/code/codeagent-plans/D5_C_transactional_patch_protocol_plan_rev12.md`;
+- its accepted content has SHA-256
+  `241c11f9b2169a5dba080fbdf82cd90e2c4e115f08ab80a56513678346812566`;
+- the file now hashes
+  `de42aaa199a1fbf200a68623c5405f9f190e2e57a7903607d6a002b55a0b38d8`, because
+  its status line alone changed to Accepted.
+
+Revision 7
+(`/Users/chandrasekhar/code/codeagent-plans/D5_C_transactional_patch_protocol_plan_rev7.md`)
+keeps its accepted-content SHA-256,
+`4ef87d2d4134fb8fc3fe0a1d522cbec403be4851c667b2f9c4c1c3cf31592adb` (the file
+hashes `b075e072d4d7eac0550ddc8e43eba35d20a3405fc37e0a3178b7ef106e452d92`).
+Revision 6
+(`/Users/chandrasekhar/code/codeagent-plans/D5_C_transactional_patch_protocol_plan_rev6.md`)
+keeps its accepted-content SHA-256,
+`0a17f54c6073e46c3d7825dcc8bf540df67d3f08cb93f82266d579963fc2c76b`; that file
+now hashes `6bc188a04046c0427e206fa4c900fabaa501a8fa959e83993945fc4164bfa9e6`
+after its status-line change.
+
+**Revision 13** (accepted at joint review 2026-11-10):
+`/Users/chandrasekhar/code/codeagent-plans/D5_C_transactional_patch_protocol_plan_rev13.md`,
+accepted-content SHA-256 `b39295869f8ed3388acd35b24519c81823de2cb6548738cc0e958a5ef671c744`; the file now
+hashes `4eb60305bb78a53dd423ef3eb466bca770d46af3ad28f21560f98d23478eba21` after its status-line change. It
+records two joint decisions of 2026-11-10, both reflected here: Phase V
+routing of the new refusal classes (§A3.2) and the hotfix harness as a
+required prior harness (§A3.9).
+
+**Mandatory pre-D5-C hotfix (a satisfied prerequisite, not part of D5-C).**
+ADR 0006 Amendment 5 (Accepted 2026-11-09):
+- committed as `067fca0767f140a0e1f4a20afbe4b3eeae0a80e8`;
+- Linux-CI-confirmed in run 42908777385;
+- its evidence reconciliation is commit
+  `6091f3b0b330c9c2540e11863b449f00cb1f70d9`.
+
+Its gate is satisfied. D5-C remains unimplemented.
+
+**Order of governance:**
+1. Revisions 8–12 govern wherever they supersede revisions 1–7, and each
+   later revision governs the one before it (12 → 11 → 10 → 9 → 8 → 7).
+2. Revision 7 governs revision 6.
+3. Revision 6 governs revision 5.
+4. Revision 5 governs revision 4.
+5. Revision 4 carries revision 3's scratch-ownership and cleanup-precedence
+   design and revision 2's protocol, except where a later revision replaced a
+   section.
+
+This amendment and its three companions restate that design **as one decision
+set**. Where a companion owns a decision, this amendment only cross-references
+it.
+
+**Ownership map.** This is the single authoritative assignment: each decision is
+defined in exactly one place.
+
+| Decision | Authoritative definition |
+|---|---|
+| Transaction phases, the mutation boundary, the meaning of "transactional", zero-change refusals | **ADR 0003 Amendment 3** §A3.2 |
+| Index-first Phase M order (N1); the untracked-path rule's re-derived rationale; the ignored-target refusal | **ADR 0003 Amendment 3** §A3.3 |
+| Phase C structural verification | **ADR 0003 Amendment 3** §A3.4 |
+| N2: evidence bounds, the exact isolated preflight's semantics, the partial-state residual | **ADR 0003 Amendment 3** §A3.5 |
+| Satisfaction of the Amendment 2 §3 command-validation obligation | **ADR 0003 Amendment 3** §A3.6 |
+| The byte-level correction of "strictly observational" | **ADR 0003 Amendment 3** §A3.7 |
+| Aggregate D5-C verification and mutation obligations, prior-harness reruns, the planning estimate | **ADR 0003 Amendment 3** §A3.9 |
+| The closed, typed Git capabilities `ReadOnlyGit` (RO-01…RO-21), `PreflightGit` (PF-01…PF-07) and `MutationGit` (W-01…W-12), their operand validators, forbidden-form contract and separation; the internal filter facts, rendering and canonical snapshot; opener-bound authority, the identity registry, session/repository binding, freshness, the eight-step verification order, the refusal exception contract (`GitCapabilityRefused`) and interrupt propagation; `FILTER_CONFIGURATION_CHANGED`; entry-gate and evidence migration (D-17b); the `check-ignore` exception (RO-20); descriptor-relative filesystem mutation; repository-control files | **ADR 0006 Amendment 6** |
+| The `=` driver-name refusal (`FILTER_DRIVER_NAME_UNRENDERABLE`) and today's entry-gate neutralization; the recreation launch pin of 22 (bound recorded in ADR 0004 §21.3a) | **ADR 0006 Amendment 5** (the implemented mandatory hotfix; D5-C reuses, never redefines) |
+| The operations schema and limits; static and cross-operation rules; repository-state rules; canonical forms and digests (`codeagent.change.v2`, `codeagent.plan.v2`, `codeagent.patch_policy.v1`); redaction; `PatchPolicy` and the test/verification-configuration policy; the syntax guard; `patch_contract` and `ApprovedChange` authority; the T11 classification row; new `ArgumentRejection` members; `test_file_paths` | **ADR 0007 Amendment 3** |
+| Private Git sessions as an owned sub-resource (location, derivation, creation, state machine, removal coverage); the scratch cleanup error, code, record and outcome table; terminal tier a2 | **ADR 0004 Amendment 22** |
+
+### A3.2 Phases, the mutation boundary and what "transactional" means
+
+**One `apply_patch` transaction** applies one approved `ApprovedChange`
+(ADR 0007 Amendment 3) in four phases:
+
+- **Phase S (static):** ADR 0007 Amendment 3's static and cross-operation
+  rules. It is enforced at `propose_plan` and repeated by the applier.
+- **Phase V (pre-write):**
+  1. `verify_approved_change`;
+  2. preflight and object format;
+  3. a clean staged baseline and object availability;
+  4. every repository-state rule for every operation;
+  5. the intended blob ids, via `hash-object --no-filters --stdin` **without**
+     `-w`;
+  6. the syntax guard;
+  7. the trusted-policy recheck;
+  8. the exact evidence preflight (§A3.5).
+
+  Every Git call uses ADR 0006 Amendment 6's `ReadOnlyGit`, and every
+  filesystem read is descriptor-relative. Every private Git session opened in
+  Phase V is **closed and confirmed absent before the boundary** (ADR 0004
+  Amendment 22).
+- **The mutation boundary** is the first Phase M write to the worktree's real
+  object store, index or files: the first real `hash-object -w`.
+  - The preflight's writes go only to its private session (ADR 0004 Amendment
+    22) and are not a boundary crossing.
+  - A failure before the boundary uses a pre-write code. A failure at or after
+    it is `PATCH_APPLICATION_FAILED`, never `PATCH_VALIDATION_FAILED`.
+  - **Phase V failure map for the new refusal classes** (owned here; revision
+    13 Decision 1):
+
+    | Raised in Phase V | Translation | Route |
+    |---|---|---|
+    | `GitSafetyError(FILTER_DRIVER_NAME_UNRENDERABLE)` | `PATCH_UNSUPPORTED_GIT_SUBSTRATE`, fixed sanitized text | T2: terminate; never `PATCH_FAILED` feedback, C28, C29, C30, repair continuation or recreation |
+    | `GitSafetyError(FILTER_CONFIGURATION_CHANGED)` | the same | T2, the same |
+    | `GitCapabilityRefused` | none: no `PatchResult`, never T1 or T2 | T8: the exact exception propagates to the existing unexpected-exception boundary, giving one failed `ToolCompleted` (`TOOL_EXECUTION_FAILED`, the fixed text "tool failed unexpectedly") and then `UNCLASSIFIED_FAILURE`; no capability, session, configuration, path or internal-exception text in any event; no C28, C29, C30, feedback, recreation, verification or later Git launch |
+
+    - **Why:** the first two describe an unusable or unstable Git substrate.
+      `GitCapabilityRefused` is an internal authority violation, and calling it
+      a substrate failure would hide a defect. None is model-correctable
+      feedback.
+    - **Unchanged:** Gate zero, cleanup dominance (ADR 0004 Amendment 22 rows
+      #3 and #4) and interrupt precedence (ADR 0005 Amendment 1).
+    - **Constraint:** `GitCapabilityRefused` is not a `GitSafetyError`, and no
+      applier handler that translates `GitSafetyError` may catch it.
+    - **Superseded hotfix behaviour:** this replaces today's hotfix behaviour,
+      under which the pre-write check maps an unrenderable name to
+      `PATCH_VALIDATION_FAILED` (T1). The hotfix's
+      `test_target_attribute_check_refuses_unrenderable_driver` is migrated to
+      the T2 expectation, not weakened (revision 13 contradiction 56).
+    - **Tests** (revision 13 §2):
+      - `test_phase_v_filter_substrate_refusals_terminate_t2[FILTER_DRIVER_NAME_UNRENDERABLE|FILTER_CONFIGURATION_CHANGED]`;
+      - `test_phase_v_capability_refusal_propagates_t8`;
+      - `test_phase_v_refusal_cleanup_unconfirmed_dominates[unrenderable|config-changed|capability-refused]`.
+- **Phase M:** §A3.3.
+- **Phase C:** §A3.4.
+
+**"Transactional" means:**
+- whole-proposal validation before the boundary (point 1, unchanged);
+- a refusal before the boundary changes nothing (below);
+- after the boundary, any handled failure contaminates the worktree, which is
+  recreated (ADR 0004 Amendments 20–21) or the run terminates;
+- a checkpoint is accepted only after Phase C and a ref advance.
+
+**It does not mean** filesystem atomicity, invisible intermediate writes,
+crash consistency, or per-file rollback (points 3 and 8, unchanged).
+
+**Zero-change refusal.** For every pre-boundary refusal, the following are
+byte-identical before and after:
+- the worktree's tree, bytes and mtimes;
+- the worktree index's bytes and mtime;
+- the admin directory's entries;
+- the common directory's object listing;
+- the refs;
+- `lifecycle.json`;
+- no session leftover.
+
+### A3.3 N1: index-first Phase M
+
+**Order.** Operations are canonical (ADR 0007 Amendment 3), and paths are
+disjoint and prefix-free, so the final tree is order-independent. The steps run
+in canonical order:
+1. For `add` and `rename`'s `to`, install the index entry first: `hash-object
+   -w --no-filters --stdin` for `add`, or the HEAD oid for `rename`, then
+   `update-index --add --cacheinfo <mode>,<oid>,<path>`.
+2. Write the bytes of `add`, `update` and `rename` `to` (exclusive or
+   truncating, descriptor-relative; ADR 0006 Amendment 6), creating missing
+   parents as 0755.
+3. Unlink `delete` and `rename` `from` from disk, then remove emptied parents
+   bottom-up, never the root.
+4. Remove `delete` and `rename` `from` from the index.
+5. Stage each `update` path with its intended blob (`hash-object -w
+   --no-filters`, then `update-index --cacheinfo`). A descriptor re-read proves
+   the disk matches.
+
+**Invariant.** At every instant:
+- each engine-created path is already in the index;
+- each removed path stays in the index until it is gone from disk.
+
+The engine therefore never leaves an engine-created path untracked.
+
+**The untracked-path rule (Amendment 2 §2)** is kept **verbatim in force**. Its
+rationale is re-derived: it is no longer "today's patch engine cannot create
+files", but "the engine never leaves an engine-created path untracked; any
+untracked path is foreign contamination and makes evidence incomplete".
+
+**Ignored targets.** An `add` or `rename` `to` whose path is gitignored is
+refused in Phase V (`PATCH_VALIDATION_FAILED`). Under index-first such a path
+would be tracked, so this is defence in depth. The control experiment showed a
+*naive* ignored write is invisible to `status` and evidence. ADR 0006 Amendment
+6 governs how the check runs. (Historical: this read "Amendment 5" after the
+mechanical renumbering, which missed it because the reference wrapped across a
+line; see §A3.11.)
+
+**Evidence** (planning; Git 2.54.0, SHA-1; temporary repositories outside this
+repository; the raw results are `n1_results.json`, SHA-256
+`d88a84cf8be8164aa8cdeba6d2c0e0678968fbed9e9e73a18391c8212ae13f88`). There were
+21 scenarios: 19 index-first and 2 controls.
+- **Index-first:** all 54 partial states (add, update, delete and rename,
+  across text, empty, non-UTF-8 binary, executable, small and empty renames,
+  and ignored-directory cases) showed no `??`.
+  - The evidence diff, applied to a base checkout, reproduced the exact on-disk
+    paths, bytes and exec bits.
+  - A fresh process read every state identically.
+  - An `index.lock` changed nothing.
+  - `git worktree remove --force` succeeded.
+- **Controls:** a naive add showed `??`; a naive ignored add was completely
+  invisible.
+
+### A3.4 Phase C structural verification
+
+1. A bounded `diff --cached --name-status -z --no-renames HEAD` must equal the
+   expected status set exactly.
+2. `diff_bytes` is computed through a **bounded** runner, replacing today's
+   unbounded capture.
+3. `write-tree`, then `commit`. The commit's exit code is not trusted, as
+   today.
+4. HEAD must move to a commit with exactly the expected parent and tree.
+5. `diff-tree -r -z --no-renames <parent> <new>` must equal the expected set.
+6. Per path: an added or updated path has the intended mode, oid and exact
+   bytes; a deleted path or rename `from` is absent; a rename `to` has the
+   source's mode and oid.
+
+The filter re-check (ADR 0006) runs before `write-tree` and before `commit`, for
+every path of the proposal. Any failure is `PATCH_APPLICATION_FAILED`.
+
+### A3.5 N2: evidence bounds by exact isolated preflight
+
+- **The bounds are unchanged.** `MAX_DIFF_BYTES` = 1 MiB applies to the raw
+  stdout of the Amendment 2 §3 evidence diff, per artifact: each recreation
+  member, against the last accepted checkpoint, and the terminal artifact,
+  against the run origin H0. `MAX_STATUS_BYTES` = 1 MiB applies to the status
+  listing. `model_protocol.MAX_RESPONSE_BYTES` is a separate model-turn bound.
+- **The closed-form bound is withdrawn.** It did not cover `--binary`
+  payloads, path quoting, function-name hunk headers, repository `diff.*` and
+  `core.bigFileThreshold` configuration, `diff` attributes, rename versus
+  fallback, or cumulative terminal scope.
+- **The preflight.**
+  1. Build the proposed tree *T* in a private session: a private index and
+     object directory, with the real object store as a read-only alternate
+     (ADR 0004 Amendment 22 for the session; ADR 0006 Amendment 6's
+     `PreflightGit` for the environment and commands). Run it **in the
+     worktree**, so the repository's own config and attributes apply.
+  2. Run the evidence command tree-to-tree twice: `<accepted> <T>` (member)
+     and `<H0> <T>` (terminal). Each read is bounded to `MAX_DIFF_BYTES + 1`.
+  3. If either exceeds 1 MiB, refuse with `PATCH_VALIDATION_FAILED` (T1; the
+     model may shrink the proposal).
+  4. A preflight **infrastructure** failure, or a refused session open, is
+     `PATCH_UNSUPPORTED_GIT_SUBSTRATE` (T2).
+  5. A session **cleanup** failure follows ADR 0004 Amendment 22, never T2.
+- **Equivalence evidence** (planning; `n2_results.json`, SHA-256
+  `dd24624cb2a0540ab7e14f8cd1b053f1227abda2f20b9ad29635f1951b42a52b`). The
+  preflight bytes equalled the real post-apply evidence bytes in all 28 cases,
+  including hostile `diff.*` configuration, `core.bigFileThreshold`, `-diff`
+  attributes, a non-ASCII path, cumulative passes, SHA-256, and 8 adversarial
+  sizes (the largest single file 201,965 bytes). The real index, objects, refs
+  and files were unchanged.
+- **Residual (fails closed).** A *partial* Phase M state may produce a
+  recreation member larger than the final state's. If it exceeds 1 MiB, Phase E
+  is incomplete, recreation is refused, and the run terminates. Tree-to-tree
+  equivalence with the worktree diff is empirical: it is pinned by tests, not
+  proved.
+
+### A3.6 The Amendment 2 §3 command-validation obligation
+
+Amendment 2 §3 required the evidence command to be independently validated for
+add, delete, rename and binary shapes before the completeness claim relies on
+them. §A3.3's matrix and §A3.5's equivalence suite are that validation, **on
+Git 2.54.0 only**. Both are ported into required tests, and they must pass on
+CI's Git (2.56.0) before the claim holds there.
+
+### A3.7 "Strictly observational", at byte level
+
+Porcelain `git diff <rev> --`, which is this ADR's evidence command, and `git
+diff --quiet HEAD --` rewrite the index's **stat cache** on a stat-dirty index,
+even with `GIT_OPTIONAL_LOCKS=0`. Entry contents and blob ids are unchanged.
+Amendment 2's "strictly observational" was therefore semantically true but not
+byte-exact. ADR 0006 Amendment 6 migrates evidence capture and the entry gate to
+`ReadOnlyGit`, which makes it byte-exact for the real index.
+
+### A3.8 Terminal precedence
+
+Amendment 2 §5's list gains tier **a2**, directly below a
+(`LIFECYCLE_CLEANUP_UNCONFIRMED`) and above b (`EVIDENCE_INCOMPLETE`). Its
+definition, code and rules are owned by **ADR 0004 Amendment 22**; this section
+only records that the list is amended there.
+
+### A3.9 Aggregate verification, mutation obligations and estimate
+
+**Required verification** (each companion lists its own suites):
+- the N1 partial-state suite;
+- the preflight-equivalence suite;
+- the read-only proof suite;
+- the scratch suite, with real reconciliation and abandonment;
+- the four-operation end-to-end tests: a scripted model on real Git, and the
+  same on real Docker;
+- fault injection at every Phase M/C boundary, preflight step and session
+  cleanup;
+- real-SIGKILL next-admission tests;
+- the contract and binding tests;
+- forward and reverse affected sets;
+- the full suite with `CODEAGENT_REQUIRE_DOCKER=1`.
+
+CI's verbose step adds the four-operation real-Docker node, the N1 partial-state
+suite and the scratch suite.
+
+**D5-C mutation catalog: 228 variants.** Each is a distinct source edit with a
+named test and assertion, under the strict assertion-only rule.
+
+| Group | IDs | Count | Subject (owning ADR) |
+|---|---|---|---|
+| S | S-01…S-18 | 18 | static schema (ADR 0007 Amendment 3) |
+| D | D-01…D-27 | 27 | canonical forms, digests, redaction (ADR 0007 Amendment 3) |
+| P | P-01…P-26 | 26 | policy, policy validation, trusted-input checks (ADR 0007 Amendment 3) |
+| A | A-01…A-18 | 18 | Phase V repository-state checks (ADR 0007 Amendment 3 rules, run in this ADR's Phase V) |
+| R | R-01…R-11, R-13 | 12 | read-only proof and capability placement (ADR 0006 Amendment 6); R-12 retired into Q-08 |
+| X | X-01…X-07, X-09, X-10 | 9 | exact preflight (this amendment §A3.5) |
+| M | M-01…M-17 | 17 | Phase M/C (this amendment §A3.3–§A3.4) |
+| C | C-01…C-10 | 10 | controller integration (ADR 0007 Amendment 3); C-09 and C-10 test this amendment's Phase V routing (§A3.2) |
+| K | K-01…K-22 | 22 | `ApprovedChange` authority (ADR 0007 Amendment 3) |
+| G | G-01…G-24 | 24 | private sessions and cleanup (ADR 0004 Amendment 22) |
+| Q | Q-01…Q-45 | 45 | closed typed Git capabilities, filter facts and snapshot, authority, verification order, refusal and interrupt semantics (ADR 0006 Amendment 6) |
+| **Total** | | **228** | |
+
+- **Field-binding inventory:** the 24 canonical fields are dispositioned in ADR
+  0007 Amendment 3. `risk_notes` is covered by D4b's MR3, re-anchored and **not**
+  counted in the 228.
+- **Check:** 18 + 27 + 26 + 18 + 12 + 9 + 17 + 10 + 22 + 24 + 45 = 228.
+  (Historical: 206 before revision 8, with Q at 25; revisions 8–12 added
+  Q-26…Q-45 and re-pointed Q-24 and Q-26, giving 226; revision 13 added C-09
+  and C-10.)
+- **The two new routing variants** (revision 13). A mechanical overlap check
+  against C-04, C-05, R-13, G-09, Q-33 and Q-45 found no existing cover, so
+  nothing was re-pointed or reused:
+  - **C-09:** a Phase V substrate refusal (`FILTER_DRIVER_NAME_UNRENDERABLE` or
+    `FILTER_CONFIGURATION_CHANGED`) mapped to T1 instead of T2. Caught by the
+    parameterized substrate-routing test: the code is
+    `PATCH_UNSUPPORTED_GIT_SUBSTRATE`, with no feedback and no C28.
+  - **C-10:** `GitCapabilityRefused` converted into a `PatchResult`
+    (canonically T2) instead of propagating to T8. Caught by the T8 test: one
+    `TOOL_EXECUTION_FAILED` `ToolCompleted`, then `UNCLASSIFIED_FAILURE`.
+- **Prior-harness reruns: 232 required** (separate from the 228 new D5-C
+  variants).
+  - **The six earlier prior harnesses: 226 reruns.**
+    - They contain 227 recorded entries at `5422046`, every one invalidated by
+      the required `tests/support/fakes.py` migration.
+    - B14 is obsolete, so **226** earlier reruns are required and runnable.
+  - **Plus the 6 mandatory-hotfix entries,** H-1…H-6 (ADR 0006 Amendment 5
+    §A5.6), required by revision 13 Decision 2:
+    - All six run, even where a D5-C mutation covers a related property; prior
+      regression evidence and new D5-C mutation evidence are separate
+      obligations.
+    - None is retired for overlap.
+    - A migrated anchor is re-anchored with its original defect and
+      designated assertion preserved.
+    - The sequence is clean baseline → H-1…H-6 → clean baseline, with
+      assertion-only counting and SHA-256-verified restoration.
+  - **Predicted re-anchors: 23 + up to 6.**
+    - The 23: A14; M14, M15 and M22–M24; S7-M28, M29, M32 and M33; and 13 D4b
+      entries including MR3.
+    - Up to 6 hotfix entries: H-1, H-5 and H-6 to `_enumerate_filter_facts`;
+      H-2, H-3 and H-4 to the migrated entry gate.
+    - That prediction is final only after implementation. Any further anchor
+      miss is classified, never dropped.
+  - **Arithmetic:** 227 − 1 + 6 = 232.
+  - (Historical: 226 before revision 13.)
+- **Machine time:** approximately **12.5–22.5 hours**.
+  - New variants: 228 × 2–4 min, about 7.6–15.2 h.
+  - Prior reruns: 232 × 1.33–1.86 min (revision 12's 5–7 h basis for 226),
+    about 5.1–7.2 h.
+  - (Historical: 12–21 h at 206; 12.5–22 h at 226 with 226 reruns.)
+
+**Planning estimate** (from accepted revisions 12 and 13; low–medium
+confidence; applied to the ledger by the documentation reconciliation accepted
+2026-11-10):
+
+| | Hours |
+|---|---|
+| D5-C only | **178–292** (replacing the provisional 45–80) |
+| Mandatory hotfix (ADR 0006 Amendment 5; landed, planned separately) | **10–18** |
+| D5, combined | **317–519** |
+| Remaining D5–D10 | **480–859** |
+| First operator run | **516–857** |
+| Gate α | **583–992** |
+| Public v1 | **645–1,131** |
+
+**Arithmetic:**
+- **D5-C:** revision 12's 175–286.5, plus revision 13's increment of +3 / +5.5:
+  - routing code +0.5 / +1;
+  - routing tests and the hotfix C4 test migration +1.5 / +2.5;
+  - C-09/C-10 runs and hotfix-harness re-anchoring +0.5 / +1.5;
+  - documentation +0.5 / +0.5.
+
+  That gives 175 + 3 = 178 and 286.5 + 5.5 = 292.
+- **D5, combined:** low 174 − 45 + 178 + 10 = 317; high 289 − 80 + 292 + 18 =
+  519.
+- **Remaining D5–D10:** 337 − 174 + 317 = 480; 629 − 289 + 519 = 859.
+- **First operator run:** 373 − 174 + 317 = 516; 627 − 289 + 519 = 857.
+- **Gate α:** 440 − 174 + 317 = 583; 762 − 289 + 519 = 992.
+- **Public v1:** 502 − 174 + 317 = 645; 901 − 289 + 519 = 1,131.
+- **Cross-check:** 165 + 480 = 645; 272 + 859 = 1,131.
+- **Unchanged:** Gate O 86–140 h and completed D1–D4 165–272 h.
+- (Historical: before revision 13, these combined figures were D5-C
+  175–286.5, D5 314–513.5, remaining 477–853.5, first operator run 513–851.5,
+  Gate α 580–986.5 and public v1 642–1,125.5.)
+
+Revision 12's figures, D5 304–495.5 h and its dependent totals (remaining
+467–835.5, first operator run 503–833.5, Gate α 570–968.5, public v1
+632–1,107.5), were **D5-C-only** implied figures. They excluded the separately
+planned hotfix. Now that the hotfix has landed, combined figures supersede them
+for proposed aggregate planning, and revision 13's figures above are the
+current ones. (Historical: before revisions
+8–12 this table read D5-C 167.5–275 and D5 296.5–484.)
+
+These estimates **have been applied** to `docs/V1_COMPLETION_LEDGER.md` by the
+separate documentation reconciliation, accepted at joint review on 2026-11-10.
+The amendments themselves were also accepted on 2026-11-10. This changes
+documentation status only. It does not mean D5-C is implemented or that D5 is
+Done. (Historical: before that reconciliation this said "These are not applied
+to `docs/V1_COMPLETION_LEDGER.md` until a separate ledger documentation update
+is reviewed", and earlier "until these amendments are accepted and that
+documentation update is separately reviewed". Both were true then.)
+Re-estimation is mandatory after acceptance, if CI's Git disagrees with the
+planning evidence, or if the `patch.py` rewrite exceeds 22 h or the session
+layer exceeds 7 h.
+
+### A3.10 Non-claims and residuals
+
+**Non-claims:**
+- no filesystem atomicity, crash consistency or invisible intermediate writes;
+- no per-file rollback;
+- no weakening detection for allowed test updates (ADR 0007 Amendment 3);
+- no live model and no operator path;
+- no D5 completion, D6, operator-readiness, Gate α, `COMPLETE_FOR_V1` or v1
+  claim;
+- no threat-model conclusion changes.
+
+**Residuals:**
+- the N1, equivalence and scratch evidence is Git 2.54-only until CI;
+- tree-diff equivalence is empirical;
+- the partial-state member may overflow (fails closed);
+- the split-index refusal (ADR 0006 Amendment 6);
+- the A4 same-user race (narrowed by descriptor-relative mutation, not
+  closed);
+- `ApprovedChange` authority is repository-enforced, not a language boundary
+  (ADR 0007 Amendment 3);
+- an abandoned entry retains its private session (ADR 0004 Amendment 22);
+- the pre-existing D3 intermittent test;
+- about 12.5–22.5 h of mutation machine time (228 new variants and 232 prior
+  reruns).
+
+The planning evidence files live in a session scratch directory outside this
+repository. Their hashes identify them, but the implementation tests are the
+authoritative proof.
+
+### A3.11 Contradictions recorded during the draft revisions, and their resolution
+
+1. **Phase V routing of the new refusal classes** (plan contradiction 54).
+   Revisions 8–12 assigned no Phase V route to `FILTER_CONFIGURATION_CHANGED`,
+   `GitCapabilityRefused` or `FILTER_DRIVER_NAME_UNRENDERABLE`. **Resolved** by
+   revision 13 Decision 1 and §A3.2's failure map: the two substrate reasons go
+   to T2, and `GitCapabilityRefused` to T8. (Historical: this item was
+   recorded as open, needing a joint decision.)
+2. **Hotfix harness reruns** (plan contradiction 55). The 226-rerun count
+   predated the hotfix's six-mutation harness. **Resolved** by revision 13
+   Decision 2: prior reruns are 232 (§A3.9). (Historical: this item was
+   recorded as open, needing a joint decision.)
+3. **The hotfix C4 expectation** (plan contradiction 56). Today's hotfix test
+   asserts T1 for a pre-write unrenderable name, while Decision 1 routes it to
+   T2 under D5-C. **Resolved:** the test is migrated, not weakened, and
+   Amendment 5's committed text is unchanged.
+4. **A stale wrapped reference.** The mechanical Amendment 5→6 renumbering
+   missed §A3.3's "ADR 0006 Amendment\n5", because it wrapped across a line. It
+   is corrected above. A whole-file multi-line search found no other instance.
+5. **The test-involvement wording.** The queued correction to ADR 0007
+   Amendment 3 §A3.5 comes from revision 7 §6, not revision 8, and it is already
+   present in that draft. No change was needed.

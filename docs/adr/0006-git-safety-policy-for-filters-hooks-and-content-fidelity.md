@@ -9,6 +9,10 @@ before its commit this read "implemented and locally verified, uncommitted and
 not Linux-CI-confirmed", which was true then.) See "Amendment 5" after
 Amendment 4.
 
+Amendment 6 (ledger D5, slice D5-C: closed, typed Git capabilities for read-only,
+preflight and mutation use, and repository-control files): **Accepted 2026-11-10, after joint review; not implemented.** (Historical:
+Proposed 2026-11-09.) See "Amendment 6" at the end of this document.
+
 Implementation status: **partially implemented.** The shared
 foundation (`src/codeagent/_git_safety.py`) and `workspace.py`'s
 `worktree add` inspect-then-refuse-or-checkout mechanism are
@@ -1789,3 +1793,658 @@ job log (523 lines, SHA-256 `8f0a33447dd648443ad61700118f182db63817a2fde8226c326
 - The mandatory pre-D5-C gate (A5.7) is satisfied.
 - No Gate α, operator-ready or v1 claim is made.
 - T-E1, T-F1 and T-F2 are unchanged.
+
+## Amendment 6 (Accepted 2026-11-10): closed, typed Git capabilities (read-only, preflight, mutation) and repository-control files (D5-C)
+
+Status: **Accepted 2026-11-10, after joint review; not implemented.**
+(Historical: "Proposed (2026-11-09). Not accepted and not implemented.")
+- D5-C is not implemented.
+- D5 stays **In progress, not Done**.
+- D6, operator reachability, Gate α and v1 remain unimplemented and unclaimed.
+
+**Source:** the accepted D5-C plan chain. The governing plan is **revision 12**:
+`/Users/chandrasekhar/code/codeagent-plans/D5_C_transactional_patch_protocol_plan_rev12.md`.
+- Revision 12's accepted-content SHA-256 is
+  `241c11f9b2169a5dba080fbdf82cd90e2c4e115f08ab80a56513678346812566`. The file
+  now hashes `de42aaa199a1fbf200a68623c5405f9f190e2e57a7903607d6a002b55a0b38d8`,
+  because only its status line changed to Accepted.
+- **Order of governance:**
+  - revisions 8–12 govern wherever they supersede revisions 1–7, and each
+    later revision governs the one before it (12 → 11 → 10 → 9 → 8 → 7);
+  - revision 7 governs revision 6, revision 6 governs revision 5, and revision
+    5 governs revision 4, which carries revision 3's design and revision 2's
+    protocol.
+- Revision 7's accepted-content SHA-256 is
+  `4ef87d2d4134fb8fc3fe0a1d522cbec403be4851c667b2f9c4c1c3cf31592adb`, and
+  revision 6's is
+  `0a17f54c6073e46c3d7825dcc8bf540df67d3f08cb93f82266d579963fc2c76b`.
+- **Revision 13** (accepted at joint review 2026-11-10;
+  accepted-content SHA-256 `b39295869f8ed3388acd35b24519c81823de2cb6548738cc0e958a5ef671c744`; the file now
+  hashes `4eb60305bb78a53dd423ef3eb466bca770d46af3ad28f21560f98d23478eba21` after its status-line change)
+  records the 2026-11-10 routing and prior-rerun decisions (ADR 0003
+  Amendment 3 §A3.2 and §A3.9).
+- **The mandatory pre-D5-C hotfix is a satisfied prerequisite, not part of
+  D5-C.** It is ADR 0006 Amendment 5 (Accepted 2026-11-09):
+  - committed as `067fca0767f140a0e1f4a20afbe4b3eeae0a80e8`;
+  - Linux-CI-confirmed in run 42908777385;
+  - its evidence reconciliation is commit
+    `6091f3b0b330c9c2540e11863b449f00cb1f70d9`.
+
+  The gate in Amendment 5 §A5.7 is therefore satisfied. D5-C itself remains
+  **unimplemented**.
+
+**Ownership:** the decision ownership map is ADR 0003 Amendment 3 §A3.1. This
+amendment owns the Git-safety mechanics:
+- the three typed Git capabilities and their operation identifiers (RO-01…RO-21,
+  PF-01…PF-07, W-01…W-12), which are defined **only here**;
+- the internal filter facts, their rendering and canonical snapshot, and the
+  capability authority, verification order and refusal semantics (§A6.2a,
+  §A6.2b), including the new codes `FILTER_CONFIGURATION_CHANGED` and
+  `GitCapabilityRefused`;
+- the `check-ignore` exception;
+- descriptor-relative mutation;
+- repository-control files.
+
+Every other ADR refers to these identifiers without redefining them.
+
+**Read-only and no-execution behaviour comes from closed, typed templates and
+operand validators, not from a subcommand allowlist.** A raw-Git positive control
+showed that allowlisted subcommands write a file (`diff --output`) or execute
+configured helpers: `diff --ext-diff`/`--textconv`, `cat-file
+--filters`/`--textconv`, and `hash-object` without `--no-filters`.
+
+### A6.1 Why a private index and `GIT_OPTIONAL_LOCKS=0` are both needed
+
+| Command (planning probe, Git 2.54.0, stat-dirty index) | Index rewritten with `GIT_OPTIONAL_LOCKS=0`? |
+|---|---|
+| `rev-parse`, `diff --cached --quiet`, `ls-tree`, `check-attr --cached`, `cat-file --batch-check`, `hash-object` without `-w`, `diff --name-only <a> <b>`, `ls-files -s` | no |
+| `status` | no (with optional locks allowed, it does rewrite the index) |
+| `diff --quiet HEAD --` | **yes** |
+| the evidence `diff --binary … <base> --` | **yes** |
+
+- Running porcelain `diff` and `status` against a private copy of the index
+  (`GIT_INDEX_FILE`) gave byte-identical output and left the real index's bytes
+  and mtime unchanged.
+- Plumbing `diff-index --quiet` gives a false "changed" on a stat-dirty index,
+  so it is not used.
+
+### A6.2 `ReadOnlyGit`: the closed catalog
+
+`_git_safety.ReadOnlyGit` is bound to one read-only private session (ADR 0004
+Amendment 22). It has **one method per operation**. No method accepts `*args`,
+`**kwargs`, a raw argv, an option string or an environment mapping.
+
+Each method:
+1. validates its typed operands (§A6.3);
+2. builds the argv from a module-private **constant template**;
+3. calls `_check_template(op, argv)`, which requires token-for-token equality
+   with the template, each operand slot holding a validated value. Anything else
+   is refused with `ValueError` (fixed text) **before launch**;
+4. launches with `BASELINE_ARGS`, `git_environment()`, `GIT_OPTIONAL_LOCKS=0`
+   and the session's private `GIT_INDEX_FILE`;
+5. enforces its exit-code set and output bound. Any other exit code is a
+   `GitSafetyError`.
+
+Unknown options are refused even where Git would accept them. There is **no
+denylist layer**: forbidden forms are unrepresentable and refused by exact
+matching.
+
+**Notation:**
+- `⟨neut⟩` is the filter neutralization **rendered internally** by the
+  capability from its verified private facts, at every launch (§A6.2a). No
+  public method accepts a neutralization, an argv, an option or a driver set.
+  (Historical: before revision 8 this notation was a caller-supplied typed `N`
+  operand, which revision 8 withdrew.)
+- `--literal-pathspecs` applies to every operation except RO-20.
+- Users: **V** = Phase V; **G** = the entry gate; **E** = evidence (terminal
+  and recreation Phase E).
+
+| ID | Method | Exact template (after the baseline) | Operands | Exit codes | Bound | Users |
+|---|---|---|---|---|---|---|
+| RO-01 | `object_format()` | `rev-parse --show-object-format` | — | 0 | 16 B; value ∈ {`sha1`, `sha256`} | V |
+| RO-02 | `shared_index_path()` | `rev-parse --shared-index-path` | — | 0 | 4 KiB; must be empty, else T2 | V, G, E |
+| RO-03 | `resolve_head()` | `rev-parse --verify --quiet HEAD^{commit}` | — | 0, 1 | 128 B; one OID | V, G |
+| RO-04 | `verify_commit(oid)` | `rev-parse --verify --quiet <oid>^{commit}` | `oid` | 0, 1 | 128 B | V, E |
+| RO-05 | `staged_clean()` | `diff --cached --quiet HEAD --` | — | 0 (clean), 1 (dirty) | 0 B | V, G |
+| RO-06 | `tree_clean()` | `⟨neut⟩ diff --quiet HEAD --` (neutralization added, revision 8) | — | 0, 1 | 0 B | G |
+| RO-07 | `status_porcelain()` | `⟨neut⟩ status --porcelain=v1 -z --untracked-files=all` | — | 0 | `MAX_STATUS_BYTES` | G, E |
+| RO-08 | **no public method** | `config -z --get-regexp ^filter\.`, run only by an opener (enumeration) and by the freshness guard (§A6.2b) | — | 0, 1 | the existing filter-enumeration bounds | internal |
+| RO-09 | `staged_entry(path)` | `ls-files --stage -z -- <path>` | `path` | 0 | 4 KiB | V |
+| RO-10 | `staged_listing()` | `ls-files --stage -z` | — | 0 | `MAX_STAGE_LISTING_BYTES` | V |
+| RO-11 | `tracked_paths()` | `ls-files -z` | — | 0 | the existing bound | V |
+| RO-12 | `tree_entry(oid, path)` | `ls-tree -z <oid> -- <path>` | `oid`, `path` | 0 | 4 KiB | V |
+| RO-13 | `tree_children(oid, parent)` | `ls-tree -z <oid> -- <parent>/`, or `ls-tree -z <oid>` for the root | `oid`, `parent` | 0 | 1 MiB | V |
+| RO-14 | `classify_attributes(cached, attrs, paths)` | `check-attr [--cached] -z --stdin <a1> … <ak>`; `cached` selects one of two fixed templates; records are classified internally against the capability's verified driver set (§A6.2b) | `cached`, `attrs`, stdin `paths` | 0 | the existing bound | V, G |
+| RO-15 | `batch_check(oids)` | `cat-file --batch-check=<the exact existing format string>` | stdin `oids` | 0 | `MAX_BATCH_CHECK_OUTPUT_BYTES` | V |
+| RO-16 | `object_type(oid)` | `cat-file -t <oid>` | `oid` | 0 | 32 B | V |
+| RO-17 | `object_size(oid)` | `cat-file -s <oid>` | `oid` | 0 | 32 B | V |
+| RO-18 | `object_bytes(oid, expected_type)` | `cat-file <type> <oid>`, with `<type>` ∈ {`blob`, `commit`, `tree`} from the typed enum (replaces today's `cat-file -p`) | `oid`, `expected_type` | 0 | `MAX_PATCH_BLOB_BYTES`, `MAX_COMMIT_OBJECT_BYTES`, or 1 MiB for a tree | V |
+| RO-19 | `hash_no_filters(data)` | `hash-object --no-filters --stdin` | `data`: stdin bytes | 0 | 128 B; one OID | V |
+| RO-20 | `check_ignore(paths)` | `check-ignore --no-index --stdin -z -v -n` (§A6.6) | stdin `paths` | 0, 1 | 1 MiB | V |
+| RO-21 | `evidence_diff(base)` | `⟨neut⟩ diff --binary --full-index --find-renames --no-ext-diff --no-textconv <base> --` | `base` | 0 | bounded preview, `MAX_DIFF_BYTES` | E |
+
+**Excluded from `ReadOnlyGit`:**
+- every write subcommand (`add`, `update-index`, `read-tree`, `write-tree`,
+  `commit`, `checkout`, `worktree`, `update-ref`, `hash-object -w`);
+- `diff-index`, `diff-tree` and `for-each-ref`;
+- every option not in a template.
+
+### A6.2a Internal filter facts, rendering and the canonical snapshot (revisions 8–9)
+
+**No neutralization crosses a public boundary.** Neutralization is enumerated
+and rendered entirely inside the capability. No `ReadOnlyGit`, `PreflightGit`
+or `MutationGit` method accepts an `N` operand, a `FilterNeutralization`
+object, an argv or a driver set.
+- **Why:** revision 8 showed that a publicly constructible
+  `FilterNeutralization` with caller-supplied `args` passes an exact-type check
+  yet carries forged `-c` pairs: a helper ran through `core.fsmonitor`, a hook
+  through `core.hooksPath`, and an untracked file vanished from status through
+  `core.excludesFile`.
+- **Retirement:** the public `FilterNeutralization` handoff is retired in
+  D5-C. No production module imports it (AST pin), and its current consumers
+  migrate to the capabilities. `enumerate_filter_neutralization` becomes the
+  private `_enumerate_filter_facts`.
+
+**`_FilterFacts`** is module-private in `_git_safety`, never exported or
+returned, and immutable:
+- `drivers`: a tuple of `(name: str, subkeys: tuple[str, ...])`, sorted by the
+  `surrogateescape` UTF-8 bytes of `name`;
+- each `subkeys` is a strictly ordered subset of `("clean", "smudge",
+  "process")`, holding exactly the configured subkeys;
+- it stores **no argv**;
+- `driver_names` is derived on demand as a `frozenset`.
+
+**Validation at parse:**
+- the existing bounds: `MAX_FILTER_DRIVERS`, `MAX_FILTER_DRIVER_NAME_BYTES`
+  and `MAX_FILTER_ARGV_BYTES`;
+- the existing passthrough check (`_verify_fixed_cat_path`) when any `clean`
+  or `smudge` is configured;
+- a driver name containing `=` is refused with
+  `GitSafetyFailure.FILTER_DRIVER_NAME_UNRENDERABLE`. That code is **defined
+  and implemented by Amendment 5** (the hotfix). D5-C **reuses** it and does
+  not redefine it. There is still no environment-variable route.
+
+**Rendering.** `_render_neutralization(facts)` exists only inside
+`_git_safety`. It emits exactly one `-c filter.<name>.<subkey>=<value>` pair
+per configured `(name, subkey)`:
+- **order:** facts order, then `clean`, `smudge`, `process`;
+- **values:** `FIXED_CAT_PATH` for `clean` and `smudge`; an empty string for
+  `process`;
+- no other pair.
+
+The tokens are recomputed at **every** launch and never stored.
+
+**Canonical registry snapshot** (revision 9). At capability opening, a
+separate snapshot is built from the validated facts:
+```
+snapshot: tuple[tuple[str, tuple[str, ...]], ...]
+  = tuple([ (name, tuple(list(subkeys_in_fixed_order))) for name in names_sorted ])
+```
+- **Names:** ascending by `name.encode("utf-8", "surrogateescape")`, as raw
+  bytes. That is neither code-point order nor locale order.
+- **Subkeys:** in the fixed order `("clean", "smudge", "process")`, restricted
+  to those configured.
+- **Separate tuples:** every non-empty tuple is constructed anew from a list,
+  so none is shared with `_FilterFacts`. In CPython, `tuple(t)` returns `t`
+  itself for an exact tuple.
+- **No identity reliance:** the empty tuple `()` is a shared singleton, and
+  equal `str` values may share an object. Correctness relies on **exact-type
+  validation and value equality only**, never on string or empty-tuple object
+  identity. This is a disclosed deviation from "every string and tuple
+  copied".
+- **No hash or digest:** the record stores the snapshot tuple itself, never the
+  `_FilterFacts` object.
+
+**`_canonical_snapshot(facts)`** rebuilds the tuple from the capability's
+**current** `_facts`, first validating exact types:
+- `type(facts) is _FilterFacts`;
+- each `drivers` entry is an exact `tuple` of length 2;
+- each name has `type(name) is str` (a `str` subclass is refused);
+- each subkey is an exact `str` from the closed set, in fixed order, without
+  duplicates;
+- names are strictly increasing by `surrogateescape` UTF-8 bytes.
+
+A violation is reported as a status and becomes the fixed refusal (§A6.2b).
+
+**What the snapshot detects:**
+- a replaced or in-place-mutated `_facts`;
+- a changed name or subkey;
+- reordering;
+- an added or removed entry;
+- a `list` or `str`-subclass substitution.
+
+An equal-content replacement passes, because it renders identical tokens.
+
+### A6.2b Capability authority, verification order and refusal semantics (revisions 8, 10, 11, 12)
+
+**Opener-bound construction.** A capability is constructed only through its
+opener:
+- `ReadOnlyGit.open(session)`;
+- `ro.open_preflight(preflight_session)`, which hands its verified facts
+  privately to the new capability, with no re-enumeration and no public
+  handoff;
+- `MutationGit.open(...)`, after the mutation boundary.
+
+Each class:
+- requires a module-private construction token in `__init__`;
+- uses `__slots__`, including `__weakref__`;
+- refuses `copy`, `deepcopy`, `pickle`, `dataclasses.replace` and attribute
+  assignment;
+- defines no `__eq__` or `__hash__`, so it compares by identity.
+
+**Enumeration and registration, once, at the opener.**
+1. The opener runs RO-08 internally against the session's bound repository and
+   worktree.
+2. It builds `_FilterFacts` and the canonical snapshot.
+3. It registers the capability in the module-private `WeakKeyDictionary`
+   `_CAPABILITIES`, with the record `(session, repository identity (canonical
+   common directory and admin id), snapshot)`.
+
+**Before every launch**, every public operation runs these steps in this order
+(revision 10):
+1. **Type and token.** Require `type(self) is` the class (subclasses are
+   refused), and that the token, read by a guarded read, `is` the module token.
+2. **Registry lookup:** `record = _CAPABILITIES.get(self)`. This is an
+   identity lookup that works on any instance, including an uninitialized one.
+3. **No record means refusal**, before any record field or other slot is read
+   and before any Git launch.
+4. **Session and repository**, through guarded reads:
+   - `record.session is` the capability's session;
+   - that session is open;
+   - its bound repository identity equals `record.repository`.
+
+   This refuses cross-session and cross-repository reuse.
+5. **Rebuild** `_canonical_snapshot(self._facts)`, reading `_facts` by the
+   guarded read, with every validation in §A6.2a.
+6. **Exact equality** with `record.snapshot`.
+7. **Freshness**, for a filter-relevant operation (RO-06, RO-07, RO-21,
+   PF-07):
+   - the internal RO-08 re-read must give canonical facts equal to the verified
+     snapshot, or the operation is refused with the new
+     `GitSafetyFailure.FILTER_CONFIGURATION_CHANGED`;
+   - this narrows, and does not remove, this ADR's accepted
+     enumerate-then-run race.
+8. **Render and launch:** render `⟨neut⟩` from the verified current facts, and
+   launch the exact template.
+
+**Shared facts and classification:**
+- Every consumer within one owned operation uses the same verified facts:
+  - Phase V's classification and preflight diff;
+  - the entry gate's classification, RO-06 and RO-07;
+  - evidence's RO-07 and RO-21.
+- `classify_attributes` (RO-14) classifies internally against that verified
+  driver set. An AST pin shows that no production code outside `_git_safety`
+  passes `configured_driver_names`.
+- `MutationGit` keeps this ADR's existing rule: a fresh internal enumeration
+  immediately before each filter-relevant Phase M/C step. It also never
+  accepts caller-supplied neutralization.
+
+**Refusal exception contract** (revision 11):
+1. **Guarded reads return a status.**
+   - The guarded-slot reader reads through the module-private indirection
+     `_slot_get = object.__getattribute__`.
+   - It catches **only** `AttributeError` (`except AttributeError:`, with no
+     `as`), and the handler only returns the private sentinel `_MISSING`.
+   - It is used for the token, the session slot and `_facts`.
+2. **No refusal inside a handler.** No refusal is constructed, raised or
+   referenced inside any `except`, `finally` or `__exit__` body, and no caught
+   exception is bound to a name that outlives its handler.
+3. **Raised plainly, after the handler.** Each step tests its local status
+   after the handler has exited and raises `GitCapabilityRefused` with the one
+   fixed message, never `from None` or `from exc`.
+4. **What the refusal carries:**
+   - exact type `GitCapabilityRefused` (which defines no state-storing
+     `__init__`);
+   - `args == (<fixed message>,)`;
+   - `__cause__ is None` and `__context__ is None`;
+   - an empty `__dict__`;
+   - no path, configuration, session data or internal-exception text.
+5. **Ordinary branches, not exceptions:** registry absence (step 3) and
+   `_canonical_snapshot` validation failures.
+6. **Caller caveat:** a caller that invokes a capability from inside its own
+   `except` block will see its own in-flight exception chained implicitly.
+   That is the caller's exception, never the capability's caught failure.
+
+**Interrupt propagation** (revision 12):
+- `KeyboardInterrupt`, `SystemExit` and any direct non-`Exception`
+  `BaseException` raised during a guarded read propagate **by exact identity**,
+  unconverted, under ADR 0005 Amendment 1.
+- Any other `Exception` from a guarded read is not converted to a refusal
+  either: it propagates as a defect.
+
+**Substrate failures versus authority refusals.** This amendment classifies
+the low-level failures; ADR 0003 Amendment 3 §A3.2 owns how Phase V routes
+them.
+- **Substrate failures** are `GitSafetyError` reasons that describe an unusable
+  or unstable Git substrate. They are `FILTER_DRIVER_NAME_UNRENDERABLE`
+  (Amendment 5) and `FILTER_CONFIGURATION_CHANGED` (this amendment), alongside
+  the existing substrate reasons. In Phase V they become
+  `PATCH_UNSUPPORTED_GIT_SUBSTRATE` (T2).
+  - This supersedes, for D5-C, Amendment 5's C4 pre-write mapping to
+    `PATCH_VALIDATION_FAILED`. Amendment 5's committed text is unchanged.
+- **`GitCapabilityRefused` is an internal authority refusal, not a substrate
+  failure.**
+  - It is not a `GitSafetyError` subclass.
+  - The capability layer never translates it, and no handler that translates
+    `GitSafetyError` may catch it.
+  - It propagates as an unexpected internal exception (T8).
+
+**Authority limit.** This is **repository-enforced authority, not a
+Python-language security boundary.** A deliberate actor that mutates the
+private registry **and** its record, or imports the private token, can bypass
+it. The defences are:
+- private names;
+- AST pins: no `src` access to `_CAPABILITIES`, the token or the record
+  outside `_git_safety`, and no production import of `FilterNeutralization`;
+- review.
+
+### A6.3 Operand validators
+
+| Operand | Accepts | Refuses |
+|---|---|---|
+| `oid` | exactly 40 or 64 lowercase hex characters, matching the session's object format | everything else, including a leading `-` and ref names |
+| `path` | the static path rules of ADR 0007 Amendment 3 §A3.1, including the 255-byte component rule; always passed after `--` | an empty string, absolute, `..`, controls, NUL, backslash, `.git`/`git~1` |
+| `parent` | a static-valid path, or the explicit root sentinel | — |
+| `attrs` | a non-empty sorted tuple from {`crlf`, `eol`, `filter`, `ident`, `text`, `working-tree-encoding`} | — |
+| `data` | `type is bytes`, ≤ `MAX_PATCH_BLOB_BYTES` | — |
+| `expected_type` | the `ObjectType` enum | — |
+| `cached` | `type is bool` | — |
+
+Stdin path and OID collections are static-valid, NUL- or newline-terminated as
+the template requires, and capped by the existing chunk and byte bounds.
+
+### A6.4 Forbidden-form contract
+
+Every form below is unrepresentable through the public methods, **and**
+`_check_template` refuses its argv before launch.
+
+| Family | Forbidden (non-exhaustive; anything outside a template is refused) |
+|---|---|
+| `diff` (RO-05, RO-06, RO-21) | `--output`, `--output=<f>`, `--ext-diff`, `--textconv`, `--no-index`, `--color*`, `--word-diff*`, `--relative`, `--src-prefix`/`--dst-prefix`, extra commits or pathspecs, any other option |
+| `cat-file` (RO-15–RO-18) | `--filters`, `--textconv`, `--batch`, `--batch-command`, `--batch-all-objects`, `--path=…`, `-p`, `-e`, a different format string, any other option |
+| `hash-object` (RO-19) | `-w`, the default filtering form (no `--no-filters`), `--path=…`, `--stdin-paths`, `--literally`, `-t`, any pathname operand, any other option |
+| `status` (RO-07) | `--ignored*`, `--porcelain=v2`, `-uno`, `--branch`, `--column`, any pathspec, any other option |
+| `ls-tree`, `ls-files`, `check-attr`, `rev-parse`, `config` | any option or operand not in the template (for example `ls-files --others`, `ls-tree -r`, `check-attr --all`, `config --show-origin` or any write form, `rev-parse --git-path`) |
+| `check-ignore` (RO-20) | every form except the single exact template |
+| Global | any `-c` pair other than the internally rendered `⟨neut⟩` (§A6.2a); any neutralization, argv, option or driver set passed by a caller; `-C`, `--git-dir`, `--work-tree`, `--namespace`, `--exec-path`; any environment override beyond the fixed set |
+
+### A6.5 Entry-gate and evidence migration (D-17b)
+
+`workspace.entry_gate` uses RO-02, RO-03, RO-05, RO-06, RO-07 and RO-14
+(`classify_attributes`). `evidence.py` uses RO-02, RO-07 and RO-21, for terminal
+and recreation Phase E evidence alike. RO-08 runs only internally, at the
+opener and in the freshness guard (§A6.2b).
+- **Already landed in today's code:** Amendment 5 already neutralizes today's
+  entry-gate `diff --quiet HEAD --` and `status` and refuses unrenderable
+  driver names. D5-C replaces that mechanism with the capability path; it does
+  not add the protection for the first time.
+- Each uses its own private session (ADR 0004 Amendment 22).
+- The evidence command and its flags are unchanged.
+- This removes the stat-cache rewrite described in ADR 0003 Amendment 3 §A3.7.
+- When no owned admin directory exists, there is **no fallback** to global
+  temporary storage. The entry gate fails with its existing code, and evidence
+  fails as `EVIDENCE_CAPTURE_FAILED`.
+
+### A6.6 The `check-ignore` exception (RO-20)
+
+`git check-ignore` refuses to run under `--literal-pathspecs` and
+`GIT_LITERAL_PATHSPECS=1`, whether paths come from argv or `--stdin`. Without
+them, pathspec magic in its input is live: `:(icase)…` was parsed and fatal. A
+`./` prefix makes `:(icase)` and `:(top)` literal file names.
+
+**RO-20 is the single exception.**
+- **Invocation:** run with `--no-literal-pathspecs` and `GIT_LITERAL_PATHSPECS`
+  unset, exactly as `check-ignore --no-index --stdin -z -v -n`.
+- **Input:** every path written as `./<path>`, after static validation.
+- **Use:** only the ignored-target refusal (ADR 0003 Amendment 3 §A3.3).
+
+### A6.7 `PreflightGit`: the exact-preflight capability
+
+This is a distinct class, constructible only from a **preflight** private
+session. Its own environment builder sets:
+- `GIT_OBJECT_DIRECTORY=<session>/objects`;
+- `GIT_ALTERNATE_OBJECT_DIRECTORIES=<trusted common dir>/objects` (used
+  read-only);
+- `GIT_INDEX_FILE=<session>/pindex`;
+- `GIT_OPTIONAL_LOCKS=0`.
+
+It runs in the worktree, so the repository's config and attributes apply. The
+discipline (one method per operation, `_check_template`, validators, exit codes)
+is the same as `ReadOnlyGit`'s.
+
+| ID | Template | Operands |
+|---|---|---|
+| PF-01 | `read-tree <oid>` | `oid` |
+| PF-02 | `hash-object -w --no-filters --stdin` | `data` |
+| PF-03 | `update-index --add --cacheinfo <mode>,<oid>,<path>` | `mode` ∈ {100644, 100755}, `oid`, `path` |
+| PF-04 | `update-index --cacheinfo <mode>,<oid>,<path>` | as PF-03 |
+| PF-05 | `update-index --force-remove -- <path>` | `path` |
+| PF-06 | `write-tree` | — |
+| PF-07 | `⟨neut⟩ diff --binary --full-index --find-renames --no-ext-diff --no-textconv <base> <tree> --` (`preflight_diff(base, tree)`) | `base`, `tree`; read bounded to `MAX_DIFF_BYTES + 1`; facts handed privately from the opening `ReadOnlyGit` (§A6.2b) |
+
+`git_environment()` still strips these variables for every other capability.
+
+### A6.8 `MutationGit`: the Phase M/C capability
+
+Reachable only after the mutation boundary (ADR 0003 Amendment 3 §A3.2), with
+the full baseline and the same template discipline:
+
+| ID | Template |
+|---|---|
+| W-01 | `hash-object -w --no-filters --stdin` (stdin bytes through a bounded bytes runner; never text mode) |
+| W-02 | `update-index --add --cacheinfo <mode>,<oid>,<path>` |
+| W-03 | `update-index --cacheinfo <mode>,<oid>,<path>` |
+| W-04 | `update-index --force-remove -- <path>` |
+| W-05 | `diff --cached --name-status -z --no-renames HEAD --` (bounded) |
+| W-06 | `diff --cached --no-color --no-ext-diff --no-textconv HEAD --` (for `diff_bytes`; bounded) |
+| W-07 | `write-tree` |
+| W-08 | the existing `commit` identity form |
+| W-09 | `rev-parse --verify --quiet HEAD^{commit}` |
+| W-10 | `diff-tree -r -z --no-renames <parent> <new>` (bounded) |
+| W-11 | `ls-tree -z <oid> -- <path>` (bounded) |
+| W-12 | `cat-file <type> <oid>` (bounded) |
+
+The filter re-check runs before W-07 and before W-08, for every path of the
+proposal. Each filter-relevant Phase M/C step uses a fresh internal enumeration,
+never caller-supplied neutralization (§A6.2b).
+
+### A6.9 Capability and session-type separation
+
+- `ReadOnlyGit`, `PreflightGit` and `MutationGit` are distinct classes. Each
+  accepts only its own session type.
+- **`ReadOnlyGit`** has no template containing `-w`, `update-index`,
+  `read-tree` or `write-tree`, and its environment never contains
+  `GIT_OBJECT_DIRECTORY`.
+- **Phase V** receives only a `ReadOnlyGit` and a `PreflightGit`. AST pins show
+  that Phase V and the entry gate call only `ReadOnlyGit` methods, the preflight
+  calls only `PreflightGit` methods, and Phase M/C calls only `MutationGit`
+  methods.
+
+### A6.10 Descriptor-relative filesystem mutation
+
+`patch._validate_path`'s pathname-based `Path.resolve()`/`is_symlink()` checks
+are replaced by descriptor-relative walks with `O_NOFOLLOW` at every component:
+- writes use `openat` with `O_CREAT|O_EXCL|O_NOFOLLOW` (an `add` or rename
+  `to`) or `O_WRONLY|O_TRUNC|O_NOFOLLOW` (an `update`);
+- each write is re-read through the same descriptor;
+- deletion uses `unlinkat`, and emptied parents are removed with
+  `unlinkat(AT_REMOVEDIR)`, bottom-up, never the root.
+
+A race after the boundary is `PATCH_APPLICATION_FAILED`. The A4 same-user race
+is narrowed, not closed.
+
+### A6.11 Repository-control files
+
+For every operation kind, and both rename paths, any path component equal to
+`.gitattributes`, `.gitignore` or `.gitmodules` after HFS-ignorable stripping
+and casefolding is refused.
+- **`.gitattributes`:** the existing refusal (Amendment 3) is kept and extended.
+- **`.gitignore`:** an edit could change another target's ignored status, while
+  the check reads the pre-proposal state.
+- **`.gitmodules`:** submodule configuration.
+
+`.git` and `git~1` remain denied by name. ADR 0007 Amendment 3 enforces this
+set statically at `propose_plan` (`CONTROL_PATH`); the applier repeats it.
+
+### A6.12 Configuration not pinned (recorded)
+
+`BASELINE_ARGS` pins no diff-formatting configuration (`diff.context`,
+`diff.noprefix`, `diff.algorithm`, `diff.renames`, `core.quotePath`,
+`core.bigFileThreshold`), and attributes can change diff output. This amendment
+does not pin them. ADR 0003 Amendment 3's exact preflight measures under the
+repository's own configuration.
+
+### A6.13 Tests and mutation obligations
+
+**Planning positive controls** (Git 2.54.0, hostile config;
+`ro_controls.out`, SHA-256
+`2584705b9912e0653cd4c3c4a77762a681de76259206303c696865376569c4b6`): every
+hazard named above created its sentinel, and `hash-object --no-filters --stdin`
+did not. Attribution per command is left to the required tests.
+
+**Required tests:**
+- **`test_raw_git_positive_controls`:** one sentinel per command.
+- **`test_readonly_refuses_dangerous_form[...]`:** at least one case per §A6.4
+  family. Each asserts, through the assertion-raising helper:
+  - the refusal before launch;
+  - a launch count of 0;
+  - no sentinel;
+  - the real index bytes and mtime, the object listing, the refs, the worktree
+    bytes, `lifecycle.json` and the admin entries unchanged.
+- **`test_readonly_public_api_cannot_express_extra_tokens`:** no method has a
+  var-positional or var-keyword parameter, or any argv, option or environment
+  parameter.
+- **`test_every_template_allowed_under_hostile_config`:** RO-01…RO-21 and
+  PF-01…PF-07 each run on a repository with the hostile config, with no
+  sentinel.
+- **`test_template_near_misses_refused`:** generated mechanically for every
+  template:
+  - each forbidden token inserted at every position;
+  - each fixed token removed;
+  - each fixed token replaced by a near spelling;
+  - adjacent fixed tokens swapped;
+  - an operand moved before `--`.
+
+  Each variant must be refused with a launch count of 0.
+- **`test_operand_validators[...]`** and **`test_exit_codes[...]`**.
+- **`test_readonly_and_preflight_capabilities_are_disjoint`**, with the
+  capability AST pins.
+- **The read-only proof suite**, run through the typed methods: for every Phase
+  V operation, on a stat-dirty index, the real state is unchanged.
+- The split-index refusal, the `check-ignore` neutralization, entry-gate and
+  evidence migration with no fallback, descriptor-relative race refusals, and
+  control-file refusals at depth 1 and 3 with HFS and casefold variants.
+
+**Revision 8 tests (internal enumeration and authority):**
+- `test_forged_neutralization_accepted_by_type_only_check`: a negative control
+  through a test-only reconstruction of the withdrawn type-only check;
+- `test_capability_has_no_neutralization_operand`;
+- `test_enumerated_facts_work` (a launcher spy: the `-c` section equals the
+  canonical rendering);
+- `test_rendering_exact[...]`;
+- `test_unrenderable_driver_name_refused`;
+- `test_capability_reuse_refused[cross-session|cross-repository]`;
+- `test_capability_copy_refused`;
+- `test_capability_tampering_detected`;
+- `test_filter_config_changed_after_open_refused`;
+- `test_classification_uses_session_facts`;
+- `test_tree_clean_neutralizes_filters`.
+
+**Revision 9 tests (snapshot):**
+- `test_capability_tampering_detected`, extended with alias,
+  mutated-in-place, name-changed, entry-removed, reordered, `list`-substitution
+  and `str`-subclass cases;
+- `test_registry_snapshot_canonical_order` (`é` versus the
+  `surrogateescape` byte name `\udc80`, and every subkey combination);
+- `test_equal_replacement_facts_accepted`.
+
+**Revision 10 tests (verification order):**
+- `test_unregistered_capability_clone_refused`: an `object.__new__` clone
+  carrying copied fields **and** the token is unregistered and refused, with
+  zero launches and unchanged state;
+- `test_uninitialized_capability_refused`: a completely uninitialized
+  instance is refused at step 1, with no incidental `AttributeError`.
+
+**Revision 11 tests (clean refusals):** each asserts, through
+`_assert_clean_refusal`, the exact type and message, `__cause__ is None`,
+`__context__ is None`, an empty `__dict__`, no sentinel reachable, zero Git
+launches and unchanged state:
+- `test_refusal_clean_uninitialized_missing_token`;
+- `test_refusal_clean_registered_missing_facts`;
+- `test_refusal_clean_guarded_read_sentinel`.
+
+**Revision 12 test (interrupt propagation):**
+`test_base_exceptions_propagate_unconverted`:
+- runs over preconstructed `KeyboardInterrupt()`, `SystemExit(3)` and a
+  test-local direct `BaseException` subclass, with `_slot_get` patched to
+  raise the exact instance;
+- the test catches `BaseException` itself, so pytest is never interrupted;
+- it asserts identity, no conversion, zero launches, no sentinel and
+  unchanged state.
+
+Every refusal test captures outcomes as values and asserts with plain `assert`
+(the assertion-raising helper). A mutation kill counts only as an
+`AssertionError` in a pytest session that ends normally with exit code 1.
+
+**Mutation groups owned here:**
+- **R** (12): R-01…R-11 and R-13.
+  - R-11 is re-pointed to "a write template added to `ReadOnlyGit`".
+  - R-12 is retired, because it is the same defect as Q-08.
+- **Q** (45):
+  - Q-01: subcommand-only fallback;
+  - Q-02…Q-04: `diff` `--output=`, `--ext-diff`, `--textconv`;
+  - Q-05: `cat-file --filters`;
+  - Q-06…Q-08: `hash-object` filtering form, `--path=`, `-w`;
+  - Q-09: a preflight write routed through `ReadOnlyGit`;
+  - Q-10…Q-22: an operand validator omitted, one per operand-bearing operation
+    (RO-04, RO-07, RO-09, RO-12, RO-13, RO-14, RO-15, RO-16, RO-17, RO-18,
+    RO-19, RO-20, RO-21);
+  - Q-23: an unlisted exit code accepted;
+  - Q-24 (re-pointed, revision 8): a capability accepts an externally
+    supplied `FilterNeutralization` (a directly constructed typed object);
+  - Q-25: `GIT_OBJECT_DIRECTORY` passed to `ReadOnlyGit`;
+  - Q-26 (re-pointed, revision 9): the snapshot comparison skipped;
+  - Q-27: the session-identity check removed;
+  - Q-28: the repository-identity check removed;
+  - Q-29: the rendered argv cached at the opener and reused;
+  - Q-30: the renderer omits the `process` subkey;
+  - Q-31: the renderer permits an extra `-c` pair;
+  - Q-32: `classify_attributes` uses a fresh enumeration instead of the session
+    facts;
+  - Q-33: the opener's `=` refusal removed;
+  - Q-34: the freshness guard removed;
+  - Q-35: RO-06 rendered without neutralization;
+  - Q-36: canonical name order not enforced;
+  - Q-37: the capability's `__copy__` refusal removed;
+  - Q-38: the record stores `_FilterFacts` by alias;
+  - Q-39: the comparison checks only object identity;
+  - Q-40: the recorded snapshot omits the last driver name;
+  - Q-41: the recorded snapshot omits the `process` subkey;
+  - Q-42: the snapshot sorts by code point, not `surrogateescape` bytes (locale
+    order is the same defect class and is not counted separately);
+  - Q-43 (revision 10): identity-registry authority bypassed, so an
+    unregistered capability is accepted;
+  - Q-44 (revision 11): the refusal is raised inside the guarded reader's
+    `except` block, or the caught exception is attached;
+  - Q-45 (revision 12): the guarded reader's handler is widened from
+    `except AttributeError:` to `except BaseException:`.
+
+The session, repository and snapshot checks are separate mutations (Q-27,
+Q-28, Q-26).
+
+Both groups are counted once in ADR 0003 Amendment 3 §A3.9's **228**.
+(Historical: before revisions 8–12 this read 206, with Q at 25; before revision
+13 it read 226.)
+
+### A6.14 Non-claims
+
+- No change to the evidence command's flags.
+- No pinning of diff configuration.
+- No claim that descriptor-relative mutation closes the A4 same-user race.
+- No claim that a subcommand allowlist alone gives read-only behaviour.
+- No Python-language security boundary: capability authority is
+  repository-enforced (§A6.2b).
+- No redefinition of `FILTER_DRIVER_NAME_UNRENDERABLE`, which Amendment 5
+  owns.
+- No implementation. Amendment 5's hotfix is implemented and
+  Linux-CI-confirmed; D5-C is not.

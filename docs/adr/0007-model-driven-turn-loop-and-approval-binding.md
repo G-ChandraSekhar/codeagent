@@ -36,6 +36,10 @@ committed as `ba653b7`, and confirmed on GitHub-hosted Linux CI (run
 said "implemented and locally verified on macOS; unstaged, uncommitted and not
 Linux-CI-confirmed"; at acceptance it said "not implemented".)
 
+Amendment 3 (ledger D5, slice D5-C: four-operation proposals, v2 digests, the
+patch policy and `ApprovedChange` authority): **Accepted 2026-11-10, after joint review; not implemented.** (Historical:
+Proposed 2026-11-09.) See "Amendment 3" at the end of this ADR.
+
 ## Context
 
 Before D4b, `RunController` asked a two-method fake model for one read path,
@@ -780,3 +784,425 @@ mutation B13; this amendment adds no mutation category.
 No D5 completion, four-operation protocol, live model, provider adapter,
 operator path, Gate α, operator-ready, `COMPLETE_FOR_V1` or v1 claim, and no
 threat-model change.
+
+## Amendment 3 (Accepted 2026-11-10): four-operation proposals, v2 digests, the patch policy and `ApprovedChange` authority (D5-C)
+
+Status: **Accepted 2026-11-10, after joint review; not implemented.**
+(Historical: "Proposed (2026-11-09). Not accepted and not implemented.")
+- D5-C is not implemented.
+- D5 stays **In progress, not Done**.
+- D6, operator reachability, Gate α and v1 remain unimplemented and unclaimed.
+
+**Source:** the accepted D5-C plan chain. The governing plan is **revision 12**:
+`/Users/chandrasekhar/code/codeagent-plans/D5_C_transactional_patch_protocol_plan_rev12.md`.
+- Revision 12's accepted-content SHA-256 is
+  `241c11f9b2169a5dba080fbdf82cd90e2c4e115f08ab80a56513678346812566`. The file
+  now hashes `de42aaa199a1fbf200a68623c5405f9f190e2e57a7903607d6a002b55a0b38d8`,
+  because only its status line changed to Accepted.
+- **Order of governance:**
+  - revisions 8–12 govern wherever they supersede revisions 1–7, each later
+    revision governing the one before it;
+  - revision 7 governs revision 6, revision 6 governs revision 5, and revision
+    5 governs revision 4, which carries revision 3's design and revision 2's
+    protocol.
+- Revision 7's accepted-content SHA-256 is
+  `4ef87d2d4134fb8fc3fe0a1d522cbec403be4851c667b2f9c4c1c3cf31592adb`, and
+  revision 6's is
+  `0a17f54c6073e46c3d7825dcc8bf540df67d3f08cb93f82266d579963fc2c76b`.
+- **Revision 13** (accepted at joint review 2026-11-10;
+  accepted-content SHA-256 `b39295869f8ed3388acd35b24519c81823de2cb6548738cc0e958a5ef671c744`; the file now
+  hashes `4eb60305bb78a53dd423ef3eb466bca770d46af3ad28f21560f98d23478eba21` after its status-line change)
+  records the 2026-11-10 decisions on Phase V routing and on the hotfix harness
+  as a prior rerun (ADR 0003 Amendment 3 §A3.2 and §A3.9).
+- **The mandatory pre-D5-C hotfix prerequisite is satisfied.** ADR 0006
+  Amendment 5 is committed as `067fca0` and Linux-CI-confirmed in run
+  42908777385; its evidence reconciliation is commit `6091f3b`. D5-C itself
+  remains unimplemented.
+
+**Ownership:** ADR 0003 Amendment 3 §A3.1 holds the ownership map. This
+amendment owns the model-facing protocol, the digests, the policy, the contract
+and classification. It cross-references the transaction (ADR 0003 Amendment 3),
+the Git mechanics (ADR 0006 Amendment 6) and the sessions and cleanup (ADR 0004
+Amendment 22).
+
+### A3.1 The operations schema (replaces the single `change`)
+
+`propose_plan`'s `change` is replaced by `operations`: a JSON array of 1 to
+**8** objects. Each object has the discriminator `"op"` and exactly these keys,
+all required, with no extras and no `null`:
+
+| `op` | Keys | Meaning |
+|---|---|---|
+| `update` | `path`, `expected_text`, `new_text` | exact single-occurrence replacement (as today) |
+| `add` | `path`, `content` | create a new regular file, mode 100644, with exactly `content` (which may be empty) |
+| `delete` | `path` | remove a tracked regular file |
+| `rename` | `from`, `to` | move a tracked regular file; bytes and mode unchanged |
+
+**Limits:**
+- each text field is strict UTF-8 with no lone surrogate, at most **64 KiB**;
+- Σ(`expected_text`, `new_text`, `content`) ≤ **131,072** bytes;
+- every path component ≤ **255** UTF-8 bytes, on top of the existing path rules
+  (512-byte path, depth 32, `.git`/`git~1` denial).
+
+No binary payload, no mode field, and no symlink, gitlink or directory
+operation.
+
+**Static rules** (refused as per-call denials, which are not turn-level):
+- `rename` with `from == to` → `CHANGE_UNCHANGED`;
+- a repository-control component (set defined by ADR 0006 Amendment 6 §A6.11) →
+  `CONTROL_PATH`;
+- an unknown `op` → `UNKNOWN_OPERATION`;
+- an over-long component → `PATH_COMPONENT_TOO_LONG`.
+
+**Cross-operation rules.** With *P* the multiset of all named paths, and
+*key(p)* = NFC then casefold per component:
+1. no two members are equal by *key*;
+2. no member is a directory prefix of another by *key*;
+3. 1 ≤ count ≤ 8.
+
+A violation is `OPERATION_CONFLICT`. These rules exclude chains, swaps, cycles,
+case-only renames and add-over-delete, and they make the final tree
+order-independent.
+
+**New `ArgumentRejection` members:** `OPERATION_CONFLICT`, `CONTROL_PATH`,
+`PROTECTED_PATH`, `UNKNOWN_OPERATION` and `PATH_COMPONENT_TOO_LONG`.
+
+**Repository-state rules** (checked in Phase V; ADR 0003 Amendment 3 §A3.2):
+
+| Rule | `update` | `add` | `delete` | `rename` |
+|---|---|---|---|---|
+| Source tracked at HEAD as 100644/100755 | yes | — | yes | `from` |
+| Source on disk: a regular file reached by a no-follow walk, ≤ 64 KiB | yes (also strict UTF-8) | — | yes (any bytes) | `from` (any bytes) |
+| Target absent on disk; no ancestor a non-directory | — | yes | — | `to` |
+| Target absent at HEAD; no *key* collision with HEAD entries in the same parent | — | yes | — | `to` |
+| Target not ignored (ADR 0003 Amendment 3 §A3.3) | — | yes | — | `to` |
+| Six-attribute ADR 0006 safety, cached and working tree, through `ReadOnlyGit.classify_attributes` against the capability's verified filter facts (ADR 0006 Amendment 6 §A6.2b) | yes | yes | yes | both |
+| `expected_text` occurs exactly once; result ≤ 64 KiB | yes | — | — | — |
+| Syntax guard (§A3.6) | `.py` | `.py` | — | — |
+| Trusted policy (§A3.4–§A3.5) | yes | yes | yes | yes |
+
+The proposal is also subject to the exact evidence preflight
+(ADR 0003 Amendment 3 §A3.5).
+
+**No compatibility path:** `change`, `ProposedChange`, `PatchOperation` and the
+single-operation applier guard are removed. Every scripted single change becomes
+one `update`.
+
+### A3.2 Canonical forms and digests
+
+`tool_schema.compute_digests(args, policy_fingerprint) -> PlanDigests` is the
+only implementation. It validates `policy_fingerprint` as 64 lowercase hex.
+`canonical_json` is unchanged: sorted keys, `(",", ":")` separators,
+`ensure_ascii=False`, UTF-8.
+
+**Canonical operation objects.** The `op` key is emitted in exactly one place:
+- `{"op": "update", "path", "expected_text", "new_text"}`
+- `{"op": "add", "path", "content"}`
+- `{"op": "delete", "path"}`
+- `{"op": "rename", "from", "to"}`
+
+These are sorted by the UTF-8 bytes of the primary path (`path`, or `from`).
+
+```
+change_digest = sha256(canonical_json({"schema": "codeagent.change.v2",
+                                        "operations": <canonical list>}))
+plan_digest   = sha256(canonical_json({"schema": "codeagent.plan.v2",
+    "change_digest": <change_digest>, "operations": <canonical list>,
+    "evidence_refs": <list, proposal order>, "problem_hypothesis": <str>,
+    "verification_intent": <str>, "risk_notes": <str>,
+    "policy_fingerprint": <§A3.4 fingerprint>}))
+```
+
+- `plan_revision` is outside both digests and is checked separately (§A3.7).
+- `material_change` still compares `change_digest` only.
+- **Redaction** (`ToolRequested`, `PlanProposed`): per operation, its kind, its
+  path(s), and for each text field the byte count and SHA-256. Never content.
+- **`proposed_file_paths`** and **`PatchApplied.files_changed`** are every
+  member of *P*, sorted.
+
+**Golden vectors** (`test_digest_golden_vectors`). The mixed proposal (add
+`new/a.py`; update `src/m.py` `a`→`b`; delete `old.txt`; rename `doc/ré.md`→
+`docs/ré.md`; evidence references `tc-1-1` and `tc-1-2`; hypothesis `h`;
+intent `v`; empty risk notes; `no_human`) gives:
+- `change.v2`: `b349a0abbae9b45c57d06433644f1d7591e731452363b6e9967bc43b66df666a`;
+- `plan.v2`: `e80dce4a6199be9e17e204a31027ee080faeb65feba49ccfd995bdfe8a1bf17a`.
+
+Implementation adds one vector per operation kind and one non-ASCII vector.
+Changing any vector requires a schema version bump.
+
+**Field-binding inventory:** 24 canonical fields, each with exactly one mutation
+disposition.
+
+| Disposition | Count | Fields or IDs |
+|---|---|---|
+| Prior mutation | 1 | `plan.v2.risk_notes`: D4b MR3, re-anchored; its `-k digest` selection reaches `test_plan_digest_binding_sweep` and `test_digest_golden_vectors` |
+| D5-C mutations | 23 | D-02, D-03, D-04, D-08…D-27 |
+| Equivalent | 0 | — |
+
+Of the 23, **8** are redundant fields caught only by a golden vector: D-03,
+D-11, D-19, D-20, D-24, D-25, D-26 and D-27. Their omission changes the schema
+bytes but not the security binding: the operations are bound twice in
+`plan.v2`, the policy sets are exact, and the version is fixed.
+
+### A3.3 Binding sweep
+
+`test_plan_digest_binding_sweep` checks, for every plan-bound field, two
+things: a mint with altered arguments and the original digests raises
+`ValueError` and registers nothing; and an in-place alteration of a minted
+snapshot is refused by `verify_approved_change` before any I/O.
+
+Fields covered:
+- `problem_hypothesis`, `verification_intent`, `risk_notes`;
+- `evidence_refs` (added, removed, reordered);
+- each operation's `op`;
+- each kind's own fields;
+- the operation count;
+- `approval_class`;
+- `plan_revision`, as a record mismatch.
+
+Policy rules, configuration names and version cannot vary under §A3.4's
+validation, so they are construction-refusal tests instead.
+
+### A3.4 `PatchPolicy` and `codeagent.patch_policy.v1`
+
+**Closed types** (in `patch_contract`):
+- `ApprovalClass`: `HUMAN_INTERACTIVE = "human_interactive"`,
+  `NO_HUMAN = "no_human"`.
+- `TestPathRule` matches on each component's *key* (NFC, then casefold). "Final"
+  is the last component; "non-final" is every other component.
+
+| Member | Value | Matches when |
+|---|---|---|
+| `DIR_COMPONENT_TEST` | `"dir_component_test"` | some non-final component equals `"test"` |
+| `DIR_COMPONENT_TESTS` | `"dir_component_tests"` | some non-final component equals `"tests"` |
+| `FILE_CONFTEST_PY` | `"file_conftest_py"` | the final component equals `"conftest.py"` |
+| `FILE_PREFIX_TEST_PY` | `"file_prefix_test_py"` | the final component starts with `"test_"` **and** ends with `".py"`. There is **no length test**, so `test_.py` matches |
+| `FILE_SUFFIX_TEST_PY` | `"file_suffix_test_py"` | the final component ends with `"_test.py"`. There is **no length test**, so `_test.py` matches |
+
+The two filename predicates equal `fnmatch.fnmatchcase(key, "test_*.py")` and
+`fnmatchcase(key, "*_test.py")`, where `*` may be empty. pytest collects
+`test_.py` and `_test.py` (planning probe; SHA-256
+`3f64271e329bbbf9a3f3165abeb6ef32b89f8e74c8a12a256a173aceb61e10a7`).
+
+- `VerificationConfigName`: `".coveragerc"`, `"conftest.py"`,
+  `"pyproject.toml"`, `"pytest.ini"`, `"setup.cfg"` and `"tox.ini"`. A path
+  matches when its final component's key equals the value, at any depth.
+
+**Fields and validation** (exact types; refusals carry fixed text):
+- `version`: `type is int`, and equal to 1;
+- `approval_class`: `type is ApprovalClass`;
+- `test_path_rules`: a tuple of `TestPathRule`, strictly increasing by the
+  UTF-8 bytes of each value (no unsorted or duplicate input), and exactly equal
+  to all five;
+- `verification_config_names`: likewise, exactly equal to all six.
+
+The only helper is `policy_for_approval_mode`. It maps `INTERACTIVE →
+HUMAN_INTERACTIVE`, and `NONE` and `PLAN_FILE → NO_HUMAN`. `PLAN_FILE` stays
+`NO_HUMAN` until D6 defines and proves a human-authored, digest-bound plan-file
+approval, and a later accepted design update moves it. Exactly **two** v1
+policies exist.
+
+**Canonical object:**
+```
+{"approval_class": <value>, "schema": "codeagent.patch_policy.v1",
+ "test_path_rules": [<values, UTF-8 byte order>],
+ "verification_config_names": [<values, UTF-8 byte order>], "version": 1}
+```
+
+- **`fingerprint`** is its SHA-256. No callable, `repr`, enum member name, set
+  iteration or platform-dependent value enters it.
+- **Golden fingerprints:**
+  - `human_interactive`: `05c2732f8b439e28438f317a9007f54ff3032f198e2de6b12307ce38b42fff94`;
+  - `no_human`: `964a2796ba9edd54e05872b76ef84c82c488b4d9f605249c041ccfc12bd1cd89`.
+- **Executable predicates:** a module-private `MappingProxyType` keyed by
+  `TestPathRule` member and total over the enum. Predicates are reached only
+  through trusted members and never enter the fingerprint.
+
+### A3.5 The test-file and verification-configuration policy
+
+A non-rename path is **test-involved** when it matches a trusted rule; a rename
+is test-involved when either its source or target matches.
+
+| Operation involving a test path | `INTERACTIVE` (`HUMAN_INTERACTIVE`) | `NONE` | `PLAN_FILE` |
+|---|---|---|---|
+| `add` | allowed, highlighted | refused | refused |
+| `update` | allowed, highlighted | refused | refused |
+| `delete` | refused | refused | refused |
+| `rename` (source or target) | refused | refused | refused |
+| any operation on verification configuration | refused | refused | refused |
+
+- Refusals are `PROTECTED_PATH`: at `propose_plan`, and again in the applier
+  from the trusted policy.
+- **Highlighted** means `PlanProposed` and `ApprovalRequest` gain `test_file_paths:
+  tuple[str, ...]` (sorted). That is an event and type addition.
+- In `NONE` and `PLAN_FILE` nothing claims a human looked.
+- No weakening detection is claimed for allowed interactive updates.
+
+**Boundary tests** (`test_test_path_rule_boundaries`,
+`test_test_path_predicates_match_pytest_globs`, and `test_policy_table` rows):
+- `test_.py`, `_test.py`, `test_a.py` and `a_test.py` are test paths, including
+  casefolded and NFD variants;
+- `test.py`, `test_`, `_test`, `atest.py` and `test_a.txt` are not test paths
+  at the root, but are under `tests/` or `test/`;
+- under `NONE` and `PLAN_FILE`, add and update of `test_.py` and `_test.py` are
+  refused;
+- under `INTERACTIVE`, they are allowed and highlighted;
+- delete and rename are refused in every mode.
+
+### A3.6 Syntax guard
+
+- **Scope:** `.py` targets of `add` and `update`.
+- **Method:** in-process `ast.parse(content, feature_version=(3, 12))`.
+  Nothing is executed and nothing is spawned.
+- **Refusal:** the new content does not parse **and** (the operation is `add`,
+  or the old content parsed).
+- **Errors caught:** `SyntaxError`, `ValueError`, `RecursionError` and
+  `MemoryError`.
+- **Message:** "operation *i*: Python syntax error at line L, column C". It
+  never includes source text.
+- **Result:** `PATCH_VALIDATION_FAILED`, route T1.
+
+### A3.7 `patch_contract` and `ApprovedChange` authority
+
+**New dependency-neutral module `codeagent.patch_contract`.** It imports only
+`domain`, `errors`, `tool_schema` and the standard library, never `controller`,
+`patch`, `executor`, `_lifecycle_run`, `_git_safety`, `evidence` or `workspace`.
+- It holds `PatchPolicy` and its types (§A3.4), **`PatchResult`** (moved from
+  `controller`, which re-exports it), `ApprovedChange`, the registry, the mint
+  function and `verify_approved_change`.
+- `patch` no longer imports `controller`.
+
+**`ApprovedChange`.** A plain `__slots__` class, **not a dataclass**:
+- **Fields:** `args`, the full approved `ProposePlanArgs` snapshot; `policy`;
+  `change_digest`; `plan_digest`; `plan_revision`; `approved_paths`, a
+  frozenset derived at mint; `_token`; `__weakref__`.
+- **Equality and hashing:** no `__eq__` or `__hash__` is defined, so both are
+  object identity.
+- **Immutability:** `__setattr__` and `__delattr__` raise `AttributeError`.
+- **No copies:** `__copy__`, `__deepcopy__` and `__reduce_ex__` raise
+  `TypeError`. `dataclasses.replace` raises `TypeError` because the class is not
+  a dataclass.
+- **Construction** requires `_token is _MINT_TOKEN`.
+
+**Registry:**
+- `_MINTED` is a `weakref.WeakKeyDictionary[ApprovedChange, _MintRecord]`, so
+  membership is the live key object's identity, never a stored integer id.
+- `_MintRecord` = `(change_digest, plan_digest, policy_fingerprint,
+  approved_paths, plan_revision)`, captured at mint.
+- An entry disappears once the minted object is collected.
+
+**Mint.** `_mint_approved_change(args, policy, digests, revision)` is called
+only by `controller`, at dispatch, after its existing digest recheck. It
+recomputes **both** digests and the paths, then registers; a mismatch is
+`ValueError` and nothing is minted.
+
+**Verify.** `verify_approved_change(change)` is the applier's first statement,
+before any Git or filesystem access. Its eight checks, all required:
+1. `type(change) is ApprovedChange`;
+2. the token is correct;
+3. registry membership;
+4. the `args` and `policy` types;
+5. the fingerprint equals the record;
+6. both digests, recomputed from the snapshot, equal both the stored values and
+   the record;
+7. the derived paths equal the stored paths and the record;
+8. the revision equals the record.
+
+**Applier signature:** `GitPatchApplier.apply(run_id, iteration, change:
+ApprovedChange)`.
+
+**Specified construction outcomes** (planning probe on Python 3.12.16; SHA-256
+`8837b266cd0a441f29242e5b4e8bf63d4022b4973393cfe81cb2d5ebe504b846`):
+- Construction without the token: `TypeError`.
+- `replace`, `copy`, `deepcopy`, `pickle`: `TypeError`.
+- An `object.__new__` clone with copied fields: not equal, not registered, and
+  refused at step 3 before I/O.
+- In-place tampering with the snapshot, policy or stored digests: refused at
+  steps 5–7 before I/O.
+- After the last reference is deleted and `gc.collect()` runs, the registry
+  entry is gone.
+
+**Required registry tests** (no allocator-specific `id()` reuse):
+- `test_registry_entry_removed_after_collection`;
+- `test_registry_membership_is_by_live_key`.
+
+A reuse test is supplemental only (`CODEAGENT_SUPPLEMENTAL=1`) and never
+required.
+
+**Authority limit.** This is **repository-enforced construction authority**,
+not an unforgeable language security boundary. A caller that deliberately
+imports the private token **and** mutates the private registry can forge an
+accepted instance. The defences are the private names, AST pins (one production
+mint site; no `src` access to `_MINTED`, `_MINT_TOKEN` or `_MintRecord` outside
+`patch_contract`; an acyclic import graph; no `id(` in `patch_contract`), and
+review.
+
+### A3.8 Classification and feedback
+
+**T1–T10 are unchanged** (Amendment 1).
+
+| Failure | Route |
+|---|---|
+| A Phase V refusal, including the evidence preflight over the bound | `PATCH_VALIDATION_FAILED`, T1 |
+| A substrate refusal, a refused session open, a preflight infrastructure failure, split index | T2 |
+| `GitSafetyError(FILTER_DRIVER_NAME_UNRENDERABLE)` or `GitSafetyError(FILTER_CONFIGURATION_CHANGED)` in Phase V | `PATCH_UNSUPPORTED_GIT_SUBSTRATE`, fixed sanitized text, **T2**: terminate; never `PATCH_FAILED` feedback, C28, C29, C30, continuation or recreation |
+| `GitCapabilityRefused` in Phase V | **not translated**: no `PatchResult`, never T1 or T2; **T8** (one `TOOL_EXECUTION_FAILED` `ToolCompleted` with the fixed text "tool failed unexpectedly", then `UNCLASSIFIED_FAILURE`; no capability, session, configuration, path or exception text in any event; no feedback, C28, C29, C30, recreation, verification or later Git launch) |
+
+The split for the new refusal classes is **owned by ADR 0003 Amendment 3 §A3.2** and is repeated here only as the classification it produces. T1–T11 are otherwise unchanged, as are Gate zero, cleanup dominance and interrupt precedence. (Historical: this row read "open: revisions 8–12 assign no route" before revision 13.)
+| Any Phase M/C failure | `PATCH_APPLICATION_FAILED`, T4 (recreation) |
+
+**New T11:** `GIT_SCRATCH_CLEANUP_UNCONFIRMED`, at any patch stage, after Gate
+zero, **terminates**. It is never T1 or T3–T5. The code, record and precedence
+are defined in ADR 0004 Amendment 22.
+
+**Feedback:** `PATCH_FAILED` messages are categorical, with the operation index
+and a sanitized path fragment, never content. `PATCH_FAILED_MESSAGE_MAX_BYTES`
+and the item bound are unchanged. Phase S denials use the existing `TOOL_DENIED`
+item.
+
+### A3.9 Tests and mutation obligations
+
+**Required tests:**
+- schema, limits and cross-operation rules;
+- golden vectors;
+- `test_plan_digest_binding_sweep`;
+- malformed-policy construction (`test_patch_policy_validation`) and
+  `test_policy_has_exactly_two_v1_values`;
+- `test_test_path_predicates_total`;
+- the boundary tests (§A3.5);
+- the policy table (every cell × every mode);
+- `test_file_paths` highlighting;
+- the syntax guard;
+- the import graph, the mint site, and the identity/forgery/tampering contract
+  tests;
+- redaction;
+- the applier receives exactly the minted change;
+- the scripted-model four-operation end-to-end test, on real Git and on real
+  Docker;
+- the Phase V routing tests, owned and listed in ADR 0003 Amendment 3 §A3.2,
+  which exercise this section's classification.
+
+**Mutation groups owned here** (counted once in ADR 0003 Amendment 3 §A3.9's
+228; Q-01…Q-45 are owned by ADR 0006 Amendment 6). (Historical: 206 before
+revisions 8–12, and 226 before revision 13.)
+- S-01…S-18;
+- D-01…D-27;
+- P-01…P-26, including P-25 (empty prefix wildcard excluded) and P-26 (empty
+  suffix wildcard excluded);
+- A-01…A-18;
+- C-01…C-08 (C-09 and C-10, the Phase V routing variants, test ADR 0003
+  Amendment 3 §A3.2's decision and are listed there);
+- K-01…K-22.
+
+### A3.10 Non-claims
+
+- No live model or provider adapter, and no operator path.
+- No weakening detection.
+- No language-level unforgeability, for `ApprovedChange` or for the Git
+  capabilities it is applied through (ADR 0006 Amendment 6 §A6.2b).
+- The applier consumes capability refusals as defined in ADR 0006 Amendment 6
+  (fixed message, no cause or context; interrupts propagate by identity). This
+  amendment does not redefine them.
+- No change to D4b's turn-loop precedence or budgets beyond the
+  `propose_plan` schema.
+- No implementation.
